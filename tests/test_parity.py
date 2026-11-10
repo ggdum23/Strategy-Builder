@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -158,6 +159,10 @@ def test_vendor_bytes_and_sample_parity(qqq):
     # because none of those files set either flag.
     assert any(row.startswith("D02,") or row.startswith("D14,") or row.startswith("D20,") for row in table)
     text = "\n".join(table) + "\n"
-    Path("/tmp/parity_table.csv").write_text(text, encoding="utf-8")
+    # Review artifact. tempfile.gettempdir() is the platform temp directory,
+    # so the same write works on Windows and Linux.
+    out = Path(tempfile.gettempdir()) / "strategy_builder_parity_table.csv"
+    out.write_text(text, encoding="utf-8")
+    assert out.read_text(encoding="utf-8") == text
     assert "D02-extended" in text
     assert "short-1x" in text
