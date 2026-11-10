@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+out/
+results/
+data/
+*.parquet
+*.pkl
+*.xz
+**/.cache/
+
+# Market data stays on disk. The only tracked bars are assets/sample.
+*.csv.gz
+!assets/sample/**/*.csv.gz
