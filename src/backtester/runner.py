@@ -3,10 +3,18 @@
 Benchmarks go through the same engine and the same cost configuration as the
 strategy. Arena financing stays at zero. Desk financing stays at the desk rate
 (7% unless the run overrides it).
+
+A walk-forward design book runs in a new interpreter started with the spawn
+method, and the locked book runs in a different one. Spawn does not copy the
+parent address space, so a strategy cannot see the locked tail through the
+stack or the garbage collector, and the design run cannot leave state behind
+for the locked run. The full referee sandbox is a later phase.
 """
 
 from __future__ import annotations
 
+import pickle
+import traceback
 from pathlib import Path
 
 from . import engine_arena, engine_desk
@@ -138,6 +146,117 @@ def _benchmarks(profile: str):
     raise ValueError(profile)
 
 
+def _strategy_spec(strategy_cls):
+    """How the child should obtain the class.
+
+    A class loaded from a file lives in a synthetic module the child cannot
+    import. The child loads that file again. An importable class is pickled
+    by module and name.
+    """
+    path = getattr(strategy_cls, "__strategy_path__", None)
+    if path:
+        return {"kind": "path", "path": str(path)}
+    return {"kind": "class", "cls": strategy_cls}
+
+
+def _load_strategy(spec):
+    if spec["kind"] == "path":
+        from .strategy_loader import load_strategy_class
+
+        return load_strategy_class(spec["path"])
+    if spec["kind"] == "class":
+        return spec["cls"]
+    raise ValueError(f"unknown strategy spec {spec.get('kind')!r}")
+
+
+def _standalone_frame(frame):
+    """A frame whose pickle contains only its own rows."""
+    out = frame.copy(deep=True).reset_index(drop=True)
+    out.attrs.clear()
+    return out
+
+
+def _plain_kwargs(kwargs):
+    out = dict(kwargs)
+    dividends = out.get("dividends")
+    if dividends:
+        out["dividends"] = {str(key): float(value) for key, value in dividends.items()}
+    return out
+
+
+def _tag_observer(result, strategy):
+    tagged = dict(result)
+    tagged["observer"] = strategy
+    return tagged
+
+
+def _picklable_books(books):
+    """Drop an observer the child cannot send back. The books themselves must travel."""
+    portable = {}
+    for label, (result, metrics) in books.items():
+        try:
+            pickle.dumps((result, metrics))
+        except Exception:
+            plain = dict(result)
+            plain.pop("observer", None)
+            pickle.dumps((plain, metrics))
+            portable[label] = (plain, metrics)
+        else:
+            portable[label] = (result, metrics)
+    return portable
+
+
+def _books_worker(queue, job):
+    try:
+        strategy_cls = _load_strategy(job["strategy"])
+        books = run_books(strategy_cls, job["frame"], job["profile"], **job["kwargs"])
+        queue.put(("ok", _picklable_books(books)))
+    except Exception as exc:
+        try:
+            pickle.dumps(exc)
+        except Exception:
+            queue.put(("err", traceback.format_exc()))
+        else:
+            queue.put(("exc", exc))
+
+
+def _isolated_books(strategy_cls, frame, profile, **kwargs):
+    """Run ``run_books`` in a fresh spawned interpreter.
+
+    The child is given this frame and these kwargs, and nothing else from the
+    caller. A long-lived process is not reused: the locked run must not observe
+    objects the design run created.
+    """
+    import multiprocessing
+    import queue as queue_mod
+
+    job = {
+        "strategy": _strategy_spec(strategy_cls),
+        "frame": _standalone_frame(frame),
+        "profile": profile,
+        "kwargs": _plain_kwargs(kwargs),
+    }
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_books_worker, args=(result_queue, job), name="walk-forward-book")
+    proc.start()
+    try:
+        message = result_queue.get(timeout=600)
+    except queue_mod.Empty as exc:
+        proc.terminate()
+        proc.join(timeout=30)
+        raise RuntimeError("walk-forward worker did not return") from exc
+    proc.join(timeout=60)
+    status = message[0]
+    if status == "ok":
+        if proc.exitcode not in (0, None):
+            raise RuntimeError(f"walk-forward worker exited {proc.exitcode}")
+        return message[1]
+    if status == "exc":
+        raise message[1]
+    raise RuntimeError(message[1])
+
+
 def run_books(
     strategy_cls,
     frame,
@@ -166,11 +285,14 @@ def run_books(
         reset_day=reset_day,
         max_day=max_day,
     )
-    result, metrics = execute(strategy_cls(), frame, profile, **common)
-    books = {"strategy": (result, metrics)}
+    strategy = strategy_cls()
+    result, metrics = execute(strategy, frame, profile, **common)
+    books = {"strategy": (_tag_observer(result, strategy), metrics)}
     if with_benchmarks:
         for label, cls in _benchmarks(profile):
-            books[label] = execute(cls(), frame, profile, **common)
+            bench = cls()
+            bench_result, bench_metrics = execute(bench, frame, profile, **common)
+            books[label] = (_tag_observer(bench_result, bench), bench_metrics)
     return books
 
 
@@ -270,6 +392,10 @@ def walk_forward(
 ):
     """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
 
+    Each book is a new spawned interpreter. The design child receives the design
+    frame only. The locked child receives the locked window and its warm-up
+    only, and it does not share memory with the design child.
+
     Arena warm-up trades, then rescales to the starting equity and keeps exposure.
     Desk warm-up is flat (``live`` false) and goes live flat at the starting equity.
     Those are different engines. This function does not merge them.
@@ -290,7 +416,7 @@ def walk_forward(
         initial_equity=initial_equity,
         with_benchmarks=with_benchmarks,
     )
-    design_books = run_books(
+    design_books = _isolated_books(
         strategy_cls,
         slices.design,
         profile,
@@ -299,7 +425,7 @@ def walk_forward(
         **common,
     )
     if profile == "arena":
-        locked_books = run_books(
+        locked_books = _isolated_books(
             strategy_cls,
             slices.locked_with_warmup,
             profile,
@@ -309,7 +435,7 @@ def walk_forward(
             **common,
         )
     elif profile == "desk":
-        locked_books = run_books(
+        locked_books = _isolated_books(
             strategy_cls,
             slices.locked_with_warmup,
             profile,

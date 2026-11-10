@@ -156,6 +156,34 @@ def discover_filled_files(src, symbol: str) -> list[Path]:
     return [path for _, _, path in parsed]
 
 
+def absent_months(paths, symbol: str) -> tuple[str, ...]:
+    """YYYY-MM labels with no file, from the earliest file through the latest.
+
+    A holiday gap inside a file that exists is not a missing month. One file,
+    or a run of consecutive months, returns an empty tuple.
+    """
+    keys = []
+    for path in paths:
+        match = _FILE_RE.match(Path(path).name)
+        if match is None or match.group(1) != symbol:
+            continue
+        keys.append(int(match.group(2)) * 12 + int(match.group(3)) - 1)
+    if len(keys) < 2:
+        return ()
+    have = set(keys)
+    missing = []
+    for index in range(min(keys), max(keys) + 1):
+        if index not in have:
+            year, month0 = divmod(index, 12)
+            missing.append(f"{year:04d}-{month0 + 1:02d}")
+    return tuple(missing)
+
+
+def _month_label(index: int) -> str:
+    year, month0 = divmod(index, 12)
+    return f"{year:04d}-{month0 + 1:02d}"
+
+
 def _read_month(path: Path) -> pd.DataFrame:
     frame = pd.read_csv(path)
     missing = [name for name in REQUIRED_COLUMNS if name not in frame.columns]
@@ -278,13 +306,26 @@ def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=()) -> LoadedSe
     native_rows = len(built)
     if bar_minutes != 1:
         built = resample(built, bar_minutes)
-    notes = (
+    notes = [
         "Prices are raw prints from the filled file, not dividend-adjusted and not split-adjusted.",
         "share_factor is 1.0 for raw files. Do not use the anonymized desk kit's 0.9 on this frame.",
         "session is pre/rth/post from the file. The desk engine maps the calendar date to its session id.",
         "short_session is 1 when the 1-minute RTH segment ends before 15:59. It is not inferred from a ticker calendar.",
         f"Loaded {len(paths)} monthly file(s), {native_rows} one-minute rows, delivered at {bar_minutes}-minute bars.",
-    )
+    ]
+    missing = absent_months(paths, symbol)
+    if missing:
+        span = []
+        for path in paths:
+            match = _FILE_RE.match(Path(path).name)
+            if match is not None and match.group(1) == symbol:
+                span.append(int(match.group(2)) * 12 + int(match.group(3)) - 1)
+        notes.append(
+            "Missing monthly file(s) between "
+            f"{_month_label(min(span))} and {_month_label(max(span))}: {', '.join(missing)}. "
+            "Files that exist were loaded. A gap inside a file that exists is not a missing month."
+        )
+    notes = tuple(notes)
     inspection = Inspection(
         symbol=symbol,
         columns=tuple(REQUIRED_COLUMNS),

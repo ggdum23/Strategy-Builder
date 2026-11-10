@@ -87,6 +87,12 @@ def _dividends(path):
     return load_dividends(path)
 
 
+def _print_data_notes(notes) -> None:
+    for note in notes or ():
+        if str(note).startswith("Missing monthly file"):
+            print(f"note: {note}")
+
+
 def _print_headline(profile: str, payload: dict) -> None:
     final = payload.get("final_equity")
     total = payload.get("total_return")
@@ -127,6 +133,7 @@ def _cmd_run(args) -> int:
         initial_equity=args.initial_equity,
     )
     _print_headline(args.profile, payload)
+    _print_data_notes(((payload.get("run") or {}).get("inspection") or {}).get("notes"))
     print(f"wrote {args.out}")
     return 0
 
@@ -144,6 +151,7 @@ def _cmd_walk(args) -> int:
     from .data import load_named as _load
 
     loaded = _load(args.src, args.ticker, bar_minutes=args.bar_minutes)
+    _print_data_notes(loaded.inspection.notes)
     factor = loaded.inspection.share_factor if loaded_factor is None else loaded_factor
     summary, _slices, _design, _locked = walk_forward(
         strategy_cls,
@@ -183,6 +191,7 @@ def _cmd_ingest(args) -> int:
         f"sessions={','.join(info.session_labels)}, share_factor={info.share_factor}, "
         f"prices={info.price_adjustment}"
     )
+    _print_data_notes(info.notes)
     print(f"wrote {args.out}")
     return 0
 

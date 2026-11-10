@@ -22,8 +22,10 @@ The textual differences in `engine_arena.py` are:
 
 PLAN.md says the Arena FINRA TAF is $0. The reference `costs.py` charges
 `$0.000195` per share sold, maximum `$9.79`, and SEC `$0.0000206` of sale value.
-Bit-identity follows the reference file. Those constants are pinned by a test
-that compares them to the literals, not only to themselves.
+Parity with the vendored engine wins. Those IBKR constants are not edited to
+match the plan sentence. Bit-identity follows the reference file. The constants
+are pinned by a test that compares them to the literals, not only to themselves.
+The same decision is stated in `docs/DESK_SPEC_DECISIONS.md`.
 
 PLAN.md lists Arena state keys `position_shares`, `position_value`, and
 `avg_price`. The reference state dict, which `D02` and `D08` read via

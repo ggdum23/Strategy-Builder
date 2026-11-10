@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import inspect
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -16,13 +18,13 @@ from backtester.runner import execute, walk_forward
 SENTINEL = 99_999.0
 
 
-def make_frame(n_days: int, *, price_of=None, sentinel_day=None) -> pd.DataFrame:
+def make_frame(n_days: int, *, price_of=None, sentinel_day=None, sentinel=SENTINEL) -> pd.DataFrame:
     rows = []
     for day in range(n_days):
         date = (datetime(2026, 3, 2) + timedelta(days=day)).date().isoformat()
         for minute, phase in ((240, "pre"), (570, "rth"), (571, "rth"), (960, "post")):
             price = 100.0 + day if price_of is None else float(price_of(day))
-            close = SENTINEL if sentinel_day == day else price
+            close = sentinel if sentinel_day == day else price
             high = max(price, close)
             low = min(price, close)
             rows.append(
@@ -70,6 +72,110 @@ class DeskProbe:
         return 1.0 if bar["time"] == "09:30" and bar["phase"] == "rth" else None
 
 
+class ArenaRec:
+    """Records delivered days. Importable so the spawned design run can unpickle it."""
+
+    WANTS_EXTENDED_HOURS = False
+
+    def __init__(self):
+        self.rows = []
+
+    def on_bar(self, bar, state):
+        self.rows.append(int(bar["day"]))
+        return 1.0
+
+
+class DeskRec:
+    def __init__(self):
+        self.rows = []
+
+    def on_bar(self, bar, account):
+        self.rows.append(
+            (bar["session"], float(bar["close"]), bar["time"], account["live"], account["equity"], account["position_shares"])
+        )
+        return 1.0 if bar["time"] == "09:30" and bar["phase"] == "rth" else None
+
+
+class MemoryScanner:
+    """Trades only if a locked-tail close is visible on the stack or in gc.
+
+    The needle is a class attribute, so a scan of every float would see it even
+    in a clean process. The scan looks for that close inside market-data
+    containers: a frame column, a bar dict, or a numeric array long enough to
+    be a column.
+    """
+
+    needle = 87_654_321.0
+    WANTS_EXTENDED_HOURS = False
+
+    def __init__(self):
+        self.checked = False
+        self.saw = False
+
+    def on_bar(self, _bar, _state):
+        if not self.checked:
+            self.checked = True
+            self.saw = market_holds(type(self).needle)
+        return 1.0 if self.saw else 0.0
+
+
+class DesignInfluence:
+    """A class flag set during design must not arm the locked run."""
+
+    primed = False
+    WANTS_EXTENDED_HOURS = False
+
+    def __init__(self):
+        self.arm = None
+
+    def on_bar(self, _bar, _state):
+        if self.arm is None:
+            self.arm = DesignInfluence.primed
+            DesignInfluence.primed = True
+            return 1.0 if self.arm else 0.0
+        return 1.0 if self.arm else 0.0
+
+
+def _close_equals(value, needle) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) == needle
+
+
+def market_holds(needle: float) -> bool:
+    """True when ``needle`` appears as a bar close reachable from this process."""
+
+    def holds(obj) -> bool:
+        try:
+            if isinstance(obj, pd.DataFrame):
+                if "close" in getattr(obj, "columns", ()):
+                    values = obj["close"].to_numpy(dtype=float, copy=False)
+                    if values.size and bool(np.any(values == needle)):
+                        return True
+                return False
+            if isinstance(obj, pd.Series) and obj.name == "close":
+                values = obj.to_numpy(dtype=float, copy=False)
+                return bool(values.size and np.any(values == needle))
+            if isinstance(obj, np.ndarray) and obj.dtype.kind in "fiu" and obj.size >= 4:
+                return bool(np.any(obj == needle))
+            if isinstance(obj, dict) and _close_equals(obj.get("close"), needle):
+                return True
+            if isinstance(obj, (list, tuple)) and obj and isinstance(obj[0], dict):
+                return any(isinstance(item, dict) and _close_equals(item.get("close"), needle) for item in obj)
+        except Exception:
+            return False
+        return False
+
+    frame = inspect.currentframe()
+    while frame is not None:
+        for value in tuple(frame.f_locals.values()):
+            if holds(value):
+                return True
+        frame = frame.f_back
+    for obj in gc.get_objects():
+        if holds(obj):
+            return True
+    return False
+
+
 def test_design_prefix_matches_the_full_sample_and_hides_the_tail():
     frame = make_frame(10, sentinel_day=9)
     slices = slice_walkforward(frame, design_end_day=5, warmup_days=2)
@@ -95,35 +201,11 @@ def test_design_prefix_matches_the_full_sample_and_hides_the_tail():
 
 def test_profile_warmup_and_no_future_bars(tmp_path):
     frame = make_frame(8, price_of=lambda _day: 100.0, sentinel_day=7)
-    seen = {"arena": [], "desk": []}
-
-    class ArenaRec:
-        WANTS_EXTENDED_HOURS = False
-
-        def __init__(self):
-            self.rows = []
-            seen["arena"].append(self)
-
-        def on_bar(self, bar, state):
-            self.rows.append(int(bar["day"]))
-            return 1.0
-
-    class DeskRec:
-        def __init__(self):
-            self.rows = []
-            seen["desk"].append(self)
-
-        def on_bar(self, bar, account):
-            self.rows.append(
-                (bar["session"], float(bar["close"]), bar["time"], account["live"], account["equity"], account["position_shares"])
-            )
-            return 1.0 if bar["time"] == "09:30" and bar["phase"] == "rth" else None
-
-    arena_summary, arena_slices, _ad, arena_locked = walk_forward(
+    arena_summary, arena_slices, arena_design, arena_locked = walk_forward(
         ArenaRec, frame, "arena", tmp_path / "arena", symbol="TEST", bar_minutes=1,
         design_end_day=4, warmup_days=2, with_benchmarks=False,
     )
-    desk_summary, desk_slices, _dd, desk_locked = walk_forward(
+    desk_summary, desk_slices, desk_design, desk_locked = walk_forward(
         DeskRec, frame, "desk", tmp_path / "desk", symbol="TEST", bar_minutes=1,
         design_end_day=4, warmup_days=2, with_benchmarks=False,
     )
@@ -131,8 +213,8 @@ def test_profile_warmup_and_no_future_bars(tmp_path):
     assert arena_summary["locked_start_day"] == 5
     assert arena_slices.warmup_sessions == 2
     assert int(arena_slices.design["day"].max()) < int(arena_slices.locked["day"].min())
-    design_days = seen["arena"][0].rows
-    locked_days = seen["arena"][1].rows
+    design_days = arena_design["strategy"][0]["observer"].rows
+    locked_days = arena_locked["strategy"][0]["observer"].rows
     assert design_days
     assert max(design_days) <= 4
     assert locked_days == sorted(locked_days)
@@ -144,10 +226,10 @@ def test_profile_warmup_and_no_future_bars(tmp_path):
     assert result["daily"][0][0] == 5
     assert abs(result["daily"][0][2] - 1.0) < 0.01
 
-    design_sessions = [row[0] for row in seen["desk"][0].rows]
-    locked_rows = seen["desk"][1].rows
+    design_sessions = [row[0] for row in desk_design["strategy"][0]["observer"].rows]
+    locked_rows = desk_locked["strategy"][0]["observer"].rows
     assert max(design_sessions) <= desk_slices.design_end_date
-    assert all(close != SENTINEL for _session, close, _time, _live, _eq, _shares in seen["desk"][0].rows)
+    assert all(close != SENTINEL for _session, close, _time, _live, _eq, _shares in desk_design["strategy"][0]["observer"].rows)
     live = [row for row in locked_rows if row[3]]
     warmup = [row for row in locked_rows if not row[3]]
     assert warmup and live
@@ -164,6 +246,41 @@ def test_profile_warmup_and_no_future_bars(tmp_path):
     assert "3795" not in inspect.getsource(runner)
     assert desk_summary["warmup_rule"] == "flat_until_live"
     assert arena_summary["warmup_rule"] == "rescale_keep_exposure"
+
+
+@pytest.mark.parametrize("profile", ["arena", "desk"])
+def test_design_process_cannot_see_the_locked_close(tmp_path, profile):
+    needle = MemoryScanner.needle
+    frame = make_frame(6, sentinel_day=5, sentinel=needle)
+    assert market_holds(needle) is True
+    summary, slices, design, locked = walk_forward(
+        MemoryScanner, frame, profile, tmp_path / profile, symbol="TEST", bar_minutes=1,
+        design_end_day=3, with_benchmarks=False,
+    )
+    assert needle not in set(slices.design["close"].tolist())
+    assert needle in set(slices.locked["close"].tolist())
+    observer = design["strategy"][0]["observer"]
+    assert observer.checked is True
+    assert observer.saw is False
+    assert design["strategy"][0]["n_fills"] == 0
+    assert summary["design"]["n_fills"] == 0
+    # The locked book is a different interpreter. It may see its own tail.
+    assert locked["strategy"][0]["observer"].checked is True
+
+
+@pytest.mark.parametrize("profile", ["arena", "desk"])
+def test_locked_run_is_not_armed_by_the_design_run(tmp_path, profile):
+    DesignInfluence.primed = False
+    frame = make_frame(5, price_of=lambda _day: 100.0)
+    _summary, _slices, design, locked = walk_forward(
+        DesignInfluence, frame, profile, tmp_path / profile, symbol="TEST", bar_minutes=1,
+        design_end_day=2, with_benchmarks=False,
+    )
+    assert design["strategy"][0]["observer"].arm is False
+    assert design["strategy"][0]["n_fills"] == 0
+    assert locked["strategy"][0]["observer"].arm is False
+    assert locked["strategy"][0]["n_fills"] == 0
+    assert DesignInfluence.primed is False
 
 
 def test_slice_requires_exactly_one_cut_and_clips_warmup():

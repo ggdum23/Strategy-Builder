@@ -668,6 +668,26 @@ def run(strategy, bars, config=None):
     }
 
 
+def _cagr(final, initial, years):
+    """Compound growth. A finite equity path that overflows the power returns a non-finite CAGR.
+
+    Arena's numpy power does the same: the value is infinite rather than an exception,
+    and the JSON writer stores that as null. One huge session must not kill a walk-forward.
+    """
+    if not final > 0.0:
+        return -1.0
+    if not years > 0.0:
+        return math.nan
+    ratio = final / initial
+    try:
+        grown = ratio ** (1.0 / years)
+    except OverflowError:
+        return math.inf if ratio >= 1.0 else -math.inf
+    if not math.isfinite(grown):
+        return math.inf if ratio >= 1.0 else -math.inf
+    return grown - 1.0
+
+
 def metrics(res):
     """Statistics on last-RTH-close marks. Definitions match the Arena metrics function."""
     daily = res["daily"]
@@ -681,10 +701,7 @@ def metrics(res):
     previous = [initial] + equity[:-1]
     returns = [equity[i] / previous[i] - 1.0 for i in range(n)]
     total = equity[-1] / initial - 1.0
-    if equity[-1] > 0.0:
-        cagr = (equity[-1] / initial) ** (1.0 / years) - 1.0
-    else:
-        cagr = -1.0
+    cagr = _cagr(equity[-1], initial, years)
     if n > 1:
         mean = sum(returns) / n
         var = sum((r - mean) ** 2 for r in returns) / (n - 1)

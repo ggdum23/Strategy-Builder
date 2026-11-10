@@ -240,7 +240,8 @@ def test_long_financing_dividend_and_fee_mult_use_the_formula():
         cash = 1_000_000.0
         cash -= shares * px + fees["total"]
         equity = cash + shares * 101.0
-        fin = D.financing_due(shares, 101.0, equity)
+        fin = 0.07 / 252 * max(0.0, abs(shares * 101.0) - equity)
+        assert fin > 0.0
         cash -= fin
         cash += shares * dividend
         return {"shares": shares, "px": px, "fees": fees["total"], "fin": fin, "cash": cash}
@@ -273,11 +274,15 @@ def test_long_financing_dividend_and_fee_mult_use_the_formula():
     _c, plain = go(odd_signal, odd, fee_mult=1.0)
     _d, doubled = go(odd_signal, odd, fee_mult=2.0)
     assert doubled["fees"]["total"] == plain["fees"]["total"] * 2
-    assert doubled["financing"] == D.financing_due(
-        doubled["financing_events"][0]["shares"],
-        doubled["financing_events"][0]["price"],
-        doubled["financing_events"][0]["equity"],
-    )
+    odd_shares = int(1_000_000 / 33.0)
+    odd_px = D.slipped_price(33.0, odd_shares, fee_mult=2.0)
+    odd_fees = D.fill_costs(odd_shares, odd_px, 0.0, fee_mult=2.0)
+    odd_cash = 1_000_000.0 - odd_shares * odd_px - odd_fees["total"]
+    odd_equity = odd_cash + odd_shares * 33.0
+    odd_fin = 0.07 / 252 * max(0.0, abs(odd_shares * 33.0) - odd_equity)
+    assert odd_fin > 0.0
+    assert doubled["financing"] == odd_fin
+    assert doubled["financing"] != 0.07 / 365 * max(0.0, abs(odd_shares * 33.0) - odd_equity)
     assert doubled["financing"] != plain["financing"] * 2
 
 
@@ -298,10 +303,12 @@ def test_short_borrow_and_dividend_debit_at_the_boundary():
     fees = D.fill_costs(shares, px, 0.0)
     cash = 1_000_000.0 - shares * px - fees["total"]
     equity = cash + shares * 150.0
-    fin = D.financing_due(shares, 150.0, equity)
-    bor = D.borrow_due(shares, 150.0)
-    assert bor == D.BORROW_RATE_ANNUAL / D.SESSIONS_PER_YEAR * (-shares * 150.0)
-    assert bor != D.BORROW_RATE_ANNUAL / D.SESSIONS_PER_YEAR * (-shares * 100.0)
+    fin = 0.07 / 252 * max(0.0, abs(shares * 150.0) - equity)
+    bor = 0.0025 / 252 * max(0.0, -shares * 150.0)
+    assert bor > 0.0
+    assert bor == 0.0025 / 252 * (-shares * 150.0)
+    assert bor != 0.0025 / 252 * (-shares * 100.0)
+    assert bor != 0.0025 / 365 * (-shares * 150.0)
     cash = cash - fin - bor + shares * 1.5
     assert res["borrow"] == bor
     assert res["financing"] == fin
@@ -321,8 +328,15 @@ def test_weekend_gap_is_one_accrual_not_three_calendar_days():
     _strategy, res = go(lambda row, _account: 2.0 if row["time"] == "09:30" and row["session"] == "2026-10-02" else None, bars)
     assert len(res["financing_events"]) == 1
     event = res["financing_events"][0]
-    assert event["amount"] == D.financing_due(event["shares"], event["price"], event["equity"])
-    assert event["amount"] != 3 * event["amount"]
+    shares = int(2.0 * 1_000_000 / 100.0)
+    px = D.slipped_price(100.0, shares)
+    fees = D.fill_costs(shares, px, 0.0)
+    cash = 1_000_000.0 - shares * px - fees["total"]
+    equity = cash + shares * 100.0
+    one_session = 0.07 / 252 * max(0.0, abs(shares * 100.0) - equity)
+    assert one_session > 0.0
+    assert event["amount"] == one_session
+    assert event["amount"] != 3 * one_session
 
 
 def test_margin_call_on_an_rth_close_fills_the_next_minute_even_at_3x():
@@ -630,6 +644,68 @@ def test_desk_does_not_call_on_day_end():
     strategy = Strategy()
     run(strategy, [bar("S1", "09:30", "rth", 100), bar("S1", "09:31", "rth", 100)], DeskConfig())
     assert strategy.ends == 0
+
+
+class OneShotLong:
+    """Module-level so a spawned walk-forward interpreter can import it."""
+
+    def on_bar(self, row, _account):
+        if row["time"] == "09:30" and row["phase"] == "rth":
+            return 1.0
+        return None
+
+
+def test_one_large_finite_session_returns_a_non_finite_cagr(tmp_path):
+    import pandas as pd
+
+    from backtester.runner import walk_forward
+
+    bars = [
+        bar("S1", "09:30", "rth", 100.0),
+        bar("S1", "09:31", "rth", 100.0, close=100_000.0, high=100_000.0),
+    ]
+    _strategy, res = go(lambda row, _account: 1.0 if row["time"] == "09:30" else None, bars)
+    equity = res["daily"][-1]["equity"]
+    assert math.isfinite(equity)
+    assert equity > 1_000_000.0
+    out = metrics(res)
+    assert math.isinf(out["cagr"])
+    assert out["cagr"] > 0.0
+
+    rows = []
+    for day, last_close in ((0, 100_000.0), (1, 100.0)):
+        date = f"2026-03-0{2 + day}"
+        for minute, close in ((570, 100.0), (571, last_close)):
+            rows.append(
+                {
+                    "date": date,
+                    "day": day,
+                    "session": "rth",
+                    "minute": minute,
+                    "time": f"{minute // 60:02d}:{minute % 60:02d}",
+                    "open": 100.0,
+                    "high": max(100.0, close),
+                    "low": 100.0,
+                    "close": close,
+                    "volume": 1000.0,
+                    "wap": close,
+                    "count": 1,
+                    "filled": 0,
+                }
+            )
+    summary, *_rest = walk_forward(
+        OneShotLong,
+        pd.DataFrame(rows),
+        "desk",
+        tmp_path,
+        symbol="TEST",
+        bar_minutes=1,
+        design_end_day=0,
+        with_benchmarks=False,
+    )
+    assert math.isinf(summary["design"]["cagr"])
+    text = (tmp_path / "walkforward.json").read_text(encoding="utf-8")
+    assert '"cagr": null' in text
 
 
 def test_warmup_past_the_sample_stays_empty():

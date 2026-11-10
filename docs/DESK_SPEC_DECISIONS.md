@@ -5,6 +5,12 @@ implementation of PLAN.md Profile B. It does not call the Arena engine, Arena
 `fill_costs`, or Arena `slipped_price`. The numeric schedule is duplicated in
 `costs_desk.py`.
 
+Arena FINRA TAF stays on the vendored reference schedule: `$0.000195` per share
+sold, cap `$9.79`, and SEC `$0.0000206` of sale value (`src/backtester/costs.py`,
+byte-identical to `tests/reference/arena/costs.py`). PLAN.md says Arena TAF is
+`$0`. Parity with the vendored engine wins. Those IBKR constants are not edited
+to match that sentence. See `docs/ARENA_PORT_NOTES.md` and item 9.
+
 These are the readings that were not fixed by a single sentence in the spec.
 
 1. **Separate engine.** Desk fill venue, leverage cap, financing, borrow, dividends,
@@ -51,7 +57,10 @@ These are the readings that were not fixed by a single sentence in the spec.
 9. **Desk sell fees.** SEC is `27.80e-6` times sale value (`abs(shares) * slipped
    price`, not scaled by `share_factor`). FINRA TAF is `min(0.000166 * abs(shares)
    * share_factor, 8.30)` on sells only. There is no TAF holiday calendar. Arena's
-   TAF and SEC stay on the Arena numbers (see `docs/ARENA_PORT_NOTES.md`).
+   TAF and SEC stay on the vendored reference numbers, not on PLAN.md: TAF is
+   `$0.000195` per share sold with a `$9.79` cap, and SEC is `$0.0000206` of
+   sale value. PLAN.md's Arena "TAF $0" is not applied. Parity with the vendored
+   engine wins, and those IBKR constants do not change. See `docs/ARENA_PORT_NOTES.md`.
 
 10. **The rest of the IBKR invoice.** Tier walk, `$0.35` minimum, 1% cap,
     exchange `$0.003`, clearing `$0.0002` capped at 0.5% of value, and CAT
@@ -196,6 +205,10 @@ These are the readings that were not fixed by a single sentence in the spec.
 33. **Walk-forward warm-up is per profile.** The default warm-up length is 0.
     There is no default design cut. Arena locked warm-up uses `reset_day`.
     Desk locked warm-up uses `live_start_ordinal`. They are not the same code path.
+    The design book and the locked book each run in a new interpreter started
+    with the spawn method. The design interpreter receives only the design frame.
+    The locked interpreter receives only the locked window plus its warm-up, and
+    it does not see objects created by the design run.
 
 34. **Performance math.** 252 sessions per year, sample standard deviation with
     delta degrees of freedom 1, Sortino uses the square root of the mean of

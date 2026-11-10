@@ -210,6 +210,7 @@ def test_months_sort_and_bad_rows_raise(tmp_path):
     loaded = load_named(tmp_path, "SPY")
     assert list(loaded.frame["date"].unique()) == ["2026-10-01", "2026-11-02"]
     assert list(loaded.frame["day"].unique()) == [0, 1]
+    assert not any(str(note).startswith("Missing monthly file") for note in loaded.inspection.notes)
     with pytest.raises(ValueError, match="Split"):
         load_named(tmp_path, "SPY", splits=((datetime(2026, 8, 1).date(), 2.0),))
     assert_no_silent_splits(())
@@ -239,6 +240,49 @@ def test_count_survives_the_desk_conversion():
         }]
     )
     assert frame_to_desk_bars(frame)[0]["count"] == 7
+
+
+def test_missing_month_is_named_and_a_gap_inside_a_file_is_kept(tmp_path, capsys):
+    from backtester.__main__ import main
+
+    # 2025-11-03 and 2025-11-06, with 2025-11-05 absent inside the file.
+    november = [
+        minute_row(datetime(2025, 11, 3), 570, "rth", 10),
+        minute_row(datetime(2025, 11, 3), 571, "rth", 10),
+        minute_row(datetime(2025, 11, 6), 570, "rth", 11),
+        minute_row(datetime(2025, 11, 6), 571, "rth", 11),
+    ]
+    february = [
+        minute_row(datetime(2026, 2, 2), 570, "rth", 12),
+        minute_row(datetime(2026, 2, 2), 571, "rth", 12),
+    ]
+    write_month(tmp_path / "QQQ_1min_filled_2025-11.csv.gz", november)
+    write_month(tmp_path / "QQQ_1min_filled_2026-02.csv.gz", february)
+    loaded = load_named(tmp_path, "QQQ")
+    assert list(loaded.frame["date"].unique()) == ["2025-11-03", "2025-11-06", "2026-02-02"]
+    notes = [note for note in loaded.inspection.notes if str(note).startswith("Missing monthly file")]
+    assert len(notes) == 1
+    assert "2025-12" in notes[0]
+    assert "2026-01" in notes[0]
+    assert "2025-11-05" not in notes[0]
+    assert "between 2025-11 and 2026-02" in notes[0]
+
+    out = tmp_path / "inspect.json"
+    assert main(["ingest", "--ticker", "QQQ", "--src", str(tmp_path), "--out", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "note: Missing monthly file" in printed
+    assert "2025-12" in printed
+    assert "2026-01" in printed
+    hold = Path(__file__).resolve().parents[1] / "examples" / "desk" / "buy_and_hold.py"
+    assert main(
+        [
+            "run", "--profile", "desk", "--ticker", "QQQ", "--strategy", str(hold),
+            "--src", str(tmp_path), "--out", str(tmp_path / "run"),
+        ]
+    ) == 0
+    run_out = capsys.readouterr().out
+    assert "note: Missing monthly file" in run_out
+    assert "2025-12" in run_out
 
 
 def test_filename_rejects_a_path_separator():
