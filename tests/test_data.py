@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -283,6 +284,24 @@ def test_missing_month_is_named_and_a_gap_inside_a_file_is_kept(tmp_path, capsys
     run_out = capsys.readouterr().out
     assert "note: Missing monthly file" in run_out
     assert "2025-12" in run_out
+
+    assert main(
+        [
+            "walkforward", "--profile", "desk", "--ticker", "QQQ", "--strategy", str(hold),
+            "--src", str(tmp_path), "--out", str(tmp_path / "walk"),
+            "--design-end-date", "2025-11-06",
+        ]
+    ) == 0
+    walk_out = capsys.readouterr().out
+    assert "note: Missing monthly file" in walk_out
+    assert "2025-12" in walk_out
+    assert "2026-01" in walk_out
+    summary = json.loads((tmp_path / "walk" / "walkforward.json").read_text(encoding="utf-8"))
+    written = [note for note in summary["inspection_notes"] if str(note).startswith("Missing monthly file")]
+    assert len(written) == 1
+    assert "2025-12" in written[0]
+    assert "2026-01" in written[0]
+    assert "2025-11-05" not in written[0]
 
 
 def test_filename_rejects_a_path_separator():

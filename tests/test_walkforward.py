@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import gc
 import inspect
+import os
+import random
+import sys
+import time
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -299,6 +303,154 @@ def test_slice_requires_exactly_one_cut_and_clips_warmup():
     assert int(warm.locked_with_warmup["day"].min()) == 0
     assert int(warm.design["day"].max()) == 5
     assert set(warm.design["day"]).isdisjoint(set(warm.locked["day"]))
+
+
+class ChildSurface:
+    """Records the argv, cwd, and environment the strategy actually sees."""
+
+    WANTS_EXTENDED_HOURS = False
+
+    def __init__(self):
+        self.argv = None
+        self.cwd = None
+        self.cwd_listing = None
+        self.env_text = None
+
+    def on_bar(self, _bar, _state):
+        if self.argv is None:
+            self.argv = list(sys.argv)
+            self.cwd = os.getcwd()
+            self.cwd_listing = sorted(os.listdir(self.cwd))
+            self.env_text = "\n".join(f"{key}={value}" for key, value in os.environ.items())
+        return 0.0
+
+
+class SystemExitChild:
+    WANTS_EXTENDED_HOURS = False
+
+    def on_bar(self, _bar, _state):
+        raise SystemExit(3)
+
+
+class HardExitChild:
+    WANTS_EXTENDED_HOURS = False
+
+    def on_bar(self, _bar, _state):
+        os._exit(7)
+
+
+def _frame_holding(needle: float) -> pd.DataFrame:
+    frame = make_frame(6, sentinel_day=5, sentinel=needle)
+    assert market_holds(needle) is True
+    assert needle not in set(frame.loc[frame["day"] <= 3, "close"].tolist())
+    assert needle in set(frame.loc[frame["day"] > 3, "close"].tolist())
+    return frame
+
+
+def _linux_dumpable() -> int | None:
+    if sys.platform != "linux":
+        return None
+    import ctypes
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    return int(libc.prctl(3, 0, 0, 0, 0))
+
+
+def test_design_child_has_no_source_path_and_parent_drops_the_locked_close(tmp_path):
+    token = "DATA_ROOT_TOKEN_9f3c"
+    needle = float(random.Random(20261110).randrange(100_000_000, 900_000_000))
+    source = tmp_path / token
+    source.mkdir()
+    parent_cwd = os.getcwd()
+    planted = ["backtester", "walkforward", "--src", str(source)]
+    old_argv = list(sys.argv)
+    old_env = os.environ.get("MARKET_DATA_ROOT")
+    held = {}
+
+    def during():
+        gc.collect()
+        held["seen"] = market_holds(needle)
+        held["dumpable"] = _linux_dumpable()
+
+    sys.argv = list(planted)
+    os.environ["MARKET_DATA_ROOT"] = str(source)
+    os.chdir(source)
+    try:
+        summary, slices, design, _locked = walk_forward(
+            ChildSurface,
+            _frame_holding(needle),
+            "arena",
+            tmp_path / "out",
+            symbol="TEST",
+            bar_minutes=1,
+            design_end_day=3,
+            with_benchmarks=False,
+            during_design=during,
+        )
+        assert os.path.samefile(os.getcwd(), source)
+        assert list(sys.argv) == planted
+    finally:
+        os.chdir(parent_cwd)
+        sys.argv = old_argv
+        if old_env is None:
+            os.environ.pop("MARKET_DATA_ROOT", None)
+        else:
+            os.environ["MARKET_DATA_ROOT"] = old_env
+
+    assert held["seen"] is False
+    if sys.platform == "linux":
+        assert held["dumpable"] == 0
+        assert _linux_dumpable() == 1
+    observer = design["strategy"][0]["observer"]
+    assert observer.argv == ["backtester-design"]
+    assert observer.inherited_argv == ["backtester-design"]
+    assert token not in observer.cwd
+    assert token not in observer.inherited_cwd
+    assert os.path.normcase(observer.cwd) != os.path.normcase(str(source))
+    assert observer.cwd_listing == []
+    assert token not in observer.env_text
+    assert "MARKET_DATA_ROOT" not in observer.env_text
+    assert needle in set(slices.locked["close"].tolist())
+    assert needle not in set(slices.design["close"].tolist())
+    assert summary["inspection_notes"] == []
+
+
+def test_systemexit_in_the_child_fails_fast(tmp_path):
+    cwd = os.getcwd()
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="SystemExit") as caught:
+        walk_forward(
+            SystemExitChild,
+            make_frame(4),
+            "arena",
+            tmp_path,
+            symbol="TEST",
+            bar_minutes=1,
+            design_end_day=1,
+            with_benchmarks=False,
+        )
+    assert time.monotonic() - started < 30
+    assert "timed out" not in str(caught.value)
+    assert os.getcwd() == cwd
+
+
+def test_os_exit_in_the_child_fails_fast(tmp_path):
+    cwd = os.getcwd()
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"exited 7") as caught:
+        walk_forward(
+            HardExitChild,
+            make_frame(4),
+            "arena",
+            tmp_path,
+            symbol="TEST",
+            bar_minutes=1,
+            design_end_day=1,
+            with_benchmarks=False,
+        )
+    assert time.monotonic() - started < 30
+    assert "timed out" not in str(caught.value)
+    assert os.getcwd() == cwd
 
 
 def test_pack_windows_still_exist_and_are_not_the_named_default():

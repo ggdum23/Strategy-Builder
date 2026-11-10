@@ -43,6 +43,8 @@ ARENA = Profile(
     share_factor_default=1.0,
 )
 
+# liquidation, margin, and the fee month are the same numbers as DeskConfig.
+# test_desk_engine_defaults_match_the_profile locks the pair.
 DESK = Profile(
     name="desk",
     max_abs_target=3.0,

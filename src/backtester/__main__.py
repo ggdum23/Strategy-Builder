@@ -1,4 +1,4 @@
-"""Command line. Library calls do not print and do not read the working directory."""
+"""Command line. Printing stays in this module. Walk-forward restores the working directory."""
 
 from __future__ import annotations
 
@@ -138,6 +138,24 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _walk_inputs(args):
+    """Load the series and return the frame without keeping the loader object.
+
+    The caller pops ``frame`` in the ``walk_forward`` argument list so this
+    command does not keep a local bound to the full series during the design run.
+    """
+    from .data import load_named as _load
+
+    loaded = _load(args.src, args.ticker, bar_minutes=args.bar_minutes)
+    _print_data_notes(loaded.inspection.notes)
+    factor = loaded.inspection.share_factor if args.share_factor is None else args.share_factor
+    return {
+        "frame": loaded.frame,
+        "notes": tuple(loaded.inspection.notes),
+        "factor": factor,
+    }
+
+
 def _cmd_walk(args) -> int:
     from .runner import walk_forward
 
@@ -147,15 +165,10 @@ def _cmd_walk(args) -> int:
             "--warmup-sessions belongs to `run`."
         )
     strategy_cls = load_strategy_class(args.strategy)
-    loaded_factor = args.share_factor
-    from .data import load_named as _load
-
-    loaded = _load(args.src, args.ticker, bar_minutes=args.bar_minutes)
-    _print_data_notes(loaded.inspection.notes)
-    factor = loaded.inspection.share_factor if loaded_factor is None else loaded_factor
+    pack = _walk_inputs(args)
     summary, _slices, _design, _locked = walk_forward(
         strategy_cls,
-        loaded.frame,
+        pack.pop("frame"),
         args.profile,
         args.out,
         symbol=args.ticker,
@@ -164,12 +177,13 @@ def _cmd_walk(args) -> int:
         design_end_date=args.design_end_date,
         design_fraction=args.design_fraction,
         warmup_days=args.warmup_days,
-        share_factor=factor,
+        share_factor=pack["factor"],
         borrow_rate_annual=args.borrow_rate,
         financing_rate_annual=args.financing_rate,
         fee_mult=args.fee_mult,
         dividends=_dividends(args.dividends),
         initial_equity=args.initial_equity,
+        inspection_notes=pack["notes"],
     )
     print(
         f"[{args.profile}] design through {summary['design_end_date']} "

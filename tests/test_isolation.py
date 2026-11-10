@@ -59,16 +59,35 @@ def test_engines_do_not_import_each_other():
     assert [name for name in cost_imports if name not in {"__future__", "math"}] == []
 
 
+def _enclosing_function(tree: ast.AST) -> dict[int, str | None]:
+    found: dict[int, str | None] = {}
+
+    def visit(node: ast.AST, name: str | None) -> None:
+        found[id(node)] = name
+        for child in ast.iter_child_nodes(node):
+            child_name = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else name
+            visit(child, child_name)
+
+    visit(tree, None)
+    return found
+
+
 def test_library_does_not_print_or_touch_the_working_directory():
     allowed = {"__main__.py", "arena_runner.py"}
+    # These two restore the parent cwd before returning. The design-child test
+    # checks that a walk-forward call leaves the caller in the directory it started in.
+    cwd_funcs = {"_launch_book", "_enter_child"}
     for path in (ROOT / "src" / "backtester").glob("*.py"):
         if path.name in allowed:
             continue
-        for node in ast.walk(_tree(path)):
+        tree = _tree(path)
+        owners = _enclosing_function(tree)
+        for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"print", "input"}:
                 raise AssertionError(f"{path.name} calls {node.func.id}")
             if isinstance(node, ast.Attribute) and node.attr in {"getcwd", "chdir"}:
-                raise AssertionError(f"{path.name} uses {node.attr}")
+                if owners.get(id(node)) not in cwd_funcs:
+                    raise AssertionError(f"{path.name} uses {node.attr}")
 
 
 def test_no_secret_paths():

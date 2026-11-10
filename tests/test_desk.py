@@ -10,6 +10,7 @@ import pytest
 from backtester import costs as arena_costs
 from backtester import costs_desk as D
 from backtester.engine_desk import DeskConfig, metrics, run
+from backtester.profiles import get_profile
 
 
 def bar(session, time, phase, price, **kw):
@@ -96,6 +97,139 @@ def test_thresholds_are_strict():
     assert D.margin_call_required(3.15) is False
     assert D.margin_call_required(3.15 + 1e-12) is True
     assert D.financing_due(0, 100.0, 1_000_000.0) == 0.0
+
+
+def test_desk_engine_defaults_match_the_profile():
+    cfg = DeskConfig()
+    desk = get_profile("desk")
+    assert cfg.margin_call_leverage == 3.15
+    assert cfg.liquidation_hwm_fraction == 0.30
+    assert cfg.sessions_per_month == 21
+    assert cfg.slippage_bps == 1.0
+    assert desk.margin_call_gross == 3.15
+    assert desk.liquidation_hwm_fraction == 0.30
+    assert desk.sessions_per_fee_month == 21
+    assert cfg.margin_call_leverage == desk.margin_call_gross
+    assert cfg.liquidation_hwm_fraction == desk.liquidation_hwm_fraction
+    assert cfg.sessions_per_month == desk.sessions_per_fee_month
+    assert cfg.slippage_bps == D.SLIPPAGE_BPS == 1.0
+    assert cfg.sessions_per_month == D.SESSIONS_PER_MONTH == 21
+
+
+def _close_for_gross(gross: float) -> float:
+    """Close that marks a 3x fill, priced at a literal 1 bp, at ``gross`` leverage."""
+    open_px = 100.0
+    equity0 = 1_000_000.0
+    shares = int(3.0 * equity0 / open_px)
+    fill = open_px * (1.0 + 1.0 * 1.0 * 1e-4)
+    cash = equity0 - shares * fill - D.fill_costs(shares, fill, 0.0)["total"]
+    return gross * cash / (shares * (1.0 - gross))
+
+
+def _run_gross(gross: float):
+    close = _close_for_gross(gross)
+    bars = [
+        bar("S1", "09:30", "rth", 100.0),
+        bar("S1", "09:31", "rth", 100.0, close=close),
+    ]
+
+    def signal(row, _account):
+        return 3.0 if row["time"] == "09:30" else None
+
+    return go(signal, bars)[1]
+
+
+def test_margin_call_queues_above_3_15_not_at_3_14():
+    above = _run_gross(3.16)
+    below = _run_gross(3.14)
+    assert above["disqualified"] is False
+    assert above["margin_calls_queued"] == 1
+    assert above["max_gross_leverage"] > 3.15
+    assert math.isclose(above["max_gross_leverage"], 3.16, rel_tol=1e-9)
+    assert below["disqualified"] is False
+    assert below["margin_calls_queued"] == 0
+    assert below["max_gross_leverage"] < 3.15
+    assert math.isclose(below["max_gross_leverage"], 3.14, rel_tol=1e-9)
+
+
+def _close_for_equity(equity_target: float) -> float:
+    """Close that marks a 1x fill, priced at a literal 1 bp, at ``equity_target``."""
+    open_px = 100.0
+    equity0 = 1_000_000.0
+    shares = int(equity0 / open_px)
+    fill = open_px * (1.0 + 1.0 * 1e-4)
+    cash = equity0 - shares * fill - D.fill_costs(shares, fill, 0.0)["total"]
+    return (equity_target - cash) / shares
+
+
+def _run_equity(equity_target: float):
+    close = _close_for_equity(equity_target)
+    bars = [
+        bar("S1", "09:30", "rth", 100.0),
+        bar("S1", "09:31", "rth", 100.0, close=close),
+    ]
+
+    def signal(row, _account):
+        return 1.0 if row["time"] == "09:30" else None
+
+    return go(signal, bars)[1]
+
+
+def test_liquidation_is_strictly_below_30_percent_of_hwm():
+    crashed = _run_equity(299_000.0)
+    assert crashed["disqualified"] is True
+    before = crashed["liquidation"]["equity_before"]
+    hwm = crashed["liquidation"]["hwm"]
+    assert hwm == 1_000_000.0
+    assert before == 299_000.0
+    assert before / hwm == 0.299
+    assert before < 0.30 * hwm
+
+    held = _run_equity(301_000.0)
+    assert held["disqualified"] is False
+    assert held["liquidation"] is None
+    assert held["daily"][-1]["equity"] == 301_000.0
+    assert held["worst_equity_over_hwm"] == 0.301
+    assert held["daily"][-1]["equity"] / 1_000_000.0 == 0.301
+
+
+def test_tier_month_changes_on_live_ordinal_21():
+    def sale(n_sessions: int, signal_session: str):
+        bars = [bar(f"S{i:02d}", "09:30", "rth", 100.0) for i in range(n_sessions)]
+
+        def signal(row, _account):
+            if row["session"] == "S00":
+                return 1.0
+            if row["session"] == signal_session:
+                return 0.0
+            return None
+
+        res = go(signal, bars)[1]
+        fill = res["fills"][-1]
+        mark = next(row for row in res["daily"] if row["session"] == fill["session"])
+        return fill, mark
+
+    early, early_mark = sale(21, "S19")
+    late, late_mark = sale(22, "S20")
+    assert early["session"] == "S20"
+    assert early["shares_delta"] < 0
+    assert early_mark["ordinal"] == 20
+    assert early["tier_month"] == 0
+    assert late["session"] == "S21"
+    assert late["shares_delta"] < 0
+    assert late_mark["ordinal"] == 21
+    assert late["tier_month"] == 1
+
+
+def test_fill_price_is_one_basis_point():
+    bars = [bar("S1", "09:30", "rth", 100.0), bar("S1", "09:31", "rth", 100.0)]
+    res = go(lambda row, _account: 1.0 if row["time"] == "09:30" else None, bars)[1]
+    fill = res["fills"][0]["fill_price"]
+    one_bp = 100.0 * (1.0 + 1.0 * 1.0 * 1e-4)
+    nudged = 100.0 * (1.0 + 1.0000001 * 1.0 * 1e-4)
+    assert fill == one_bp
+    assert fill != nudged
+    assert DeskConfig().slippage_bps == 1.0
 
 
 def test_next_rth_can_be_the_next_minute():
@@ -260,8 +394,8 @@ def test_long_financing_dividend_and_fee_mult_use_the_formula():
 
     _b, stressed = go(signal, bars(), fee_mult=2.0)
     want2 = expect(2.0, 0.0)
-    assert stressed["fills"][0]["fill_price"] == 100.0 * (1.0 + D.SLIPPAGE_BPS * 2.0 * 1e-4)
-    assert res["fills"][0]["fill_price"] == 100.0 * (1.0 + D.SLIPPAGE_BPS * 1e-4)
+    assert stressed["fills"][0]["fill_price"] == 100.0 * (1.0 + 1.0 * 2.0 * 1e-4)
+    assert res["fills"][0]["fill_price"] == 100.0 * (1.0 + 1.0 * 1.0 * 1e-4)
     assert stressed["financing"] == want2["fin"]
     assert stressed["fees"]["total"] == want2["fees"]
     # At a price where trunc(equity/price)*price is not the starting equity,

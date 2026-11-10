@@ -208,7 +208,9 @@ These are the readings that were not fixed by a single sentence in the spec.
     The design book and the locked book each run in a new interpreter started
     with the spawn method. The design interpreter receives only the design frame.
     The locked interpreter receives only the locked window plus its warm-up, and
-    it does not see objects created by the design run.
+    it does not see objects created by the design run. Phase 1 isolates the heap,
+    class attributes, module globals, environment, argv, and cwd. It does not
+    confine the filesystem or another process's memory. See docs/ISOLATION.md.
 
 34. **Performance math.** 252 sessions per year, sample standard deviation with
     delta degrees of freedom 1, Sortino uses the square root of the mean of

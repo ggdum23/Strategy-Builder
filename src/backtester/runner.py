@@ -4,21 +4,25 @@ Benchmarks go through the same engine and the same cost configuration as the
 strategy. Arena financing stays at zero. Desk financing stays at the desk rate
 (7% unless the run overrides it).
 
-A walk-forward design book runs in a new interpreter started with the spawn
-method, and the locked book runs in a different one. Spawn does not copy the
-parent address space, so a strategy cannot see the locked tail through the
-stack or the garbage collector, and the design run cannot leave state behind
-for the locked run. The full referee sandbox is a later phase.
+Phase 1 walk-forward isolation is the heap, class attributes, module globals,
+the environment, argv, and cwd. It is not an OS jail. See docs/ISOLATION.md.
 """
 
 from __future__ import annotations
 
+import gc
+import os
 import pickle
+import shutil
+import sys
+import tempfile
+import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import engine_arena, engine_desk
-from .data import frame_to_desk_bars, load_named, slice_walkforward
+from .data import WalkSlices, frame_to_desk_bars, load_named, slice_walkforward
 from .engine_desk import BuyAndHold as DeskBuyAndHold
 from .engine_desk import DeskConfig, TwoXLong
 from .profiles import get_profile
@@ -206,55 +210,258 @@ def _picklable_books(books):
     return portable
 
 
+# Names a spawned book may inherit. Anything else, including a data-root
+# variable, is dropped. PATH stays because the interpreter and native
+# libraries may need it; a data directory placed on PATH is not stripped.
+_ENV_KEEP = frozenset(
+    {
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "SYSTEMDRIVE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONNOUSERSITE",
+        "PYTHONHASHSEED",
+        "PYTHONUTF8",
+        "PYTHONIOENCODING",
+        "PYTHONUNBUFFERED",
+        "PYTHONSAFEPATH",
+        "PYTHONLEGACYWINDOWSSTDIO",
+        "PYTHONMALLOC",
+        "VIRTUAL_ENV",
+        "LD_LIBRARY_PATH",
+        "LIBPATH",
+        "DYLD_LIBRARY_PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+    }
+)
+_CHILD_ARGV = ["backtester-design"]
+
+
+def _child_environ(source) -> dict:
+    kept = {}
+    for key, value in source.items():
+        upper = key.upper()
+        if upper in _ENV_KEEP or upper.startswith("LC_"):
+            kept[key] = value
+    return kept
+
+
+def _enter_child(job):
+    """Scrub the book process before any strategy code runs.
+
+    Returns the argv and cwd spawn copied in, so a test can see that the copy
+    itself was already clean.
+    """
+    inherited_argv = list(sys.argv)
+    inherited_cwd = os.getcwd()
+    sys.argv = list(_CHILD_ARGV)
+    os.chdir(job["cwd"])
+    os.environ.clear()
+    os.environ.update(job["env"])
+    return inherited_argv, inherited_cwd
+
+
+def _launch_book(ctx, queue, job):
+    """Start one book. Spawn copies argv and cwd at start, so set them first.
+
+    The parent directory, argv, and environment are restored before this
+    returns, including when start fails.
+    """
+    cwd = tempfile.mkdtemp(prefix="bt-book-")
+    job["cwd"] = cwd
+    job["env"] = _child_environ(os.environ)
+    proc = ctx.Process(target=_books_worker, args=(queue, job), name="walk-forward-book")
+    old_argv = list(sys.argv)
+    old_cwd = os.getcwd()
+    old_env = dict(os.environ)
+    sys.argv = list(_CHILD_ARGV)
+    os.chdir(cwd)
+    os.environ.clear()
+    os.environ.update(job["env"])
+    started = False
+    try:
+        proc.start()
+        started = True
+    finally:
+        sys.argv = old_argv
+        os.chdir(old_cwd)
+        os.environ.clear()
+        os.environ.update(old_env)
+        if not started:
+            shutil.rmtree(cwd, ignore_errors=True)
+    return proc, cwd
+
+
+def _set_dumpable(enabled: bool) -> int | None:
+    """Set PR_SET_DUMPABLE on Linux. Returns the previous flag, or None elsewhere.
+
+    A non-dumpable parent cannot be attached with ptrace, which is the cheap
+    mitigation for a same-user /proc/<pid>/mem read. It is not a sandbox.
+    Windows DACL work is out of scope for this phase.
+    """
+    if sys.platform != "linux":
+        return None
+    import ctypes
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    previous = libc.prctl(3, 0, 0, 0, 0)
+    if previous < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, "prctl PR_GET_DUMPABLE failed")
+    target = 1 if enabled else 0
+    if previous != target:
+        rc = libc.prctl(4, target, 0, 0, 0)
+        if rc != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, "prctl PR_SET_DUMPABLE failed")
+    return int(previous)
+
+
+def _restore_dumpable(previous: int | None) -> None:
+    if previous is None:
+        return
+    _set_dumpable(bool(previous))
+
+
 def _books_worker(queue, job):
     try:
+        inherited_argv, inherited_cwd = _enter_child(job)
+        gate = job.get("gate")
+        if gate is not None:
+            gate["started"].set()
+            if not gate["release"].wait(timeout=180):
+                raise RuntimeError("design parent did not release the walk-forward child")
         strategy_cls = _load_strategy(job["strategy"])
         books = run_books(strategy_cls, job["frame"], job["profile"], **job["kwargs"])
+        _note_child(books, inherited_argv, inherited_cwd)
         queue.put(("ok", _picklable_books(books)))
-    except Exception as exc:
-        try:
-            pickle.dumps(exc)
-        except Exception:
-            queue.put(("err", traceback.format_exc()))
-        else:
-            queue.put(("exc", exc))
+    except BaseException:
+        queue.put(("err", traceback.format_exc()))
+    finally:
+        queue.close()
+        queue.join_thread()
 
 
-def _isolated_books(strategy_cls, frame, profile, **kwargs):
-    """Run ``run_books`` in a fresh spawned interpreter.
+def _note_child(books, inherited_argv, inherited_cwd) -> None:
+    observer = books["strategy"][0].get("observer")
+    if observer is None:
+        return
+    observer.inherited_argv = list(inherited_argv)
+    observer.inherited_cwd = inherited_cwd
 
-    The child is given this frame and these kwargs, and nothing else from the
-    caller. A long-lived process is not reused: the locked run must not observe
-    objects the design run created.
-    """
-    import multiprocessing
+
+def _wait_until_started(proc, event, queue, timeout: float) -> None:
     import queue as queue_mod
 
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if event.wait(0.05):
+            return
+        if not proc.is_alive():
+            proc.join(timeout=5)
+            try:
+                message = queue.get_nowait()
+            except queue_mod.Empty:
+                message = None
+            if message is not None and message[0] == "err":
+                raise RuntimeError(message[1])
+            raise RuntimeError(f"walk-forward worker exited {proc.exitcode} before it was ready")
+    raise RuntimeError("walk-forward worker did not start")
+
+
+def _take_result(proc, queue, timeout: float):
+    """Read the result, or raise as soon as the child exits without one.
+
+    A dead child used to block on ``queue.get`` until the 600s timeout.
+    The process sentinel and the queue are waited together.
+    """
+    import queue as queue_mod
+    from multiprocessing.connection import wait
+
+    deadline = time.monotonic() + timeout
+    reader = queue._reader
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=30)
+            raise RuntimeError(f"walk-forward worker timed out (exit {proc.exitcode})")
+        ready = wait([reader, proc.sentinel], timeout=remaining)
+        if reader in ready:
+            try:
+                return queue.get_nowait()
+            except queue_mod.Empty:
+                pass
+        if proc.sentinel in ready or not proc.is_alive():
+            proc.join(timeout=30)
+            try:
+                return queue.get_nowait()
+            except queue_mod.Empty:
+                raise RuntimeError(
+                    f"walk-forward worker exited {proc.exitcode} without a result"
+                ) from None
+
+
+def _isolated_books(strategy_cls, frame, profile, *, during=None, **kwargs):
+    """Run ``run_books`` in a fresh spawned interpreter.
+
+    The child receives this frame, the strategy, and the run kwargs. Its argv
+    is ``['backtester-design']``, its cwd is an empty temporary directory, and
+    its environment is the allowlist in ``_child_environ``. ``during``, when
+    given, runs in the parent after the child is up and before the child
+    continues. A long-lived process is not reused.
+    """
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    gate = None
+    if during is not None:
+        gate = {"started": ctx.Event(), "release": ctx.Event()}
     job = {
         "strategy": _strategy_spec(strategy_cls),
         "frame": _standalone_frame(frame),
         "profile": profile,
         "kwargs": _plain_kwargs(kwargs),
+        "gate": gate,
     }
-    ctx = multiprocessing.get_context("spawn")
-    result_queue = ctx.Queue()
-    proc = ctx.Process(target=_books_worker, args=(result_queue, job), name="walk-forward-book")
-    proc.start()
+    proc = None
+    cwd = None
     try:
-        message = result_queue.get(timeout=600)
-    except queue_mod.Empty as exc:
-        proc.terminate()
-        proc.join(timeout=30)
-        raise RuntimeError("walk-forward worker did not return") from exc
-    proc.join(timeout=60)
-    status = message[0]
-    if status == "ok":
-        if proc.exitcode not in (0, None):
-            raise RuntimeError(f"walk-forward worker exited {proc.exitcode}")
-        return message[1]
-    if status == "exc":
-        raise message[1]
-    raise RuntimeError(message[1])
+        proc, cwd = _launch_book(ctx, result_queue, job)
+        if gate is not None:
+            _wait_until_started(proc, gate["started"], result_queue, 60)
+            try:
+                during()
+            finally:
+                gate["release"].set()
+        message = _take_result(proc, result_queue, 600)
+        proc.join(timeout=60)
+        if proc.exitcode != 0:
+            detail = "" if message[0] == "ok" else message[1]
+            raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n{detail}")
+        if message[0] == "ok":
+            return message[1]
+        raise RuntimeError(message[1])
+    finally:
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10)
+        result_queue.close()
+        result_queue.join_thread()
+        if cwd is not None:
+            shutil.rmtree(cwd, ignore_errors=True)
 
 
 def run_books(
@@ -370,6 +577,31 @@ def run_named(
     return payload
 
 
+@dataclass(frozen=True)
+class _SliceMeta:
+    design_end_day: int
+    design_end_date: str
+    locked_start_day: int
+    locked_start_date: str
+    warmup_days_requested: int
+    warmup_sessions: int
+    locked_day_max: int
+
+
+def _spill_frame(frame) -> str:
+    """Write ``frame`` to a temp file and return the path. The copy is not kept."""
+    fd, path = tempfile.mkstemp(prefix="bt-locked-", suffix=".pkl")
+    os.close(fd)
+    _standalone_frame(frame).to_pickle(path)
+    return path
+
+
+def _read_spilled(path: str):
+    import pandas as pd
+
+    return pd.read_pickle(path)
+
+
 def walk_forward(
     strategy_cls,
     frame,
@@ -389,12 +621,15 @@ def walk_forward(
     dividends: dict | None = None,
     initial_equity: float = 1_000_000.0,
     with_benchmarks: bool = True,
+    inspection_notes=(),
+    during_design=None,
 ):
     """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
 
-    Each book is a new spawned interpreter. The design child receives the design
-    frame only. The locked child receives the locked window and its warm-up
-    only, and it does not share memory with the design child.
+    The parent keeps the design slice, spills the locked window to disk, and
+    drops the caller's frame before the design child starts. The locked window
+    is loaded again only after that child has exited. Each book is a new
+    spawned interpreter. See docs/ISOLATION.md.
 
     Arena warm-up trades, then rescales to the starting equity and keeps exposure.
     Desk warm-up is flat (``live`` false) and goes live flat at the starting equity.
@@ -407,6 +642,21 @@ def walk_forward(
         design_fraction=design_fraction,
         warmup_days=warmup_days,
     )
+    design = _standalone_frame(slices.design)
+    meta = _SliceMeta(
+        design_end_day=slices.design_end_day,
+        design_end_date=slices.design_end_date,
+        locked_start_day=slices.locked_start_day,
+        locked_start_date=slices.locked_start_date,
+        warmup_days_requested=slices.warmup_days_requested,
+        warmup_sessions=slices.warmup_sessions,
+        locked_day_max=int(slices.locked["day"].max()),
+    )
+    spilled = _spill_frame(slices.locked_with_warmup)
+    del slices
+    del frame
+    gc.collect()
+    gc.collect()
     common = dict(
         share_factor=share_factor,
         borrow_rate_annual=borrow_rate_annual,
@@ -416,59 +666,85 @@ def walk_forward(
         initial_equity=initial_equity,
         with_benchmarks=with_benchmarks,
     )
-    design_books = _isolated_books(
-        strategy_cls,
-        slices.design,
-        profile,
-        max_day=slices.design_end_day,
-        warmup_sessions=0,
-        **common,
-    )
-    if profile == "arena":
-        locked_books = _isolated_books(
-            strategy_cls,
-            slices.locked_with_warmup,
-            profile,
-            reset_day=slices.locked_start_day if slices.warmup_sessions else None,
-            max_day=int(slices.locked["day"].max()),
-            warmup_sessions=0,
-            **common,
+    notes = [str(note) for note in (inspection_notes or ())]
+    previous_dumpable = _set_dumpable(False)
+    try:
+        try:
+            design_books = _isolated_books(
+                strategy_cls,
+                design,
+                profile,
+                max_day=meta.design_end_day,
+                warmup_sessions=0,
+                during=during_design,
+                **common,
+            )
+        finally:
+            _restore_dumpable(previous_dumpable)
+        locked_with = _standalone_frame(_read_spilled(spilled))
+        locked = _standalone_frame(
+            locked_with.loc[locked_with["day"] >= meta.locked_start_day].reset_index(drop=True)
         )
-    elif profile == "desk":
-        locked_books = _isolated_books(
-            strategy_cls,
-            slices.locked_with_warmup,
-            profile,
-            warmup_sessions=slices.warmup_sessions,
-            max_day=int(slices.locked["day"].max()),
-            **common,
+        rebuilt = WalkSlices(
+            design_end_day=meta.design_end_day,
+            design_end_date=meta.design_end_date,
+            locked_start_day=meta.locked_start_day,
+            locked_start_date=meta.locked_start_date,
+            warmup_days_requested=meta.warmup_days_requested,
+            warmup_sessions=meta.warmup_sessions,
+            design=design,
+            locked=locked,
+            locked_with_warmup=locked_with,
         )
-    else:
-        raise ValueError(profile)
+        if profile == "arena":
+            locked_books = _isolated_books(
+                strategy_cls,
+                rebuilt.locked_with_warmup,
+                profile,
+                reset_day=meta.locked_start_day if meta.warmup_sessions else None,
+                max_day=meta.locked_day_max,
+                warmup_sessions=0,
+                **common,
+            )
+        elif profile == "desk":
+            locked_books = _isolated_books(
+                strategy_cls,
+                rebuilt.locked_with_warmup,
+                profile,
+                warmup_sessions=meta.warmup_sessions,
+                max_day=meta.locked_day_max,
+                **common,
+            )
+        else:
+            raise ValueError(profile)
+    finally:
+        os.unlink(spilled)
     out = Path(out_dir)
-    design_payload = write_books(out / "design", profile, symbol, bar_minutes, slices.design, design_books)
-    locked_frame = slices.locked_with_warmup
-    locked_payload = write_books(out / "locked", profile, symbol, bar_minutes, locked_frame, locked_books)
+    design_payload = write_books(out / "design", profile, symbol, bar_minutes, rebuilt.design, design_books)
+    locked_payload = write_books(
+        out / "locked", profile, symbol, bar_minutes, rebuilt.locked_with_warmup, locked_books
+    )
     summary = {
         "profile": profile,
         "symbol": symbol,
         "bar_minutes": bar_minutes,
-        "design_end_day": slices.design_end_day,
-        "design_end_date": slices.design_end_date,
-        "locked_start_day": slices.locked_start_day,
-        "locked_start_date": slices.locked_start_date,
-        "warmup_days_requested": slices.warmup_days_requested,
-        "warmup_sessions": slices.warmup_sessions,
-        "design_days_max": int(slices.design["day"].max()),
-        "locked_days_min": int(slices.locked["day"].min()),
-        "design_sessions": int(slices.design["day"].nunique()),
-        "locked_sessions": int(slices.locked["day"].nunique()),
+        "design_end_day": rebuilt.design_end_day,
+        "design_end_date": rebuilt.design_end_date,
+        "locked_start_day": rebuilt.locked_start_day,
+        "locked_start_date": rebuilt.locked_start_date,
+        "warmup_days_requested": rebuilt.warmup_days_requested,
+        "warmup_sessions": rebuilt.warmup_sessions,
+        "design_days_max": int(rebuilt.design["day"].max()),
+        "locked_days_min": int(rebuilt.locked["day"].min()),
+        "design_sessions": int(rebuilt.design["day"].nunique()),
+        "locked_sessions": int(rebuilt.locked["day"].nunique()),
         "warmup_rule": get_profile(profile).warmup,
+        "inspection_notes": notes,
         "design": _summary(profile, design_payload),
         "locked": _summary(profile, locked_payload),
     }
     write_json(out / "walkforward.json", summary)
-    return summary, slices, design_books, locked_books
+    return summary, rebuilt, design_books, locked_books
 
 
 def run_parallel(*_args, **_kwargs):

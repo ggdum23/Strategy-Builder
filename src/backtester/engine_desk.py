@@ -28,6 +28,7 @@ class DeskConfig:
     fee_mult: float = 1.0
     slippage_bps: float = D.SLIPPAGE_BPS
     max_abs_target: float = 3.0
+    # Same numbers as profiles.DESK. test_desk_engine_defaults_match_the_profile locks them.
     margin_call_leverage: float = 3.15
     margin_call_target: float = 3.0
     liquidation_hwm_fraction: float = 0.30
