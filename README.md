@@ -18,9 +18,9 @@ The same target is not rebalanced for drift. Costs, splits, data roots, share fa
 and borrow are configuration. The two fee schedules are not.
 
 Phase 2 adds the series registry, session-anchored resampling, and the pack
-builder on top of the engines. The desktop window and the Windows installer are
-not built yet. See `packaging/README.md`. The registry schema is `docs/REGISTRY.md`.
-Packs, the sidecar, and the residual leaks are `docs/PACK.md`.
+builder on top of the engines. The desktop window is `docs/GUI.md`. The Windows
+installer is still a later phase. See `packaging/README.md`. The registry schema
+is `docs/REGISTRY.md`. Packs, the sidecar, and the residual leaks are `docs/PACK.md`.
 
 ## Install
 
@@ -29,7 +29,12 @@ Python 3.11 or newer. From this directory:
 ```powershell
 py -3 -m pip install -e ".[dev]"
 py -3 -m backtester test
+py -3 -m pip install -e ".[gui]"
+py -3 -m backtester gui
 ```
+
+The window is optional. The commands below do not need it. Paths with spaces,
+including `C:\Users\Jeu\Desktop\Strategy Builder`, are passed through as one path.
 
 `run.ps1` and `run.bat` call `python -m backtester` and do not copy or unzip data.
 
@@ -154,8 +159,10 @@ fees used real share counts). `metrics.json` carries the same record.
 
 ## What this phase does not do
 
-No window, no `setup.exe`, no one-bar referee, no process pool, no equity PNG,
-no Arena financing switch. The engines, the registry, and the pack builder are
-importable so those can sit on top without another rewrite. Interpretations that
-the Desk spec left open are in `docs/DESK_SPEC_DECISIONS.md`. The Arena port is
-in `docs/ARENA_PORT_NOTES.md`. Walk-forward isolation is `docs/ISOLATION.md`.
+No `setup.exe`, no one-bar referee, no process pool, no equity PNG from the CLI,
+no Arena financing switch. The desktop window reads report files and does not
+score a book itself (`docs/GUI.md`). The engines, the registry, and the pack
+builder are importable so those can sit on top without another rewrite.
+Interpretations that the Desk spec left open are in `docs/DESK_SPEC_DECISIONS.md`.
+The Arena port is in `docs/ARENA_PORT_NOTES.md`. Walk-forward isolation is
+`docs/ISOLATION.md`.

@@ -1,11 +1,13 @@
-"""Seam for a later desktop window.
+"""Window entry. ``python -m backtester gui`` and a frozen executable both call this.
 
-Phase 1 does not draw a GUI. A future front end imports runner, data, and
-report. Those modules do not import this one, and they do not need a console.
+The implementation lives in ``backtester.gui``. Importing this module does not
+import Qt; ``main`` does, so a CLI install without the gui extra still imports.
 """
 
+from __future__ import annotations
 
-def main() -> None:
-    raise NotImplementedError(
-        "The desktop GUI is not in this phase. Run `python -m backtester run`."
-    )
+
+def main() -> int:
+    from .gui.app import main as gui_main
+
+    return int(gui_main())

@@ -176,12 +176,18 @@ def test_no_secret_paths():
         text = path.read_text(encoding="utf-8", errors="replace")
         for token in SECRETS:
             assert token not in text, f"{path} contains {token}"
+    # The desktop shell is the operator's process. Its preferences module is the
+    # one place that names the default data folder. Designer packs and the
+    # engines stay free of that path.
+    operator_shell = ROOT / "src" / "backtester" / "gui" / "preferences.py"
     src_text = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
         for path in (ROOT / "src").rglob("*.py")
+        if path != operator_shell
     )
     for token in USER_ROOT:
         assert token not in src_text
+    assert r"C:\Users\Jeu\Desktop\Backtester" in operator_shell.read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     script = (ROOT / "run.ps1").read_text(encoding="utf-8")
     for blob in (readme, script):

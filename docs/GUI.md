@@ -1,0 +1,107 @@
+# Desktop research terminal
+
+`py -3 -m backtester gui` opens the window. It is a PySide6 application. The engines, the registry, the pack builder, and the runner are unchanged. The window calls those public functions and then reads the files they wrote.
+
+Install the extra. The core CLI does not need it.
+
+```powershell
+py -3 -m pip install -e ".[gui]"
+py -3 -m backtester gui
+```
+
+The same entry is `backtester.desktop:main`, which a frozen executable can call. Qt is imported only when that function runs.
+
+## What it is for
+
+Six pages, one path through a study:
+
+1. **Data.** Point at a folder. The default root shown in the field is `C:\Users\Jeu\Desktop\Backtester`. Inspect and, if you choose, record the series. Hours, tick, timezone, fill policy, gaps, and warnings are the inspection result. A gap or a non-runnable series is a banner, not a footnote.
+2. **Packs.** Build a named pack or an anonymized pack. The choice is a radio, not a default. The sidecar path is shown. The sidecar is not opened. The manifest on screen is the designer-facing manifest only (`ASSET`, chunks, bar size, pack id).
+3. **Strategies.** Pick a `strategy.py` or a folder of them. The list is an AST parse. Nothing is imported in the window process. Arena and Desk rules (clamp, fills, fees, borrow, financing, liquidation, warm-up) are written out from `backtester.profiles`, with the numbers taken from that profile.
+4. **Run.** Single, walk-forward, or batch. The transcript is the argument list that will be passed. A blank borrow or financing field is `null`, and the transcript says the engine default is not being replaced. Walk-forward requires exactly one cut. There is no default cut. Run is disabled until the draft validates. The engine runs in a spawned process. Cancel terminates that process. The window thread does not call `on_bar`.
+5. **Results.** Metrics, benchmark table, equity / drawdown / exposure chart, fills, round trips, the saved `equity.png` if Phase 3 wrote one, and the Desk risk panel. Every figure is read from the run directory.
+6. **History.** Folders under a runs root that contain `metrics.json` or `walkforward.json`.
+
+Paths are `pathlib` paths. `C:\Users\Jeu\Desktop\Strategy Builder` is one path. It is not split on the space.
+
+The theme is dark or light, Fusion, with a fixed type scale. Qt 6 high-DPI rounding is pass-through. On Windows the process id is `StrategyBuilder.Backtester` so the taskbar icon groups. The UI font is Segoe UI when it is installed, otherwise Inter, Source Sans 3, IBM Plex Sans, Noto Sans, or DejaVu Sans. Numbers use Cascadia Mono, Cascadia Code, JetBrains Mono, Consolas, or DejaVu Sans Mono.
+
+## What the window refuses to do
+
+- It does not recompute Sharpe, drawdown, fees, or a rank. A dash means the report did not contain the field. A zero is shown only when the file stored a zero.
+- It does not pick Arena or Desk, raw or total-return, or a walk-forward cut when the operator has not.
+- It does not offer a share factor of 0.9. Named runs do not pass a share factor. The runner keeps raw files at 1. Pack runs read the sidecar inside the runner.
+- It does not display sidecar contents: price factor, volume factor, date map, operator note. If a report file contains one of those keys, the key is withheld and the page says so. `cost_basis.share_scale` is shown, because the runner writes that invoice record on purpose.
+- It does not write `leaderboard.csv`. Phase 3 owns that file. Until it exists, a batch view copies cells out of each child's `metrics.json` and says that is what it did.
+- It does not run the strategy inside the window process. A worker process is the operator parent. `run_pack` and `walk_forward` still do their own isolation underneath that. Cancel kills the worker. On Linux the worker calls `setsid` and cancel signals the process group, so a walk-forward child does not keep running. On Windows cancel uses `taskkill /T`.
+
+`run_config.json` is written in the report directory before the engine starts. It records the API name, the strategy path and sha256, and every argument, including the nulls. That file is not a metric.
+
+## Report contract
+
+Contract id: `strategy-builder.report.v1`, in `backtester.gui.schema`.
+
+A finished book directory:
+
+| File | Required now | Role |
+| --- | --- | --- |
+| `metrics.json` | yes | Scalar metrics, nested `benchmarks`, `cost_basis`, `run` |
+| `equity_curve.csv` or `equity.csv` | expected | Session equity. Column `equity`. Exposure from `exposure` or `position`. Session label from `date`, `session`, or `day`, in that order. |
+| `fills.csv` | expected | Fills. Recognized by `shares_delta`, `fill_price`, `fees`, `price`, or `shares_after`. |
+| `trades.csv` | optional | Round trips when it is not the fills file. |
+| `benchmarks/buy_and_hold_1x/` | expected | Same files for the 1× book. |
+| `benchmarks/long_2x/` | Desk | Same files for the constant 2× book. |
+| `equity.png` or `equity_curve.png` | optional | Saved figure. Shown as an image. The interactive chart uses the CSV. |
+| `liquidation.json` or `liquidation_postmortem.json` | optional | Desk post-mortem. If absent, `metrics.json`'s `liquidation` object is shown. |
+| `leaderboard.csv` | optional | Batch board. Columns are shown as stored. |
+| `run_config.json` | written by the window | Launch record. Not required to display an older run. |
+| `walkforward.json` | walk-forward | Summary. Legs are `design/` and `locked/`, each a book. The window does not blend them. |
+| `batch_status.json` | batch | Per-strategy ok / failed / cancelled. Not a metric. `error.txt` in a child folder is the failure text. |
+
+`metrics.json` fields the cards know about, with units:
+
+- Fractions, displayed × 100: `total_return`, `cagr`, `ann_vol`, `max_drawdown`, `hit_rate`, `percent_up_days`, `best_day`, `worst_day`, `financing_rate_annual`, `borrow_rate_annual`.
+- Dollars: `initial_equity`, `final_equity`, `fees_total`, `slippage_cost`, `borrow_cost`, `costs_total`, `financing_cost`, `dividends_net`.
+- Ratios: `sharpe`, `sortino`, `calmar`, `turnover_per_year`, exposure fields, `worst_equity_over_hwm`, `share_factor`, `fee_mult`.
+- Counts: `n_fills`, `round_trips`, `sessions`, `max_dd_duration_sessions`, margin-call counts.
+- Leverage, with a ×: `max_gross_leverage`, `avg_gross_leverage`.
+- Flag: `disqualified`. `false` is shown as "no". Missing is a dash, not "no".
+
+Annualization, stated on those tooltips: 252 sessions per year, risk-free rate 0, session-close marks, first return against initial equity. That is the engine definition. The window does not apply it again.
+
+Any other scalar in `metrics.json` is listed under "Other reported fields" so a Phase 3 addition is visible. Nested objects the window already understands (`benchmarks`, `fees_breakdown`, `period_returns`, `cost_basis`, `run`, `liquidation`) are not repeated there.
+
+If `benchmarks/<name>/metrics.json` and the parent `benchmarks` object disagree on a shared number, the page warns and shows the file.
+
+The drawdown line on the chart is equity / running peak − 1 along the equity column, with `initial_equity` prepended when the file has it. The caption says so. The official max drawdown is the card, which is `max_drawdown` from `metrics.json`. The chart does not print a second max-drawdown number.
+
+Benchmark curves are aligned on the session column. Rows that do not match are not drawn and are counted in the caption. There is no interpolation. If there is no shared session column, the overlay is by row order and the caption says that.
+
+## Screenshots
+
+Rendered offscreen at 1680×1180. These are fixture reports and the real profile text, not a backtest of the sample month.
+
+- `docs/screenshots/01-data-dark.png`
+- `docs/screenshots/02-packs-dark.png`
+- `docs/screenshots/03-strategies-dark.png`
+- `docs/screenshots/04-run-dark.png`
+- `docs/screenshots/05-results-dark.png`
+- `docs/screenshots/06-desk-risk-dark.png`
+- `docs/screenshots/07-history-dark.png`
+- `docs/screenshots/08-results-light.png`
+
+## Tests
+
+`tests/gui/` holds the adapter tests, the validation tests, and the pytest-qt tests. The Qt tests skip when PySide6 is not installed, so `python -m backtester test` on a core install still passes. `.github/workflows/gui.yml` installs the extra and runs `tests/gui` offscreen on Ubuntu and Windows, Python 3.11–3.13.
+
+## Known gaps
+
+- The engine does not report bar progress. The window shows the stage and, for a batch, which strategy is running. It does not invent a percent complete for one book.
+- Cancel leaves whatever files the process had already written. The page says a partial folder is not a finished report. `metrics.json` is only trusted after the worker status is `done`.
+- Batch runs call `run_named` or `run_pack` one strategy after another in the worker. They do not call `run_parallel`. Phase 3 can keep owning that function. When it writes `leaderboard.csv`, the batch page will show that file instead of the assembled view.
+- Walk-forward from the window is named files only. `walk_forward` takes a frame. A pack is a single `run_pack`.
+- The equity PNG is displayed when present. The interactive chart is always the CSV.
+- There is no referee page and no multi-name book. Those are later phases.
+- OS-level isolation is still Phase 4. The window does not weaken the Phase 1 rules, and it does not claim to be the jail.
+- A strategy is imported in the worker, which is the same process the CLI uses for `run`. It is not imported in the window process.
+- Linux and the CI image do not have Segoe UI or Cascadia Mono. The type scale is the same; the family falls through the list above.

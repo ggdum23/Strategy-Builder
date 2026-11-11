@@ -7,7 +7,7 @@ Phase 1 does not build an installer. The layout is meant to take one later.
   them does not read the working directory, does not print, and does not load
   market data. The GUI should call those modules. Printing stays in `backtester.__main__`.
 - CLI entry for PyInstaller: `backtester.__main__:main`.
-- Window entry, still empty: `backtester.desktop:main`.
+- Window entry: `backtester.desktop:main` (PySide6, optional extra `gui`).
 - A Windows build should bundle its own Python. The operator machine's system
   Python is 3.14 and is not a dependency of the installed app.
 - Inno Setup is a later step. It should run the bundled executable. It should
