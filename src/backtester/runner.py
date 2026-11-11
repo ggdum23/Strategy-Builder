@@ -44,6 +44,7 @@ _ARENA_KEYS = (
     "fees_total",
     "borrow_cost",
     "percent_up_days",
+    "cost_basis",
 )
 
 _DESK_KEYS = _ARENA_KEYS + (
@@ -60,6 +61,25 @@ _DESK_KEYS = _ARENA_KEYS + (
     "share_factor",
     "fee_mult",
 )
+
+
+def _cost_basis(profile: str, share_factor: float, *, anonymized: bool) -> dict:
+    """What the invoice used. The strategy does not receive this dict."""
+    schedule = get_profile(profile).fee_table
+    name = get_profile(profile).name
+    return {
+        "share_scale": share_factor,
+        "share_factor": share_factor,
+        "anonymized": bool(anonymized),
+        "per_share_fees": "real_share_counts",
+        "value_fees": "unscaled_trade_value",
+        "cost_schedule": schedule,
+        "profile": name,
+        "note": (
+            f"Per-share fees use real share counts (share_scale={share_factor}). "
+            f"Value-based fees use trade value. Cost schedule: {schedule}."
+        ),
+    }
 
 
 def _summary(profile: str, metrics: dict) -> dict:
@@ -81,6 +101,7 @@ def execute(
     initial_equity: float = 1_000_000.0,
     reset_day: int | None = None,
     max_day: int | None = None,
+    anonymized: bool = False,
 ):
     """Run one strategy instance on ``frame``.
 
@@ -122,6 +143,7 @@ def execute(
         metrics["share_factor"] = share_factor
         metrics["borrow_rate_annual"] = borrow
         metrics["financing_rate_annual"] = 0.0
+        metrics["cost_basis"] = _cost_basis(name, share_factor, anonymized=anonymized)
         return result, metrics
     if name == "desk":
         rate = engine_desk.D.FINANCING_RATE_ANNUAL if financing_rate_annual is None else financing_rate_annual
@@ -138,6 +160,7 @@ def execute(
         rows = frame_to_desk_bars(frame)
         result = engine_desk.run(strategy, rows, config)
         metrics = engine_desk.metrics(result)
+        metrics["cost_basis"] = _cost_basis(name, share_factor, anonymized=anonymized)
         return result, metrics
     raise ValueError(f"unknown profile {profile}")
 
@@ -479,6 +502,7 @@ def run_books(
     reset_day: int | None = None,
     max_day: int | None = None,
     with_benchmarks: bool = True,
+    anonymized: bool = False,
 ):
     """Fresh instance per book. Benchmarks reuse the strategy's cost configuration."""
     common = dict(
@@ -491,6 +515,7 @@ def run_books(
         initial_equity=initial_equity,
         reset_day=reset_day,
         max_day=max_day,
+        anonymized=anonymized,
     )
     strategy = strategy_cls()
     result, metrics = execute(strategy, frame, profile, **common)
@@ -545,6 +570,11 @@ def run_named(
     with_benchmarks: bool = True,
 ):
     loaded = load_named(src, symbol, bar_minutes=bar_minutes, splits=splits)
+    if not loaded.inspection.runnable:
+        raise ValueError(
+            f"{symbol} is {loaded.inspection.price_adjustment} and is not runnable. "
+            "This phase executes raw prices only."
+        )
     factor = loaded.inspection.share_factor if share_factor is None else share_factor
     warnings = []
     if factor != 1.0:
@@ -790,6 +820,87 @@ def walk_forward(
     }
     write_json(out / "walkforward.json", summary)
     return summary, rebuilt, design_books, locked_books
+
+
+def run_pack(
+    strategy_cls,
+    pack_dir,
+    sidecar_path,
+    profile: str,
+    out_dir,
+    *,
+    borrow_rate_annual: float | None = None,
+    financing_rate_annual: float | None = None,
+    fee_mult: float = 1.0,
+    dividends: dict | None = None,
+    warmup_sessions: int = 0,
+    initial_equity: float = 1_000_000.0,
+    with_benchmarks: bool = True,
+    during=None,
+):
+    """Run a pack. The sidecar stays in this process.
+
+    An anonymized pack's share_scale is the price factor k. It is the only
+    sidecar field handed to the strategy process, and only as the engine's
+    share_factor. The date map, ticker, volume factor, and operator note are
+    not part of that job.
+    """
+    from .pack import load_pack, load_sidecar
+
+    loaded = load_pack(pack_dir)
+    secret = load_sidecar(sidecar_path)
+    if secret["pack_id"] != loaded.pack_id:
+        raise ValueError("sidecar does not match this pack")
+    if bool(secret["anonymized"]) != loaded.anonymized:
+        raise ValueError("sidecar anonymized flag does not match the pack")
+    anonymized = bool(secret["anonymized"])
+    share_scale = float(secret["share_scale"])
+    symbol = str(secret["symbol"])
+    if anonymized and dividends:
+        raise ValueError(
+            "An anonymized pack cannot take a raw dividend file. "
+            "Dividend cash is shares times amount, and pack share counts are rescaled. "
+            "Refusing to apply an unscaled dividend."
+        )
+    if borrow_rate_annual is None and secret["borrow_rate_source"] == "explicit":
+        borrow_rate_annual = float(secret["borrow_rate_annual"])
+    # The rest of the sidecar (date map, ticker, volume factor, note) is not
+    # copied into the child job. Drop the document before the spawn.
+    del secret
+    gc.collect()
+    books = _isolated_books(
+        strategy_cls,
+        loaded.frame,
+        profile,
+        share_factor=share_scale,
+        borrow_rate_annual=borrow_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        fee_mult=fee_mult,
+        dividends=dividends,
+        warmup_sessions=warmup_sessions,
+        initial_equity=initial_equity,
+        with_benchmarks=with_benchmarks,
+        anonymized=anonymized,
+        during=during,
+    )
+    payload = write_books(
+        out_dir,
+        get_profile(profile).name,
+        symbol,
+        loaded.bar_minutes,
+        loaded.frame,
+        books,
+        extra={
+            "warnings": [],
+            "pack_id": loaded.pack_id,
+            "anonymized": anonymized,
+        },
+    )
+    # Not written to metrics.json. A test reads what the child strategy observed.
+    observer = books["strategy"][0].get("observer")
+    if observer is not None:
+        payload["strategy_observer"] = observer
+    return payload
 
 
 def run_parallel(*_args, **_kwargs):
