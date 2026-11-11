@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import shutil
 from pathlib import Path
@@ -25,7 +26,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..audience import export_allowed, export_text, peek_scale, peek_symbols, scrub_text
+from ..audience import (
+    apply_designer,
+    designer_surface_text,
+    export_allowed,
+    export_text,
+    peek_scale,
+    peek_symbols,
+)
 from ..backend import RunReport, chart_overlay, drawdown_line, exposure_line, load_run
 from ..charts import ChartPanel
 from ..format import MISSING, format_number, is_missing
@@ -229,7 +237,11 @@ class ResultsPage(QWidget):
     def load_path(self, path: str, audience: str | None = None) -> None:
         self._source_path = path or ""
         chosen = audience or "auto"
-        report = load_run(self._source_path, audience=chosen) if self._source_path else load_run(path, audience=chosen)
+        try:
+            report = load_run(self._source_path, audience=chosen) if self._source_path else load_run(path, audience=chosen)
+        except (OSError, ValueError, csv.Error) as exc:
+            # One boundary. A decode or parse error must not skip the wipe.
+            report = _unreadable_report(self._source_path, chosen, exc)
         self._set_audience_combo(report.audience)
         self._show_path(report)
         self.show_report(report)
@@ -246,7 +258,7 @@ class ResultsPage(QWidget):
         shown = self._source_path
         if report.audience == "designer" and shown:
             folder = Path(shown)
-            shown = scrub_text(shown, peek_symbols(folder), scale=peek_scale(folder))
+            shown = self._designer_line(report, shown)
         self.path.edit.blockSignals(True)
         self.path.set_text(shown)
         self.path.edit.blockSignals(False)
@@ -270,13 +282,13 @@ class ResultsPage(QWidget):
         self._set_audience_combo(report.audience)
         clear_layout(self.banners)
         for warning in report.warnings:
-            severity = "error" if "disagree" in warning or "could not" in warning else "warn"
-            self.banners.addWidget(Banner(severity, warning))
-        missing = self._visible_missing(report)
+            text = self._designer_line(report, warning)
+            severity = "error" if "disagree" in text or "could not" in text else "warn"
+            self.banners.addWidget(Banner(severity, text))
+        missing = [self._designer_line(report, item) for item in self._visible_missing(report)]
         if missing:
-            self.banners.addWidget(
-                Banner("info", "Not in this report, so left blank: " + ", ".join(missing) + ".")
-            )
+            notice = "Not in this report, so left blank: " + ", ".join(missing) + "."
+            self.banners.addWidget(Banner("info", self._designer_line(report, notice)))
         if report.kind == "walkforward":
             self.leg.blockSignals(True)
             self.leg.clear()
@@ -291,6 +303,22 @@ class ResultsPage(QWidget):
         note = getattr(self.host, "note_results_audience", None)
         if callable(note):
             note()
+
+    def _designer_line(self, report: RunReport, text: str) -> str:
+        """Designer warnings and banners go through the path stripper and the allow-list."""
+        if report.audience != "designer":
+            return text
+        opened = report.opened or report.directory
+        symbols: tuple[str, ...] = ()
+        scale = None
+        if opened is not None:
+            try:
+                symbols = peek_symbols(opened)
+                scale = peek_scale(opened)
+            except (OSError, ValueError):
+                symbols = ()
+                scale = None
+        return designer_surface_text(text, symbols, scale=scale)
 
     def _apply_heading(self, audience: str) -> None:
         self.header.set_title("Designer report" if audience == "designer" else "Operator report")
@@ -444,9 +472,9 @@ class ResultsPage(QWidget):
             detail = str(child.get("error") or "").strip()
             lines = [line.strip() for line in detail.splitlines() if line.strip()]
             summary = lines[-1] if lines else child.get("state")
-            banner = Banner("error", f"{child.get('name')}: {summary}")
+            banner = Banner("error", self._designer_line(report, f"{child.get('name')}: {summary}"))
             if detail:
-                banner.setToolTip(detail)
+                banner.setToolTip(self._designer_line(report, detail))
             self.banners.addWidget(banner)
 
     def _show_chart(self, visible: bool) -> None:
@@ -886,6 +914,30 @@ class ResultsPage(QWidget):
             return True
         path.unlink(missing_ok=True)
         return False
+
+
+def _unreadable_report(path: str, audience: str, exc: BaseException) -> RunReport:
+    """A decode or parse failure. No book, one warning, and the previous picture can be wiped."""
+    folder = Path(path) if path else Path()
+    chosen = audience if audience in {"operator", "designer"} else "operator"
+    report = RunReport(
+        directory=folder,
+        kind="incomplete",
+        audience=chosen,
+        opened=folder if path else None,
+        warnings=[f"Report could not be read: {exc.__class__.__name__}: {exc}"],
+    )
+    if chosen == "designer":
+        symbols: tuple[str, ...] = ()
+        scale = None
+        if path:
+            try:
+                symbols = peek_symbols(folder)
+                scale = peek_scale(folder)
+            except (OSError, ValueError):
+                symbols, scale = (), None
+        apply_designer(report, symbols, redacted=True, scale=scale)
+    return report
 
 
 def report_is_designer(report: RunReport) -> bool:

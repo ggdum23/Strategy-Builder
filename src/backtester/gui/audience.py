@@ -24,8 +24,12 @@ _MONTH = (
 )
 _ORDINAL = r"(?:st|nd|rd|th)"
 # Longer spellings first. A bare year is last so ``2024-01`` and ``2024-1-4`` stay one token.
-# A year glued to a decimal, or the word "day" in front of a session index, is a number.
-_BARE_YEAR = re.compile(r"(?<![A-Za-z0-9.])(?<!day )(?:19|20)\d{2}(?![A-Za-z0-9.])", re.IGNORECASE)
+# A year glued to a decimal is a number. A bare year stays only when the whole
+# preceding word is "day" (``today 2024`` and ``holiday 2024`` still lose the year).
+_BARE_YEAR = re.compile(
+    r"(?<![A-Za-z0-9.])(?<!\bday )(?:19|20)\d{2}(?![A-Za-z0-9.])",
+    re.IGNORECASE,
+)
 _DATE_PATTERNS = (
     # ISO, padded or not, with an optional time: 2024-01-04, 2024-1-4.
     re.compile(
@@ -39,9 +43,10 @@ _DATE_PATTERNS = (
         rf"(?<!\d)\d{{1,2}}[\s.\-]+{_MONTH}(?![A-Za-z])\.?[\s,.\-]*(?:19|20)\d{{2}}(?!\d)",
         re.IGNORECASE,
     ),
-    # Dotted abbreviation and ordinal day: Jan. 4, 2024 and January 4th, 2024.
+    # Month and day. A period alone separates them: Jan.4, 2024 and January.4 2024.
     re.compile(
-        rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])\.?\s+\d{{1,2}}{_ORDINAL}?(?:,\s*|\s+)(?:19|20)\d{{2}}(?!\d)",
+        rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])(?:\.\s*|\s+)\d{{1,2}}{_ORDINAL}?"
+        rf"(?:(?:,\s*|\s+)(?:19|20)\d{{2}})(?!\d)",
         re.IGNORECASE,
     ),
     re.compile(r"(?<!\d)(?:19|20)\d{2}-\d{2}(?!\d)"),
@@ -57,14 +62,32 @@ _SECRET_TOKENS = ("share_scale", "share_factor", "price_factor", "volume_factor"
 _SECRET_WORDS = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:share_scale|share_factor|price_factor|volume_factor|date_map)(?![A-Za-z0-9_])"
 )
-# A Windows path may contain spaces (``Strategy Builder\QQQ\data.csv``). After the
-# drive or UNC prefix, keep going until a quote, a comma, or the end of the field.
+# A path may contain spaces (``Strategy Builder/QQQ/data.csv``). After the drive,
+# UNC, or POSIX prefix, keep going until a quote, a comma, or the end of the line.
 _ABS_PATH = re.compile(
     r"(?:[A-Za-z]:[\\/][^'\"<>|*?,\r\n]*)"
     r"|(?:\\\\[^\\/'\"<>|*?,\r\n]+[\\/][^'\"<>|*?,\r\n]*)"
     r"|(?:[/]{2}[^/'\"<>|*?,\r\n]+/[^'\"<>|*?,\r\n]*)"
-    r"|(?:/(?:[\w.\-]+/)+[\w.\-]+)"
+    # A letter in the final segment keeps a slash date such as 2024/1/4 from
+    # being read as a path. Spaces still belong to the path, through a comma.
+    r"|(?:/(?:[^/'\"<>|*?,\r\n]+/)+[^/'\"<>|*?,\r\n]*[A-Za-z][^/'\"<>|*?,\r\n]*)"
 )
+# A scale value is its own number, not a digit inside ``long_2x`` or ``2.5``.
+_NUMBER_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![A-Za-z0-9_])"
+)
+_MONTH_WORDS = frozenset(
+    "jan january feb february mar march apr april may jun june jul july aug august "
+    "sep sept september oct october nov november dec december".split()
+)
+_MONTH_WORD = re.compile(rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])", re.IGNORECASE)
+_NEAR_YEAR = re.compile(r"(?<![A-Za-z0-9.])(?:19|20)\d{2}(?![A-Za-z0-9.])")
+_FREE_TOKEN = re.compile(r"[A-Za-z0-9_.]+")
+_FREE_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_SESSION_ID = re.compile(r"[Ss]\d+")
+_YEAR_TOKEN = re.compile(r"(?:19|20)\d{2}")
+_PLAIN_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+_DOTTED_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+")
 
 # Keys a designer tree is not allowed to carry. ``cost_basis`` holds the
 # invoice scale. Named operator runs still show that object.
@@ -190,9 +213,10 @@ def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = No
     """Remove calendar dates, scale words, the scale number, and ticker tokens.
 
     ISO dates, unpadded ISO, slash dates, dotted DMY and MDY, month names,
-    dotted abbreviations, ordinal days, ``YYYY-MM`` keys, and a bare year all
-    count. ``2024.50``, ``0.2024``, and ``day 2024`` stay, because those are
-    numbers. Session ids such as ``S01`` stay. A one-letter ticker is a ticker.
+    dotted abbreviations, a period with no space (``Jan.4, 2024``), ordinal
+    days, ``YYYY-MM`` keys, and a bare year all count. ``2024.50``, ``0.2024``,
+    and ``day 2024`` stay. ``today 2024`` does not. Session ids such as ``S01``
+    stay. A one-letter ticker is a ticker.
     A digit glued to a ticker is still that ticker. Ticker matching uses
     casefold, so ``ß`` and ``ﬁ`` count.
     """
@@ -206,19 +230,59 @@ def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = No
     return text
 
 
-def _scrub_scale_number(text: str, scale: float | None) -> str:
+def _scale_number(scale: float | None) -> float | None:
+    """The invoice scale, when it is a finite number other than 1."""
     if scale is None:
-        return text
+        return None
     try:
         number = float(scale)
     except (TypeError, ValueError):
-        return text
+        return None
     if not math.isfinite(number) or abs(number - 1.0) <= 1e-9:
+        return None
+    return number
+
+
+def _same_number(token: str, number: float) -> bool:
+    try:
+        value = float(token)
+    except ValueError:
+        return False
+    if not math.isfinite(value):
+        return False
+    return abs(value - number) <= 1e-9 * max(1.0, abs(number))
+
+
+def _scrub_scale_number(text: str, scale: float | None) -> str:
+    """Remove the scale only when it is its own numeric token.
+
+    ``2`` inside ``long_2x`` or ``2.5`` is a different token and stays.
+    """
+    number = _scale_number(scale)
+    if number is None:
         return text
-    rendered = f"{number:.10g}"
-    for token in {rendered, str(scale)}:
-        text = re.sub(rf"(?<![\d.]){re.escape(token)}(?!\d)", "", text)
-    return text
+
+    def replace(match: re.Match[str]) -> str:
+        return "" if _same_number(match.group(0), number) else match.group(0)
+
+    return _NUMBER_TOKEN.sub(replace, text)
+
+
+def _contains_scale(text: str, scale: float | None) -> bool:
+    number = _scale_number(scale)
+    if number is None:
+        return False
+    return any(_same_number(match.group(0), number) for match in _NUMBER_TOKEN.finditer(text))
+
+
+def _month_near_year(text: str) -> bool:
+    """A month word and a calendar year in the same short phrase."""
+    years = [match.start() for match in _NEAR_YEAR.finditer(text)]
+    if not years:
+        return False
+    return any(
+        any(abs(month.start() - year) <= 32 for year in years) for month in _MONTH_WORD.finditer(text)
+    )
 
 
 def _scrub_obj(value, symbols: tuple[str, ...], *, drop_prices: bool, scale: float | None = None):
@@ -242,10 +306,7 @@ def _scrub_obj(value, symbols: tuple[str, ...], *, drop_prices: bool, scale: flo
 
 
 def _scrub_string(value: str, symbols: tuple[str, ...], scale: float | None) -> str:
-    text = value
-    if "Traceback" in text or _ABS_PATH.search(text):
-        text = designer_error(text)
-    return scrub_text(text, symbols, scale=scale)
+    return designer_surface_text(value, symbols, scale=scale)
 
 
 def _is_period_map(value: dict) -> bool:
@@ -327,12 +388,15 @@ def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: f
         report.fees_breakdown = _scrub_obj(report.fees_breakdown, symbols, drop_prices=False, scale=scale)
     if report.period_returns is not None:
         report.period_returns = _scrub_obj(report.period_returns, symbols, drop_prices=False, scale=scale)
-    report.warnings = [scrub_text(str(item), symbols, scale=scale) for item in report.warnings]
-    report.missing = [scrub_text(str(item), symbols, scale=scale) for item in report.missing]
+    report.warnings = [designer_surface_text(str(item), symbols, scale=scale) for item in report.warnings]
+    report.missing = [designer_surface_text(str(item), symbols, scale=scale) for item in report.missing]
     for curve in list(report.curves) + list(report.benchmark_curves):
-        curve.sessions = [scrub_text(str(label), symbols, scale=scale) for label in curve.sessions]
-        curve.name = scrub_text(str(curve.name), symbols, scale=scale)
-        curve.drawdown_note = scrub_text(str(curve.drawdown_note), symbols, scale=scale)
+        curve.sessions = [
+            _designer_session_label(label, index, symbols, scale) for index, label in enumerate(curve.sessions)
+        ]
+        if curve.name not in _PROTECTED_CURVE_NAMES:
+            curve.name = designer_surface_text(str(curve.name), symbols, scale=scale)
+        curve.drawdown_note = designer_surface_text(str(curve.drawdown_note), symbols, scale=scale)
     report.fills = _scrub_table(report.fills, symbols, drop_prices=redacted, scale=scale)
     report.episodes = _scrub_table(report.episodes, symbols, drop_prices=redacted, scale=scale)
     if report.leaderboard is not None:
@@ -354,6 +418,83 @@ def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: f
             continue
         cleaned_children.append(_designer_child(child, symbols, scale=scale))
     report.children = cleaned_children
+
+
+_PROTECTED_CURVE_NAMES = frozenset(
+    {
+        "Strategy",
+        "1× buy and hold",
+        "2× long",
+    }
+)
+
+
+def _designer_session_label(label: str, index: int, symbols: tuple[str, ...], scale: float | None) -> str:
+    """A designer tick is the day or session id, else the integer index.
+
+    A calendar date is not a session label. A pure index is kept even when it
+    happens to equal the invoice scale.
+    """
+    raw = str(label).strip()
+    if re.fullmatch(r"\d+", raw) or _SESSION_ID.fullmatch(raw):
+        return raw
+    cleaned = designer_surface_text(raw, symbols, scale=scale)
+    if re.fullmatch(r"\d+", cleaned) or _SESSION_ID.fullmatch(cleaned):
+        return cleaned
+    return str(index)
+
+
+def _allow_listed_text(text: str) -> str:
+    """Keep numbers, session ids, and words. Drop everything else.
+
+    A month name is not a word we show. A four-digit year stays only when the
+    previous word is ``day``. This is the structural layer. The regexes have
+    already run.
+    """
+    pieces: list[str] = []
+    previous = ""
+    for match in _FREE_TOKEN.finditer(text):
+        token = match.group(0)
+        head = token.split(".", 1)[0].casefold()
+        if head in _MONTH_WORDS:
+            previous = ""
+            continue
+        if _PLAIN_NUMBER.fullmatch(token):
+            pieces.append(token)
+            previous = ""
+            continue
+        if _SESSION_ID.fullmatch(token):
+            pieces.append(token)
+            previous = token
+            continue
+        if _YEAR_TOKEN.fullmatch(token):
+            if previous.casefold() == "day":
+                pieces.append(token)
+            previous = ""
+            continue
+        if token.casefold() in _MONTH_WORDS:
+            previous = ""
+            continue
+        if _FREE_WORD.fullmatch(token) or _DOTTED_WORD.fullmatch(token):
+            pieces.append(token)
+            previous = token if _FREE_WORD.fullmatch(token) else ""
+            continue
+        previous = ""
+    return " ".join(pieces)
+
+
+def designer_surface_text(value: str, symbols: tuple[str, ...] = (), *, scale: float | None = None) -> str:
+    """Text a designer banner, warning, or free-text cell may show.
+
+    Paths are consumed through spaces. The remainder is limited to numbers,
+    session ids, and words, and the date, ticker, and scale regexes still run.
+    """
+    raw = str(value)
+    if "Traceback" in raw or _ABS_PATH.search(raw):
+        raw = designer_error(raw)
+    raw = _ABS_PATH.sub(" ", raw)
+    raw = scrub_text(raw, symbols, scale=scale)
+    return _allow_listed_text(raw)
 
 
 def designer_error(text: str) -> str:
@@ -378,7 +519,7 @@ def designer_error(text: str) -> str:
 def _strip_child_error(cleaned: dict, symbols: tuple[str, ...], scale: float | None) -> None:
     error = cleaned.get("error")
     if isinstance(error, str):
-        cleaned["error"] = scrub_text(designer_error(error), symbols, scale=scale)
+        cleaned["error"] = designer_surface_text(error, symbols, scale=scale)
 
 
 def _leaf_token(value, symbols: tuple[str, ...], *, scale: float | None = None) -> str:
@@ -431,7 +572,7 @@ def book_is_anonymized(document) -> bool:
 def _read_json(path: Path):
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     return document if isinstance(document, dict) else None
 
@@ -616,18 +757,23 @@ def _itxt_text(chunk: bytes) -> str:
 
 
 def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) -> bool:
-    """False when a file still contains operator-only text."""
+    """False when a file still contains operator-only text.
+
+    The date and path regexes are the second layer. A month word next to a
+    year, a path, or the scale as its own number fails even when the spelling
+    is one the date list has not named yet.
+    """
     folded = text.casefold()
     # Same case-insensitive token check for every invoice word, including share_factor.
     if any(token in folded for token in _SECRET_TOKENS):
         return False
     if any(pattern.search(text) for pattern in _EXPORT_DATE_PATTERNS):
         return False
+    if _month_near_year(text) or _ABS_PATH.search(text):
+        return False
     for symbol in symbols:
         if symbol and _ticker_spans(text, symbol):
             return False
-    if scale is not None and abs(scale - 1.0) > 1e-9:
-        rendered = f"{scale:.10g}"
-        if rendered in text or str(scale) in text:
-            return False
+    if _contains_scale(text, scale):
+        return False
     return True

@@ -212,20 +212,22 @@ def _drawdown(equity: list[float], initial) -> tuple[list[float], str]:
     return points, note
 
 
-def _curve(path: Path, name: str, initial) -> Curve | None:
+def _curve(path: Path, name: str, initial, *, designer: bool = False) -> Curve | None:
     table = _load_table(path)
     if not table.columns:
         return None
     equity_col = _pick(table.columns, EQUITY_COLUMNS)
     if equity_col is None:
         return None
-    session_col = _pick(table.columns, SESSION_COLUMNS)
+    # A designer chart must not prefer the calendar column. ``day`` and
+    # ``session`` are the anonymized index. A missing one becomes the row index.
+    session_col = _pick(table.columns, ("day", "session") if designer else SESSION_COLUMNS)
     exposure_col = _pick(table.columns, EXPOSURE_COLUMNS)
     sessions = []
     equity = []
     exposure = [] if exposure_col else None
     for index, row in enumerate(table.rows):
-        sessions.append("" if session_col is None else str(row.get(session_col) or index))
+        sessions.append(_session_label(row, session_col, index, designer=designer))
         equity.append(_floats([row.get(equity_col)])[0])
         if exposure is not None:
             exposure.append(_floats([row.get(exposure_col)])[0])
@@ -239,6 +241,16 @@ def _curve(path: Path, name: str, initial) -> Curve | None:
         drawdown=drawdown,
         drawdown_note=note,
     )
+
+
+def _session_label(row: dict, column: str | None, index: int, *, designer: bool) -> str:
+    if designer:
+        raw = None if column is None else row.get(column)
+        text = "" if raw is None else str(raw).strip()
+        return text
+    if column is None:
+        return ""
+    return str(row.get(column) or index)
 
 
 def _align_note(strategy: Curve, other: Curve) -> tuple[list[float], list[float], str]:
@@ -304,7 +316,7 @@ def _other_fields(metrics: dict) -> dict:
     return other
 
 
-def _load_book(directory: Path, withheld: list[str]) -> RunReport:
+def _load_book(directory: Path, withheld: list[str], *, designer: bool = False) -> RunReport:
     report = RunReport(directory=directory, kind="book")
     metrics_path = directory / METRICS_FILE
     if not metrics_path.is_file():
@@ -338,7 +350,7 @@ def _load_book(directory: Path, withheld: list[str]) -> RunReport:
     if equity_path is None:
         report.missing.append(" or ".join(EQUITY_FILES))
     else:
-        curve = _curve(equity_path, "Strategy", initial)
+        curve = _curve(equity_path, "Strategy", initial, designer=designer)
         if curve is None:
             report.warnings.append(f"{equity_path.name} has no equity column")
         else:
@@ -392,7 +404,12 @@ def _load_book(directory: Path, withheld: list[str]) -> RunReport:
             _compare_summaries(folder.name, nested.get(folder.name), full, report.warnings)
             path = _first_file(folder, EQUITY_FILES)
             if path is not None:
-                curve = _curve(path, BENCHMARK_TITLES.get(folder.name, folder.name), full.get("initial_equity", initial))
+                curve = _curve(
+                    path,
+                    BENCHMARK_TITLES.get(folder.name, folder.name),
+                    full.get("initial_equity", initial),
+                    designer=designer,
+                )
                 if curve is not None:
                     report.benchmark_curves.append(curve)
     for label, summary in nested.items():
@@ -423,7 +440,7 @@ def _looks_like_desk(metrics: dict) -> bool:
     return any(key in metrics for key in ("disqualified", "financing_cost", "margin_calls_filled"))
 
 
-def _load_walkforward(directory: Path, withheld: list[str]) -> RunReport:
+def _load_walkforward(directory: Path, withheld: list[str], *, designer: bool = False) -> RunReport:
     report = RunReport(directory=directory, kind="walkforward")
     try:
         summary = _withhold(_read_json(directory / WALKFORWARD_FILE), withheld)
@@ -440,7 +457,7 @@ def _load_walkforward(directory: Path, withheld: list[str]) -> RunReport:
     for leg in ("design", "locked"):
         leg_dir = directory / leg
         if (leg_dir / METRICS_FILE).is_file():
-            book = _load_book(leg_dir, withheld)
+            book = _load_book(leg_dir, withheld, designer=designer)
             report.children.append({"leg": leg, "report": book})
         else:
             report.missing.append(f"{leg}/{METRICS_FILE}")
@@ -688,13 +705,13 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
     return report
 
 
-def _dispatch(folder: Path, withheld: list[str]) -> RunReport:
+def _dispatch(folder: Path, withheld: list[str], *, designer: bool = False) -> RunReport:
     if _is_parallel_tree(folder) or (folder / LEADERBOARD_FILE).is_file() and _nested_job_dirs(folder):
         return _load_parallel(folder, withheld)
     if (folder / WALKFORWARD_FILE).is_file():
-        return _load_walkforward(folder, withheld)
+        return _load_walkforward(folder, withheld, designer=designer)
     if (folder / METRICS_FILE).is_file():
-        return _load_book(folder, withheld)
+        return _load_book(folder, withheld, designer=designer)
     if (folder / BATCH_STATUS_FILE).is_file() or (folder / LEADERBOARD_FILE).is_file() or _child_dirs(folder):
         return _load_batch(folder, withheld)
     report = RunReport(directory=folder, kind="incomplete")
@@ -715,7 +732,7 @@ def load_run(directory, *, audience: str = "auto") -> RunReport:
         return report
     chosen, root, redacted = resolve_view(folder, audience)
     withheld: list[str] = []
-    report = _dispatch(root, withheld)
+    report = _dispatch(root, withheld, designer=chosen == "designer")
     report.audience = chosen
     report.opened = folder
     report.redacted = redacted
