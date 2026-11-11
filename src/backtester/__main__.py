@@ -53,9 +53,41 @@ def _add_data_args(parser: argparse.ArgumentParser, *, require_out: bool, requir
             f"{ARENA.borrow_rate_annual:.4f} on Arena and {DESK.borrow_rate_annual:.4f} on Desk."
         ),
     )
-    parser.add_argument("--financing-rate", type=float, default=None, help="Desk only. Default 0.07. Arena stays at 0.")
+    parser.add_argument(
+        "--financing-rate",
+        type=float,
+        default=None,
+        help="Annual decimal charged on borrowed money. Arena default 0. Desk default 0.07. Above 1.0 is rejected.",
+    )
     parser.add_argument("--fee-mult", type=float, default=1.0, help="Desk only. Doubles fees and slippage when set to 2.")
-    parser.add_argument("--dividends", default=None, help="CSV with columns session,amount. Desk only.")
+    parser.add_argument(
+        "--dividends",
+        default=None,
+        help="CSV with columns session,amount. Desk credits it on raw prices. Arena credits it only with --price-basis total_return.",
+    )
+    parser.add_argument(
+        "--price-basis",
+        choices=("raw", "total_return"),
+        default="raw",
+        help="raw uses the stored prints. total_return uses a registry total-return series, or credits dividends.csv.",
+    )
+    parser.add_argument(
+        "--cash-rate",
+        type=float,
+        default=None,
+        help="Annual decimal earned by idle cash. Default 0. One accrual of rate/252 at each session boundary.",
+    )
+    parser.add_argument(
+        "--withholding",
+        type=float,
+        default=None,
+        help="Fraction withheld from a positive long dividend. Default 0. Shorts pay the gross amount.",
+    )
+    parser.add_argument(
+        "--registry",
+        default=None,
+        help="Registry JSON. Required to run a series that was ingested as total_return.",
+    )
     parser.add_argument("--initial-equity", type=float, default=1_000_000.0)
     parser.add_argument(
         "--warmup-sessions",
@@ -138,9 +170,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parallel.add_argument("--timeout", type=float, default=600.0, help="Seconds for one strategy after its process has started")
     parallel.add_argument("--memory-mb", type=int, default=None, help="Resident-set cap for one strategy process")
     parallel.add_argument("--borrow-rate", type=float, default=None)
-    parallel.add_argument("--financing-rate", type=float, default=None)
+    parallel.add_argument(
+        "--financing-rate",
+        type=float,
+        default=None,
+        help="Annual decimal. Arena default 0. Desk default 0.07. Above 1.0 is rejected.",
+    )
     parallel.add_argument("--fee-mult", type=float, default=1.0)
-    parallel.add_argument("--dividends", default=None, help="One CSV for the whole batch. Desk only.")
+    parallel.add_argument(
+        "--dividends",
+        default=None,
+        help="One CSV for the whole batch. Arena credits it only with --price-basis total_return.",
+    )
+    parallel.add_argument("--price-basis", choices=("raw", "total_return"), default="raw")
+    parallel.add_argument("--cash-rate", type=float, default=None, help="Annual decimal earned by idle cash. Default 0.")
+    parallel.add_argument("--withholding", type=float, default=None, help="Fraction withheld from a positive long dividend. Default 0.")
+    parallel.add_argument("--registry", default=None, help="Registry JSON used for every named ticker.")
     parallel.add_argument("--initial-equity", type=float, default=1_000_000.0)
     parallel.add_argument("--warmup-sessions", type=int, default=0)
     parallel.add_argument("--no-benchmarks", action="store_true")
@@ -220,6 +265,9 @@ def _cmd_run(args) -> int:
             dividends=_dividends(args.dividends),
             warmup_sessions=args.warmup_sessions,
             initial_equity=args.initial_equity,
+            price_basis=args.price_basis,
+            cash_rate_annual=args.cash_rate,
+            withholding_rate=args.withholding,
         )
         _print_headline(args.profile, payload)
         print(f"wrote {args.out}")
@@ -229,6 +277,7 @@ def _cmd_run(args) -> int:
             profile=payload.get("profile") or args.profile,
             symbol=payload.get("symbol"),
             anonymized=bool((payload.get("run") or {}).get("anonymized")),
+            accounting=payload.get("accounting"),
         )
         return 0
     if not args.src or not args.ticker:
@@ -247,11 +296,21 @@ def _cmd_run(args) -> int:
         dividends=_dividends(args.dividends),
         warmup_sessions=args.warmup_sessions,
         initial_equity=args.initial_equity,
+        price_basis=args.price_basis,
+        cash_rate_annual=args.cash_rate,
+        withholding_rate=args.withholding,
+        registry_path=args.registry,
     )
     _print_headline(args.profile, payload)
     _print_data_notes(((payload.get("run") or {}).get("inspection") or {}).get("notes"))
     print(f"wrote {args.out}")
-    _remember(args.out, kind="book", profile=payload.get("profile") or args.profile, symbol=payload.get("symbol"))
+    _remember(
+        args.out,
+        kind="book",
+        profile=payload.get("profile") or args.profile,
+        symbol=payload.get("symbol"),
+        accounting=payload.get("accounting"),
+    )
     return 0
 
 
@@ -261,15 +320,22 @@ def _walk_inputs(args):
     The caller pops ``frame`` in the ``walk_forward`` argument list so this
     command does not keep a local bound to the full series during the design run.
     """
-    from .data import load_named as _load
+    from .runner import load_run_series
 
-    loaded = _load(args.src, args.ticker, bar_minutes=args.bar_minutes)
+    loaded, series_kind = load_run_series(
+        args.src,
+        args.ticker,
+        bar_minutes=args.bar_minutes,
+        price_basis=args.price_basis,
+        registry_path=args.registry,
+    )
     _print_data_notes(loaded.inspection.notes)
     factor = loaded.inspection.share_factor if args.share_factor is None else args.share_factor
     return {
         "frame": loaded.frame,
         "notes": tuple(loaded.inspection.notes),
         "factor": factor,
+        "series_kind": series_kind,
     }
 
 
@@ -301,6 +367,10 @@ def _cmd_walk(args) -> int:
         dividends=_dividends(args.dividends),
         initial_equity=args.initial_equity,
         inspection_notes=pack["notes"],
+        price_basis=args.price_basis,
+        series_kind=pack["series_kind"],
+        cash_rate_annual=args.cash_rate,
+        withholding_rate=args.withholding,
     )
     print(
         f"[{args.profile}] design through {summary['design_end_date']} "
@@ -309,7 +379,13 @@ def _cmd_walk(args) -> int:
         f"rule={summary['warmup_rule']}"
     )
     print(f"wrote {args.out}")
-    _remember(args.out, kind="walkforward", profile=args.profile, symbol=args.ticker)
+    _remember(
+        args.out,
+        kind="walkforward",
+        profile=args.profile,
+        symbol=args.ticker,
+        accounting=summary.get("accounting"),
+    )
     return 0
 
 
@@ -417,7 +493,15 @@ def _cmd_pack(args) -> int:
     return 0
 
 
-def _remember(out, *, kind: str, profile: str, symbol: str | None = None, anonymized: bool = False) -> str:
+def _remember(
+    out,
+    *,
+    kind: str,
+    profile: str,
+    symbol: str | None = None,
+    anonymized: bool = False,
+    accounting: dict | None = None,
+) -> str:
     from .report import register_run
 
     run_id = "r" + secrets.token_hex(8)
@@ -430,6 +514,10 @@ def _remember(out, *, kind: str, profile: str, symbol: str | None = None, anonym
     }
     if symbol:
         document["symbol"] = symbol
+    if isinstance(accounting, dict):
+        document["accounting"] = accounting
+        for key, value in accounting.items():
+            document.setdefault(key, value)
     write_json(Path(out) / "run.json", document)
     register_run(Path.cwd() / ".backtester-runs.json", run_id, out, kind=kind, profile=profile)
     print(f"run {run_id}")
@@ -497,6 +585,10 @@ def _cmd_parallel(args) -> int:
             initial_equity=args.initial_equity,
             with_benchmarks=not args.no_benchmarks,
             index_path=Path.cwd() / ".backtester-runs.json",
+            price_basis=args.price_basis,
+            cash_rate_annual=args.cash_rate,
+            withholding_rate=args.withholding,
+            registry_path=args.registry,
         )
     finally:
         signal.signal(signal.SIGINT, previous)

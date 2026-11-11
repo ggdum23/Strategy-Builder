@@ -119,7 +119,10 @@ These are the readings that were not fixed by a single sentence in the spec.
     fill of any pending order, then mark and high-water update, then the
     liquidation test, then the strategy, then the margin check. Worst equity/HWM
     is sampled at the end of the bar. The daily mark is written on the last RTH
-    bar. The financing snap is written on the last bar of the session.
+    bar. The financing snap is written on the last bar of the session, after
+    any fill on that bar. A post bar does not fill. A target set there waits
+    for the next RTH open, which is after the boundary charge, so the snap
+    still has the shares held through the close.
 
 18. **Margin call.** On every RTH bar close, after the strategy has spoken, if
     there is no pending order, the position is not flat, equity is positive, and
@@ -236,3 +239,24 @@ These are the readings that were not fixed by a single sentence in the spec.
 36. **First live session and dividends.** There is no previous live close, so
     the first live session does not pay a dividend even if that date is listed.
     A flat book would have made the cash zero anyway.
+
+37. **Cash interest is off unless asked.** Idle cash is
+    `max(0, equity - |shares * price|)` on the pre-charge snap. One accrual is
+    `cash_rate / sessions_per_year * idle`, default sessions 252. The default
+    cash rate is 0, and that 0 does not add to cash. Financing stays the
+    existing `financing_due` call, including a zero charge when nothing is
+    borrowed, so a default book matches a book that passes 0.07, cash 0, and
+    withholding 0. An omitted desk rate is `FINANCING_RATE_ANNUAL` read when
+    `execute` starts, which is 0.07 unless that constant was patched in the
+    process. The parent recomputes benchmarks against the unpatched constant.
+
+38. **Withholding.** The default rate is 0, and the dividend line stays
+    `shares * amount`. A positive rate pays a long
+    `shares * amount * (1 - rate)` when the amount is positive, and a short
+    still pays the gross amount. Above 1.0 or below 0 is an error.
+
+39. **Price basis is not a second engine.** Desk fill, leverage, borrow,
+    liquidation, and the 7 percent financing default stay in this module.
+    `price_basis=total_return` either runs a registry total-return series with
+    no dividend file, or credits `dividends.csv` on raw prices. The two
+    profiles are not merged.

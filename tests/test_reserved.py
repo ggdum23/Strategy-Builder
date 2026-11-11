@@ -15,6 +15,7 @@ import pytest
 
 from backtester.__main__ import main
 from backtester.pack import build_pack
+from backtester.accounting import EXACT_RESERVED
 from backtester.report import (
     RESERVED_VOCABULARY,
     TICKER_STAND_IN,
@@ -78,7 +79,7 @@ def _reserved_message(symbol: str) -> str:
     )
 
 
-@pytest.mark.parametrize("symbol", _README_SYMBOLS + ("2", "10", "SS", "FI", "AS", "ET", "asset"))
+@pytest.mark.parametrize("symbol", _README_SYMBOLS + ("1", "2", "10", "SS", "FI", "AS", "ET", "asset", "SESSION", "RETURN"))
 def test_readme_symbols_pass_the_guard(symbol):
     assert reserved_symbol_conflict(symbol) is None
     require_anonymizable_symbol(symbol)
@@ -104,6 +105,8 @@ def test_readme_lists_every_reserved_token_and_the_exit_code():
     assert "exits 2" in text
     assert "RANDOM" in text
     for token in RESERVED_VOCABULARY:
+        assert f"`{token}`" in text, token
+    for token in EXACT_RESERVED:
         assert f"`{token}`" in text, token
 
 
