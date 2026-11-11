@@ -1,0 +1,104 @@
+{
+ "columns": [
+  "day",
+  "weekday",
+  "minute",
+  "time",
+  "session",
+  "open",
+  "high",
+  "low",
+  "close",
+  "volume",
+  "wap",
+  "count",
+  "filled",
+  "short_session"
+ ],
+ "days": [
+  0,
+  3795
+ ],
+ "design_days": [
+  0,
+  2999
+ ],
+ "validation_days": [
+  3000,
+  3795
+ ],
+ "rows": 3395659,
+ "rth_rows": 1474500,
+ "files": {
+  "bars_1min_part01.csv.xz": {
+   "sha256": "7db73e3902aa0678b099eb921d422065ecf7703d494cf935a01fb65295a5b78a",
+   "bytes": 3368712
+  },
+  "bars_1min_part02.csv.xz": {
+   "sha256": "c65664fb0da26d2601d10ce4100f7b8736697d6d9857f69ca8a15f28cf77bfb9",
+   "bytes": 4004496
+  },
+  "bars_1min_part03.csv.xz": {
+   "sha256": "1dc23d26c64c9f3e611e41b3a15f187fcbd057e953258e0143634415f1a03434",
+   "bytes": 4027868
+  },
+  "bars_1min_part04.csv.xz": {
+   "sha256": "b381d22a564dfdd5e11905e3c450137fc3fa1dd9bd19def3b225759fa54edbf8",
+   "bytes": 3869192
+  },
+  "bars_1min_part05.csv.xz": {
+   "sha256": "0c26899e598e3c1717390a86dad9afff29e516b16e4ac6f841418be55e8b3e11",
+   "bytes": 3719312
+  },
+  "bars_1min_part06.csv.xz": {
+   "sha256": "2d05042b32e5b52f80370447a51cb1e836b17c87da01e77eb6cf700b65b74902",
+   "bytes": 3838028
+  },
+  "bars_1min_part07.csv.xz": {
+   "sha256": "f74f1300eb1412c5763b954168d11c1f1a8b96dd32295b7a4897540551c12f31",
+   "bytes": 4381916
+  },
+  "bars_1min_part08.csv.xz": {
+   "sha256": "62c58e238cb5d5421f6f492f529d245d73a1d481d70f138224325a2b054fe4be",
+   "bytes": 3096164
+  },
+  "daily_rth.csv": {
+   "sha256": "fa51be703a2cd902a6cd1611f8174c991a146ce9168259a28bc277625fe3645f",
+   "bytes": 266767
+  }
+ },
+ "chunks": {
+  "bars_1min_part01.csv.xz": [
+   0,
+   499
+  ],
+  "bars_1min_part02.csv.xz": [
+   500,
+   999
+  ],
+  "bars_1min_part03.csv.xz": [
+   1000,
+   1499
+  ],
+  "bars_1min_part04.csv.xz": [
+   1500,
+   1999
+  ],
+  "bars_1min_part05.csv.xz": [
+   2000,
+   2499
+  ],
+  "bars_1min_part06.csv.xz": [
+   2500,
+   2999
+  ],
+  "bars_1min_part07.csv.xz": [
+   3000,
+   3499
+  ],
+  "bars_1min_part08.csv.xz": [
+   3500,
+   3795
+  ]
+ }
+}

@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.gz binary
+*.png binary
+*.xz binary
+tests/reference/** text eol=lf
+src/backtester/costs.py text eol=lf
+src/backtester/engine_arena.py text eol=lf
