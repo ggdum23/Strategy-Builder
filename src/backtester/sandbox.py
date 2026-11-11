@@ -326,7 +326,10 @@ def _windows_guarantees() -> dict:
             "AppContainer SID is not granted on data, market, or repository files. "
             "An explicit deny ACE is added on those directories and on the files under them "
             "when the walk finishes, and removed when the referee exits. The private temp "
-            "directory is the writable grant."
+            "directory is the writable grant. LOCALAPPDATA is the host value, because the "
+            "AppContainer profile lives there, and a non-inheriting deny stops the container "
+            "from opening that directory. The profile and the runtime grants are kept for "
+            "the life of this process so later launches do not walk the Python tree again."
         ),
         "process": (
             "job object with KILL_ON_JOB_CLOSE, active process limit 1, a commit-charge cap, "
@@ -444,7 +447,27 @@ class Sandbox:
             shutil.rmtree(self.workdir, ignore_errors=True)
 
 
-def launch(strategy_path, *, memory_bytes: int, cpu_seconds: int, deny_paths) -> Sandbox:
+def _interpreter_command(script: Path) -> list[str]:
+    """How to execute a copied jail script with this interpreter.
+
+    A normal CPython is started with ``-I -B -s`` so it does not read the
+    user site or write bytecode. A frozen executable is not that interpreter.
+    ``--backtester-sandbox`` is the entry the frozen launcher recognizes, and
+    it runs the copied script inside the same jail.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--backtester-sandbox", str(script)]
+    return [sys.executable, "-I", "-B", "-s", str(script)]
+
+
+def launch(
+    strategy_path,
+    *,
+    memory_bytes: int,
+    cpu_seconds: int,
+    deny_paths,
+    capture_stdio: bool = False,
+) -> Sandbox:
     """Copy the strategy into a private directory and start it inside the jail.
 
     ``deny_paths`` are host directories the child must not open. They are not
@@ -463,7 +486,13 @@ def launch(strategy_path, *, memory_bytes: int, cpu_seconds: int, deny_paths) ->
         for banned in denied:
             if work == banned or banned in work.parents or work in banned.parents:
                 raise SandboxError("the private directory overlaps a denied directory")
-        _write_workspace(work, strategy, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        _write_workspace(
+            work,
+            strategy,
+            memory_bytes=memory_bytes,
+            cpu_seconds=cpu_seconds,
+            capture_stdio=capture_stdio,
+        )
         if sys.platform == "win32":
             return _launch_windows(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
         if sys.platform != "linux":
@@ -499,11 +528,22 @@ def _deny_roots(paths) -> list[Path]:
     return roots
 
 
-def _write_workspace(work: Path, strategy: Path, *, memory_bytes: int, cpu_seconds: int) -> None:
+def _write_workspace(
+    work: Path,
+    strategy: Path,
+    *,
+    memory_bytes: int,
+    cpu_seconds: int,
+    capture_stdio: bool,
+) -> None:
     shim = Path(__file__).resolve().parent / "sandbox_child.py"
     (work / "strategy.py").write_bytes(strategy.read_bytes())
     (work / "sandbox_child.py").write_bytes(shim.read_bytes())
-    limits = {"memory_bytes": int(memory_bytes), "cpu_seconds": int(cpu_seconds)}
+    limits = {
+        "memory_bytes": int(memory_bytes),
+        "cpu_seconds": int(cpu_seconds),
+        "capture_stdio": bool(capture_stdio),
+    }
     (work / "limits.json").write_text(json.dumps(limits), encoding="utf-8")
 
 
@@ -671,7 +711,7 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
         )
         for key, value in _child_env(work).items():
             cmd.extend(["--setenv", key, value])
-        cmd.extend([sys.executable, "-I", "-B", "-s", str(work / "sandbox_child.py")])
+        cmd.extend(_interpreter_command(work / "sandbox_child.py"))
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -739,7 +779,7 @@ def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_s
     (work / "enter.py").write_text(_LANDLOCK_ENTER, encoding="utf-8")
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-I", "-B", "-s", str(work / "enter.py")],
+            _interpreter_command(work / "enter.py"),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -832,6 +872,8 @@ def main():
             os.unlink(name)
         except OSError:
             _fail("jail metadata was left in the work directory")
+    if getattr(sys, "frozen", False):
+        os.execv(sys.executable, [sys.executable, "--backtester-sandbox", "sandbox_child.py"])
     os.execv(sys.executable, [sys.executable, "-I", "-B", "-s", "sandbox_child.py"])
 
 
@@ -847,19 +889,28 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
     lease = _win_lease_acquire()
     extra_grants: list[tuple[Path, bool]] = []
     denies: list[Path] = []
+    shallow: list[Path] = []
+    popen = None
     try:
-        _win_reject_overlap(lease.grant_paths, denied)
-        extra_grants = _win_grant_work(lease, work)
-        denies = _win_apply_denies(lease, denied)
-        popen = _win_spawn(work, lease, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
-    except Exception:
-        _win_remove_aces(lease, denies, recurse=True)
-        _win_remove_aces(lease, [path for path, _recurse in extra_grants], recurse=False)
-        for path, recurse in extra_grants:
-            if recurse:
-                _win_remove_aces(lease, [path], recurse=True)
-        _win_lease_release()
-        raise
+        try:
+            _win_reject_overlap(lease.grant_paths, denied)
+            extra_grants = _win_grant_work(lease, work)
+            denies = _win_apply_denies(lease, denied)
+            local = _local_app_data()
+            # The private directory is under the user temp, which is inside
+            # LOCALAPPDATA. An inheriting deny would cover the work directory
+            # and the AppContainer profile. A deny on the directory object
+            # itself blocks opening it. Children keep their own ACEs.
+            if local is not None and local.exists() and not _is_volume_root(local):
+                _win_deny_shallow(lease, local)
+                shallow.append(local)
+            popen = _win_spawn(work, lease, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        except Exception:
+            _win_drop_launch_aces(lease, denies, shallow, extra_grants)
+            raise
+    finally:
+        if popen is None:
+            _win_lease_release()
 
     def _cleanup():
         try:
@@ -873,12 +924,19 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
                 kernel.CloseHandle(process)
                 popen._process = None
         finally:
-            _win_remove_aces(lease, denies, recurse=True)
-            for path, recurse in extra_grants:
-                _win_remove_aces(lease, [path], recurse=recurse)
-            _win_lease_release()
+            try:
+                _win_drop_launch_aces(lease, denies, shallow, extra_grants)
+            finally:
+                _win_lease_release()
 
     return Sandbox(popen, work, "job+appcontainer", _windows_guarantees(), _cleanup)
+
+
+def _win_drop_launch_aces(lease, denies, shallow, extra_grants) -> None:
+    _win_remove_aces(lease, denies, recurse=True)
+    _win_remove_aces(lease, shallow, recurse=False)
+    for path, recurse in extra_grants:
+        _win_remove_aces(lease, [path], recurse=recurse)
 
 
 class _WinLease:
@@ -900,7 +958,8 @@ _WIN_LOCK = threading.Lock()
 def _win_lease_acquire() -> _WinLease:
     global _WIN_LEASE
     with _WIN_LOCK:
-        if _WIN_LEASE is None or _WIN_LEASE.refs <= 0:
+        if _WIN_LEASE is None:
+            _win_sweep_orphans()
             _WIN_LEASE = _WinLease()
             _win_lease_open(_WIN_LEASE)
         lease = _WIN_LEASE
@@ -909,23 +968,16 @@ def _win_lease_acquire() -> _WinLease:
 
 
 def _win_lease_release() -> None:
-    global _WIN_LEASE
+    """Drop one launch. The profile and the runtime grants stay until exit.
+
+    Releasing them here made every test walk the Python tree with icacls
+    again. Orphaned profiles from a dead process are removed on the next start.
+    """
     with _WIN_LOCK:
         lease = _WIN_LEASE
-        if lease is None:
+        if lease is None or lease.refs <= 0:
             return
         lease.refs -= 1
-        if lease.refs > 0:
-            return
-        try:
-            for path, recurse in lease.grant_paths:
-                _win_remove_aces(lease, [path], recurse=recurse)
-            if lease.name and lease.userenv is not None:
-                lease.userenv.DeleteAppContainerProfile(lease.name)
-            if lease.sid.value and lease.advapi is not None:
-                lease.advapi.FreeSid(lease.sid)
-        finally:
-            _WIN_LEASE = None
 
 
 def _win_fail(prefix: str) -> SandboxError:
@@ -981,7 +1033,7 @@ def _win_lease_open(lease: _WinLease) -> None:
             for parent in _ancestors(root):
                 if parent == root or any(parent == earlier for earlier, _flag in grants):
                     continue
-                _win_grant(lease, parent, "(RX)", recurse=False)
+                _win_grant(lease, parent, "(X)", recurse=False)
                 grants.append((parent, False))
     except Exception:
         lease.grant_paths = grants
@@ -1003,7 +1055,11 @@ def _system_root() -> Path | None:
 
 def _windows_grant_roots() -> list[Path]:
     roots: list[Path] = []
-    for raw in (sys.base_prefix, sys.prefix, os.path.dirname(sys.executable)):
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    candidates = (sys.base_prefix, sys.prefix, os.path.dirname(sys.executable), frozen_root)
+    for raw in candidates:
+        if not raw:
+            continue
         path = Path(raw).resolve()
         if path.is_dir() and path not in roots:
             roots.append(path)
@@ -1016,14 +1072,29 @@ def _windows_grant_roots() -> list[Path]:
     return roots
 
 
+def _is_volume_root(path: Path) -> bool:
+    """True for ``/`` or ``C:\\``. icacls on a volume root does not finish."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    return resolved.parent == resolved
+
+
 def _ancestors(path: Path) -> list[Path]:
+    """Parents of ``path``, stopping before the volume root.
+
+    The volume root already grants traverse to All Application Packages.
+    Editing its ACL with icacls does not finish on a CI runner.
+    """
     nodes = []
     current = path.resolve().parent
-    while True:
+    while not _is_volume_root(current):
         nodes.append(current)
-        if current.parent == current:
+        parent = current.parent
+        if parent == current:
             break
-        current = current.parent
+        current = parent
     return nodes
 
 
@@ -1059,6 +1130,104 @@ def _win_grant(lease: _WinLease, path: Path, rights: str, *, recurse: bool) -> N
 def _win_deny(lease: _WinLease, path: Path) -> None:
     command = [_icacls(), str(path), "/deny", f"*{lease.sid_text}:(OI)(CI)(F)", "/T", "/C", "/Q"]
     _icacls_run(command)
+
+
+def _win_deny_shallow(lease: _WinLease, path: Path) -> None:
+    """Deny reading the directory itself. Children keep the ACEs they have."""
+    command = [_icacls(), str(path), "/deny", f"*{lease.sid_text}:(R)", "/C", "/Q"]
+    _icacls_run(command)
+
+
+def _win_sweep_orphans() -> None:
+    """Delete sb* AppContainer profiles left by a process that did not exit cleanly.
+
+    A failure here does not open the jail. The new profile is still created,
+    and a profile that cannot be deleted is unused once its process is gone.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+    except ImportError:
+        return
+    key_path = (
+        r"Software\Classes\Local Settings\Software\Microsoft\Windows"
+        r"\CurrentVersion\AppContainer\Mappings"
+    )
+    try:
+        mapping = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path)
+    except OSError:
+        return
+    orphans: list[tuple[str, str]] = []
+    try:
+        index = 0
+        while True:
+            try:
+                sid_name = winreg.EnumKey(mapping, index)
+            except OSError:
+                break
+            index += 1
+            try:
+                child = winreg.OpenKey(mapping, sid_name)
+            except OSError:
+                continue
+            try:
+                moniker = ""
+                for value_name in ("Moniker", "DisplayName"):
+                    try:
+                        moniker, _kind = winreg.QueryValueEx(child, value_name)
+                        break
+                    except OSError:
+                        continue
+            finally:
+                winreg.CloseKey(child)
+            text = str(moniker)
+            if len(text) == 18 and text.startswith("sb") and all(ch in "0123456789abcdef" for ch in text[2:]):
+                orphans.append((text, sid_name))
+    finally:
+        winreg.CloseKey(mapping)
+    if not orphans:
+        return
+    try:
+        userenv = ctypes.WinDLL("userenv", use_last_error=True)
+        userenv.DeleteAppContainerProfile.argtypes = [ctypes.c_wchar_p]
+        userenv.DeleteAppContainerProfile.restype = ctypes.c_long
+    except OSError:
+        return
+    roots = []
+    try:
+        roots = _windows_grant_roots()
+    except SandboxError:
+        roots = []
+    icacls = None
+    try:
+        icacls = _icacls()
+    except SandboxError:
+        icacls = None
+    for name, sid_text in orphans:
+        if icacls is not None and sid_text.startswith("S-"):
+            for root in roots:
+                if not root.exists():
+                    continue
+                command = [
+                    icacls,
+                    str(root),
+                    "/remove:g",
+                    f"*{sid_text}",
+                    "/remove:d",
+                    f"*{sid_text}",
+                    "/T",
+                    "/C",
+                    "/Q",
+                ]
+                try:
+                    _icacls_run(command)
+                except SandboxError:
+                    continue
+        try:
+            userenv.DeleteAppContainerProfile(name)
+        except OSError:
+            continue
 
 
 def _win_remove_aces(lease: _WinLease, paths, *, recurse: bool) -> None:
@@ -1108,7 +1277,7 @@ def _win_grant_work(lease: _WinLease, work: Path) -> list[tuple[Path, bool]]:
     for parent in _ancestors(work):
         if parent in granted:
             continue
-        _win_grant(lease, parent, "(RX)", recurse=False)
+        _win_grant(lease, parent, "(X)", recurse=False)
         applied.append((parent, False))
     return applied
 
@@ -1328,19 +1497,14 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
         info.StartupInfo.hStdOutput = stdout_w
         info.StartupInfo.hStdError = stderr_w
         info.lpAttributeList = ctypes.cast(attributes, ctypes.c_void_p)
-        command = subprocess.list2cmdline(
-            [sys.executable, "-I", "-B", "-s", str(work / "sandbox_child.py")]
-        )
+        command = subprocess.list2cmdline(_interpreter_command(work / "sandbox_child.py"))
         command_buf = ctypes.create_unicode_buffer(command)
-        env = _windows_env(work)
-        env_buf = ctypes.create_unicode_buffer(
-            "\0".join(f"{key}={value}" for key, value in env.items()) + "\0\0"
-        )
+        env_buf = _windows_env_block(_windows_env(work))
         created = _WinProcessInformation()
         # CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
         flags = 0x00000004 | 0x00080000 | 0x08000000 | 0x00000400
         ok = kernel.CreateProcessW(
-            None,
+            sys.executable,
             command_buf,
             None,
             None,
@@ -1396,7 +1560,17 @@ def _win_pipe(kernel):
     return read.value, write.value
 
 
+def _local_app_data() -> Path | None:
+    raw = os.environ.get("LOCALAPPDATA")
+    if not raw:
+        return None
+    return Path(raw)
+
+
 def _windows_env(work: Path) -> dict:
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        raise SandboxError("LOCALAPPDATA is not set; refusing to start the sandbox")
     system = os.environ.get("SystemRoot", "")
     parts = [os.path.dirname(sys.executable)]
     if system:
@@ -1412,6 +1586,10 @@ def _windows_env(work: Path) -> dict:
         "TMP": str(work),
         "HOME": str(work),
         "USERPROFILE": str(work),
+        # The real directory. Pointing this at the private temp does not
+        # locate the AppContainer profile, and CreateProcess then fails
+        # with ERROR_ENVVAR_NOT_FOUND (203).
+        "LOCALAPPDATA": local,
         "PYTHONUNBUFFERED": "1",
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",
@@ -1419,6 +1597,43 @@ def _windows_env(work: Path) -> dict:
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     return {key: value for key, value in env.items() if value}
+
+
+def _windows_env_entries(env: dict) -> list[str]:
+    """``name=value`` lines in the order CreateProcess requires.
+
+    Windows rejects an unsorted block with ERROR_ENVVAR_NOT_FOUND (203).
+    Names are compared case-insensitively. A name may not contain ``=``.
+    """
+    entries = []
+    for key in sorted(env, key=str.upper):
+        if not key or "=" in key or "\0" in key:
+            raise SandboxError(f"environment name {key!r} cannot be passed to CreateProcess")
+        value = str(env[key])
+        if not value or "\0" in value:
+            continue
+        entries.append(f"{key}={value}")
+    if not entries:
+        raise SandboxError("the sandbox environment is empty; refusing to start")
+    return entries
+
+
+def _windows_env_block(env: dict):
+    """A double-null-terminated Unicode environment block.
+
+    ``create_unicode_buffer`` stores a Python string through a setter that
+    stops at the first null, so the block is filled one character at a time.
+    """
+    entries = _windows_env_entries(env)
+    chars: list[str] = []
+    for entry in entries:
+        chars.extend(entry)
+        chars.append("\0")
+    chars.append("\0")
+    buf = (ctypes.c_wchar * len(chars))()
+    for index, char in enumerate(chars):
+        buf[index] = char
+    return buf
 
 
 def _win_arm_job(kernel, process, *, memory_bytes: int, cpu_seconds: int):

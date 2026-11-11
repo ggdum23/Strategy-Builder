@@ -8,7 +8,7 @@ Prices (open, high, low, close, wap) are multiplied by `price_factor` k. Volume 
 
 Calendar dates become session ordinals starting at 1. The session id is `S00001`, `S00002`, ... The file names are `bars_part_NNN.csv.gz`, `daily_rth.csv.gz`, and `manifest.json`. The manifest calls the asset `RANDOM`. A ticker that matches a reserved report token is refused before any pack file is written. The README lists those tokens. The command exits 2.
 
-The pack files do not contain the ticker, a real year in a file name, an ISO date, the date map, or a scale factor. The sidecar is the file that stores them: symbol, both factors, `share_scale` (equal to k), the ordinal-to-date map, borrow, the source path, and an operator note. A walk-forward or parallel child still runs the engine, so that process receives `share_scale` for the invoice. The referee does not. It bills in the parent and the jailed strategy never sees the scale, the sidecar, or the calendar. That handoff is a residual of the in-process engine path, listed below. It is not a second copy of the sidecar.
+The pack files do not contain the ticker, a real year in a file name, an ISO date, the date map, or a scale factor. The sidecar is the file that stores them: symbol, both factors, `share_scale` (equal to k), the ordinal-to-date map, borrow, the source path, and an operator note. The worker that runs the engine receives `share_scale` for the invoice. A strategy file does not. It runs in the same jail as the referee, and that process is not given the scale, the sidecar, or the calendar. The worker is not a second copy of the sidecar.
 
 A named pack is the other switch. It keeps real dates and forces every factor, including `share_scale`, to 1. The CLI makes the choice explicit: `--anonymize` or `--named`.
 
@@ -39,7 +39,7 @@ These are the leaks the plan already names. Scrambling further does not remove t
 - Weekday plus early-close and holiday gaps can be lined up with a real calendar. Weekday stays in the file because the engines and the strategies receive it. The ordinal calendar hides the year. The shape of the week stays visible.
 - A crash-shaped return path is recognizable without a date.
 - Native tick times `price_factor` can reveal the scale, because the price grid is still a grid after a constant rescale.
-- `share_scale` is still on the engine frame of a walk-forward or parallel child, because that child runs the engine. Post-fee cash and the published fee schedule determine k exactly. The referee closes this for the jailed strategy: the engine and the scale stay in the parent. A designer can still infer k from post-fee cash when the engine runs in their process. The referee's child does not get the engine frame.
+- The strategy process does not receive `share_scale`. The worker runs the engine and bills there. Post-fee cash is still in the account sent one bar at a time, so the public fee schedule can be lined up with that cash. The factor itself is not on a frame the strategy can see.
 - Bar `count` is the source trade count. It is not multiplied by `volume_factor`, so an unchanged count is an identity cue. The builder leaves `count` alone.
 
 Mitigation is the rule set (no identification, no external market data, no sidecar in the designer tree) plus an audit of the pack, not another hash of the prices. `assert_anonymized_pack_clean` is that audit for the fields that must be absent: ticker, years in file names, ISO dates, and the sidecar keys.

@@ -7,7 +7,6 @@ module. The smoke driver deletes it.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -41,10 +40,10 @@ class Strategy:
         return None
 
     def _record(self) -> None:
-        here = Path(__file__).resolve().parent
-        destination = here / f"probe_{os.getpid()}.json"
         cwd = os.getcwd()
-        payload = {
+        # The jail cannot write beside this file. The worker copies ``surface``
+        # into the operator directory after the engine finishes.
+        self.surface = {
             "argv": list(sys.argv),
             "cwd": cwd,
             "cwd_name": Path(cwd).name,
@@ -52,8 +51,10 @@ class Strategy:
             "env_keys": sorted(os.environ),
             "sentinel": os.environ.get("STRATEGY_BUILDER_SENTINEL"),
             "market_data_root": os.environ.get("MARKET_DATA_ROOT"),
+            "home": os.environ.get("HOME"),
+            "userprofile": os.environ.get("USERPROFILE"),
+            "localappdata": os.environ.get("LOCALAPPDATA"),
             "os_command_line": _os_command_line(),
             "frozen": bool(getattr(sys, "frozen", False)),
             "executable": sys.executable,
         }
-        destination.write_text(json.dumps(payload), encoding="utf-8")

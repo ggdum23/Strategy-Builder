@@ -19,6 +19,7 @@ import math
 import os
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import engine_arena, engine_desk
@@ -191,7 +192,7 @@ def replay(
     pipe = None
     try:
         pipe = _Pipe(box)
-        remote = _Remote(pipe, prepared.profile, call_timeout=call_timeout)
+        remote = _Remote(pipe, prepared.profile, box, call_timeout=call_timeout)
         ready = pipe.hello(startup_timeout)
         remote.arm(ready)
         try:
@@ -776,6 +777,23 @@ class _Pipe:
             raise Disqualified("protocol", "expected a decision")
         return _decode_target(message.get("target"))
 
+    def state(self, timeout: float) -> dict:
+        """JSON-safe attributes the strategy stored on itself. Not a bar."""
+        with self._cv:
+            if self._protocol:
+                raise Disqualified("protocol", self._protocol)
+            if self._buf:
+                raise Disqualified("protocol", "unread output before the state request")
+            self._awaiting = True
+        self._write({"op": "state"})
+        message = self._message(self._read_line(timeout))
+        if message.get("op") == "error":
+            raise Disqualified("strategy", str(message.get("error") or "strategy error"))
+        values = message.get("values")
+        if message.get("op") != "state" or not isinstance(values, dict):
+            raise Disqualified("protocol", "expected state")
+        return values
+
     def _message(self, line: bytes) -> dict:
         try:
             payload = json.loads(line.decode("utf-8"))
@@ -792,9 +810,10 @@ class _Pipe:
 
 
 class _Remote:
-    def __init__(self, pipe: _Pipe, profile: str, *, call_timeout: float):
+    def __init__(self, pipe: _Pipe, profile: str, box, *, call_timeout: float):
         self._pipe = pipe
         self._profile = profile
+        self._box = box
         self._timeout = call_timeout
         self.WANTS_EXTENDED_HOURS = False
 
@@ -809,6 +828,71 @@ class _Remote:
 
     def _day_end(self, summary) -> None:
         self._pipe.decision({"op": "day_end", "summary": summary}, self._timeout)
+
+    def snapshot(self) -> dict:
+        return self._pipe.state(self._timeout)
+
+    def exit_code(self) -> int | None:
+        """The jail process status. Waits briefly when it is already exiting."""
+        proc = self._box.process
+        code = proc.poll()
+        if code is not None:
+            return code
+        try:
+            return proc.wait(timeout=2)
+        except Exception:
+            return proc.poll()
+
+    def spill_stdio(self, *, wait: bool) -> None:
+        """Copy the jail's print log onto this process's stdout.
+
+        Designer runs capture prints in the jail so they are not protocol
+        lines. The worker's own stdio file is what an operator error attaches.
+        Waiting is for a child that is already leaving: a live child is left
+        alone so a parent-side failure does not sit on the timeout.
+        """
+        if wait:
+            self.exit_code()
+        path = Path(self._box.workdir) / "stdio.log"
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return
+        if not data:
+            return
+        try:
+            os.write(1, data[:8000])
+        except OSError:
+            pass
+
+
+@contextmanager
+def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_seconds, call_timeout):
+    """Run a strategy file in the referee jail. The caller keeps the engine.
+
+    ``on_bar`` sends one bar and reads one decision. The dividend map, the
+    accounting record, and the share scale are not written on the pipe.
+    ``snapshot`` reads the attributes the strategy stored on itself.
+    """
+    box = launch(
+        strategy_path,
+        memory_bytes=int(memory_bytes),
+        cpu_seconds=int(cpu_seconds),
+        deny_paths=deny_paths,
+        capture_stdio=True,
+    )
+    pipe = _Pipe(box)
+    try:
+        ready = pipe.hello(min(60.0, float(call_timeout)))
+        remote = _Remote(pipe, profile, box, call_timeout=float(call_timeout))
+        remote.arm(ready)
+        yield remote
+    finally:
+        try:
+            pipe.close()
+        finally:
+            box.terminate()
+            box.close()
 
 
 def _load_side(

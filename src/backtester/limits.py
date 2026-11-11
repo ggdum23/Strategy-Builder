@@ -111,14 +111,59 @@ def _linux_rss(pid: int) -> int | None:
 
 
 def _child_pids(pid: int) -> list[int]:
-    if sys.platform != "linux":
+    if sys.platform == "linux":
+        path = Path(f"/proc/{pid}/task/{pid}/children")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        return [int(part) for part in text.split() if part.isdigit()]
+    if sys.platform == "win32":
+        return _windows_child_pids(pid)
+    return []
+
+
+def _windows_child_pids(pid: int) -> list[int]:
+    """Direct children, so a memory cap includes the jailed strategy."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    kernel.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel.Process32FirstW.restype = ctypes.c_int
+    kernel.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel.Process32NextW.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+
+    class _ProcessEntry(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_wchar * 260),
+        )
+
+    snapshot = kernel.CreateToolhelp32Snapshot(0x00000002, 0)
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
         return []
-    path = Path(f"/proc/{pid}/task/{pid}/children")
+    found = []
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    return [int(part) for part in text.split() if part.isdigit()]
+        entry = _ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            if int(entry.th32ParentProcessID) == int(pid):
+                found.append(int(entry.th32ProcessID))
+            ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    return found
 
 
 def _windows_rss(pid: int) -> int | None:

@@ -6,7 +6,9 @@ strategy. Omitted switches are the profile defaults: Arena raw prices, cash
 total-return, a cash rate, or a financing rate is recorded on the metrics.
 
 Phase 1 walk-forward isolation is the heap, class attributes, module globals,
-the environment, argv, and cwd. It is not an OS jail. See docs/ISOLATION.md.
+the environment, argv, and cwd. A strategy file does not run in that worker.
+It runs in the referee jail, one bar at a time, while this process keeps the
+engine, the accounting record, and the window's dividends. See docs/ISOLATION.md.
 """
 
 from __future__ import annotations
@@ -551,6 +553,10 @@ _ENV_KEEP = frozenset(
         "DYLD_LIBRARY_PATH",
         "LANG",
         "LC_ALL",
+        # The Windows AppContainer profile is stored under this directory.
+        # The worker keeps the value so the jail can be created. The jail
+        # denies the directory. It is not a data root the strategy can read.
+        "LOCALAPPDATA",
         "LC_CTYPE",
         "TZ",
     }
@@ -830,12 +836,11 @@ def _restore_dumpable(previous: int | None) -> None:
 
 def _books_worker(queue, job):
     _new_session()
-    # The worker is the session leader. A grandchild that calls setsid would
-    # leave the group this process just created. The filter denies setsid and
-    # setpgid from here on, including in children. See docs/ISOLATION.md.
-    from .sandbox import lock_worker_session
-
-    lock_worker_session()
+    # The session is created before the jail. The seccomp filter that denies
+    # setsid is installed after a file strategy's jail is up: bubblewrap needs
+    # setsid for its own new session, and the filter would be inherited.
+    # Class strategies have no jail process, so the filter is installed before
+    # they run. See docs/ISOLATION.md.
     spool = None
     try:
         inherited_argv, inherited_cwd = _enter_child(job)
@@ -845,19 +850,28 @@ def _books_worker(queue, job):
             gate["started"].set()
             if not gate["release"].wait(timeout=180):
                 raise RuntimeError("design parent did not release the walk-forward child")
-        strategy_cls = _load_strategy(job["strategy"])
+        spec = job["strategy"]
         frame = job["frame"]
         profile = job["profile"]
         kwargs = job["kwargs"]
         job.clear()
-        books = run_books(
-            strategy_cls,
-            frame,
-            profile,
-            share_factor=kwargs.pop("share_factor"),
-            **kwargs,
-        )
-        _note_child(books, inherited_argv, inherited_cwd)
+        if spec.get("kind") == "path":
+            books = _run_jailed_books(
+                spec["path"], frame, profile, kwargs, inherited_argv, inherited_cwd
+            )
+        else:
+            from .sandbox import lock_worker_session
+
+            lock_worker_session()
+            strategy_cls = _load_strategy(spec)
+            books = run_books(
+                strategy_cls,
+                frame,
+                profile,
+                share_factor=kwargs.pop("share_factor"),
+                **kwargs,
+            )
+            _note_child(books, inherited_argv, inherited_cwd)
         queue.put(("ok", _picklable_books(books)))
     except BaseException:
         tail = ""
@@ -870,6 +884,64 @@ def _books_worker(queue, job):
     finally:
         queue.close()
         queue.join_thread()
+
+
+_JAIL_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
+_JAIL_CPU_SECONDS = 3600
+_JAIL_CALL_TIMEOUT_S = 3600.0
+
+
+def _run_jailed_books(strategy_path, frame, profile, kwargs, inherited_argv, inherited_cwd):
+    """Engine in this process. The strategy file runs in the referee jail.
+
+    ``kwargs`` already holds the accounting record and this window's dividend
+    slice. Those stay here. The pipe carries bars and decisions only, so a
+    locked ex-date is not in the design strategy and the scale is not in
+    either strategy process. The parent's resident-set cap is separate from
+    the jail's ceiling: a smaller cap must be able to observe the allocation
+    before the jail's own limit kills it.
+    """
+    from .referee import Disqualified, jailed_strategy
+    from .sandbox import lock_worker_session
+
+    deny = [Path(strategy_path).resolve().parent]
+    cwd = Path.cwd()
+    if cwd not in deny:
+        deny.append(cwd)
+    share_factor = kwargs.pop("share_factor")
+    crash_code = None
+    with jailed_strategy(
+        strategy_path,
+        profile,
+        deny_paths=deny,
+        memory_bytes=_JAIL_MEMORY_BYTES,
+        cpu_seconds=_JAIL_CPU_SECONDS,
+        call_timeout=_JAIL_CALL_TIMEOUT_S,
+    ) as remote:
+        # The jail is already a new session. Later forks of this worker cannot
+        # leave the group.
+        lock_worker_session()
+        try:
+            books = run_books(lambda: remote, frame, profile, share_factor=share_factor, **kwargs)
+            surface = remote.snapshot()
+        except Disqualified as exc:
+            # Prints live in the jail log. Attach them to this worker's stdio
+            # before the operator error is built. A hard exit (os._exit) has
+            # no decision line; leave with that status so the row is a crash.
+            remote.spill_stdio(wait=exc.reason in {"strategy", "crash", "protocol"})
+            if exc.reason == "crash":
+                code = remote.exit_code()
+                if isinstance(code, int) and 1 < code < 128:
+                    crash_code = code
+                else:
+                    raise
+            else:
+                raise
+    if crash_code is not None:
+        os._exit(crash_code)
+    books["strategy"][0]["observer"] = _ObserverView(surface)
+    _note_child(books, inherited_argv, inherited_cwd)
+    return books
 
 
 def _note_child(books, inherited_argv, inherited_cwd) -> None:
@@ -1278,6 +1350,20 @@ def run_books(
     return books
 
 
+def _write_child_surface(directory, books) -> None:
+    """Write a strategy's own report when it stored one.
+
+    The jail cannot create that file beside the strategy. The worker writes
+    it into the operator directory after the engine has finished. It is not
+    copied into ``designer/``.
+    """
+    observer = books["strategy"][0].get("observer")
+    surface = getattr(observer, "surface", None)
+    if not isinstance(surface, dict):
+        return
+    write_json(Path(directory) / "child_surface.json", surface)
+
+
 def write_books(
     out_dir,
     profile: str,
@@ -1635,6 +1721,8 @@ def walk_forward(
     locked_payload = write_books(
         out / "locked", profile, symbol, bar_minutes, rebuilt.locked_with_warmup, locked_books
     )
+    _write_child_surface(out / "design", design_books)
+    _write_child_surface(out / "locked", locked_books)
     summary = {
         "profile": profile,
         "symbol": symbol,

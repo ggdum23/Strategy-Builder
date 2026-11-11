@@ -123,6 +123,24 @@ def assert_child_surface(payload: dict) -> None:
         raise SystemExit(f"child cwd was not empty: {entries}")
 
 
+def assert_jailed_surface(payload: dict) -> None:
+    """The strategy process is the jail, not the worker's temp directory.
+
+    Its cwd holds the copied strategy and the protocol child. A data file,
+    a sibling of the strategy, or anything else is a mount that should not
+    be there. HOME and USERPROFILE are checked by the caller against the cwd.
+    """
+    entries = payload.get("cwd_entries")
+    if not isinstance(entries, list):
+        raise SystemExit(f"child cwd entries are not a list: {entries!r}")
+    allowed = {"strategy.py", "sandbox_child.py", "stdio.log"}
+    unexpected = [name for name in entries if name not in allowed]
+    if unexpected:
+        raise SystemExit(f"jail cwd has unexpected entries: {entries}")
+    if "strategy.py" not in entries or "sandbox_child.py" not in entries:
+        raise SystemExit(f"jail cwd is missing the strategy: {entries}")
+
+
 def windows_file_version(path: Path) -> str:
     """Fixed file and product version from a PE version resource."""
     import ctypes
@@ -321,32 +339,35 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
             raise SystemExit("walk-forward design window is not before the locked window")
         if not (walk_dir / "design" / "metrics.json").is_file() or not (walk_dir / "locked" / "metrics.json").is_file():
             raise SystemExit("walk-forward did not write design and locked metrics")
-        probes = sorted(probe_dir.glob("probe_*.json"))
-        if len(probes) != 2:
-            details = "\n".join(path.read_text(encoding="utf-8") for path in probes)
-            raise SystemExit(f"expected two walk-forward children, found {len(probes)} probe files\n{details}")
+        # The worker is still a spawn child (multiprocessing-fork, argv
+        # backtester-design). The strategy process is the jail.
+        probes = [walk_dir / "design" / "child_surface.json", walk_dir / "locked" / "child_surface.json"]
+        missing = [path for path in probes if not path.is_file()]
+        if missing:
+            raise SystemExit(f"expected a jailed child surface, missing {missing}")
         src_text = str(src)
         for path in probes:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if payload.get("frozen") is not True:
                 raise SystemExit(f"child was not the frozen executable: {payload.get('executable')}")
-            if payload.get("argv") != ["backtester-design"]:
-                raise SystemExit(f"child argv was not scrubbed: {payload.get('argv')}")
+            if payload.get("argv") != ["strategy"]:
+                raise SystemExit(f"child argv was not the jail: {payload.get('argv')}")
             if payload.get("sentinel") not in (None, ""):
                 raise SystemExit("sentinel environment leaked into the child")
             if payload.get("market_data_root") not in (None, ""):
                 raise SystemExit("MARKET_DATA_ROOT leaked into the child")
             command = str(payload.get("os_command_line") or "")
-            if "multiprocessing-fork" not in command:
-                raise SystemExit(
-                    "child was not a spawn worker: "
-                    f"{command!r} argv={payload.get('argv')} exe={payload.get('executable')}"
-                )
             if "--src" in command or src_text in command:
                 raise SystemExit(f"child command line still carries the data path: {command}")
-            if not str(payload.get("cwd_name") or "").startswith("bt-book-"):
-                raise SystemExit(f"child cwd was not the isolated directory: {payload.get('cwd')}")
-            assert_child_surface(payload)
+            if "sandbox_child.py" not in command and "--backtester-sandbox" not in command:
+                raise SystemExit(f"child was not the sandbox: {command!r}")
+            if not str(payload.get("cwd_name") or "").startswith("bt-referee-"):
+                raise SystemExit(f"child cwd was not the jail directory: {payload.get('cwd')}")
+            cwd = str(payload.get("cwd") or "")
+            for label, value in (("HOME", payload.get("home")), ("USERPROFILE", payload.get("userprofile"))):
+                if value not in (None, "") and os.path.normcase(str(value)) != os.path.normcase(cwd):
+                    raise SystemExit(f"{label} is not the jail directory: {value}")
+            assert_jailed_surface(payload)
             executable_name = Path(str(payload.get("executable"))).name.casefold()
             if executable_name not in {"backtester", "backtester.exe"}:
                 raise SystemExit(f"child executable was {executable_name}")

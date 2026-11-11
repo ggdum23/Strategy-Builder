@@ -37,7 +37,9 @@ Phase 1 does not build that jail.
   `PYTHONNOUSERSITE`, `PYTHONHASHSEED`, `PYTHONUTF8`, `PYTHONIOENCODING`,
   `PYTHONUNBUFFERED`, `PYTHONSAFEPATH`, `PYTHONLEGACYWINDOWSSTDIO`,
   `PYTHONMALLOC`, `VIRTUAL_ENV`, the dynamic-linker path variables,
-  `LANG`/`LC_*`, and `TZ`). `PYTHONPATH` is not on that list. Every other
+  `LANG`/`LC_*`, `TZ`, and on Windows `LOCALAPPDATA`). `PYTHONPATH` is not
+  on that list. `LOCALAPPDATA` is the host path the AppContainer profile
+  needs. The jail denies that directory. Every other
   variable is dropped, including a data-root variable. `PATH` is kept because
   the interpreter and native libraries may need it. A data directory that
   someone has placed on `PATH` is not removed.
@@ -61,19 +63,22 @@ receive the data directory, the CLI argv, or the locked frame.
 An anonymized pack run uses the same channels. `run_pack` reads the sidecar in
 the operator process, then drops that document before the spawn. The sidecar
 file is where the scale factors, the date map, and the ticker are stored. The
-child still receives `share_scale` (the price factor k) because the engine
-bills per-share fees on real share counts. It does not receive the sidecar
+worker that runs the engine receives `share_scale` (the price factor k) so
+per-share fees use real share counts. It does not receive the sidecar
 document, the date map, the ticker, the volume factor, the operator note, or
-the sidecar path. The runner frames that are only forwarding the number do not
-keep a local named `share_scale` or `share_factor` while `on_bar` runs. The
-engine frame does: Arena's `run` parameter and Desk's `DeskConfig.share_factor`
-are how the invoice is computed, and a strategy can see them.
+the sidecar path.
 
-Post-fee cash determines k from the public fee schedule even if those names
-were hidden. That residual follows from the owner's choice to charge real
-per-share fees. Moving billing into the parent is a Phase 4 option. It would
-take the scale off the child engine frame. It would not remove the inference
-from post-fee cash.
+A strategy loaded from a file does not run in that worker. The worker launches
+the same jail as `backtester referee` and drives it one bar at a time. The
+pipe is not given the scale, the accounting record, or the dividend map. The
+strategy process has no engine frame, so it cannot see `share_scale` or
+`share_factor`. An in-memory class still runs beside the engine. That is how
+a test observes the window's ex-dates. Benchmarks are official code and stay
+in the worker.
+
+Post-fee cash is still in the account the engine sends. A designer who knows
+the public fee schedule can infer k from that cash. The name and the factor
+are not in the strategy process.
 
 The same pack leaks that `docs/PACK.md` lists apply here: weekday plus
 early-close shape, a crash-shaped path, native tick times `price_factor`, the
@@ -83,16 +88,15 @@ identity cue. `count` stays the source trade count.
 Heap, environment, argv, and cwd are the in-scope checks. A hardcoded absolute
 path can still open a file. That is the Phase 4 jail.
 
-The referee in Phase 4 stops the reads below for the jailed strategy. This
-phase still does not stop them on the walk-forward child:
+File-backed design, locked, pack, and parallel runs use that jail. The reads
+below fail in the strategy process:
 
 - `/proc/<ppid>/cmdline`
 - `/proc/<ppid>/environ`
 - `/proc/<ppid>/cwd`, and the Windows handle equivalents
-- `share_scale` on the child engine frame. The parent passes it so per-share
-  fees use real share counts. Post-fee cash determines it as well. See
-  `docs/PACK.md`. The referee bills in the parent, so its child has no engine
-  frame and is not sent the scale.
+- `share_scale` on an engine frame. The worker bills. The strategy is not
+  sent the scale. Post-fee cash in the account can still be lined up with the
+  public fee schedule. See `docs/PACK.md`.
 
 `walk_forward` deletes the frame it was given. The command line passes that
 frame as the argument and does not keep another name for it. A caller that
@@ -101,12 +105,13 @@ receive it.
 
 ## Parallel runner
 
-`backtester parallel` scores each strategy in a new spawned process. The process
-is the same one a pack run uses: argv `['backtester-design']`, an empty working
-directory, and the environment allowlist. The parent keeps the sidecar, the
-date map, and the unscaled dividend amounts. `share_scale` is passed the same
-way `run_pack` passes it. Desk dividends are remapped in the parent before the
-child starts.
+`backtester parallel` scores each strategy in a new spawned process. The worker
+uses argv `['backtester-design']`, an empty working directory, and the
+environment allowlist. The parent keeps the sidecar, the date map, and the
+unscaled dividend amounts. `share_scale` is passed to the worker the same way
+`run_pack` passes it, and the worker runs the engine. The strategy file runs
+in the jail and is not given the scale. Desk dividends are remapped in the
+parent before the worker starts. The worker receives only that remapped slice.
 
 Spawn copies the parent environment at `Process.start`. A launch lock holds
 the argv, cwd, and environment scrub so two jobs cannot snapshot a cleared
@@ -121,10 +126,12 @@ not the installed `backtester` package is also removed from the child's
 of those entries.
 
 The worker calls `setsid` on Linux before it waits for the parent, so it is
-its own process-group leader and the group id is the worker pid. It then
-installs a seccomp filter that returns EPERM for `setsid` and `setpgid` in
-that process and every process it starts. A grandchild that calls `setsid`
-stays in the group. The parent
+its own process-group leader and the group id is the worker pid. A file
+strategy is launched in the jail before the worker installs its seccomp
+filter, because bubblewrap needs `setsid` for its own session and would
+inherit the denial. The filter is then installed in the worker. The jail
+has its own filter, which denies `setsid`, `setpgid`, and `fork`. A
+grandchild the worker itself starts cannot call `setsid`. The parent
 records that id when the child reports it has entered. A normal return, a
 strategy exception, a timeout, a cancel, a resident-set kill, and the final
 cleanup all signal that saved group: SIGTERM, then SIGKILL. The signal does
@@ -142,6 +149,15 @@ The worker redirects file descriptors 1 and 2 to a file in its temp directory,
 capped at 256 KiB. Further output is discarded without blocking the writer.
 A short scrubbed tail of that output can be attached to the operator error
 row. It is not written into `designer/`.
+
+A file strategy's own `print` is not a protocol line. The jail keeps the
+decision pipe separate and writes prints to `stdio.log` in the strategy's
+cwd, with the same 256 KiB cap, still draining after the file is full. On a
+failure that log is copied into the worker's stdio file, so the operator
+error can show it and the designer sentence does not. `backtester referee`
+does not do this: there, extra stdout is a protocol disqualification.
+`os._exit` in the strategy skips that log. The worker then exits with the
+same status, and the row is a crash rather than a strategy error.
 
 The child returns equity, fills, and the statistics it computed. The parent
 recomputes those statistics from the returned result and runs the benchmarks
@@ -216,10 +232,20 @@ The backend name is `job+appcontainer`.
   `JOB_OBJECT_LIMIT_PROCESS_MEMORY`, and `JOB_OBJECT_LIMIT_JOB_MEMORY`.
 - The token is an AppContainer profile with zero capabilities, so it has no
   network capability. A socket call fails with access denied (10013).
-- `icacls` grants read/execute on the Python runtime and the Windows
-  directory, and full control on the private temp directory only. Data,
-  market, and repository directories get an explicit deny ACE for the
-  AppContainer SID. The ACE is removed when the referee exits.
+-   `icacls` grants read/execute on the Python runtime and the Windows
+  directory, traverse-only on the directories between those and the volume
+  root, and full control on the private temp directory only. The volume root
+  itself is not edited: All Application Packages can already traverse it, and
+  `icacls` on that root does not finish. The AppContainer profile and those
+  runtime grants are kept for the life of the process. Each launch still
+  grants the private directory and removes that grant when the process exits.
+  Orphaned `sb*` profiles left by a dead process are deleted on the next
+  start. Data, market, and repository directories get an explicit deny ACE
+  for the AppContainer SID. `LOCALAPPDATA` is the host value. CreateProcess
+  returns 203 when it is missing, so a missing value refuses the launch.
+  The directory itself is denied without inheritance, because the profile and
+  the private temp live under it. The process environment is a sorted
+  Unicode block. CreateProcess rejects an unsorted block.
 - `OpenProcess` of the parent with `PROCESS_VM_READ` is denied by the
   AppContainer token.
 - If the profile, the job, the assignment, or an ACL edit fails, the launch

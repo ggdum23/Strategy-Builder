@@ -582,6 +582,33 @@ class Strategy:
     assert probe(path, deny_paths=[tmp_path], call_timeout=5, startup_timeout=20) == 0.0
 
 
+def test_windows_environment_block_is_sorted_and_terminated(monkeypatch):
+    from backtester.sandbox import (
+        SandboxError,
+        _is_volume_root,
+        _windows_env,
+        _windows_env_block,
+        _windows_env_entries,
+    )
+
+    entries = _windows_env_entries({"TEMP": "t", "path": "p", "COMSPEC": "c"})
+    assert entries == ["COMSPEC=c", "path=p", "TEMP=t"]
+    block = _windows_env_block({"TEMP": "t", "PATH": "p"})
+    text = "".join(block)
+    assert text == "PATH=p\0TEMP=t\0\0"
+    anchor = Path(Path.cwd().anchor)
+    assert _is_volume_root(anchor)
+    assert not _is_volume_root(Path.cwd())
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    with pytest.raises(SandboxError, match="LOCALAPPDATA"):
+        _windows_env(Path("work"))
+    monkeypatch.setenv("LOCALAPPDATA", "C:\\Users\\x\\AppData\\Local")
+    env = _windows_env(Path("work"))
+    assert env["LOCALAPPDATA"] == "C:\\Users\\x\\AppData\\Local"
+    assert env["TEMP"] == str(Path("work"))
+    assert env["USERPROFILE"] == str(Path("work"))
+
+
 def test_describe_isolation_matches_the_host():
     info = describe_isolation()
     assert info["fail_closed"] is True
