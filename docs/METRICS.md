@@ -192,8 +192,8 @@ the Desk 2x book's total return and is empty for Arena.
 
 ## What a designer may see
 
-An anonymized run writes two trees. The operator files keep the ticker and
-`cost_basis.share_scale`. The `designer/` tree drops the ticker, calendar
+An anonymized run writes two trees. The operator files keep the original ticker and
+`cost_basis.share_scale`. The `designer/` tree replaces the ticker with `RANDOM`, drops calendar
 dates, and the scale fields (`symbol`, `share_factor`, `share_scale`,
 `price_factor`, `volume_factor`, `date_map`, `cost_basis`, the sidecar, and
 the source paths). ISO dates are blanked. A parallel batch puts the designer

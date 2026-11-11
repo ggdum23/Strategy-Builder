@@ -124,11 +124,33 @@ CLI above. Reports are yours.
 sidecar. The pack has no ticker, no real year in a file name, and no scale
 factor. The sidecar stays on the operator machine. `run --pack` and `parallel`
 load that sidecar in the parent and pass `share_scale` into the engine. The
-operator `metrics.json` still records that cost basis. `designer/` is the copy
-to hand a strategy designer: no ticker, no calendar date, and no scale field.
-Do not put operator paths in a strategy. `referee` still raises, on purpose.
+operator `metrics.json` still records that cost basis and the original ticker.
+`designer/` is the copy to hand a strategy designer: no ticker, no calendar
+date, and no scale field. The designer-facing stand-in for a ticker is
+`RANDOM`. Strategy and source directory names use that spelling, with a
+`-2`, `-3`, ... suffix when two ids would be the same folder. Do not put
+operator paths in a strategy. `referee` still raises, on purpose.
 The twenty designer strategies under `examples/strategies/` are the Arena examples.
 Desk examples are under `examples/desk/`.
+
+Fixed report names stay canonical: `metrics.json`, `equity_curve.csv`,
+`equity.csv`, `equity.png`, `fills.csv`, `trades.csv`, `liquidation.json`,
+`error.json`, `leaderboard.csv`, `benchmarks/buy_and_hold_1x`,
+`benchmarks/long_2x`, `manifest.json`, `bars_part_NNN.csv.gz`, and
+`daily_rth.csv.gz`. An anonymized symbol is rejected when it matches one of
+the reserved tokens below (casefolded, as its own token, so `MA` is not
+`manifest` and `2` is not `2x`). `pack`, `run --pack`, and `parallel` on an
+anonymized pack print the reason. The command exits 2. They do not write the pack or
+the report, and they do not print a traceback. Run that symbol as an operator
+(raw) book, or rename it in the data. A raw run, including `walkforward`,
+keeps the original ticker and is not checked against this list.
+
+Reserved tokens: `001`, `1x`, `2x`, `and`, `arena`, `bars`, `benchmarks`,
+`builder`, `buy`, `csv`, `curve`, `daily`, `designer`, `desk`, `equity`,
+`error`, `failed`, `fills`, `gz`, `hold`, `json`, `leaderboard`,
+`liquidation`, `long`, `manifest`, `margin`, `metrics`, `not`, `part`, `png`,
+`post`, `pre`, `published`, `random`, `rth`, `software`, `stopped`,
+`strategy`, `tbl`, `the`, `title`, `trades`, `withheld`.
 
 ## Commands
 

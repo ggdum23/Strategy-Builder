@@ -30,12 +30,11 @@ import pandas as pd
 
 from .data import load_named
 from .registry import get_series, load_registry, same_series
-from .report import accepted_stand_in, designer_visible_name, ticker_token_spans
+from .report import TICKER_STAND_IN, require_anonymizable_symbol, ticker_token_spans
 
 SCHEMA_VERSION = 1
 CHUNK_SESSIONS = 250
 MAX_FILE_BYTES = 25 * 1024 * 1024
-ASSET_NAME = "ASSET"
 
 PACK_COLUMNS = (
     "day",
@@ -228,7 +227,7 @@ def _read_csv_gz(path: Path) -> pd.DataFrame:
 
 
 def _token_present(symbol: str, text: str) -> bool:
-    """The report token rule. A raw substring would treat ``SS`` as present in ``ASSET``."""
+    """The report token rule. A raw substring would treat ``SS`` as present in ``RANDOM``."""
     return bool(ticker_token_spans(text, symbol))
 
 
@@ -257,16 +256,13 @@ def _text_has_ticker(name: str, text: str, symbol: str) -> bool:
     symbol ``ID``. Every other string is.
     """
     lower = name.lower()
-    header, _, _rest = text.partition("\n")
     if lower.endswith(".json"):
         try:
             document = json.loads(text)
         except json.JSONDecodeError:
             return _token_present(symbol, text)
         return _json_values_have_ticker(document, symbol)
-    # A screened pack table keeps the schema header and drops ``.csv`` from the
-    # file name when that extension is the ticker. The cells are still columns.
-    if ".csv" in lower or header == ",".join(PACK_COLUMNS):
+    if ".csv" in lower:
         rows = list(csv.reader(io.StringIO(text)))
         for row in rows[1:]:
             if any(_token_present(symbol, cell) for cell in row):
@@ -476,7 +472,7 @@ def _daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=list(PACK_COLUMNS))
 
 
-def _write_chunks(frame: pd.DataFrame, directory: Path, chunk_sessions: int, max_bytes: int, part_name=None):
+def _write_chunks(frame: pd.DataFrame, directory: Path, chunk_sessions: int, max_bytes: int):
     days = list(dict.fromkeys(int(day) for day in frame["day"].tolist()))
     written = []
     start = 0
@@ -489,10 +485,7 @@ def _write_chunks(frame: pd.DataFrame, directory: Path, chunk_sessions: int, max
             subset = frame.loc[frame["day"].isin(chosen_set)]
             blob = _gzip_csv(subset)
             if len(blob) < max_bytes:
-                if part_name is None:
-                    name = f"bars_part_{part:03d}.csv.gz"
-                else:
-                    name = part_name(part)
+                name = f"bars_part_{part:03d}.csv.gz"
                 (directory / name).write_bytes(blob)
                 written.append(
                     {
@@ -544,6 +537,8 @@ def build_pack(
         raise ValueError("max_bytes must be a positive integer")
     if not isinstance(operator_note, str):
         raise ValueError("operator_note must be a string")
+    if anonymize:
+        require_anonymizable_symbol(symbol)
     destination = Path(out_dir)
     sidecar = Path(sidecar_path)
     if destination == sidecar or _inside(sidecar, destination):
@@ -594,18 +589,11 @@ def build_pack(
     destination.mkdir(parents=True, exist_ok=True)
     sidecar_existed = sidecar.exists()
     try:
-        screened = [symbol] if anonymize else []
-
-        def part_name(part: int) -> str:
-            if not anonymize:
-                return f"bars_part_{part:03d}.csv.gz"
-            return designer_visible_name("bars_part", screened, part=f"{part:03d}")
-
-        chunks = _write_chunks(frame, destination, chunk_sessions, max_bytes, part_name)
+        chunks = _write_chunks(frame, destination, chunk_sessions, max_bytes)
         daily_blob = _gzip_csv(_daily_frame(frame))
         if len(daily_blob) >= max_bytes:
             raise ValueError(f"daily file is {len(daily_blob)} bytes, which is not under {max_bytes}")
-        daily_name = "daily_rth.csv.gz" if not anonymize else designer_visible_name("daily", screened)
+        daily_name = "daily_rth.csv.gz"
         (destination / daily_name).write_bytes(daily_blob)
         hashed = [(item["file"], item["bytes"]) for item in chunks]
         hashed.append((daily_name, daily_blob))
@@ -614,7 +602,7 @@ def build_pack(
             "schema_version": SCHEMA_VERSION,
             "anonymized": bool(anonymize),
             "bar_minutes": int(bar_minutes),
-            "asset_name": designer_visible_name("stand_in", [symbol]) if anonymize else symbol,
+            "asset_name": TICKER_STAND_IN if anonymize else symbol,
             "pack_id": pack_id,
             "columns": list(PACK_COLUMNS),
             "chunks": [
@@ -700,10 +688,8 @@ def _validate_manifest(document: dict) -> None:
         raise ValueError(f"pack schema_version {document['schema_version']!r} is not supported")
     if not isinstance(document["anonymized"], bool):
         raise ValueError("pack anonymized flag is not true or false")
-    if document["anonymized"] and not accepted_stand_in(document["asset_name"]):
-        raise ValueError(
-            f"an anonymized pack must call the asset {ASSET_NAME} or another screened stand-in"
-        )
+    if document["anonymized"] and document["asset_name"] != TICKER_STAND_IN:
+        raise ValueError(f"an anonymized pack must call the asset {TICKER_STAND_IN}")
     if list(document["columns"]) != list(PACK_COLUMNS):
         raise ValueError("pack columns do not match the schema")
     if not isinstance(document["chunks"], list) or not document["chunks"]:

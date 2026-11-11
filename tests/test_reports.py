@@ -138,7 +138,7 @@ def test_redaction_drops_the_ticker_the_date_and_the_factor(tmp_path):
         assert key not in cleaned
     assert "2024-01-02" not in text
     assert "BRK.B" not in text
-    assert "ASSET" in text
+    assert "RANDOM" in text
     assert cleaned["total_return"] == 0.1
     assert cleaned["audience"] == "designer"
     root = tmp_path / "designer"
@@ -341,23 +341,22 @@ def test_token_match_is_casefolded_and_bounded_for_one_character(tmp_path):
     from backtester.report import _scrub_text, scrub_symbols, ticker_token_spans
 
     assert ticker_token_spans("my_V_v2", "V") == [(3, 4)]
-    assert _scrub_text("my_V_v2", "V") == "my_ASSET_v2"
+    assert _scrub_text("my_V_v2", "V") == "my_RANDOM_v2"
     assert _scrub_text("avg", "V") == "avg"
     assert _scrub_text("equity", "V") == "equity"
-    assert _scrub_text("my_ß_v2", "SS") == "my_ASSET_v2"
-    assert _scrub_text("my_ﬁ_v2", "FI") == "my_ASSET_v2"
-    assert ticker_token_spans("ASSET", "SS") == []
-    assert ticker_token_spans("ASSET", "AS") == []
-    assert ticker_token_spans("ASSET", "ET") == []
-    assert ticker_token_spans("ASSET", "ASS") == []
-    assert scrub_symbols("my_GOOGL_v2", ["GOOG", "GOOGL"]) == "my_ASSET_v2"
-    assert scrub_symbols("my_GOOG_v2", ["GOOGL", "GOOG"]) == "my_ASSET_v2"
-    assert ticker_token_spans("ASSET-2", "2") == [(6, 7)]
+    assert _scrub_text("my_ß_v2", "SS") == "my_RANDOM_v2"
+    assert _scrub_text("my_ﬁ_v2", "FI") == "my_RANDOM_v2"
+    assert ticker_token_spans("RANDOM", "SS") == []
+    assert ticker_token_spans("RANDOM", "RAN") == []
+    assert ticker_token_spans("RANDOM", "AND") == []
+    assert ticker_token_spans("RANDOM", "DOM") == []
+    assert scrub_symbols("my_GOOGL_v2", ["GOOG", "GOOGL"]) == "my_RANDOM_v2"
+    assert scrub_symbols("my_GOOG_v2", ["GOOGL", "GOOG"]) == "my_RANDOM_v2"
+    assert ticker_token_spans("RANDOM-2", "2") == [(7, 8)]
     assert ticker_token_spans(scrub_symbols("asset", ["asset"]), "asset") == []
-    assert ticker_token_spans(scrub_symbols("my_asset_v2", ["asset"]), "asset") == []
-    assert scrub_symbols("COST", ["COST"]) == "ASSET"
-    assert _scrub_text("my_asset_v2", "asset") == "my_BOOK_v2"
-    assert "ASSET" not in _scrub_text("my_asset_v2", "asset")
+    assert scrub_symbols("asset", ["asset"]) == "RANDOM"
+    assert scrub_symbols("COST", ["COST"]) == "RANDOM"
+    assert _scrub_text("my_cost_v2", "COST") == "my_RANDOM_v2"
     root = tmp_path / "designer"
     root.mkdir()
     (root / "equity.csv").write_text("equity\navg\n", encoding="utf-8")
@@ -368,93 +367,49 @@ def test_token_match_is_casefolded_and_bounded_for_one_character(tmp_path):
         assert_designer_clean(root, symbol="V")
 
 
-def test_per_job_scrub_does_not_publish_the_asset_stand_in():
-    """A symbol that casefolds to ``asset`` must not be replaced with ``ASSET``."""
-    from backtester.report import redact_metrics, ticker_token_spans
+def test_redact_metrics_uses_the_random_stand_in():
+    """Designer failure text and ids use RANDOM. The ticker does not survive."""
+    from backtester.report import TICKER_STAND_IN, redact_metrics, ticker_token_spans
 
     cleaned = redact_metrics(
-        {"strategy_id": "my_asset_v2", "error": "asset broke", "status": "error"},
-        symbol="asset",
+        {"strategy_id": "my_cost_v2", "error": "cost broke", "status": "error"},
+        symbol="COST",
     )
-    assert cleaned["strategy_id"] == "my_BOOK_v2"
-    assert ticker_token_spans(cleaned["error"], "asset") == []
-    assert "ASSET" not in cleaned["strategy_id"]
-    assert "ASSET" not in cleaned["error"]
+    assert TICKER_STAND_IN == "RANDOM"
+    assert cleaned["strategy_id"] == "my_RANDOM_v2"
+    assert cleaned["error"] == "RANDOM broke"
+    assert ticker_token_spans(cleaned["error"], "COST") == []
+    assert cleaned["status"] == "error"
 
 
 def test_a_per_job_stand_in_keeps_the_directory_suffix(tmp_path):
-    """``my_ASSET_v2`` is this row's id when the batch stand-in is ``BOOK``.
-
-    The file must gain the directory's ``-N``, not the unsuffixed scrub.
-    """
+    """``my_RANDOM_v2`` is this row's id. The file must gain the directory's ``-N``."""
     from backtester.report import scrub_designer_tree, write_json
 
-    folder = tmp_path / "my_BOOK_v2-2"
+    folder = tmp_path / "my_RANDOM_v2-2"
     folder.mkdir()
     write_json(
         folder / "metrics.json",
-        {"strategy_id": "my_ASSET_v2", "source_id": "pack_ASSET", "status": "ok"},
+        {"strategy_id": "my_RANDOM_v2", "source_id": "pack_RANDOM", "status": "ok"},
     )
     write_json(
         folder / "error.json",
         {
-            "strategy_id": "my_ASSET_v2",
-            "source_id": "pack_ASSET",
+            "strategy_id": "my_RANDOM_v2",
+            "source_id": "pack_RANDOM",
             "status": "error",
             "error": "the strategy failed",
         },
     )
     scrub_designer_tree(
         folder,
-        ["COST", "asset"],
+        ["COST"],
         strategy_id="my_cost_v2",
-        folder="my_BOOK_v2-2",
+        folder="my_RANDOM_v2-2",
         source_id="pack_COST",
-        source_name="pack_BOOK-2",
+        source_name="pack_RANDOM-2",
     )
     for name in ("metrics.json", "error.json"):
         document = json.loads((folder / name).read_text(encoding="utf-8"))
-        assert document["strategy_id"] == "my_BOOK_v2-2"
-        assert document["source_id"] == "pack_BOOK-2"
-
-
-def test_fixed_names_are_screened_against_the_union(tmp_path):
-    from backtester.report import (
-        _png_metadata_texts,
-        assert_designer_clean,
-        designer_visible_name,
-        screen_designer_tree,
-    )
-
-    root = tmp_path / "designer"
-    book = root / "flat" / "pack_x"
-    (book / "benchmarks" / "buy_and_hold_1x").mkdir(parents=True)
-    (book / "benchmarks" / "long_2x").mkdir()
-    (book / "equity_curve.csv").write_text("day,equity\n1,1\n", encoding="utf-8")
-    (book / "equity.csv").write_text("day,equity\n1,1\n", encoding="utf-8")
-    (book / "equity.png").write_bytes(_png_with_text("Title", "equity"))
-    (book / "fills.csv").write_text("day\n1\n", encoding="utf-8")
-    (book / "trades.csv").write_text("day\n1\n", encoding="utf-8")
-    (root / "leaderboard.csv").write_text("strategy_id,status\nflat,ok\n", encoding="utf-8")
-    symbols = ["EQUITY", "PNG", "CSV", "BUY", "HOLD", "LONG"]
-    screen_designer_tree(root, symbols)
-    for name in (
-        "equity_curve.csv",
-        "equity.csv",
-        "equity.png",
-        "fills.csv",
-        "trades.csv",
-        "leaderboard.csv",
-        "buy_and_hold_1x",
-        "long_2x",
-    ):
-        assert not any(path.name == name for path in root.rglob("*")), name
-    assert (book / "benchmarks" / designer_visible_name("buy_and_hold_1x", symbols)).is_dir()
-    assert (book / "benchmarks" / designer_visible_name("long_2x", symbols)).is_dir()
-    pngs = [path for path in root.rglob("*") if path.is_file() and path.suffix == ".img"]
-    assert pngs
-    for png in pngs:
-        texts = {item.casefold() for item in _png_metadata_texts(png.read_bytes())}
-        assert "equity" not in texts
-    for symbol in (*symbols, ""):
-        assert_designer_clean(root, symbol=symbol)
+        assert document["strategy_id"] == "my_RANDOM_v2-2"
+        assert document["source_id"] == "pack_RANDOM-2"

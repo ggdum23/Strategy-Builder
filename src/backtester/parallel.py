@@ -32,13 +32,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .profiles import get_profile
+from . import report as report_mod
 from .report import (
     OPERATOR_LEADERBOARD_COLUMNS,
     _designer_value_error,
-    _scrub_text,
     assert_designer_clean,
     redact_metrics,
-    screen_designer_tree,
+    require_anonymizable_symbol,
     scrub_designer_tree,
     scrub_symbols,
     register_run,
@@ -266,6 +266,10 @@ def run_parallel(
             raise ValueError(f"duplicate job {ref.strategy_id} / {_pair_source(market)}")
         seen.add(key)
 
+    for market in prepared:
+        if market.anonymized:
+            require_anonymizable_symbol(market.symbol)
+
     out.mkdir(parents=True, exist_ok=True)
     assignments = []
     for ref, market in pairs:
@@ -380,10 +384,11 @@ def run_parallel(
             text = _clip(str(exc))
             tail = getattr(exc, "tail", "") or ""
             if tail:
-                scrubbed = _scrub_text(str(tail), market.symbol if market.symbol else "")
-                scrubbed = scrubbed.strip()
-                if scrubbed:
-                    text = _clip(text + "\n" + scrubbed[:2000])
+                # The operator copy keeps the original ticker. The designer
+                # sentence below does not include this tail.
+                shown = str(tail).strip()
+                if shown:
+                    text = _clip(text + "\n" + shown[:2000])
             try:
                 _write_failure(
                     directory,
@@ -906,27 +911,27 @@ def _designer_component(value: str, symbols, used: set) -> str:
     """A designer path component scrubbed against every symbol in the batch.
 
     ``used`` stores casefolded names, the same reservation as job directories.
-    ``My_ASSET_v2`` and ``my_ASSET_v2`` would be one folder on a
-    case-insensitive disk, so the second becomes ``my_ASSET_v2-2``. A candidate
-    whose base or suffix is a ticker for any batch symbol is skipped, including
-    ``ASSET-2`` when the symbol is ``2`` and ``ASSET`` when the symbol casefolds
-    to ``asset``. The same strategy id always gets the same component, so the
-    caller passes one shared ``used`` set per directory.
+    ``My_RANDOM_v2`` and ``my_RANDOM_v2`` would be one folder on a
+    case-insensitive disk, so the second becomes ``my_RANDOM_v2-2``. A
+    candidate whose base or suffix is a ticker for any batch symbol is
+    skipped, including ``RANDOM-2`` when the symbol is ``2``. The stand-in
+    is :data:`report_mod.TICKER_STAND_IN`. The same strategy id always gets
+    the same component, so the caller passes one shared ``used`` set.
     """
     symbol_list = tuple(dict.fromkeys(symbol for symbol in (symbols or ()) if symbol))
     scrubbed = scrub_symbols(str(value), symbol_list) if symbol_list else str(value)
+    stand_in = report_mod.TICKER_STAND_IN
     stems: list[str] = []
     if scrubbed and not _name_dirty(scrubbed, symbol_list):
         stems.append(scrubbed)
-    for stand_in in ("ASSET", "BOOK", "RUN", "NAME", "SLOT", "ITEM"):
-        if stand_in not in stems and not _name_dirty(stand_in, symbol_list):
-            stems.append(stand_in)
-    length = 2
-    while len(stems) < 6 and length <= 48:
-        generated = "q" * length
-        length += 1
-        if generated not in stems and not _name_dirty(generated, symbol_list):
-            stems.append(generated)
+    if stand_in not in stems and not _name_dirty(stand_in, symbol_list):
+        stems.append(stand_in)
+    if not stems:
+        shown = symbol_list[0] if symbol_list else value
+        raise ValueError(
+            f"Symbol {shown!r} collides with a reserved report name and cannot be anonymized; "
+            "run it as an operator (raw) book or rename the symbol in the data."
+        )
     for stem in stems:
         bare = True
         suffix = 2
@@ -1038,7 +1043,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
     mutated = False
     placed = {}
     # One folder per strategy id. A second id that scrubs to the same text
-    # becomes ASSET-2. Both markets of one strategy share the folder.
+    # becomes RANDOM-2. Both markets of one strategy share the folder.
     used_folders: set[str] = set()
     folders: dict[str, str] = {}
     used_sources: dict[str, set[str]] = {}
@@ -1062,7 +1067,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             shutil.rmtree(dest)
         try:
             shutil.copytree(source, dest)
-            screen_designer_tree(dest, unique_symbols)
             scrub_designer_tree(
                 dest,
                 unique_symbols,
@@ -1144,7 +1148,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         write_leaderboard(out / "leaderboard.csv", ranked_rows, audience="operator")
 
     def assert_tree() -> None:
-        screen_designer_tree(designer, unique_symbols)
         assert_designer_clean(designer, symbol="")
         for symbol in unique_symbols:
             assert_designer_clean(designer, symbol=symbol)
@@ -1370,5 +1373,4 @@ def _write_failure(
             symbol=symbol or "",
         )
         write_json(designer / "error.json", cleaned)
-        screen_designer_tree(designer, [symbol] if symbol else [])
         assert_designer_clean(designer, symbol=symbol or "")

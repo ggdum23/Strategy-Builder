@@ -1066,6 +1066,10 @@ def write_books(
     strategy designer may see. It has no ticker, no calendar date, and no
     scale factor. The files next to it are the operator copy and may have those.
     """
+    if anonymized:
+        from .report import require_anonymizable_symbol
+
+        require_anonymizable_symbol(symbol)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     strategy_result, strategy_metrics = books["strategy"]
@@ -1251,6 +1255,10 @@ def walk_forward(
     Arena warm-up trades, then rescales to the starting equity and keeps exposure.
     Desk warm-up is flat (``live`` false) and goes live flat at the starting equity.
     Those are different engines. This function does not merge them.
+
+    The books written here are operator books. They keep the original ticker.
+    There is no designer tree, so a symbol that is reserved for anonymized
+    reports is allowed.
     """
     if share_factor != 1.0:
         raise ValueError(
@@ -1406,6 +1414,10 @@ def run_pack(
     anonymized = bool(secret["anonymized"])
     share_scale = float(secret["share_scale"])
     symbol = str(secret["symbol"])
+    if anonymized:
+        from .report import require_anonymizable_symbol
+
+        require_anonymizable_symbol(symbol)
     child_dividends = _pack_dividends(
         dividends,
         anonymized=anonymized,
