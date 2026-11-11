@@ -148,8 +148,33 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--run", required=True, help="Run id or the directory that contains run.json")
     report.add_argument("--audience", choices=("operator", "designer"), default="operator")
 
-    referee = sub.add_parser("referee", help="One-bar replay (later phase)")
-    referee.add_argument("rest", nargs=argparse.REMAINDER)
+    referee = sub.add_parser("referee", help="Replay one bar at a time in the OS jail")
+    referee.add_argument("--strategy", default=None, help="Path to a strategy.py that defines Strategy")
+    referee.add_argument("--hidden", default=None, help="Hidden sample: a filled directory or a pack directory")
+    referee.add_argument("--profile", choices=("arena", "desk"), default=None)
+    referee.add_argument("--out", default=None)
+    referee.add_argument("--train", default=None, help="Warm-up sample. Arena keeps about the last 504 sessions.")
+    referee.add_argument("--ticker", default=None, help="Named data only. A pack takes the ticker from the sidecar.")
+    referee.add_argument("--sidecar", default=None, help="Operator sidecar for --hidden when it is a pack")
+    referee.add_argument("--train-sidecar", default=None, help="Operator sidecar for --train when it is a pack")
+    referee.add_argument("--bar-minutes", type=int, default=1)
+    referee.add_argument("--share-factor", type=float, default=None, help="Refused on a pack. Raw files stay 1.0.")
+    referee.add_argument("--borrow-rate", type=float, default=None)
+    referee.add_argument("--financing-rate", type=float, default=None, help="Desk only. Arena stays at 0.")
+    referee.add_argument("--fee-mult", type=float, default=1.0, help="Desk only.")
+    referee.add_argument("--dividends", default=None, help="CSV with columns session,amount. Desk only.")
+    referee.add_argument("--initial-equity", type=float, default=1_000_000.0)
+    referee.add_argument(
+        "--warmup-days",
+        type=int,
+        default=None,
+        help="Arena only: how many train sessions to replay before the rescale. Default 504. Desk rejects this.",
+    )
+    referee.add_argument("--memory-mb", type=int, default=2048)
+    referee.add_argument("--cpu-seconds", type=int, default=3600)
+    referee.add_argument("--call-timeout", type=float, default=10.0, help="Seconds per bar. A look-ahead blocks until this.")
+    referee.add_argument("--startup-timeout", type=float, default=60.0)
+    referee.add_argument("--no-benchmarks", action="store_true")
 
     return parser
 
@@ -565,6 +590,53 @@ def _cmd_report(args) -> int:
     return 0
 
 
+def _cmd_referee(args) -> int:
+    from .referee import run_referee
+    from .sandbox import SandboxError
+
+    try:
+        outcome = run_referee(
+            strategy=args.strategy,
+            hidden=args.hidden,
+            profile=args.profile,
+            out=args.out,
+            train=args.train,
+            ticker=args.ticker,
+            sidecar=args.sidecar,
+            train_sidecar=args.train_sidecar,
+            bar_minutes=args.bar_minutes,
+            warmup_days=args.warmup_days,
+            share_factor=args.share_factor,
+            borrow_rate=args.borrow_rate,
+            financing_rate=args.financing_rate,
+            fee_mult=args.fee_mult,
+            dividends=args.dividends,
+            initial_equity=args.initial_equity,
+            memory_mb=args.memory_mb,
+            cpu_seconds=args.cpu_seconds,
+            call_timeout=args.call_timeout,
+            startup_timeout=args.startup_timeout,
+            with_benchmarks=not args.no_benchmarks,
+        )
+    except SandboxError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if outcome.exit_code != 0:
+        print(outcome.message, file=sys.stderr)
+        return outcome.exit_code
+    if outcome.metrics:
+        _print_headline(outcome.profile, outcome.metrics)
+    print(f"wrote {args.out}")
+    _remember(
+        args.out,
+        kind="referee",
+        profile=outcome.profile,
+        symbol=outcome.symbol,
+        anonymized=outcome.anonymized,
+    )
+    return 0
+
+
 def _cmd_test() -> int:
     import pytest
 
@@ -591,7 +663,7 @@ def main(argv=None) -> int:
         if args.command == "parallel":
             return _cmd_parallel(args)
         if args.command == "referee":
-            raise NotImplementedError("The one-bar referee is a later phase.")
+            return _cmd_referee(args)
         if args.command == "report":
             return _cmd_report(args)
         parser.error(f"unknown command {args.command}")

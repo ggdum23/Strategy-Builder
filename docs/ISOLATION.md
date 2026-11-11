@@ -75,14 +75,16 @@ identity cue. `count` stays the source trade count.
 Heap, environment, argv, and cwd are the in-scope checks. A hardcoded absolute
 path can still open a file. That is the Phase 4 jail.
 
-Phase 4 also still owns these reads, which this phase does not stop:
+The referee in Phase 4 stops the reads below for the jailed strategy. This
+phase still does not stop them on the walk-forward child:
 
 - `/proc/<ppid>/cmdline`
 - `/proc/<ppid>/environ`
 - `/proc/<ppid>/cwd`, and the Windows handle equivalents
 - `share_scale` on the child engine frame. The parent passes it so per-share
   fees use real share counts. Post-fee cash determines it as well. See
-  `docs/PACK.md`.
+  `docs/PACK.md`. The referee bills in the parent, so its child has no engine
+  frame and is not sent the scale.
 
 `walk_forward` deletes the frame it was given. The command line passes that
 frame as the argument and does not keep another name for it. A caller that
@@ -111,13 +113,15 @@ not the installed `backtester` package is also removed from the child's
 of those entries.
 
 The worker calls `setsid` on Linux before it waits for the parent, so it is
-its own process-group leader and the group id is the worker pid. The parent
+its own process-group leader and the group id is the worker pid. It then
+installs a seccomp filter that returns EPERM for `setsid` and `setpgid` in
+that process and every process it starts. A grandchild that calls `setsid`
+stays in the group. The parent
 records that id when the child reports it has entered. A normal return, a
 strategy exception, a timeout, a cancel, a resident-set kill, and the final
 cleanup all signal that saved group: SIGTERM, then SIGKILL. The signal does
 not ask `getpgid` again, so it still works after the leader has been reaped.
-A grandchild that ignores SIGTERM dies on the SIGKILL. A grandchild that
-calls `setsid` itself leaves the group; that is the Phase 4 jail. On Windows
+A grandchild that ignores SIGTERM dies on the SIGKILL. On Windows
 every worker is placed in a job object before the parent releases it. The job
 sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Every exit path, including a
 normal return, calls `TerminateJobObject` and then closes the handle. If the
@@ -141,9 +145,10 @@ engine loop into the parent is the Phase 4 one-bar referee.
 
 A crash, a hang, or a resident-set overrun is one failed row. The other jobs
 keep running. The Linux non-dumpable flag is not set on this path. `run_pack`
-does not set it either. Phase 4 owns the OS jail and the one-bar referee.
+does not set it either. The OS jail and the one-bar referee are below.
 The Windows job object on this path is the process tree and, when requested,
-the commit-charge ceiling. It is not the restricted-token sandbox.
+the commit-charge ceiling. It is not the AppContainer sandbox. The referee
+uses that sandbox.
 
 ## What Phase 1 does not isolate
 
@@ -159,7 +164,7 @@ the design window must not have.
 Phase 1 leaves argv as `['backtester-design']`, the working directory as an
 empty temporary directory, and data-path environment variables unset, so the
 argv form does not see the source. A hardcoded absolute path still opens.
-Phase 4 must make both opens fail.
+The referee jail makes that open fail. This phase does not.
 
 ### Probe: `/proc/<ppid>/mem`
 
@@ -169,9 +174,9 @@ space for a locked-tail close. The Windows equivalent is `OpenProcess` and
 
 Phase 1 sets the Linux parent non-dumpable while the design child runs.
 That blocks the ordinary same-user ptrace path and is not applied on Windows.
-It is not a claim that every read of parent memory fails. Phase 4 must make
-the `/proc/<ppid>/mem` read and the `OpenProcess` read fail inside the
-referee sandbox.
+It is not a claim that every read of parent memory fails. Inside the referee
+sandbox a read of `/proc/<ppid>/mem` returns no bytes, `process_vm_readv` and
+`ptrace` return EPERM, and Windows `OpenProcess` with `PROCESS_VM_READ` fails.
 
 ### Probe: file-based arming of the locked run
 
@@ -180,4 +185,91 @@ strategy reads that file and trades only when the flag is present. The two
 runs do not share a process, so an in-memory flag does not carry over. They
 are not confined to a filesystem. A path outside the empty working directory
 still works, and the locked run can see a file the design run wrote.
-Phase 4 must stop the design run from creating a file the locked run can read.
+The referee jail does not mount those directories, and on Windows a deny ACE
+covers them. A file the jailed strategy creates does not survive the jail
+and is not a path the next run is given.
+
+## Referee sandbox (Phase 4)
+
+`backtester referee` runs the official engine in the parent and the strategy
+in a child. One JSON line goes out, one decision comes back, and the next bar
+is not written before that decision. The default per-call limit is 10
+seconds. `describe_isolation()` is what this machine will apply, and
+`referee.json` records the backend that was actually used. A launch that
+cannot apply the jail raises `SandboxError` and does not start the strategy.
+
+### Windows
+
+The backend name is `job+appcontainer`.
+
+- The process is created suspended, assigned to a job, then resumed. The job
+  sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`
+  of 1, `JOB_OBJECT_LIMIT_PROCESS_TIME`, `JOB_OBJECT_LIMIT_JOB_TIME`,
+  `JOB_OBJECT_LIMIT_PROCESS_MEMORY`, and `JOB_OBJECT_LIMIT_JOB_MEMORY`.
+- The token is an AppContainer profile with zero capabilities, so it has no
+  network capability. A socket call fails with access denied (10013).
+- `icacls` grants read/execute on the Python runtime and the Windows
+  directory, and full control on the private temp directory only. Data,
+  market, and repository directories get an explicit deny ACE for the
+  AppContainer SID. The ACE is removed when the referee exits.
+- `OpenProcess` of the parent with `PROCESS_VM_READ` is denied by the
+  AppContainer token.
+- If the profile, the job, the assignment, or an ACL edit fails, the launch
+  raises and the process is not resumed. There is no second, weaker backend.
+
+### Linux with bubblewrap
+
+This is the CI backend. The workflow installs `bubblewrap`. The launch is
+`bwrap --unshare-all --unshare-user --disable-userns --die-with-parent
+--new-session --cap-drop ALL`, with read-only binds for the interpreter and
+a bind of the private temp directory only. Data and repository paths are not
+mounted. Installer metadata that contains a denied path (`*.pth`,
+`*.egg-link`, `*.dist-info/direct_url.json`) is covered with an empty file.
+
+A seccomp filter returns EPERM for `socket`, `connect`, `accept`, `accept4`,
+`sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `shutdown`, `bind`, `listen`,
+`socketpair`, `fork`, `vfork`, `ptrace`, `setpgid`, `setsid`, `unshare`,
+`setns`, `process_vm_readv`, `process_vm_writev`, `userfaultfd`, and
+`pidfd_getfd`. `clone` is allowed only when `CLONE_THREAD` is set. `clone3`
+stays allowed: glibc creates threads with it, and classic BPF cannot read the
+flag pointer. A `clone3` task inherits the filter, the mount namespace, and
+the network namespace, and it dies with the pid namespace when the referee
+exits. It cannot call `setsid`.
+
+The host `/proc` is not mounted. `os.getppid()` inside the jail is the
+bubblewrap process in the new pid namespace, not the referee. Opening
+`/proc/1/mem` can return a descriptor; reading it returns EIO and zero
+bytes. `process_vm_readv` and `ptrace` return EPERM. `/proc/1/cmdline` is
+visible and is why the child's command line carries no data path, no ticker,
+and no scale. The private directory path is on that command line because it
+is the child's own work directory.
+
+`RLIMIT_AS`, `RLIMIT_DATA`, and `RLIMIT_CPU` are set before the strategy is
+loaded. The parent also enforces the wall-clock per-call timeout and kills
+the sandbox on the way out. `--die-with-parent` covers a referee that dies
+without running that cleanup.
+
+### Linux without bubblewrap
+
+If `bwrap` cannot start a namespace, the launch uses landlock plus the same
+seccomp filter, the same rlimits, and `PR_SET_PDEATHSIG` set to `SIGKILL`.
+Landlock allows reading the interpreter and writing the private directory.
+Opening a data path returns EPERM. There is no pid namespace and no network
+namespace, so the network block is the seccomp filter alone. `/proc` is not
+in the allow-list. A raw `clone3` task on this backend is not reaped by a
+pid namespace; bubblewrap is the stronger backend and is the one CI installs.
+If landlock cannot be applied either, the launch is refused.
+
+### What the child is not given
+
+The bar and the account or state are the engine's public fields. Keys named
+`share_scale` or `share_factor`, and any key that starts with `_`, are
+dropped before the line is written. The calendar month callable and the
+sidecar stay in the parent. The designer-facing ticker stand-in remains
+`RANDOM`. Post-fee cash can still be used to infer a scale when someone runs
+the engine themselves. The jailed strategy does not have that frame.
+
+Arena warm-up and Desk warm-up are separate. Arena replays about the last
+504 train sessions, then rescales to $1,000,000 keeping exposure. Desk
+replays the whole train history with `live` false and a flat book, then
+goes live at $1,000,000. A Desk run that is given `--warmup-days` is refused.

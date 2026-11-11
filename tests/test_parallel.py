@@ -2188,3 +2188,69 @@ def test_a_reserved_symbol_rejects_the_batch_before_output(tmp_path):
             with_benchmarks=False,
         )
     assert not out.exists()
+
+
+def test_setsid_cannot_move_a_grandchild_out_of_the_worker_group(tmp_path):
+    """A grandchild that calls setsid stays in the worker group and is reaped.
+
+    The worker installs the filter after its own setsid. Without that filter
+    the grandchild would leave the group and survive the worker's SIGKILL.
+    """
+    if sys.platform != "linux":
+        pytest.skip("setsid is the Linux process-group escape")
+    marker = tmp_path / "setsid.json"
+    grandchild = (
+        "import json, os, time\n"
+        "from pathlib import Path\n"
+        "escaped = False\n"
+        "err = 0\n"
+        "try:\n"
+        "    os.setsid()\n"
+        "    escaped = True\n"
+        "except OSError as exc:\n"
+        "    err = int(exc.errno)\n"
+        f"Path({str(marker)!r}).write_text(json.dumps({{'pid': os.getpid(), 'escaped': escaped, 'errno': err}}))\n"
+        "time.sleep(300)\n"
+    )
+    source = (
+        "import subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "class Strategy:\n"
+        "    def __init__(self):\n"
+        "        self.done = False\n"
+        "    def on_bar(self, bar, state):\n"
+        "        if self.done:\n"
+        "            return None\n"
+        "        self.done = True\n"
+        f"        subprocess.Popen([sys.executable, '-c', {grandchild!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "        deadline = time.time() + 15\n"
+        f"        while not Path({str(marker)!r}).is_file():\n"
+        "            if time.time() > deadline:\n"
+        "                break\n"
+        "            time.sleep(0.02)\n"
+        "        return None\n"
+    )
+    _strategy(tmp_path / "setsid", "orphan", source)
+    try:
+        result = run_parallel(
+            discover_strategies(tmp_path / "setsid"),
+            [FrameMarket("book", "TEST", frame=_frame())],
+            tmp_path / "out",
+            profile="arena",
+            workers=1,
+            timeout_s=30,
+            with_benchmarks=False,
+        )
+        assert result.results[0].status == "ok", (result.results[0].status, result.results[0].error)
+        assert marker.is_file(), "grandchild never reported"
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        assert payload["escaped"] is False
+        assert payload["errno"] == 1
+        assert _wait_dead(payload["pid"]), f"grandchild {payload['pid']} survived setsid"
+    finally:
+        if marker.is_file():
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                payload = {}
+            _reap(payload.get("pid"))

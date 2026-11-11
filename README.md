@@ -129,15 +129,16 @@ operator `metrics.json` still records that cost basis and the original ticker.
 date, and no scale field. The designer-facing stand-in for a ticker is
 `RANDOM`. Strategy and source directory names use that spelling, with a
 `-2`, `-3`, ... suffix when two ids would be the same folder. Do not put
-operator paths in a strategy. `referee` still raises, on purpose.
+operator paths in a strategy. `referee` runs that strategy one bar at a time
+in an OS jail; the child does not receive the sidecar, the calendar, or `share_scale`.
 The twenty designer strategies under `examples/strategies/` are the Arena examples.
 Desk examples are under `examples/desk/`.
 
 Fixed report names stay canonical: `metrics.json`, `equity_curve.csv`,
 `equity.csv`, `equity.png`, `fills.csv`, `trades.csv`, `liquidation.json`,
 `error.json`, `leaderboard.csv`, `benchmarks/buy_and_hold_1x`,
-`benchmarks/long_2x`, `manifest.json`, `bars_part_NNN.csv.gz`, and
-`daily_rth.csv.gz`. An anonymized symbol is rejected when it matches one of
+`benchmarks/long_2x`, `manifest.json`, `bars_part_NNN.csv.gz`,
+`daily_rth.csv.gz`, and `referee.json`. An anonymized symbol is rejected when it matches one of
 the reserved tokens below (casefolded, as its own token, so `MA` is not
 `manifest` and `2` is not `2x`). `pack`, `run --pack`, and `parallel` on an
 anonymized pack print the reason. The command exits 2. They do not write the pack or
@@ -149,7 +150,7 @@ Reserved tokens: `001`, `1x`, `2x`, `and`, `arena`, `bars`, `benchmarks`,
 `builder`, `buy`, `csv`, `curve`, `daily`, `designer`, `desk`, `equity`,
 `error`, `failed`, `fills`, `gz`, `hold`, `json`, `leaderboard`,
 `liquidation`, `long`, `manifest`, `margin`, `metrics`, `not`, `part`, `png`,
-`post`, `pre`, `published`, `random`, `rth`, `software`, `stopped`,
+`post`, `pre`, `published`, `random`, `referee`, `rth`, `software`, `stopped`,
 `strategy`, `tbl`, `the`, `title`, `trades`, `withheld`.
 
 ## Commands
@@ -165,6 +166,7 @@ python -m backtester pack --ticker SYM --src DIR --registry FILE.json --out DIR 
 python -m backtester parallel --strategies DIR --workers N --profile arena|desk --ticker SYM --src DIR --out DIR
 python -m backtester parallel --strategies DIR --workers N --profile desk --pack DIR --sidecar FILE --out DIR
 python -m backtester report --run RUN_ID
+python -m backtester referee --strategy PATH --hidden PATH --profile arena|desk --out DIR
 python -m backtester test
 ```
 
@@ -195,7 +197,8 @@ fees used real share counts). `metrics.json` carries the same record.
 
 ## What this checkout does not do yet
 
-No desktop window and no one-bar referee. The parallel runner, the report
+No desktop window. The one-bar referee is `python -m backtester referee`.
+The parallel runner, the report
 files, and the equity PNG are in place for a later GUI. The Windows
 `setup.exe` is built by the installer workflow. See `docs/INSTALLER.md`.
 No Arena financing switch. The engines, the registry, and the pack builder
@@ -203,3 +206,33 @@ stay importable. Interpretations that the Desk spec left open are in
 `docs/DESK_SPEC_DECISIONS.md`. The Arena port is in `docs/ARENA_PORT_NOTES.md`.
 Walk-forward and parallel isolation are `docs/ISOLATION.md`. Metric
 definitions are `docs/METRICS.md`.
+
+## Referee
+
+`referee` replays a hidden sample one bar per pipe round trip. Bar t+1 is
+written only after the decision for bar t. The per-call limit is 10 seconds.
+A strategy that reads ahead blocks until that limit and is disqualified. A
+crash, a non-finite target, and a protocol break are disqualified too. The
+process exit is 1. The report is `error.json` plus `referee.json`.
+
+The official engine stays in the parent. Arena fills at the next delivered
+bar's open. Desk fills at the next regular-session open. Fees use the real
+calendar month and real share counts (`share_scale` from the sidecar, or 1.0
+on named files). Neither the scale nor the calendar is sent to the child.
+`--share-factor` is refused on a pack. A named run that passes a factor other
+than 1.0 exits 2.
+
+Warm-up follows the profile that is running. Arena feeds about the last 504
+train sessions through the same engine, then rescales the account to
+$1,000,000 and keeps the exposure at the first hidden bar. Desk runs the
+whole train history with `live` false: targets are ignored, the book stays
+flat, and indicators still update. It then goes live at $1,000,000 on the
+hidden bars. `--warmup-days` is the Arena session count. Desk rejects it.
+
+The child runs in an OS jail. Windows uses a job object (kill on close, one
+active process, a memory cap, a CPU cap), an AppContainer with no network
+capability, and a deny ACE on the data, market, and repository directories.
+Linux uses bubblewrap when `bwrap` can start a namespace, and otherwise
+landlock plus seccomp. If the jail cannot be applied, the command exits 2 and
+the strategy is not started. The guarantees that were actually applied are
+written to `referee.json`. `docs/ISOLATION.md` lists them per operating system.

@@ -633,6 +633,12 @@ def _restore_dumpable(previous: int | None) -> None:
 
 def _books_worker(queue, job):
     _new_session()
+    # The worker is the session leader. A grandchild that calls setsid would
+    # leave the group this process just created. The filter denies setsid and
+    # setpgid from here on, including in children. See docs/ISOLATION.md.
+    from .sandbox import lock_worker_session
+
+    lock_worker_session()
     spool = None
     try:
         inherited_argv, inherited_cwd = _enter_child(job)

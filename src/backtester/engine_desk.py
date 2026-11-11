@@ -37,6 +37,9 @@ class DeskConfig:
     liquidation_hwm_fraction: float = 0.30
     live_start_ordinal: int = 0
     dividends: dict | None = None
+    # None keeps the 21-session fee month. The referee passes a calendar-month
+    # callable. A local run does not, so the kit month stays the kit month.
+    month_of_session: object | None = None
 
     def __post_init__(self):
         if self.initial_equity <= 0.0:
@@ -448,12 +451,19 @@ class _Book:
             }
         )
 
+    def _month_key(self, live_ordinal, row):
+        """Fee-month id. The default is a block of sessions, not a calendar month."""
+        fn = self.cfg.month_of_session
+        if fn is None:
+            return live_ordinal // self.cfg.sessions_per_month
+        return fn(str(row["session"]))
+
     def _execute(self, new_shares, price, kind, live_ordinal, row):
         delta = new_shares - self.shares
         if delta == 0:
             return
         px = D.slipped_price(price, delta, self.cfg.slippage_bps, self.cfg.fee_mult)
-        month = live_ordinal // self.cfg.sessions_per_month
+        month = self._month_key(live_ordinal, row)
         before = self.month_shares.get(month, 0.0)
         fees = D.fill_costs(delta, px, before, self.cfg.share_factor, self.cfg.fee_mult)
         self.month_shares[month] = before + fees["tier_shares"]

@@ -465,6 +465,7 @@ _FIXED_REPORT_NAMES = (
     "manifest.json",
     "bars_part_001.csv.gz",
     "daily_rth.csv.gz",
+    "referee.json",
 )
 # Extensions the audit would match in a file name, including ``tbl`` so a
 # ticker of that extension cannot be anonymized into a report path.

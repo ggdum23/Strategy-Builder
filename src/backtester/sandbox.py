@@ -1,0 +1,1501 @@
+"""OS jail for the referee child.
+
+Windows: a job object (kill on close, one active process, a memory cap, a CPU
+cap), an AppContainer with no network capability, and file ACL deny entries on
+the data, market, and repository directories. The private temp directory is
+the only writable location. If any of that cannot be applied, the launch
+raises and the strategy is not started.
+
+Linux: bubblewrap when ``bwrap`` can start a throwaway namespace. Otherwise
+landlock plus a seccomp filter, rlimits, and ``PR_SET_PDEATHSIG``. The report
+from ``describe_isolation`` is the guarantee that was actually applied.
+
+``lock_worker_session`` is the smaller filter used by the walk-forward and
+parallel workers after they become session leaders. It denies ``setsid`` and
+``setpgid`` so a grandchild cannot leave the process group.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import shutil
+import signal
+import site
+import struct
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+
+class SandboxError(RuntimeError):
+    """The jail could not be applied. The strategy was not started."""
+
+
+# seccomp / BPF
+_BPF_LD = 0x00
+_BPF_W = 0x00
+_BPF_ABS = 0x20
+_BPF_JMP = 0x05
+_BPF_JEQ = 0x10
+_BPF_RET = 0x06
+_BPF_ALU = 0x04
+_BPF_AND = 0x50
+_BPF_K = 0x00
+_LD_W_ABS = _BPF_LD | _BPF_W | _BPF_ABS
+_JMP_JEQ = _BPF_JMP | _BPF_JEQ | _BPF_K
+_RET_K = _BPF_RET | _BPF_K
+_ALU_AND = _BPF_ALU | _BPF_AND | _BPF_K
+_SECCOMP_RET_ALLOW = 0x7FFF0000
+_SECCOMP_RET_ERRNO = 0x00050000
+_SECCOMP_RET_KILL = 0x80000000
+_EPERM = 1
+_AUDIT_ARCH_X86_64 = 0xC000003E
+_PR_SET_PDEATHSIG = 1
+_PR_SET_NO_NEW_PRIVS = 38
+_PR_SET_SECCOMP = 22
+_SECCOMP_MODE_FILTER = 2
+_CLONE_THREAD = 0x00010000
+
+# x86_64 syscall numbers. Other machines fail closed rather than guess.
+_X86_64_NR = {
+    "socket": 41,
+    "connect": 42,
+    "accept": 43,
+    "sendto": 44,
+    "recvfrom": 45,
+    "sendmsg": 46,
+    "recvmsg": 47,
+    "shutdown": 48,
+    "bind": 49,
+    "listen": 50,
+    "socketpair": 53,
+    "clone": 56,
+    "fork": 57,
+    "vfork": 58,
+    "ptrace": 101,
+    "setpgid": 109,
+    "setsid": 112,
+    "unshare": 272,
+    "accept4": 288,
+    "setns": 308,
+    "process_vm_readv": 310,
+    "process_vm_writev": 311,
+    "userfaultfd": 323,
+    "clone3": 435,
+    "pidfd_getfd": 438,
+}
+
+_SANDBOX_DENY = (
+    "socket",
+    "connect",
+    "accept",
+    "accept4",
+    "sendto",
+    "recvfrom",
+    "sendmsg",
+    "recvmsg",
+    "shutdown",
+    "bind",
+    "listen",
+    "socketpair",
+    "fork",
+    "vfork",
+    "ptrace",
+    "setpgid",
+    "setsid",
+    "unshare",
+    "setns",
+    "process_vm_readv",
+    "process_vm_writev",
+    "userfaultfd",
+    "pidfd_getfd",
+)
+
+_LANDLOCK_HANDLED_FS = 0xFFFF
+_LANDLOCK_READ = (1 << 0) | (1 << 2) | (1 << 3)  # execute, read file, read dir
+_LANDLOCK_WRITE = _LANDLOCK_READ | (1 << 1) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 13) | (1 << 14)
+
+
+class _SockFilter(ctypes.Structure):
+    _fields_ = (
+        ("code", ctypes.c_uint16),
+        ("jt", ctypes.c_uint8),
+        ("jf", ctypes.c_uint8),
+        ("k", ctypes.c_uint32),
+    )
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = (
+        ("len", ctypes.c_uint16),
+        ("filter", ctypes.POINTER(_SockFilter)),
+    )
+
+
+def _insn(code: int, jt: int, jf: int, k: int) -> bytes:
+    return struct.pack("<HBBI", code, jt, jf, k)
+
+
+def _arch_and_numbers():
+    machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+    if machine in {"x86_64", "amd64"}:
+        return _AUDIT_ARCH_X86_64, _X86_64_NR
+    raise SandboxError(
+        f"seccomp is not implemented for {machine or sys.platform}; refusing to run without it"
+    )
+
+
+def _filter_bytes(*, deny: tuple[str, ...], allow_threads: bool) -> bytes:
+    arch, numbers = _arch_and_numbers()
+    program = [
+        _insn(_LD_W_ABS, 0, 0, 4),
+        _insn(_JMP_JEQ, 1, 0, arch),
+        _insn(_RET_K, 0, 0, _SECCOMP_RET_KILL),
+        _insn(_LD_W_ABS, 0, 0, 0),
+    ]
+    for name in deny:
+        program.append(_insn(_JMP_JEQ, 0, 1, numbers[name]))
+        program.append(_insn(_RET_K, 0, 0, _SECCOMP_RET_ERRNO | _EPERM))
+    if allow_threads:
+        # clone is allowed only when CLONE_THREAD is set, so a thread can
+        # start and a process cannot. clone3 is not listed: glibc uses it for
+        # threads, and classic BPF cannot read the flag struct it points at.
+        clone = numbers["clone"]
+        program.extend(
+            (
+                _insn(_JMP_JEQ, 0, 4, clone),
+                _insn(_LD_W_ABS, 0, 0, 16),
+                _insn(_ALU_AND, 0, 0, _CLONE_THREAD),
+                _insn(_JMP_JEQ, 1, 0, _CLONE_THREAD),
+                _insn(_RET_K, 0, 0, _SECCOMP_RET_ERRNO | _EPERM),
+            )
+        )
+    program.append(_insn(_RET_K, 0, 0, _SECCOMP_RET_ALLOW))
+    return b"".join(program)
+
+
+def _install_filter(blob: bytes) -> None:
+    count = len(blob) // 8
+    filters = (_SockFilter * count).from_buffer_copy(blob)
+    prog = _SockFprog(count, filters)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        err = ctypes.get_errno()
+        raise SandboxError(f"PR_SET_NO_NEW_PRIVS failed (errno {err})")
+    if libc.prctl(_PR_SET_SECCOMP, _SECCOMP_MODE_FILTER, ctypes.byref(prog)) != 0:
+        err = ctypes.get_errno()
+        raise SandboxError(f"seccomp filter failed (errno {err})")
+    # Keep the buffer alive until prctl has copied it.
+    del filters, prog
+
+
+def lock_worker_session() -> None:
+    """Deny setsid and setpgid in this process and every process it starts.
+
+    The caller has already called ``setsid``. A later ``setsid`` returns
+    EPERM, so a double fork cannot leave the process group. Windows does
+    nothing here: the worker job object is the group. Non-Linux does nothing
+    because there is no seccomp.
+    """
+    if sys.platform != "linux":
+        return
+    _install_filter(_filter_bytes(deny=("setsid", "setpgid"), allow_threads=False))
+
+
+def _which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def _bwrap_available() -> bool:
+    binary = _which("bwrap")
+    if not binary:
+        return False
+    command = [
+        binary,
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--die-with-parent",
+    ]
+    for raw in ("/usr", "/lib", "/lib64"):
+        if Path(raw).exists():
+            command.extend(["--ro-bind", raw, raw])
+    command.extend(["--proc", "/proc", "--dev", "/dev", "--", "/usr/bin/true"])
+    try:
+        probe = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=15,
+            env={"PATH": "/usr/bin:/bin"},
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+def _landlock_available() -> bool:
+    if sys.platform != "linux":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        version = libc.syscall(444, None, 0, 1)
+    except OSError:
+        return False
+    return version >= 1
+
+
+def describe_isolation() -> dict:
+    """What a launch on this machine will apply. Nothing is started."""
+    if sys.platform == "win32":
+        return _windows_guarantees()
+    if sys.platform == "linux" and _bwrap_available():
+        return _bwrap_guarantees()
+    if sys.platform == "linux" and _landlock_available():
+        return _landlock_guarantees()
+    return {
+        "os": sys.platform,
+        "backend": None,
+        "fail_closed": True,
+        "note": "no bubblewrap, unshare jail, or landlock; a launch is refused",
+    }
+
+
+def _bwrap_guarantees() -> dict:
+    return {
+        "os": "linux",
+        "backend": "bubblewrap",
+        "network": (
+            "new network namespace, and seccomp returns EPERM for socket, connect, "
+            "and the rest of the socket calls"
+        ),
+        "filesystem": (
+            "new mount namespace. The Python runtime and the private temp directory "
+            "are mounted. Data, market, and repository directories are not. Installer "
+            "metadata that names the repository is mounted over with an empty file."
+        ),
+        "process": (
+            "new pid namespace and die-with-parent. seccomp denies setsid, setpgid, "
+            "fork, vfork, and clone without CLONE_THREAD. clone3 stays allowed because "
+            "glibc creates threads with it and classic BPF cannot read its flag pointer. "
+            "A clone3 task inherits the filter, the mount namespace, and the network "
+            "namespace, and it dies with the pid namespace."
+        ),
+        "parent_memory": (
+            "the host /proc is not mounted. ptrace and process_vm_readv return EPERM"
+        ),
+        "memory": "RLIMIT_AS and RLIMIT_DATA hard caps, set before the strategy is loaded",
+        "cpu": "RLIMIT_CPU hard cap, plus the parent's wall-clock per-call timeout",
+        "fail_closed": True,
+    }
+
+
+def _landlock_guarantees() -> dict:
+    return {
+        "os": "linux",
+        "backend": "landlock+seccomp",
+        "network": "seccomp returns EPERM for socket and connect. A network namespace is not created.",
+        "filesystem": (
+            "landlock allow-list: read the Python runtime, write the private temp directory. "
+            "Opening a data or repository path returns EPERM. This is not a mount namespace. "
+            "An editable install's path string can still be read from site-packages metadata; "
+            "opening that path is denied."
+        ),
+        "process": (
+            "seccomp denies setsid, setpgid, fork, vfork, and clone without CLONE_THREAD. "
+            "PR_SET_PDEATHSIG is SIGKILL. There is no pid namespace, so a raw clone3 task "
+            "can outlive the strategy process if it is not killed with it. bubblewrap is "
+            "the stronger backend and is used when it runs."
+        ),
+        "parent_memory": "/proc is not in the allow-list, so /proc/<pid>/mem cannot be opened. ptrace is denied.",
+        "memory": "RLIMIT_AS and RLIMIT_DATA hard caps",
+        "cpu": "RLIMIT_CPU hard cap, plus the parent's wall-clock per-call timeout",
+        "fail_closed": True,
+    }
+
+
+def _windows_guarantees() -> dict:
+    return {
+        "os": "windows",
+        "backend": "job+appcontainer",
+        "network": "AppContainer with no capabilities, so the process has no network capability",
+        "filesystem": (
+            "AppContainer SID is not granted on data, market, or repository files. "
+            "An explicit deny ACE is added on those directories and on the files under them "
+            "when the walk finishes, and removed when the referee exits. The private temp "
+            "directory is the writable grant."
+        ),
+        "process": (
+            "job object with KILL_ON_JOB_CLOSE, active process limit 1, a commit-charge cap, "
+            "and a per-process user-time cap. The process is assigned while it is suspended."
+        ),
+        "parent_memory": (
+            "the AppContainer token cannot open the parent with PROCESS_VM_READ"
+        ),
+        "memory": "JOB_OBJECT_LIMIT_PROCESS_MEMORY and JOB_OBJECT_LIMIT_JOB_MEMORY",
+        "cpu": "JOB_OBJECT_LIMIT_PROCESS_TIME, plus the parent's wall-clock per-call timeout",
+        "fail_closed": True,
+    }
+
+
+def _host_children(pid: int) -> list[int]:
+    path = Path(f"/proc/{pid}/task/{pid}/children")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    children = []
+    for item in text.split():
+        try:
+            children.append(int(item))
+        except ValueError:
+            continue
+    return children
+
+
+def _kill_tree(pid: int) -> None:
+    """SIGKILL a process and the host-visible processes under it.
+
+    The inner sandbox calls setsid, so it is not in the launcher's group.
+    die-with-parent covers that case. Walking the children covers a process
+    that is still alive when the launcher has just been signaled.
+    """
+    seen = set()
+
+    def walk(current: int) -> None:
+        if current in seen or current <= 0:
+            return
+        seen.add(current)
+        for child in _host_children(current):
+            walk(child)
+        for sig_target in (current,):
+            try:
+                os.kill(sig_target, signal.SIGKILL)
+            except OSError:
+                pass
+
+    for _ in range(3):
+        walk(pid)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        if not _host_children(pid):
+            break
+
+
+class Sandbox:
+    """A running jailed interpreter. ``close`` kills it and removes the temp dir."""
+
+    def __init__(self, process, workdir: Path, backend: str, guarantees: dict, cleanup):
+        self.process = process
+        self.workdir = workdir
+        self.backend = backend
+        self.guarantees = guarantees
+        self.stdin_fd = process.stdin.fileno()
+        self.stdout_fd = process.stdout.fileno()
+        self.stderr_fd = process.stderr.fileno()
+        self._cleanup = cleanup
+        self._closed = False
+
+    def terminate(self) -> None:
+        proc = self.process
+        if proc.poll() is not None:
+            return
+        if os.name != "nt":
+            _kill_tree(proc.pid)
+        else:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                return
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.terminate()
+        finally:
+            for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except OSError:
+                    pass
+            cleanup = self._cleanup
+            self._cleanup = None
+            if cleanup is not None:
+                cleanup()
+            shutil.rmtree(self.workdir, ignore_errors=True)
+
+
+def launch(strategy_path, *, memory_bytes: int, cpu_seconds: int, deny_paths) -> Sandbox:
+    """Copy the strategy into a private directory and start it inside the jail.
+
+    ``deny_paths`` are host directories the child must not open. They are not
+    passed on the command line of the child.
+    """
+    if not isinstance(memory_bytes, int) or isinstance(memory_bytes, bool) or memory_bytes <= 0:
+        raise ValueError("memory cap must be a positive number of bytes")
+    if not isinstance(cpu_seconds, int) or isinstance(cpu_seconds, bool) or cpu_seconds <= 0:
+        raise ValueError("cpu cap must be a positive number of seconds")
+    strategy = Path(strategy_path).resolve()
+    if not strategy.is_file():
+        raise FileNotFoundError(f"strategy file not found: {strategy}")
+    denied = _deny_roots(deny_paths)
+    work = Path(_private_dir())
+    try:
+        for banned in denied:
+            if work == banned or banned in work.parents or work in banned.parents:
+                raise SandboxError("the private directory overlaps a denied directory")
+        _write_workspace(work, strategy, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        if sys.platform == "win32":
+            return _launch_windows(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        if sys.platform != "linux":
+            raise SandboxError(f"no referee jail for {sys.platform}; refusing to run the strategy")
+        if _bwrap_available():
+            return _launch_bwrap(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        if _landlock_available():
+            return _launch_landlock(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        raise SandboxError(
+            "bubblewrap is not available and landlock cannot be applied; refusing to run the strategy"
+        )
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
+def _private_dir() -> str:
+    import tempfile
+
+    return tempfile.mkdtemp(prefix="bt-referee-")
+
+
+def _deny_roots(paths) -> list[Path]:
+    roots = []
+    repo = Path(__file__).resolve().parents[2]
+    raw = list(paths or []) + [repo]
+    for item in raw:
+        if not item:
+            continue
+        path = Path(item).resolve()
+        if path not in roots:
+            roots.append(path)
+    return roots
+
+
+def _write_workspace(work: Path, strategy: Path, *, memory_bytes: int, cpu_seconds: int) -> None:
+    shim = Path(__file__).resolve().parent / "sandbox_child.py"
+    (work / "strategy.py").write_bytes(strategy.read_bytes())
+    (work / "sandbox_child.py").write_bytes(shim.read_bytes())
+    limits = {"memory_bytes": int(memory_bytes), "cpu_seconds": int(cpu_seconds)}
+    (work / "limits.json").write_text(json.dumps(limits), encoding="utf-8")
+
+
+def _runtime_roots() -> list[Path]:
+    """Directories the dynamic linker and the interpreter open.
+
+    ``/lib`` and ``/lib64`` stay even when they are symlinks into ``/usr``.
+    The sandbox has to have those paths, not only the directory they point at.
+    """
+    roots: list[Path] = []
+
+    def add(path: Path, *, fold: bool) -> None:
+        if not path.exists():
+            return
+        if any(path == earlier for earlier in roots):
+            return
+        if fold and any(path == earlier or earlier in path.parents for earlier in roots):
+            return
+        roots.append(path)
+
+    for raw in ("/usr", "/lib", "/lib64", "/bin"):
+        add(Path(os.path.abspath(raw)), fold=False)
+    for raw in (sys.base_prefix, sys.prefix):
+        if raw:
+            add(Path(raw).resolve(), fold=True)
+    add(Path(sys.executable).resolve().parent, fold=True)
+    return roots
+
+
+def _site_dirs() -> list[Path]:
+    found = []
+    try:
+        candidates = list(site.getsitepackages())
+    except Exception:
+        candidates = []
+    try:
+        user = site.getusersitepackages()
+    except Exception:
+        user = None
+    if user:
+        candidates.append(user)
+    for raw in candidates:
+        path = Path(raw).resolve()
+        if path.is_dir() and path not in found:
+            found.append(path)
+    return found
+
+
+def _needles(denied: list[Path]) -> tuple[str, ...]:
+    values = []
+    for path in denied:
+        text = str(path)
+        if len(text) >= 2:
+            values.append(text)
+    return tuple(values)
+
+
+def _leak_files(directory: Path, needles: tuple[str, ...]) -> list[Path]:
+    if not needles or not directory.is_dir():
+        return []
+    candidates = list(directory.glob("*.pth"))
+    candidates.extend(directory.glob("*.egg-link"))
+    candidates.extend(directory.glob("*.dist-info/direct_url.json"))
+    hits = []
+    seen = set()
+    for path in candidates:
+        if not path.is_file() or path in seen:
+            continue
+        seen.add(path)
+        try:
+            if path.stat().st_size > 1_000_000:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if any(needle in text for needle in needles):
+            hits.append(path)
+    return hits
+
+
+def _child_env(work: Path) -> dict:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "HOME": str(work),
+        "TMPDIR": str(work),
+        "TEMP": str(work),
+        "TMP": str(work),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    return env
+
+
+def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seconds: int) -> Sandbox:
+    binary = _which("bwrap")
+    if not binary:
+        raise SandboxError("bubblewrap disappeared before launch")
+    roots = _runtime_roots()
+    for root in roots:
+        for banned in denied:
+            if root == banned or banned in root.parents:
+                raise SandboxError(
+                    f"the Python runtime {root} is inside a denied directory; refusing to mount it"
+                )
+    needles = _needles(denied)
+    cmd = [
+        binary,
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--die-with-parent",
+        "--new-session",
+        "--cap-drop",
+        "ALL",
+    ]
+    for root in roots:
+        cmd.extend(["--ro-bind", str(root), str(root)])
+    cmd.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind", str(work), str(work)])
+    dep_names = []
+    pass_fds = []
+    sites = _site_dirs()
+    site_mounts = []
+    for index, directory in enumerate(sites):
+        covered = any(directory == root or root in directory.parents for root in roots)
+        sandbox_root = directory if covered else work / f"deps{index}"
+        if not covered:
+            cmd.extend(["--ro-bind", str(directory), str(sandbox_root)])
+            dep_names.append(sandbox_root.name)
+        site_mounts.append((directory, sandbox_root))
+    if dep_names:
+        (work / "runtime.json").write_text(json.dumps(dep_names), encoding="utf-8")
+    empty = os.memfd_create("sb-empty", 0)
+    try:
+        overlays = []
+        seen_dest = set()
+        for directory, sandbox_root in site_mounts:
+            for leak in _leak_files(directory, needles):
+                dest = str(Path(sandbox_root) / leak.relative_to(directory))
+                if dest in seen_dest:
+                    continue
+                seen_dest.add(dest)
+                overlays.append(dest)
+        for dest in overlays:
+            dup = os.dup(empty)
+            pass_fds.append(dup)
+            cmd.extend(["--ro-bind-data", str(dup), dest])
+        filt = _filter_bytes(deny=_SANDBOX_DENY, allow_threads=True)
+        seccomp_fd = os.memfd_create("sb-seccomp", 0)
+        os.write(seccomp_fd, filt)
+        os.lseek(seccomp_fd, 0, os.SEEK_SET)
+        pass_fds.append(seccomp_fd)
+        cmd.extend(
+            [
+                "--seccomp",
+                str(seccomp_fd),
+                "--chdir",
+                str(work),
+                "--clearenv",
+            ]
+        )
+        for key, value in _child_env(work).items():
+            cmd.extend(["--setenv", key, value])
+        cmd.extend([sys.executable, "-I", "-B", "-s", str(work / "sandbox_child.py")])
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                pass_fds=tuple(pass_fds),
+                start_new_session=True,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                cwd=str(work),
+            )
+        except OSError as exc:
+            raise SandboxError(f"bubblewrap did not start: {exc}") from exc
+    finally:
+        for fd in pass_fds:
+            os.close(fd)
+        os.close(empty)
+
+    def _cleanup():
+        return None
+
+    return Sandbox(proc, work, "bubblewrap", _bwrap_guarantees(), _cleanup)
+
+
+def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seconds: int) -> Sandbox:
+    """Landlock, seccomp, rlimits, and a parent-death signal. No preexec fork."""
+    read_dirs = [str(path) for path in _runtime_roots()]
+    for directory in _site_dirs():
+        if directory not in read_dirs and str(directory) not in read_dirs:
+            read_dirs.append(str(directory))
+    for directory in read_dirs:
+        path = Path(directory)
+        for banned in denied:
+            if path == banned or banned in path.parents:
+                raise SandboxError(
+                    "the Python runtime is inside a denied directory; refusing to grant it"
+                )
+    rules = []
+    for directory in read_dirs:
+        if directory and os.path.isdir(directory):
+            rules.append([directory, _LANDLOCK_READ])
+    rules.append([str(work), _LANDLOCK_WRITE])
+    dep_names = []
+    for directory in _site_dirs():
+        covered = any(
+            Path(directory) == root or root in Path(directory).parents for root in _runtime_roots()
+        )
+        if not covered:
+            dep_names.append(str(directory))
+    if dep_names:
+        (work / "runtime.json").write_text(json.dumps(dep_names), encoding="utf-8")
+    (work / "filter.bin").write_bytes(_filter_bytes(deny=_SANDBOX_DENY, allow_threads=True))
+    (work / "jail.json").write_text(
+        json.dumps(
+            {
+                "handled": _LANDLOCK_HANDLED_FS,
+                "rules": rules,
+                "memory_bytes": int(memory_bytes),
+                "cpu_seconds": int(cpu_seconds),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (work / "enter.py").write_text(_LANDLOCK_ENTER, encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-B", "-s", str(work / "enter.py")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            cwd=str(work),
+            env=_child_env(work),
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise SandboxError(f"landlock jail did not start: {exc}") from exc
+    return Sandbox(proc, work, "landlock+seccomp", _landlock_guarantees(), lambda: None)
+
+
+_LANDLOCK_ENTER = r"""
+import ctypes
+import json
+import os
+import signal
+import sys
+from pathlib import Path
+
+
+def _fail(message):
+    raise SystemExit(message)
+
+
+def main():
+    spec = json.loads(Path("jail.json").read_text(encoding="utf-8"))
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, int(signal.SIGKILL), 0, 0, 0) != 0:
+        _fail("parent-death signal was not installed")
+
+    class Attr(ctypes.Structure):
+        _fields_ = (("handled_access_fs", ctypes.c_uint64),)
+
+    class Rule(ctypes.Structure):
+        _pack_ = 1
+        _fields_ = (("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32))
+
+    attr = Attr(int(spec["handled"]))
+    ruleset = libc.syscall(444, ctypes.byref(attr), ctypes.sizeof(attr), 0)
+    if ruleset < 0:
+        _fail("landlock_create_ruleset failed")
+    try:
+        for directory, access in spec["rules"]:
+            if not directory or not os.path.isdir(directory):
+                continue
+            raw = os.open(directory, os.O_PATH | os.O_CLOEXEC)
+            try:
+                rule = Rule(int(access), raw)
+                if libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0) != 0:
+                    _fail("landlock_add_rule failed")
+            finally:
+                os.close(raw)
+        if libc.prctl(38, 1, 0, 0, 0) != 0:
+            _fail("no-new-privs was not set")
+        if libc.syscall(446, ruleset, 0) != 0:
+            _fail("landlock_restrict_self failed")
+    finally:
+        os.close(ruleset)
+
+    import resource
+
+    memory = int(spec["memory_bytes"])
+    cpu = int(spec["cpu_seconds"])
+    resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+    resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+
+    blob = Path("filter.bin").read_bytes()
+
+    class SockFilter(ctypes.Structure):
+        _fields_ = (
+            ("code", ctypes.c_uint16),
+            ("jt", ctypes.c_uint8),
+            ("jf", ctypes.c_uint8),
+            ("k", ctypes.c_uint32),
+        )
+
+    class SockFprog(ctypes.Structure):
+        _fields_ = (("len", ctypes.c_uint16), ("filter", ctypes.POINTER(SockFilter)))
+
+    count = len(blob) // 8
+    filters = (SockFilter * count).from_buffer_copy(blob)
+    prog = SockFprog(count, filters)
+    if libc.prctl(22, 2, ctypes.byref(prog)) != 0:
+        _fail("seccomp filter was not installed")
+    for name in ("jail.json", "filter.bin"):
+        try:
+            os.unlink(name)
+        except OSError:
+            _fail("jail metadata was left in the work directory")
+    os.execv(sys.executable, [sys.executable, "-I", "-B", "-s", "sandbox_child.py"])
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seconds: int) -> Sandbox:
+    """Job object, AppContainer with no capabilities, and file ACLs. Fail closed."""
+    if sys.platform != "win32":
+        raise SandboxError("the Windows jail is only applied on Windows")
+    lease = _win_lease_acquire()
+    extra_grants: list[tuple[Path, bool]] = []
+    denies: list[Path] = []
+    try:
+        _win_reject_overlap(lease.grant_paths, denied)
+        extra_grants = _win_grant_work(lease, work)
+        denies = _win_apply_denies(lease, denied)
+        popen = _win_spawn(work, lease, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+    except Exception:
+        _win_remove_aces(lease, denies, recurse=True)
+        _win_remove_aces(lease, [path for path, _recurse in extra_grants], recurse=False)
+        for path, recurse in extra_grants:
+            if recurse:
+                _win_remove_aces(lease, [path], recurse=True)
+        _win_lease_release()
+        raise
+
+    def _cleanup():
+        try:
+            kernel = getattr(popen, "_kernel", None)
+            job = getattr(popen, "_job", None)
+            process = getattr(popen, "_process", None)
+            if kernel is not None and job:
+                kernel.CloseHandle(job)
+                popen._job = None
+            if kernel is not None and process:
+                kernel.CloseHandle(process)
+                popen._process = None
+        finally:
+            _win_remove_aces(lease, denies, recurse=True)
+            for path, recurse in extra_grants:
+                _win_remove_aces(lease, [path], recurse=recurse)
+            _win_lease_release()
+
+    return Sandbox(popen, work, "job+appcontainer", _windows_guarantees(), _cleanup)
+
+
+class _WinLease:
+    def __init__(self):
+        self.sid = ctypes.c_void_p()
+        self.sid_text = ""
+        self.name = ""
+        self.refs = 0
+        self.grant_paths: list[tuple[Path, bool]] = []
+        self.userenv = None
+        self.advapi = None
+        self.kernel = None
+
+
+_WIN_LEASE: _WinLease | None = None
+_WIN_LOCK = threading.Lock()
+
+
+def _win_lease_acquire() -> _WinLease:
+    global _WIN_LEASE
+    with _WIN_LOCK:
+        if _WIN_LEASE is None or _WIN_LEASE.refs <= 0:
+            _WIN_LEASE = _WinLease()
+            _win_lease_open(_WIN_LEASE)
+        lease = _WIN_LEASE
+        lease.refs += 1
+        return lease
+
+
+def _win_lease_release() -> None:
+    global _WIN_LEASE
+    with _WIN_LOCK:
+        lease = _WIN_LEASE
+        if lease is None:
+            return
+        lease.refs -= 1
+        if lease.refs > 0:
+            return
+        try:
+            for path, recurse in lease.grant_paths:
+                _win_remove_aces(lease, [path], recurse=recurse)
+            if lease.name and lease.userenv is not None:
+                lease.userenv.DeleteAppContainerProfile(lease.name)
+            if lease.sid.value and lease.advapi is not None:
+                lease.advapi.FreeSid(lease.sid)
+        finally:
+            _WIN_LEASE = None
+
+
+def _win_fail(prefix: str) -> SandboxError:
+    code = ctypes.get_last_error()
+    return SandboxError(f"{prefix} (winerror {code})")
+
+
+def _win_lease_open(lease: _WinLease) -> None:
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    userenv = ctypes.WinDLL("userenv", use_last_error=True)
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    userenv.CreateAppContainerProfile.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    userenv.CreateAppContainerProfile.restype = ctypes.c_long
+    userenv.DeleteAppContainerProfile.argtypes = [ctypes.c_wchar_p]
+    userenv.DeleteAppContainerProfile.restype = ctypes.c_long
+    advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi.ConvertSidToStringSidW.restype = ctypes.c_int
+    advapi.FreeSid.argtypes = [ctypes.c_void_p]
+    advapi.FreeSid.restype = ctypes.c_void_p
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    name = "sb" + os.urandom(8).hex()
+    sid = ctypes.c_void_p()
+    hr = userenv.CreateAppContainerProfile(name, name, name, None, 0, ctypes.byref(sid))
+    if hr != 0 or not sid.value:
+        raise SandboxError(f"CreateAppContainerProfile failed (hresult {hr & 0xFFFFFFFF:08x})")
+    text_ptr = ctypes.c_wchar_p()
+    if not advapi.ConvertSidToStringSidW(sid, ctypes.byref(text_ptr)) or not text_ptr.value:
+        advapi.FreeSid(sid)
+        userenv.DeleteAppContainerProfile(name)
+        raise _win_fail("ConvertSidToStringSidW failed")
+    sid_text = str(text_ptr.value)
+    kernel.LocalFree(text_ptr)
+    lease.sid = sid
+    lease.sid_text = sid_text
+    lease.name = name
+    lease.userenv = userenv
+    lease.advapi = advapi
+    lease.kernel = kernel
+    grants: list[tuple[Path, bool]] = []
+    try:
+        for root in _windows_grant_roots():
+            recurse = root != _system_root()
+            _win_grant(lease, root, "(OI)(CI)(RX)", recurse=recurse)
+            grants.append((root, recurse))
+            for parent in _ancestors(root):
+                if parent == root or any(parent == earlier for earlier, _flag in grants):
+                    continue
+                _win_grant(lease, parent, "(RX)", recurse=False)
+                grants.append((parent, False))
+    except Exception:
+        lease.grant_paths = grants
+        for path, recurse in grants:
+            _win_remove_aces(lease, [path], recurse=recurse)
+        advapi.FreeSid(sid)
+        userenv.DeleteAppContainerProfile(name)
+        raise
+    lease.grant_paths = grants
+
+
+def _system_root() -> Path | None:
+    raw = os.environ.get("SystemRoot")
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_dir() else None
+
+
+def _windows_grant_roots() -> list[Path]:
+    roots: list[Path] = []
+    for raw in (sys.base_prefix, sys.prefix, os.path.dirname(sys.executable)):
+        path = Path(raw).resolve()
+        if path.is_dir() and path not in roots:
+            roots.append(path)
+    system = _system_root()
+    if system is not None and system not in roots:
+        roots.append(system)
+    for directory in _site_dirs():
+        if directory not in roots:
+            roots.append(directory)
+    return roots
+
+
+def _ancestors(path: Path) -> list[Path]:
+    nodes = []
+    current = path.resolve().parent
+    while True:
+        nodes.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    return nodes
+
+
+def _icacls() -> str:
+    system = _system_root()
+    if system is None:
+        raise SandboxError("SystemRoot is not set; refusing to edit file ACLs")
+    path = system / "System32" / "icacls.exe"
+    if not path.is_file():
+        raise SandboxError("icacls is not available; refusing to run without file ACLs")
+    return str(path)
+
+
+def _icacls_run(args: list[str]) -> None:
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=180, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SandboxError(f"icacls did not finish: {exc}") from exc
+    if proc.returncode != 0:
+        detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        raise SandboxError(f"icacls failed ({proc.returncode}): {detail[-500:]}")
+
+
+def _win_grant(lease: _WinLease, path: Path, rights: str, *, recurse: bool) -> None:
+    if not path.exists():
+        return
+    command = [_icacls(), str(path), "/grant", f"*{lease.sid_text}:{rights}", "/C", "/Q"]
+    if recurse:
+        command.append("/T")
+    _icacls_run(command)
+
+
+def _win_deny(lease: _WinLease, path: Path) -> None:
+    command = [_icacls(), str(path), "/deny", f"*{lease.sid_text}:(OI)(CI)(F)", "/T", "/C", "/Q"]
+    _icacls_run(command)
+
+
+def _win_remove_aces(lease: _WinLease, paths, *, recurse: bool) -> None:
+    if lease is None or not lease.sid_text:
+        return
+    for path in paths:
+        if not path or not Path(path).exists():
+            continue
+        command = [
+            _icacls(),
+            str(path),
+            "/remove:g",
+            f"*{lease.sid_text}",
+            "/remove:d",
+            f"*{lease.sid_text}",
+            "/C",
+            "/Q",
+        ]
+        if recurse:
+            command.append("/T")
+        try:
+            _icacls_run(command)
+        except SandboxError:
+            # A path that disappeared is already gone. A real ACL failure still
+            # has to surface: the next command raises if the ACE is still there
+            # only when icacls itself fails. Keep the first failure.
+            raise
+
+
+def _win_reject_overlap(grants, denied) -> None:
+    for banned in denied:
+        if banned is None:
+            continue
+        banned_path = Path(banned)
+        for grant, _recurse in grants:
+            if grant == banned_path or banned_path in grant.parents:
+                raise SandboxError(
+                    "a denied directory contains the Python runtime; refusing to grant and deny the same tree"
+                )
+
+
+def _win_grant_work(lease: _WinLease, work: Path) -> list[tuple[Path, bool]]:
+    applied: list[tuple[Path, bool]] = []
+    _win_grant(lease, work, "(OI)(CI)(F)", recurse=True)
+    applied.append((work, True))
+    granted = {path for path, _recurse in lease.grant_paths}
+    for parent in _ancestors(work):
+        if parent in granted:
+            continue
+        _win_grant(lease, parent, "(RX)", recurse=False)
+        applied.append((parent, False))
+    return applied
+
+
+def _win_apply_denies(lease: _WinLease, denied) -> list[Path]:
+    applied = []
+    for banned in denied:
+        if banned is None:
+            continue
+        path = Path(banned)
+        if not path.exists():
+            continue
+        try:
+            _win_deny(lease, path)
+        except SandboxError:
+            _win_remove_aces(lease, applied, recurse=True)
+            raise
+        applied.append(path)
+    return applied
+
+
+class _WinSecurityAttributes(ctypes.Structure):
+    _fields_ = (
+        ("nLength", ctypes.c_uint32),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_int),
+    )
+
+
+class _WinStartupInfo(ctypes.Structure):
+    _fields_ = (
+        ("cb", ctypes.c_uint32),
+        ("lpReserved", ctypes.c_wchar_p),
+        ("lpDesktop", ctypes.c_wchar_p),
+        ("lpTitle", ctypes.c_wchar_p),
+        ("dwX", ctypes.c_uint32),
+        ("dwY", ctypes.c_uint32),
+        ("dwXSize", ctypes.c_uint32),
+        ("dwYSize", ctypes.c_uint32),
+        ("dwXCountChars", ctypes.c_uint32),
+        ("dwYCountChars", ctypes.c_uint32),
+        ("dwFillAttribute", ctypes.c_uint32),
+        ("dwFlags", ctypes.c_uint32),
+        ("wShowWindow", ctypes.c_uint16),
+        ("cbReserved2", ctypes.c_uint16),
+        ("lpReserved2", ctypes.c_void_p),
+        ("hStdInput", ctypes.c_void_p),
+        ("hStdOutput", ctypes.c_void_p),
+        ("hStdError", ctypes.c_void_p),
+    )
+
+
+class _WinStartupInfoEx(ctypes.Structure):
+    _fields_ = (("StartupInfo", _WinStartupInfo), ("lpAttributeList", ctypes.c_void_p))
+
+
+class _WinSecurityCapabilities(ctypes.Structure):
+    _fields_ = (
+        ("AppContainerSid", ctypes.c_void_p),
+        ("Capabilities", ctypes.c_void_p),
+        ("CapabilityCount", ctypes.c_uint32),
+        ("Reserved", ctypes.c_uint32),
+    )
+
+
+class _WinProcessInformation(ctypes.Structure):
+    _fields_ = (
+        ("hProcess", ctypes.c_void_p),
+        ("hThread", ctypes.c_void_p),
+        ("dwProcessId", ctypes.c_uint32),
+        ("dwThreadId", ctypes.c_uint32),
+    )
+
+
+class _WinJobBasic(ctypes.Structure):
+    _fields_ = (
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    )
+
+
+class _WinJobIo(ctypes.Structure):
+    _fields_ = tuple(
+        (name, ctypes.c_uint64)
+        for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )
+    )
+
+
+class _WinJobExtended(ctypes.Structure):
+    _fields_ = (
+        ("BasicLimitInformation", _WinJobBasic),
+        ("IoInfo", _WinJobIo),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    )
+
+
+def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: int):
+    import msvcrt
+
+    kernel = lease.kernel
+    kernel.CreatePipe.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel.CreatePipe.restype = ctypes.c_int
+    kernel.SetHandleInformation.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+    kernel.SetHandleInformation.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    kernel.ResumeThread.argtypes = [ctypes.c_void_p]
+    kernel.ResumeThread.restype = ctypes.c_uint32
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    kernel.SetInformationJobObject.restype = ctypes.c_int
+    kernel.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.TerminateJobObject.restype = ctypes.c_int
+    kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.TerminateProcess.restype = ctypes.c_int
+    kernel.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel.GetExitCodeProcess.restype = ctypes.c_int
+    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel.InitializeProcThreadAttributeList.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel.InitializeProcThreadAttributeList.restype = ctypes.c_int
+    kernel.UpdateProcThreadAttribute.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel.UpdateProcThreadAttribute.restype = ctypes.c_int
+    kernel.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+    kernel.DeleteProcThreadAttributeList.restype = None
+    kernel.CreateProcessW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    kernel.CreateProcessW.restype = ctypes.c_int
+
+    if ctypes.sizeof(_WinJobExtended) != 144:
+        raise SandboxError(
+            f"job object layout is {ctypes.sizeof(_WinJobExtended)} bytes, not 144; refusing to apply a misread cap"
+        )
+    stdin_r, stdin_w = _win_pipe(kernel)
+    stdout_r, stdout_w = _win_pipe(kernel)
+    stderr_r, stderr_w = _win_pipe(kernel)
+    for handle in (stdin_w, stdout_r, stderr_r):
+        kernel.SetHandleInformation(handle, 0x1, 0)
+    for handle in (stdin_r, stdout_w, stderr_w):
+        kernel.SetHandleInformation(handle, 0x1, 0x1)
+    attributes = None
+    listed = False
+    process = None
+    thread = None
+    job = None
+    try:
+        size = ctypes.c_size_t(0)
+        kernel.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(size))
+        if not size.value:
+            raise _win_fail("InitializeProcThreadAttributeList did not return a size")
+        attributes = ctypes.create_string_buffer(size.value)
+        if not kernel.InitializeProcThreadAttributeList(attributes, 2, 0, ctypes.byref(size)):
+            raise _win_fail("InitializeProcThreadAttributeList failed")
+        listed = True
+        caps = _WinSecurityCapabilities(lease.sid, None, 0, 0)
+        handles = (ctypes.c_void_p * 3)(stdin_r, stdout_w, stderr_w)
+        if not kernel.UpdateProcThreadAttribute(
+            attributes, 0, 0x20009, ctypes.byref(caps), ctypes.sizeof(caps), None, None
+        ):
+            raise _win_fail("the AppContainer attribute was not applied")
+        if not kernel.UpdateProcThreadAttribute(
+            attributes, 0, 0x20002, handles, ctypes.sizeof(handles), None, None
+        ):
+            raise _win_fail("the inherited-handle list was not applied")
+        info = _WinStartupInfoEx()
+        info.StartupInfo.cb = ctypes.sizeof(info)
+        info.StartupInfo.dwFlags = 0x100
+        info.StartupInfo.hStdInput = stdin_r
+        info.StartupInfo.hStdOutput = stdout_w
+        info.StartupInfo.hStdError = stderr_w
+        info.lpAttributeList = ctypes.cast(attributes, ctypes.c_void_p)
+        command = subprocess.list2cmdline(
+            [sys.executable, "-I", "-B", "-s", str(work / "sandbox_child.py")]
+        )
+        command_buf = ctypes.create_unicode_buffer(command)
+        env = _windows_env(work)
+        env_buf = ctypes.create_unicode_buffer(
+            "\0".join(f"{key}={value}" for key, value in env.items()) + "\0\0"
+        )
+        created = _WinProcessInformation()
+        # CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+        flags = 0x00000004 | 0x00080000 | 0x08000000 | 0x00000400
+        ok = kernel.CreateProcessW(
+            None,
+            command_buf,
+            None,
+            None,
+            1,
+            flags,
+            ctypes.cast(env_buf, ctypes.c_void_p),
+            str(work),
+            ctypes.byref(info),
+            ctypes.byref(created),
+        )
+        if not ok:
+            raise _win_fail("CreateProcessW failed")
+        process = created.hProcess
+        thread = created.hThread
+        job = _win_arm_job(kernel, process, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        if kernel.ResumeThread(thread) == 0xFFFFFFFF:
+            raise _win_fail("ResumeThread failed")
+        kernel.CloseHandle(thread)
+        thread = None
+        for handle in (stdin_r, stdout_w, stderr_w):
+            kernel.CloseHandle(handle)
+        stdin_r = stdout_w = stderr_w = None
+        binary = os.O_BINARY if hasattr(os, "O_BINARY") else 0
+        stdin_fd = msvcrt.open_osfhandle(stdin_w, os.O_WRONLY | binary)
+        stdout_fd = msvcrt.open_osfhandle(stdout_r, os.O_RDONLY | binary)
+        stderr_fd = msvcrt.open_osfhandle(stderr_r, os.O_RDONLY | binary)
+        stdin_w = stdout_r = stderr_r = None
+        return _WindowsPopen(process, int(created.dwProcessId), stdin_fd, stdout_fd, stderr_fd, kernel, job)
+    except Exception:
+        if thread:
+            kernel.CloseHandle(thread)
+        if process:
+            kernel.TerminateProcess(process, 1)
+            kernel.CloseHandle(process)
+        if job:
+            kernel.TerminateJobObject(job, 1)
+            kernel.CloseHandle(job)
+        for handle in (stdin_r, stdin_w, stdout_r, stdout_w, stderr_r, stderr_w):
+            if handle:
+                kernel.CloseHandle(handle)
+        raise
+    finally:
+        if listed:
+            kernel.DeleteProcThreadAttributeList(attributes)
+
+
+def _win_pipe(kernel):
+    read = ctypes.c_void_p()
+    write = ctypes.c_void_p()
+    security = _WinSecurityAttributes(ctypes.sizeof(_WinSecurityAttributes), None, 1)
+    if not kernel.CreatePipe(ctypes.byref(read), ctypes.byref(write), ctypes.byref(security), 0):
+        raise _win_fail("CreatePipe failed")
+    return read.value, write.value
+
+
+def _windows_env(work: Path) -> dict:
+    system = os.environ.get("SystemRoot", "")
+    parts = [os.path.dirname(sys.executable)]
+    if system:
+        parts.append(str(Path(system) / "System32"))
+        parts.append(system)
+    env = {
+        "PATH": os.pathsep.join(parts),
+        "SYSTEMROOT": system,
+        "WINDIR": system,
+        "COMSPEC": os.environ.get("COMSPEC", ""),
+        "PATHEXT": os.environ.get("PATHEXT", ".EXE;.PY"),
+        "TEMP": str(work),
+        "TMP": str(work),
+        "HOME": str(work),
+        "USERPROFILE": str(work),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    return {key: value for key, value in env.items() if value}
+
+
+def _win_arm_job(kernel, process, *, memory_bytes: int, cpu_seconds: int):
+    job = kernel.CreateJobObjectW(None, None)
+    if not job:
+        raise _win_fail("CreateJobObjectW failed")
+    info = _WinJobExtended()
+    ticks = int(cpu_seconds) * 10_000_000
+    info.BasicLimitInformation.PerProcessUserTimeLimit = ticks
+    info.BasicLimitInformation.PerJobUserTimeLimit = ticks
+    info.BasicLimitInformation.ActiveProcessLimit = 1
+    info.BasicLimitInformation.LimitFlags = (
+        0x00000008 | 0x00000002 | 0x00000004 | 0x00002000 | 0x00000100 | 0x00000200
+    )
+    info.ProcessMemoryLimit = int(memory_bytes)
+    info.JobMemoryLimit = int(memory_bytes)
+    if not kernel.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        err = _win_fail("SetInformationJobObject failed")
+        kernel.CloseHandle(job)
+        raise err
+    if not kernel.AssignProcessToJobObject(job, process):
+        err = _win_fail("AssignProcessToJobObject failed")
+        kernel.CloseHandle(job)
+        raise err
+    return job
+
+
+class _WindowsPopen:
+    """The slice of subprocess.Popen the referee uses, backed by CreateProcess."""
+
+    def __init__(self, process, pid, stdin_fd, stdout_fd, stderr_fd, kernel, job):
+        self._process = process
+        self.pid = pid
+        self.returncode = None
+        self.stdin = _Fd(stdin_fd)
+        self.stdout = _Fd(stdout_fd)
+        self.stderr = _Fd(stderr_fd)
+        self._kernel = kernel
+        self._job = job
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        code = ctypes.c_uint32()
+        if not self._kernel.GetExitCodeProcess(self._process, ctypes.byref(code)):
+            return None
+        if code.value == 259:
+            return None
+        self.returncode = int(code.value)
+        return self.returncode
+
+    def wait(self, timeout=None):
+        millis = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+        waited = self._kernel.WaitForSingleObject(self._process, millis)
+        if waited != 0:
+            raise subprocess.TimeoutExpired([sys.executable], timeout)
+        return self.poll()
+
+    def kill(self):
+        if self._job:
+            self._kernel.TerminateJobObject(self._job, 1)
+        else:
+            self._kernel.TerminateProcess(self._process, 1)
+
+
+class _Fd:
+    def __init__(self, fd: int):
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def close(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+        self._fd = None
