@@ -528,8 +528,12 @@ def _private_dir() -> str:
 
 def _deny_roots(paths) -> list[Path]:
     roots = []
-    repo = Path(__file__).resolve().parents[2]
-    raw = list(paths or []) + [repo]
+    raw = list(paths or [])
+    # A source tree sits outside the interpreter, so the child must not read
+    # it. A frozen bundle is the interpreter: ``parents[2]`` is the install
+    # directory, and denying it overlaps the runtime grant.
+    if not getattr(sys, "frozen", False):
+        raw.append(Path(__file__).resolve().parents[2])
     for item in raw:
         if not item:
             continue
