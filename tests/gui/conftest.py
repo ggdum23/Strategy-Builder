@@ -14,17 +14,23 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Leave before PySide tears down.
+    """Leave before PySide tears down on Linux.
 
-    On Python 3.11 the suite can finish and then abort in the interpreter
-    finalizer (``bool_dealloc`` while garbage-collecting). The tests have
-    already reported. PySide and pyqtgraph both document this class of exit
-    crash. Ending the process here keeps that abort from failing the job.
+    Python 3.11 on Linux finishes the suite and then aborts in the
+    interpreter finalizer (``bool_dealloc`` while garbage-collecting).
+    The tests have already reported. Ending the process here keeps that
+    abort from failing the job. Windows raises an access violation inside
+    ``os._exit`` while Qt is still loaded, and it does not hit the Linux
+    abort, so it returns normally.
     """
+    if sys.platform == "win32":
+        return
     try:
         from PySide6.QtWidgets import QApplication
     except ImportError:
         return
     if QApplication.instance() is None:
         return
+    sys.stdout.flush()
+    sys.stderr.flush()
     os._exit(int(exitstatus))
