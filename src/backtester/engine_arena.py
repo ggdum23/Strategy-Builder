@@ -19,7 +19,9 @@ Execution model
   same target never rebalances for drift.
 - Targets are clamped to [-2, 2]. A non-finite target is an error.
 - Costs: see costs.py (commission tiers, exchange/clearing/regulatory fees, 1 bp slippage, short
-  borrow). Cash earns 0 %, leverage is not charged financing.
+  borrow). The default call earns 0 % on cash and charges 0 financing, and it does not construct
+  the session-boundary carry. A non-zero cash rate, a non-zero financing rate, or a dividend map
+  accrues once per session boundary at rate/252. That path is off unless the caller opts in.
 - Daily equity is marked at the close of the last regular-session bar of each session.
 - strategy.on_day_end(summary) (optional) is called after the last delivered bar of each session.
 """
@@ -31,6 +33,14 @@ import numpy as np
 import pandas as pd
 
 from . import costs as C
+from .accounting import (
+    borrowed_base,
+    dividend_cash,
+    idle_base,
+    require_annual_rate,
+    require_withholding_rate,
+    session_accrual,
+)
 
 PACK_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PACK_DIR, "data")
@@ -88,9 +98,70 @@ def _local_month(day):
     return day // C.LOCAL_SESSIONS_PER_MONTH
 
 
+class _SessionCarry:
+    """Session-boundary financing, cash interest, and dividends.
+
+    Built only when a caller opts in. The default ``run`` leaves this object
+    as None and does not touch cash here. The snap is the previous session's
+    close, after that session's borrow charge and before this session's fill.
+    """
+
+    def __init__(self, cash_rate, financing_rate, withholding, dividends):
+        self.cash_rate = float(cash_rate)
+        self.financing_rate = float(financing_rate)
+        self.withholding = float(withholding)
+        mapped = {}
+        for key, amount in (dividends or {}).items():
+            day = int(key)
+            value = float(amount)
+            if not math.isfinite(value):
+                raise ValueError(f"dividend for day {day} is not finite")
+            if day in mapped:
+                raise ValueError(f"duplicate dividend for day {day}")
+            mapped[day] = value
+        self.dividends = mapped
+        self.snap = None
+        self.financing = 0.0
+        self.cash_interest = 0.0
+        self.dividends_total = 0.0
+
+    def retarget(self, shares, cash, price):
+        price = float(price)
+        self.snap = (shares, price, cash + shares * price)
+
+    def snap_close(self, shares, cash, price):
+        price = float(price)
+        self.snap = (shares, price, cash + shares * price)
+
+    def due(self, day):
+        snap = self.snap
+        if snap is None:
+            return 0.0, 0.0, 0.0
+        shares, price, equity = snap
+        fin = 0.0
+        interest = 0.0
+        div = 0.0
+        if self.financing_rate != 0.0:
+            fin = session_accrual(
+                self.financing_rate, borrowed_base(shares, price, equity), C.SESSIONS_PER_YEAR
+            )
+        if self.cash_rate != 0.0:
+            interest = session_accrual(
+                self.cash_rate, idle_base(shares, price, equity), C.SESSIONS_PER_YEAR
+            )
+        if int(day) in self.dividends:
+            amount = self.dividends[int(day)]
+            if self.withholding == 0.0:
+                div = shares * amount
+            else:
+                div = dividend_cash(shares, amount, self.withholding)
+        return fin, interest, div
+
+
 def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month_of_day=None,
         taf_active_of_day=None, reset_day=None, period_label_of_day=None, record_fills=True,
-        borrow_rate_annual=None):
+        borrow_rate_annual=None, cash_rate_annual=0.0, financing_rate_annual=0.0,
+        withholding_rate=0.0, dividends=None):
     """Run `strategy` over `bars` (DataFrame with BAR_FIELDS, all sessions, time-ordered).
 
     reset_day: if given, the account is rescaled to `initial_equity` (keeping exposure) at the
@@ -105,6 +176,10 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
       the raw-file default.
     borrow_rate_annual: None uses costs.daily_borrow (0.30%/252). Any other value is an
       explicit override and is not the reference default.
+    cash_rate_annual / financing_rate_annual: 0 leaves the reference loop unchanged.
+      Any other rate accrues once per session boundary on the previous close.
+    dividends: None leaves the reference loop unchanged. A map of day -> amount
+      is credited at that day's boundary, before the fill.
     """
     month_of_day = month_of_day or _local_month
     taf_active_of_day = taf_active_of_day or (lambda d: True)
@@ -161,11 +236,18 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
         episodes.append({"side": ep["side"], "start_day": ep["start_day"], "end_day": day,
                          "bars": ep_bar_count[0], "pnl": cf, "entry_notional": ep["entry_notional"]})
 
+    carry = None
+    if cash_rate_annual != 0.0 or financing_rate_annual != 0.0 or withholding_rate != 0.0 or dividends:
+        cash_rate_annual = require_annual_rate("cash_rate_annual", cash_rate_annual)
+        financing_rate_annual = require_annual_rate("financing_rate_annual", financing_rate_annual)
+        withholding_rate = require_withholding_rate("withholding_rate", withholding_rate)
+        carry = _SessionCarry(cash_rate_annual, financing_rate_annual, withholding_rate, dividends)
     ep_bar_count = [0]
     for j in range(n):
         day = days[j]
         if day != cur_day:
             cur_day = day
+            did_reset = False
             if not started and day >= reset_day:
                 # rescale account to initial_equity keeping exposure, using the last mark
                 last_eq = daily[-1][1] if daily else cash
@@ -186,6 +268,27 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                                                 "cf": -shares * last_px, "entry_notional": abs(shares * last_px)}
                 ep_bar_count[0] = 0
                 started = True
+                did_reset = True
+            if carry is not None:
+                # Reset rescales first. The accrual then uses that book, not the warm-up book.
+                if did_reset:
+                    carry.retarget(shares, cash, last_px)
+                fin, interest, div = carry.due(day)
+                if fin != 0.0:
+                    cash -= fin
+                    if ep is not None:
+                        ep["cf"] -= fin
+                if div != 0.0:
+                    cash += div
+                    if ep is not None:
+                        ep["cf"] += div
+                if interest != 0.0:
+                    cash += interest
+                    if ep is not None:
+                        ep["cf"] += interest
+                carry.financing += fin
+                carry.cash_interest += interest
+                carry.dividends_total += div
         o = O[j]
         # ---- fill pending order at this bar's open
         if pending is not None and dlv[j]:
@@ -250,6 +353,8 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 cash -= b; borrow_tot += b
                 if ep is not None: ep["cf"] -= b
             eq = cash + shares * c
+            if carry is not None:
+                carry.snap_close(shares, cash, c)
             if eq <= 0 and not busted:
                 busted = True
             daily.append((day, eq, (shares * c / eq) if eq > 0 else 0.0, shares, c))
@@ -283,7 +388,7 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
     if ep is not None:
         open_ep = {"side": ep["side"], "start_day": ep["start_day"], "end_day": cur_day, "bars": ep_bar_count[0],
                    "pnl": ep["cf"] + shares * last_close, "entry_notional": ep["entry_notional"], "open": True}
-    return {
+    out = {
         "initial_equity": initial_equity, "share_scale": share_scale,
         "daily": daily, "fills": fills, "episodes": episodes, "open_episode": open_ep,
         "fees": fees_tot, "slippage": slip_tot, "borrow": borrow_tot, "traded_notional": traded_notional,
@@ -292,6 +397,11 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                          "frac_short": n_short / n_exp if n_exp else 0.0, "n_bars": n_exp},
         "wants_extended_hours": wants_ext, "period_label_of_day": period_label_of_day,
     }
+    if carry is not None:
+        out["financing"] = carry.financing
+        out["cash_interest"] = carry.cash_interest
+        out["dividends"] = carry.dividends_total
+    return out
 
 
 # ------------------------------------------------------------------------------------ metrics
@@ -377,6 +487,11 @@ def metrics(res, period_label_of_day=None):
         "frac_sessions_long_at_close": float((expo > 0).mean()), "frac_sessions_short_at_close": float((expo < 0).mean()),
         "busted": bool(res["busted"]),
     }
+    if "financing" in res:
+        out["financing_cost"] = float(res["financing"])
+        out["cash_interest"] = float(res.get("cash_interest", 0.0))
+        out["dividends_net"] = float(res.get("dividends", 0.0))
+        out["costs_total"] = float(res["fees"]["total"] + res["slippage"] + res["borrow"] + res["financing"])
     # per-period returns: 252-session blocks (local) or labels supplied by caller
     lab = period_label_of_day or res.get("period_label_of_day")
     if lab is None:

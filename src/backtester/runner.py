@@ -1,8 +1,9 @@
 """Run one strategy, or a design window and a locked tail.
 
 Benchmarks go through the same engine and the same cost configuration as the
-strategy. Arena financing stays at zero. Desk financing stays at the desk rate
-(7% unless the run overrides it).
+strategy. Omitted switches are the profile defaults: Arena raw prices, cash
+0, financing 0; Desk raw prices, cash 0, financing 0.07. Opting into
+total-return, a cash rate, or a financing rate is recorded on the metrics.
 
 Phase 1 walk-forward isolation is the heap, class attributes, module globals,
 the environment, argv, and cwd. It is not an OS jail. See docs/ISOLATION.md.
@@ -28,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import engine_arena, engine_desk
+from .accounting import normalize_price_basis, resolve_accounting, stamp_accounting
 from .data import WalkSlices, frame_to_desk_bars, load_named, slice_walkforward
 from .engine_desk import BuyAndHold as DeskBuyAndHold
 from .engine_desk import DeskConfig, TwoXLong
@@ -49,6 +51,15 @@ _ARENA_KEYS = (
     "borrow_cost",
     "percent_up_days",
     "cost_basis",
+    "price_basis",
+    "total_return_method",
+    "series_kind",
+    "cash_rate_annual",
+    "financing_rate_annual",
+    "withholding_rate",
+    "accrual",
+    "sessions_per_year",
+    "dividends_applied",
 )
 
 _DESK_KEYS = _ARENA_KEYS + (
@@ -61,7 +72,6 @@ _DESK_KEYS = _ARENA_KEYS + (
     "worst_equity_over_hwm",
     "disqualified",
     "borrow_rate_annual",
-    "financing_rate_annual",
     "share_factor",
     "fee_mult",
 )
@@ -145,6 +155,98 @@ def _summary(profile: str, metrics: dict) -> dict:
     return {key: metrics.get(key) for key in keys}
 
 
+def _arena_dividend_days(frame, dividends) -> dict:
+    """Map a dividend file onto Arena day indexes.
+
+    Keys may already be day indexes, or calendar dates / pack session ids
+    that appear in ``frame["date"]``.
+    """
+    if not dividends:
+        return {}
+    if "date" not in frame.columns:
+        raise ValueError("dividend mapping needs a date column")
+    by_date = {}
+    present = set()
+    for date, day in zip(frame["date"].tolist(), frame["day"].tolist()):
+        day_i = int(day)
+        present.add(day_i)
+        key = str(date)
+        previous = by_date.get(key)
+        if previous is not None and previous != day_i:
+            raise ValueError(f"dividend date {key} maps to two sessions")
+        by_date[key] = day_i
+    out = {}
+    for key, amount in dividends.items():
+        text = str(key)
+        value = float(amount)
+        if not math.isfinite(value):
+            raise ValueError(f"dividend for {text} is not finite")
+        if text in by_date:
+            day = by_date[text]
+        else:
+            try:
+                day = int(text)
+            except ValueError as exc:
+                raise ValueError(f"dividend date {text} is not in this sample") from exc
+            if day not in present:
+                raise ValueError(f"dividend date {text} is not in this sample")
+        if day in out:
+            raise ValueError(f"dividend date {text} maps to session {day} twice")
+        out[day] = value
+    return out
+
+
+def _accounting_for(profile: str, kwargs: dict):
+    return resolve_accounting(
+        profile,
+        price_basis=kwargs.get("price_basis", "raw"),
+        series_kind=kwargs.get("series_kind", "raw"),
+        cash_rate_annual=kwargs.get("cash_rate_annual"),
+        financing_rate_annual=kwargs.get("financing_rate_annual"),
+        withholding_rate=kwargs.get("withholding_rate"),
+        dividends=kwargs.get("dividends"),
+    )
+
+
+def load_run_series(src, symbol: str, *, bar_minutes: int = 1, price_basis: str = "raw", registry_path=None, splits=()):
+    """Load one named series for a run.
+
+    A registry entry declared ``total_return`` stays ``runnable: false``.
+    This function still returns it when ``price_basis`` is ``total_return``
+    and the entry has no declared splits. A raw request keeps the refusal.
+    """
+    from .accounting import normalize_price_basis
+    from .registry import get_series, load_registry
+
+    basis = normalize_price_basis(price_basis)
+    declared = None
+    if registry_path is not None:
+        entry = get_series(load_registry(registry_path), symbol)
+        declared = str(entry["price_adjustment"])
+        if entry.get("splits"):
+            raise ValueError(
+                f"{symbol} is {declared} and is not runnable. This phase executes raw prices only."
+            )
+        if declared == "total_return" and basis != "total_return":
+            raise ValueError(
+                f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
+            )
+    kind = "total_return" if declared == "total_return" and basis == "total_return" else "raw"
+    loaded = load_named(src, symbol, bar_minutes=bar_minutes, splits=splits, price_kind=kind)
+    if kind == "total_return":
+        if loaded.inspection.splits:
+            raise ValueError(
+                f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
+            )
+        return loaded, "total_return"
+    if not loaded.inspection.runnable:
+        raise ValueError(
+            f"{symbol} is {loaded.inspection.price_adjustment} and is not runnable. "
+            "This phase executes raw prices only."
+        )
+    return loaded, "raw"
+
+
 def execute(
     strategy,
     frame,
@@ -160,6 +262,10 @@ def execute(
     reset_day: int | None = None,
     max_day: int | None = None,
     anonymized: bool = False,
+    price_basis: str = "raw",
+    series_kind: str = "raw",
+    cash_rate_annual: float | None = None,
+    withholding_rate: float | None = None,
 ):
     """Run one strategy instance on ``frame``.
 
@@ -174,17 +280,25 @@ def execute(
         raise RuntimeError(
             f"refusing to run: frame contains day {int(frame['day'].max())} after declared end {int(max_day)}"
         )
+    # Desk's omitted rate is the live constant, read in the process that runs
+    # the book. A strategy that patches it changes the child book, and the
+    # parent benchmark (unpatched) rejects the row. The profile value is the
+    # same 0.07 when the constant is untouched.
+    if name == "desk" and financing_rate_annual is None:
+        financing_rate_annual = engine_desk.D.FINANCING_RATE_ANNUAL
+    accounting = resolve_accounting(
+        name,
+        price_basis=price_basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        withholding_rate=withholding_rate,
+        dividends=dividends,
+    )
     if name == "arena":
         if fee_mult != 1.0:
             raise ValueError(
                 "fee-mult is a desk cost-stress switch. An arena run uses the unmodified Arena schedule."
-            )
-        if dividends:
-            raise ValueError("The arena profile does not credit dividends.")
-        if financing_rate_annual not in (None, 0.0):
-            raise ValueError(
-                "Arena financing is 0 in this phase so the reference loop stays unchanged. "
-                "A financing switch is later work."
             )
         effective_reset = reset_day
         if warmup_sessions and reset_day is None:
@@ -193,6 +307,7 @@ def execute(
                 raise ValueError("arena warmup covers the whole sample")
             effective_reset = days[warmup_sessions]
         borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
+        arena_dividends = _arena_dividend_days(frame, dividends) if accounting.dividends_applied else None
         result = engine_arena.run(
             strategy,
             frame,
@@ -200,16 +315,19 @@ def execute(
             share_scale=_release(billing),
             reset_day=effective_reset,
             borrow_rate_annual=borrow,
+            cash_rate_annual=accounting.cash_rate_annual,
+            financing_rate_annual=accounting.financing_rate_annual,
+            withholding_rate=accounting.withholding_rate,
+            dividends=arena_dividends,
         )
         metrics = enrich_arena_metrics(result, engine_arena.metrics(result))
         scale = float(result["share_scale"])
         metrics["share_factor"] = scale
         metrics["borrow_rate_annual"] = borrow
-        metrics["financing_rate_annual"] = 0.0
         metrics["cost_basis"] = _cost_basis(name, scale, anonymized=anonymized)
+        stamp_accounting(metrics, accounting)
         return result, metrics
     if name == "desk":
-        rate = engine_desk.D.FINANCING_RATE_ANNUAL if financing_rate_annual is None else financing_rate_annual
         borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
         rows = frame_to_desk_bars(frame)
         result = engine_desk.run(
@@ -219,7 +337,9 @@ def execute(
                 initial_equity=initial_equity,
                 share_factor=_release(billing),
                 borrow_rate_annual=borrow,
-                financing_rate_annual=rate,
+                financing_rate_annual=accounting.financing_rate_annual,
+                cash_rate_annual=accounting.cash_rate_annual,
+                withholding_rate=accounting.withholding_rate,
                 fee_mult=fee_mult,
                 live_start_ordinal=warmup_sessions,
                 dividends=dict(dividends or {}),
@@ -227,6 +347,7 @@ def execute(
         )
         metrics = engine_desk.metrics(result)
         metrics["cost_basis"] = _cost_basis(name, metrics["share_factor"], anonymized=anonymized)
+        stamp_accounting(metrics, accounting)
         return result, metrics
     raise ValueError(f"unknown profile {profile}")
 
@@ -820,21 +941,31 @@ def _metric_delta(child, parent) -> list[str]:
     return bad
 
 
-def _metrics_from_result(profile: str, result: dict, *, anonymized: bool, borrow_rate_annual):
+def _metrics_from_result(profile: str, result: dict, *, anonymized: bool, borrow_rate_annual, run_kwargs=None):
     """The statistics ``execute`` would attach, computed in this process."""
     name = get_profile(profile).name
+    kwargs = dict(run_kwargs or {})
+    if name == "desk" and kwargs.get("financing_rate_annual") is None:
+        # The strategy book was already run. Stamp the rate stored on that
+        # result so the recomputation matches it. Benchmarks are re-run here
+        # and still read the live constant.
+        recorded = (result.get("config") or {}).get("financing_rate_annual")
+        if recorded is not None:
+            kwargs["financing_rate_annual"] = recorded
+    accounting = _accounting_for(name, kwargs)
     if name == "arena":
         metrics = enrich_arena_metrics(result, engine_arena.metrics(result))
         scale = float(result["share_scale"])
         borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
         metrics["share_factor"] = scale
         metrics["borrow_rate_annual"] = borrow
-        metrics["financing_rate_annual"] = 0.0
         metrics["cost_basis"] = _cost_basis(name, scale, anonymized=anonymized)
+        stamp_accounting(metrics, accounting)
         return metrics
     if name == "desk":
         metrics = engine_desk.metrics(result)
         metrics["cost_basis"] = _cost_basis(name, float(metrics["share_factor"]), anonymized=anonymized)
+        stamp_accounting(metrics, accounting)
         return metrics
     raise ValueError(f"unknown profile {profile}")
 
@@ -857,6 +988,7 @@ def _accept_child_books(profile: str, frame, child_books: dict, kwargs: dict) ->
         strategy_result,
         anonymized=anonymized,
         borrow_rate_annual=kwargs.get("borrow_rate_annual"),
+        run_kwargs=kwargs,
     )
     delta = _metric_delta(child_metrics, parent_metrics)
     if delta:
@@ -875,6 +1007,10 @@ def _accept_child_books(profile: str, frame, child_books: dict, kwargs: dict) ->
         reset_day=kwargs.get("reset_day"),
         max_day=kwargs.get("max_day"),
         anonymized=anonymized,
+        price_basis=kwargs.get("price_basis", "raw"),
+        series_kind=kwargs.get("series_kind", "raw"),
+        cash_rate_annual=kwargs.get("cash_rate_annual"),
+        withholding_rate=kwargs.get("withholding_rate"),
     )
     billing = [float(kwargs.get("share_factor", 1.0))]
     for label, cls in _benchmarks(get_profile(profile).name):
@@ -1019,6 +1155,10 @@ def run_books(
     max_day: int | None = None,
     with_benchmarks: bool = True,
     anonymized: bool = False,
+    price_basis: str = "raw",
+    series_kind: str = "raw",
+    cash_rate_annual: float | None = None,
+    withholding_rate: float | None = None,
 ):
     """Fresh instance per book. Benchmarks reuse the strategy's cost configuration."""
     billing = [share_factor]
@@ -1033,6 +1173,10 @@ def run_books(
         reset_day=reset_day,
         max_day=max_day,
         anonymized=anonymized,
+        price_basis=price_basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        withholding_rate=withholding_rate,
     )
     strategy = strategy_cls()
     result, metrics = execute(strategy, frame, profile, share_factor=_release(billing), **common)
@@ -1110,13 +1254,23 @@ def run_named(
     initial_equity: float = 1_000_000.0,
     splits=(),
     with_benchmarks: bool = True,
+    price_basis: str = "raw",
+    series_kind: str | None = None,
+    cash_rate_annual: float | None = None,
+    withholding_rate: float | None = None,
+    registry_path=None,
 ):
-    loaded = load_named(src, symbol, bar_minutes=bar_minutes, splits=splits)
-    if not loaded.inspection.runnable:
-        raise ValueError(
-            f"{symbol} is {loaded.inspection.price_adjustment} and is not runnable. "
-            "This phase executes raw prices only."
-        )
+    loaded, declared_kind = load_run_series(
+        src,
+        symbol,
+        bar_minutes=bar_minutes,
+        price_basis=price_basis,
+        registry_path=registry_path,
+        splits=splits,
+    )
+    if series_kind is not None and series_kind != declared_kind:
+        raise ValueError(f"series kind {series_kind} does not match the loaded series ({declared_kind})")
+    series_kind = declared_kind
     if share_factor is not None and float(share_factor) != 1.0:
         raise ValueError(
             f"share_factor {share_factor} is not 1.0. Raw runs use 1.0. "
@@ -1141,6 +1295,10 @@ def run_named(
         warmup_sessions=warmup_sessions,
         initial_equity=initial_equity,
         with_benchmarks=with_benchmarks,
+        price_basis=price_basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        withholding_rate=withholding_rate,
     )
     payload = write_books(
         out_dir,
@@ -1243,6 +1401,10 @@ def walk_forward(
     with_benchmarks: bool = True,
     inspection_notes=(),
     during_design=None,
+    price_basis: str = "raw",
+    series_kind: str = "raw",
+    cash_rate_annual: float | None = None,
+    withholding_rate: float | None = None,
 ):
     """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
 
@@ -1296,6 +1458,10 @@ def walk_forward(
         dividends=dividends,
         initial_equity=initial_equity,
         with_benchmarks=with_benchmarks,
+        price_basis=price_basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        withholding_rate=withholding_rate,
     )
     notes = [str(note) for note in (inspection_notes or ())]
     previous_dumpable = _set_dumpable(False)
@@ -1374,6 +1540,14 @@ def walk_forward(
         "design": _summary(profile, design_payload),
         "locked": _summary(profile, locked_payload),
     }
+    design_record = design_payload.get("accounting")
+    locked_record = locked_payload.get("accounting")
+    if design_record != locked_record:
+        raise RuntimeError("design and locked books disagree on accounting settings")
+    if design_record:
+        summary["accounting"] = design_record
+        for key, value in design_record.items():
+            summary.setdefault(key, value)
     write_json(out / "walkforward.json", summary)
     return summary, rebuilt, design_books, locked_books
 
@@ -1393,6 +1567,9 @@ def run_pack(
     initial_equity: float = 1_000_000.0,
     with_benchmarks: bool = True,
     during=None,
+    price_basis: str = "raw",
+    cash_rate_annual: float | None = None,
+    withholding_rate: float | None = None,
 ):
     """Run a pack. The sidecar stays in this process.
 
@@ -1414,6 +1591,12 @@ def run_pack(
     anonymized = bool(secret["anonymized"])
     share_scale = float(secret["share_scale"])
     symbol = str(secret["symbol"])
+    series_kind = str(loaded.manifest["price_basis"])
+    basis = normalize_price_basis(price_basis)
+    if series_kind == "total_return" and basis != "total_return":
+        raise ValueError(
+            f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
+        )
     if anonymized:
         from .report import require_anonymizable_symbol
 
@@ -1444,6 +1627,10 @@ def run_pack(
         with_benchmarks=with_benchmarks,
         anonymized=anonymized,
         during=during,
+        price_basis=basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        withholding_rate=withholding_rate,
     )
     payload = write_books(
         out_dir,

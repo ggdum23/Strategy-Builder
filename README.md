@@ -172,33 +172,57 @@ python -m backtester test
 A strategy that crashes, hangs, or exceeds `--memory-mb` is one failed row, and
 the rest of the batch still finishes. A process that strategy starts is stopped
 with it, including when the strategy returns or raises. `--timeout` starts after that process is up. One `--dividends` file
-applies to the whole batch. Arena rejects it. On an anonymized Desk pack the
+applies to the whole batch. Arena credits that file only with `--price-basis total_return`. On an anonymized pack the
 parent remaps each date and scales the amount before the child starts. The
 parent recomputes the statistics and runs the benchmarks; a child that rewrites
 those figures fails that row. `report --run` reads a run id from this
 directory's `.backtester-runs.json`, or a directory that contains `run.json`.
 `--share-factor` is refused on a pack run. The sidecar holds the scale.
 
-`--borrow-rate` overrides that profile's borrow. `--financing-rate` and
-`--fee-mult` are Desk switches. Arena rejects a financing rate, a fee multiplier
-other than 1, and a dividend file, so the reference loop stays the reference loop.
+`--borrow-rate` overrides that profile's borrow. `--fee-mult` is a Desk
+switch. Arena rejects a fee multiplier other than 1. `--financing-rate` and
+`--cash-rate` are annual decimals (0.07 means 7 percent). Omit them and Arena
+finances at 0 while Desk finances at 0.07; cash earns 0 on both. The default
+call does not change the reference Arena loop.
 `--dividends` is a CSV with columns `session,amount`: real dollars per real
 share, keyed by calendar date. On an anonymized pack the runner multiplies the
 amount by `share_scale` and remaps the date to the pack session id. The child
 does not receive the calendar key or the unscaled amount. A date that is not in
-the pack is an error.
+the pack is an error. See the price-basis section below.
 
 A pack run prints the cost basis (`share_scale`, schedule, and that per-share
 fees used real share counts). `metrics.json` carries the same record.
 
 `python -m backtester test` runs pytest on this checkout. It needs the source tree.
 
+## Price basis, cash, and financing
+
+These switches are opt-in. Leaving them off reproduces the previous books.
+
+| Switch | Default | What it does |
+| --- | --- | --- |
+| `--price-basis raw` | yes | Use the prints in the file. Arena still refuses a dividend file. Desk credits a dividend file gross (`profile_dividends`) |
+| `--price-basis total_return` | no | Either run a registry series declared `total_return` (`registry_series`), or credit `dividends.csv` on a raw series (`cash_dividends`) |
+| `--cash-rate` | 0 | Idle cash earns `rate / 252` once per session boundary |
+| `--financing-rate` | Arena 0, Desk 0.07 | Borrowed money is charged `rate / 252` once per session boundary. Desk's omitted rate is `costs_desk.FINANCING_RATE_ANNUAL`, read when that run starts |
+| `--withholding` | 0 | Fraction kept back from a positive long dividend. Shorts pay the gross amount |
+
+Idle cash is `max(0, equity - |shares * price|)`. Borrowed money is `max(0, |shares * price| - equity)`. Both use the previous session's snap, before the charge. They are not both positive. The charge is applied at the next session boundary, before that session's first fill. There is no calendar-day count. A rate below 0 or above 1.0 is an error. `0.07` means 7 percent per year.
+
+A long dividend with withholding `w` credits `shares * amount * (1 - w)` when the amount is positive. Withholding 0 uses `shares * amount` for longs and shorts. A short always pays the gross `shares * amount`.
+
+A series ingested as `total_return` stays `runnable: false` in the registry, and a pack of that series is still refused. `run --price-basis total_return --registry registry.json` executes it when the entry has no declared splits. Prices are not rewritten. A dividend file on that run is an error, because the series already includes distributions. Without `--registry`, `--price-basis total_return` means cash dividends and requires the CSV.
+
+Every run writes `price_basis`, `total_return_method`, `series_kind`, `cash_rate_annual`, `financing_rate_annual`, `withholding_rate`, `accrual` (`session_boundary_1_252`), `sessions_per_year` (252), and `dividends_applied` on `metrics.json` and `run.json`, both flat and under `accounting`. The leaderboard has the same columns and refuses a file whose rows disagree. A pack manifest and its sidecar record `price_basis` as the series kind (`raw` or `total_return`).
+
+Raw runs keep `share_factor` 1.0. An anonymized pack still passes the sidecar `share_scale` so per-share fees use real share counts. Value-based charges stay on trade value. Designer files still replace the ticker with `RANDOM` and do not carry the scale.
+
 ## What this checkout does not do yet
 
 No desktop window and no one-bar referee. The parallel runner, the report
 files, and the equity PNG are in place for a later GUI. The Windows
 `setup.exe` is built by the installer workflow. See `docs/INSTALLER.md`.
-No Arena financing switch. The engines, the registry, and the pack builder
+The engines, the registry, and the pack builder
 stay importable. Interpretations that the Desk spec left open are in
 `docs/DESK_SPEC_DECISIONS.md`. The Arena port is in `docs/ARENA_PORT_NOTES.md`.
 Walk-forward and parallel isolation are `docs/ISOLATION.md`. Metric

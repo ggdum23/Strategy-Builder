@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from .accounting import LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
+
 _ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
 _BANNED_DESIGNER_KEYS = frozenset(
     {
@@ -85,6 +87,7 @@ _BOOL_KEYS = frozenset(
         "anonymized",
         "cancelled",
         "open_position_at_end",
+        "dividends_applied",
     }
 )
 _STATUS_TOKENS = frozenset({"ok", "error", "timeout", "cancelled", "memory", "crash"})
@@ -99,6 +102,7 @@ OPERATOR_LEADERBOARD_COLUMNS = (
     "source_id",
     "symbol",
     "profile",
+    *LEADERBOARD_KEYS,
     "status",
     "total_return",
     "excess_total_return",
@@ -425,6 +429,8 @@ def _exempt_designer_value(key: str, text: str) -> bool:
     if key == "status" and folded in _STATUS_TOKENS:
         return True
     if key in _BOOL_KEYS and folded in _BOOL_TOKENS:
+        return True
+    if key in LEADERBOARD_KEYS and folded in VOCABULARY:
         return True
     if key not in _FREE_TEXT_KEYS and key != "status" and _float_token(text):
         return True
@@ -977,7 +983,12 @@ def _csv_cell(value) -> str:
 
 
 def write_leaderboard(path, rows, *, audience: str = "operator") -> None:
-    """Write ``leaderboard.csv``. ``rows`` are already in rank order."""
+    """Write ``leaderboard.csv``. ``rows`` are already in rank order.
+
+    Rows that record a price basis must share one accounting setting.
+    Rows with no price basis are left alone so an older board still writes.
+    """
+    refuse_mixed_rows(rows)
     if audience == "operator":
         columns = OPERATOR_LEADERBOARD_COLUMNS
     elif audience == "designer":

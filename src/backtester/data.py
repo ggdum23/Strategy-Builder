@@ -746,7 +746,8 @@ def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=(), phase_map=N
     else:
         price_note = (
             "Operator declared total_return. Prices were not modified. "
-            "This phase does not execute a total-return series."
+            "The registry records the series as not runnable. "
+            "A run executes it only with price basis total_return and no declared splits."
         )
     notes = [
         price_note,

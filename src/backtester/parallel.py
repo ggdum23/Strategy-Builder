@@ -31,6 +31,7 @@ from concurrent.futures import FIRST_COMPLETED
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .accounting import normalize_price_basis, normalize_series_kind, require_annual_rate, require_withholding_rate, resolve_accounting
 from .profiles import get_profile
 from . import report as report_mod
 from .report import (
@@ -86,6 +87,7 @@ class FrameMarket:
     symbol: str
     frame: object
     bar_minutes: int = 1
+    series_kind: str = "raw"
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ class _Prepared:
     borrow_rate_annual: float | None
     pack_id: str | None
     inspection: dict | None
+    series_kind: str = "raw"
 
 
 class _Stop:
@@ -219,12 +222,28 @@ def run_parallel(
     initial_equity: float = 1_000_000.0,
     with_benchmarks: bool = True,
     index_path=None,
+    price_basis: str = "raw",
+    cash_rate_annual: float | None = None,
+    withholding_rate: float | None = None,
+    registry_path=None,
 ) -> ParallelResult:
     """Cartesian product of strategies and markets. See the module docstring."""
     from . import runner as runner_mod
 
     name = get_profile(profile).name
-    _check_batch(name, workers, timeout_s, memory_bytes, fee_mult, financing_rate_annual, dividends)
+    basis = normalize_price_basis(price_basis)
+    _check_batch(
+        name,
+        workers,
+        timeout_s,
+        memory_bytes,
+        fee_mult,
+        financing_rate_annual,
+        dividends,
+        price_basis=basis,
+        cash_rate_annual=cash_rate_annual,
+        withholding_rate=withholding_rate,
+    )
     strategy_list = tuple(strategies)
     market_list = tuple(markets)
     if not strategy_list or not market_list:
@@ -249,7 +268,20 @@ def run_parallel(
         index_path = Path(index_path).resolve()
 
     prepared, prepare_failures = _prepare_markets(
-        market_list, dividends, borrow_rate_annual, runner_mod
+        market_list,
+        dividends,
+        borrow_rate_annual,
+        runner_mod,
+        price_basis=basis,
+        registry_path=registry_path,
+    )
+    accounting = _one_accounting(
+        name,
+        prepared,
+        price_basis=basis,
+        cash_rate_annual=cash_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        withholding_rate=withholding_rate,
     )
     gc.collect()
     pairs = []
@@ -356,6 +388,10 @@ def run_parallel(
                 initial_equity=initial_equity,
                 with_benchmarks=with_benchmarks,
                 anonymized=market.anonymized,
+                price_basis=basis,
+                series_kind=market.series_kind,
+                cash_rate_annual=cash_rate_annual,
+                withholding_rate=withholding_rate,
             )
             extra = {
                 "warnings": [],
@@ -446,6 +482,10 @@ def run_parallel(
             results.append(_job_result(ref, source_id, "error", directory, None, _clip(str(exc)), timeout_s))
 
     ranked_rows = _rank_rows(results, assignments, name, timeout_s)
+    if accounting is not None:
+        fields = accounting.leaderboard_fields()
+        for row in ranked_rows:
+            row.update(fields)
     for index, row in enumerate(ranked_rows, start=1):
         row["rank"] = index
     leaderboard = out / "leaderboard.csv"
@@ -476,6 +516,7 @@ def run_parallel(
             "timeout_s": timeout_s,
             "workers": workers,
             "jobs": jobs,
+            **({} if accounting is None else {"accounting": accounting.as_dict(), **accounting.as_dict()}),
         },
     )
     if index_path is not None:
@@ -500,7 +541,19 @@ def _ready() -> None:
     return None
 
 
-def _check_batch(name, workers, timeout_s, memory_bytes, fee_mult, financing_rate_annual, dividends) -> None:
+def _check_batch(
+    name,
+    workers,
+    timeout_s,
+    memory_bytes,
+    fee_mult,
+    financing_rate_annual,
+    dividends,
+    *,
+    price_basis,
+    cash_rate_annual,
+    withholding_rate,
+) -> None:
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers must be a positive integer")
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not timeout_s > 0:
@@ -509,26 +562,75 @@ def _check_batch(name, workers, timeout_s, memory_bytes, fee_mult, financing_rat
         isinstance(memory_bytes, bool) or not isinstance(memory_bytes, int) or memory_bytes <= 0
     ):
         raise ValueError("memory_bytes must be a positive number of bytes")
-    if name == "arena":
-        if fee_mult != 1.0:
-            raise ValueError(
-                "fee-mult is a desk cost-stress switch. An arena run uses the unmodified Arena schedule."
-            )
-        if dividends:
-            raise ValueError("The arena profile does not credit dividends.")
-        if financing_rate_annual not in (None, 0.0):
-            raise ValueError(
-                "Arena financing is 0 in this phase so the reference loop stays unchanged. "
-                "A financing switch is later work."
-            )
+    if name == "arena" and fee_mult != 1.0:
+        raise ValueError(
+            "fee-mult is a desk cost-stress switch. An arena run uses the unmodified Arena schedule."
+        )
+    if name == "arena" and price_basis == "raw" and dividends:
+        raise ValueError("The arena profile does not credit dividends.")
+    if cash_rate_annual is not None:
+        require_annual_rate("cash_rate_annual", cash_rate_annual)
+    if financing_rate_annual is not None:
+        require_annual_rate("financing_rate_annual", financing_rate_annual)
+    if withholding_rate is not None:
+        require_withholding_rate("withholding_rate", withholding_rate)
 
 
-def _prepare_markets(markets, dividends, borrow_rate_annual, runner_mod):
+def _one_accounting(name, prepared, *, price_basis, cash_rate_annual, financing_rate_annual, withholding_rate):
+    """One accounting record for the batch, or None when nothing was prepared.
+
+    Every prepared market must resolve to the same record. A raw series and a
+    total-return series in one leaderboard is a mix, and so is one market
+    with dividends beside one without.
+    """
+    if not prepared:
+        return None
+    kinds = {normalize_series_kind(market.series_kind) for market in prepared}
+    if len(kinds) > 1:
+        raise ValueError(
+            "refusing a batch that mixes raw and total-return series. Compare those runs separately."
+        )
+    dividend_flags = {bool(market.dividends) for market in prepared}
+    if len(dividend_flags) > 1:
+        raise ValueError(
+            "refusing a batch that mixes markets with and without dividends. Compare those runs separately."
+        )
+    accounting = None
+    for market in prepared:
+        resolved = resolve_accounting(
+            name,
+            price_basis=price_basis,
+            series_kind=market.series_kind,
+            cash_rate_annual=cash_rate_annual,
+            financing_rate_annual=financing_rate_annual,
+            withholding_rate=withholding_rate,
+            dividends=market.dividends,
+        )
+        if accounting is None:
+            accounting = resolved
+        elif resolved.identity() != accounting.identity():
+            raise ValueError(
+                "refusing a batch that mixes price basis, series kind, or cash and financing settings. "
+                "Compare those runs separately."
+            )
+    return accounting
+
+
+def _prepare_markets(markets, dividends, borrow_rate_annual, runner_mod, *, price_basis, registry_path):
     prepared = []
     failures = []
     for market in markets:
         try:
-            prepared.append(_prepare_one(market, dividends, borrow_rate_annual, runner_mod))
+            prepared.append(
+                _prepare_one(
+                    market,
+                    dividends,
+                    borrow_rate_annual,
+                    runner_mod,
+                    price_basis=price_basis,
+                    registry_path=registry_path,
+                )
+            )
         except Exception as exc:
             if isinstance(market, PackMarket):
                 source_id = market.source_id or _path_source_id(market.pack_dir)
@@ -542,7 +644,7 @@ def _prepare_markets(markets, dividends, borrow_rate_annual, runner_mod):
     return prepared, failures
 
 
-def _prepare_one(market, dividends, borrow_rate_annual, runner_mod) -> _Prepared:
+def _prepare_one(market, dividends, borrow_rate_annual, runner_mod, *, price_basis, registry_path) -> _Prepared:
     if isinstance(market, FrameMarket):
         source_id = _safe_component(market.source_id)
         return _Prepared(
@@ -556,16 +658,16 @@ def _prepare_one(market, dividends, borrow_rate_annual, runner_mod) -> _Prepared
             borrow_rate_annual=borrow_rate_annual,
             pack_id=None,
             inspection=None,
+            series_kind=normalize_series_kind(market.series_kind),
         )
     if isinstance(market, NamedMarket):
-        from .data import load_named
-
-        loaded = load_named(market.src, market.symbol, bar_minutes=market.bar_minutes)
-        if not loaded.inspection.runnable:
-            raise ValueError(
-                f"{market.symbol} is {loaded.inspection.price_adjustment} and is not runnable. "
-                "This phase executes raw prices only."
-            )
+        loaded, series_kind = runner_mod.load_run_series(
+            market.src,
+            market.symbol,
+            bar_minutes=market.bar_minutes,
+            price_basis=price_basis,
+            registry_path=registry_path,
+        )
         factor = loaded.inspection.share_factor
         if factor != 1.0:
             raise ValueError(
@@ -584,13 +686,20 @@ def _prepare_one(market, dividends, borrow_rate_annual, runner_mod) -> _Prepared
             borrow_rate_annual=borrow_rate_annual,
             pack_id=None,
             inspection=loaded.inspection.as_dict(),
+            series_kind=series_kind,
         )
     if isinstance(market, PackMarket):
-        return _prepare_pack(market, dividends, borrow_rate_annual, runner_mod)
+        return _prepare_pack(
+            market,
+            dividends,
+            borrow_rate_annual,
+            runner_mod,
+            price_basis=price_basis,
+        )
     raise TypeError(f"unknown market {type(market).__name__}")
 
 
-def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod) -> _Prepared:
+def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod, *, price_basis) -> _Prepared:
     from .pack import load_pack, load_sidecar
 
     loaded = load_pack(market.pack_dir)
@@ -613,6 +722,11 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod)
         if borrow is None and secret["borrow_rate_source"] == "explicit":
             borrow = float(secret["borrow_rate_annual"])
         pack_id = str(loaded.pack_id)
+        series_kind = str(loaded.manifest["price_basis"])
+        if series_kind == "total_return" and price_basis != "total_return":
+            raise ValueError(
+                f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
+            )
         if anonymized:
             source_id = f"pack_{pack_id[:12]}"
         else:
@@ -633,6 +747,7 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod)
         borrow_rate_annual=borrow,
         pack_id=pack_id,
         inspection=None,
+        series_kind=series_kind,
     )
 
 

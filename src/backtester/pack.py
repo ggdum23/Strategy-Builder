@@ -72,6 +72,7 @@ _SIDECAR_KEYS = {
     "source_glob",
     "bar_minutes",
     "operator_note",
+    "price_basis",
 }
 _MANIFEST_KEYS = {
     "schema_version",
@@ -83,6 +84,7 @@ _MANIFEST_KEYS = {
     "chunks",
     "daily_file",
     "n_sessions",
+    "price_basis",
 }
 _CHUNK_KEYS = {"file", "first_day", "last_day", "sessions"}
 _DATE_RE = re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b")
@@ -186,6 +188,8 @@ def validate_sidecar(document: dict) -> None:
             _fail("date_map", "keys and values must be strings")
         if _DATE_RE.fullmatch(value) is None:
             _fail("date_map", f"{value!r} is not a calendar date")
+    if document.get("price_basis") not in {"raw", "total_return"}:
+        _fail("price_basis", "expected raw or total_return")
     if document["borrow_rate_source"] not in {"profile_default", "explicit", "unregistered"}:
         _fail("borrow_rate_source", "unknown source")
     borrow = document["borrow_rate_annual"]
@@ -243,7 +247,7 @@ def _json_values_have_ticker(value, symbol: str) -> bool:
     if isinstance(value, list):
         return any(_json_values_have_ticker(item, symbol) for item in value)
     if isinstance(value, str):
-        if value in PACK_COLUMNS:
+        if value in PACK_COLUMNS or value in {"raw", "total_return"}:
             return False
         return _token_present(symbol, value)
     return False
@@ -616,6 +620,7 @@ def build_pack(
             ],
             "daily_file": daily_name,
             "n_sessions": int(frame["day"].nunique()),
+            "price_basis": loaded.inspection.price_adjustment,
         }
         (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         if anonymize:
@@ -636,6 +641,7 @@ def build_pack(
             "source_glob": loaded.inspection.source_glob,
             "bar_minutes": int(bar_minutes),
             "operator_note": operator_note,
+            "price_basis": loaded.inspection.price_adjustment,
         }
         validate_sidecar(sidecar_document)
         sidecar.parent.mkdir(parents=True, exist_ok=True)
@@ -686,6 +692,8 @@ def _validate_manifest(document: dict) -> None:
         raise ValueError(f"pack manifest fields are wrong (missing {missing}, unknown {extra})")
     if document["schema_version"] != SCHEMA_VERSION:
         raise ValueError(f"pack schema_version {document['schema_version']!r} is not supported")
+    if document.get("price_basis") not in {"raw", "total_return"}:
+        raise ValueError("pack price_basis must be raw or total_return")
     if not isinstance(document["anonymized"], bool):
         raise ValueError("pack anonymized flag is not true or false")
     if document["anonymized"] and document["asset_name"] != TICKER_STAND_IN:

@@ -42,3 +42,9 @@ python -m backtester registry show --registry registry.json --ticker SYM
 `--splits 2020-08-31:4` or `--splits none`. Declared splits are stored and not applied.
 
 `--phase-map morning=pre,core=rth` renames labels. Two labels may not share a phase.
+
+## Total-return series
+
+`price_adjustment: total_return` is still stored with `runnable: false`. A pack of that series is refused, and a raw run is refused, with the same "not runnable" error as before. Prices are not rewritten.
+
+`python -m backtester run --price-basis total_return --registry registry.json` is the opt-in. It runs the series when the split list is empty. The run records `total_return_method: registry_series`. A dividends file on that run is an error. Cash dividends on a raw series are the other total-return method and do not require the registry. See `README.md`.
