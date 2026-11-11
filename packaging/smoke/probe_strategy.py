@@ -17,7 +17,10 @@ def _os_command_line() -> str:
     if sys.platform == "win32":
         import ctypes
 
-        return str(ctypes.windll.kernel32.GetCommandLineW())
+        # The default restype is a pointer-sized integer, which is the address
+        # of the command line rather than the text.
+        ctypes.windll.kernel32.GetCommandLineW.restype = ctypes.c_wchar_p
+        return ctypes.windll.kernel32.GetCommandLineW() or ""
     proc = Path("/proc/self/cmdline")
     if proc.is_file():
         parts = proc.read_bytes().split(b"\0")

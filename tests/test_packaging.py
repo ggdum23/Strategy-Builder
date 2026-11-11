@@ -127,6 +127,9 @@ def test_workflow_builds_installs_smokes_and_publishes():
     assert "walkforward" in smoke
     assert "multiprocessing-fork" in smoke
     assert "backtester-design" in smoke
+    probe = (PACKAGING / "smoke" / "probe_strategy.py").read_text(encoding="utf-8")
+    assert "GetCommandLineW.restype" in probe
+    assert "c_wchar_p" in probe
 
 
 def test_spec_is_one_folder_and_collects_optional_gui_stack():

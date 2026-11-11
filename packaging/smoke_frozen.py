@@ -206,7 +206,10 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
                 raise SystemExit("MARKET_DATA_ROOT leaked into the child")
             command = str(payload.get("os_command_line") or "")
             if "multiprocessing-fork" not in command:
-                raise SystemExit(f"child was not a spawn worker: {command}")
+                raise SystemExit(
+                    "child was not a spawn worker: "
+                    f"{command!r} argv={payload.get('argv')} exe={payload.get('executable')}"
+                )
             if "--src" in command or src_text in command:
                 raise SystemExit(f"child command line still carries the data path: {command}")
             if not str(payload.get("cwd_name") or "").startswith("bt-book-"):
