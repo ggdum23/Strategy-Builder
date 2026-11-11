@@ -115,7 +115,9 @@ def assert_child_surface(payload: dict) -> None:
     extra = sorted({name for name in keys if name not in _ENV_KEEP and not name.startswith("LC_")})
     if extra:
         raise SystemExit(f"child environment is outside the allowlist: {extra}")
-    entries = payload.get("cwd_entries") or []
+    if "cwd_entries" not in payload or not isinstance(payload.get("cwd_entries"), list):
+        raise SystemExit(f"child cwd entries are not a list: {payload.get('cwd_entries')!r}")
+    entries = payload["cwd_entries"]
     unexpected = [name for name in entries if name != "stdio.log"]
     if unexpected:
         raise SystemExit(f"child cwd was not empty: {entries}")

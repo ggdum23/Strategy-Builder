@@ -12,6 +12,7 @@ engine so per-share fees use real share counts. The pack files do not contain it
 
 from __future__ import annotations
 
+import csv
 import gzip
 import hashlib
 import io
@@ -29,6 +30,7 @@ import pandas as pd
 
 from .data import load_named
 from .registry import get_series, load_registry, same_series
+from .report import ticker_token_spans
 
 SCHEMA_VERSION = 1
 CHUNK_SESSIONS = 250
@@ -226,13 +228,52 @@ def _read_csv_gz(path: Path) -> pd.DataFrame:
 
 
 def _token_present(symbol: str, text: str) -> bool:
-    if len(symbol) >= 2:
-        return symbol in text
-    return re.search(rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])", text) is not None
+    """The report token rule. A raw substring would treat ``SS`` as present in ``ASSET``."""
+    return bool(ticker_token_spans(text, symbol))
 
 
-def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, bool, int]:
-    """mtime, file name, FCOMMENT, FEXTRA, and the deflate offset.
+def _json_values_have_ticker(value, symbol: str) -> bool:
+    """String values only. Keys and pack column names are schema labels.
+
+    The manifest stores ``session_id`` in ``columns``. That label is not the
+    ticker ``ID``, which is the same exemption the report audit gives a CSV
+    header. Any other string still uses the token rule.
+    """
+    if isinstance(value, dict):
+        return any(_json_values_have_ticker(item, symbol) for item in value.values())
+    if isinstance(value, list):
+        return any(_json_values_have_ticker(item, symbol) for item in value)
+    if isinstance(value, str):
+        if value in PACK_COLUMNS:
+            return False
+        return _token_present(symbol, value)
+    return False
+
+
+def _text_has_ticker(name: str, text: str, symbol: str) -> bool:
+    """Apply the token rule the way the report audit does.
+
+    CSV headers and JSON keys are not tickers, so ``session_id`` is not the
+    symbol ``ID``. Every other string is.
+    """
+    lower = name.lower()
+    if lower.endswith(".json"):
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError:
+            return _token_present(symbol, text)
+        return _json_values_have_ticker(document, symbol)
+    if ".csv" in lower:
+        rows = list(csv.reader(io.StringIO(text)))
+        for row in rows[1:]:
+            if any(_token_present(symbol, cell) for cell in row):
+                return True
+        return False
+    return _token_present(symbol, text)
+
+
+def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, bool, bool, int]:
+    """mtime, file name, FCOMMENT, FEXTRA, FHCRC, and the deflate offset.
 
     RFC 1952 order after the 10-byte header is FEXTRA, FNAME, FCOMMENT, FHCRC.
     ``blob`` is one member, or a member followed by further members. Only the
@@ -244,6 +285,7 @@ def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, bool, int]:
     flags = blob[3]
     mtime = int.from_bytes(blob[4:8], "little")
     has_extra = bool(flags & 0x04)
+    has_hcrc = bool(flags & 0x02)
     pos = 10
     if flags & 0x04:
         if pos + 2 > len(blob):
@@ -269,7 +311,7 @@ def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, bool, int]:
         pos += 2
     if pos > len(blob):
         raise ValueError("gzip member is truncated")
-    return mtime, fname, has_comment, has_extra, pos
+    return mtime, fname, has_comment, has_extra, has_hcrc, pos
 
 
 def _gzip_members(blob: bytes):
@@ -285,7 +327,7 @@ def _gzip_members(blob: bytes):
         rest = rest.lstrip(b"\x00")
         if not rest:
             return
-        mtime, fname, has_comment, has_extra, start = _gzip_member(rest)
+        mtime, fname, has_comment, has_extra, has_hcrc, start = _gzip_member(rest)
         inflator = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
         payload = inflator.decompress(rest[start:])
         unused = inflator.unused_data
@@ -294,7 +336,7 @@ def _gzip_members(blob: bytes):
         crc, length = struct.unpack("<II", unused[:8])
         if crc != zlib.crc32(payload) or length != (len(payload) & 0xFFFFFFFF):
             raise ValueError("gzip member failed its checksum")
-        yield (mtime, fname, has_comment, has_extra), payload
+        yield (mtime, fname, has_comment, has_extra, has_hcrc), payload
         rest = unused[8:]
 
 
@@ -307,7 +349,7 @@ def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
     builder writes a single member.
     """
     payloads = []
-    for (mtime, fname, has_comment, has_extra), payload in _gzip_members(blob):
+    for (mtime, fname, has_comment, has_extra, has_hcrc), payload in _gzip_members(blob):
         if mtime != 0:
             raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
         if fname:
@@ -317,6 +359,8 @@ def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
             raise ValueError(f"{name} gzip member has an FCOMMENT")
         if has_extra:
             raise ValueError(f"{name} gzip member has an FEXTRA")
+        if has_hcrc:
+            raise ValueError(f"{name} gzip member has an FHCRC")
         payloads.append(payload)
     if not payloads:
         raise ValueError(f"{name} gzip member is not gzip")
@@ -349,7 +393,7 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
                 text = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError(f"{name} is not text; refusing to ship it") from exc
-        if _token_present(symbol, text):
+        if _text_has_ticker(name, text, symbol):
             raise ValueError(f"{name} contains the ticker")
         for key in _BANNED_TEXT:
             if key in text:
@@ -665,8 +709,8 @@ def _validate_manifest(document: dict) -> None:
 def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
     """The same gzip rules as the designer-pack audit.
 
-    One member, mtime 0, no file name, no comment, and no FEXTRA. A second
-    member is rejected here as well, including one whose header is clean.
+    One member, mtime 0, no file name, no comment, no FEXTRA, and no FHCRC.
+    A second member is rejected here as well, including one whose header is clean.
     ``load_pack`` repeats the check so a pack that bypassed the builder still
     fails closed.
     """

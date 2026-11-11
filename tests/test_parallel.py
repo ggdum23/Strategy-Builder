@@ -1462,7 +1462,12 @@ def test_mixed_zzzx_and_cost_batch_registers_both(tmp_path):
 _REAL_COPYTREE = shutil.copytree
 
 
-def _plant_cost_note(src, dst, *args, **kwargs):
+def _plant_ticker_file(src, dst, *args, **kwargs):
+    """Drop a ticker-named file beside the copied job, not inside it.
+
+    The per-job audit looks at the copied directory. A sibling is only visible
+    to the whole-tree audit. That failure must not blank the other strategies.
+    """
     _REAL_COPYTREE(src, dst, *args, **kwargs)
     metrics = Path(dst) / "metrics.json"
     if not metrics.is_file():
@@ -1471,12 +1476,23 @@ def _plant_cost_note(src, dst, *args, **kwargs):
     strategy = (document.get("run") or {}).get("strategy_id") or document.get("strategy_id")
     if strategy != "leaky":
         return
-    document["note"] = "COST"
-    metrics.write_text(json.dumps(document), encoding="utf-8")
+    (Path(dst).parent / "COST.json").write_text("{}\n", encoding="utf-8")
+
+
+def _plant_v_json(src, dst, *args, **kwargs):
+    _REAL_COPYTREE(src, dst, *args, **kwargs)
+    metrics = Path(dst) / "metrics.json"
+    if not metrics.is_file():
+        return
+    document = json.loads(metrics.read_text(encoding="utf-8"))
+    strategy = (document.get("run") or {}).get("strategy_id") or document.get("strategy_id")
+    if strategy != "leaky":
+        return
+    (Path(dst) / "V.json").write_text("{}\n", encoding="utf-8")
 
 
 def test_a_ticker_in_a_value_fails_only_that_row(tmp_path, monkeypatch):
-    monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_cost_note)
+    monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_ticker_file)
     pack, sidecar, _built = _anon_pack(tmp_path, "COST", name="cost")
     index = tmp_path / "runs.json"
     out = tmp_path / "out"
@@ -1507,13 +1523,16 @@ def test_a_ticker_in_a_value_fails_only_that_row(tmp_path, monkeypatch):
         if path.is_file() and path.suffix.lower() != ".png":
             blob.append(path.read_text(encoding="utf-8"))
     assert "COST" not in "\n".join(blob)
+    assert (out / "designer" / "flat").is_dir()
+    assert any((out / "designer" / "flat").rglob("metrics.json"))
+    assert not (out / "designer" / "error.json").is_file()
     assert_designer_clean(out / "designer", symbol="COST")
 
 
 def test_parallel_cli_exits_without_a_traceback_when_one_row_fails(tmp_path, monkeypatch, capsys):
     from backtester.__main__ import main
 
-    monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_cost_note)
+    monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_ticker_file)
     monkeypatch.chdir(tmp_path)
     pack, sidecar, _built = _anon_pack(tmp_path, "COST", name="cost")
     strategies = tmp_path / "strategies"
@@ -1549,3 +1568,248 @@ def test_parallel_cli_exits_without_a_traceback_when_one_row_fails(tmp_path, mon
     assert {job["status"] for job in info["jobs"]} == {"ok", "error"}
     index = json.loads((tmp_path / ".backtester-runs.json").read_text(encoding="utf-8"))
     assert info["id"] in index["runs"]
+
+
+# The names in README.md. PROGRAM.md and PLAN.md are not in this repo.
+_REQUIRED_SYMBOLS = (
+    "AAPL",
+    "ABBV",
+    "AMD",
+    "BRK.B",
+    "CVX",
+    "GOOG",
+    "GOOGL",
+    "INTC",
+    "JNJ",
+    "JPM",
+    "LLY",
+    "MA",
+    "META",
+    "MSFT",
+    "MU",
+    "NVDA",
+    "PLTR",
+    "QQQ",
+    "SPY",
+    "TSLA",
+    "V",
+    "WMT",
+    "XOM",
+)
+
+
+def _designer_text(designer: Path) -> str:
+    parts = []
+    for path in designer.rglob("*"):
+        parts.append(path.name)
+        if path.is_file() and path.suffix.lower() != ".png":
+            parts.append(path.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
+@pytest.mark.parametrize("symbol", _REQUIRED_SYMBOLS + ("SS", "FI", "AS", "ET"))
+def test_each_required_symbol_publishes_an_embedded_id(tmp_path, symbol):
+    from backtester.report import read_leaderboard, ticker_token_spans
+
+    pack, sidecar, _built = _anon_pack(tmp_path, symbol, name="pack", price_factor=1.2)
+    strategy_id = f"my_{symbol}_v2"
+    index = tmp_path / "runs.json"
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "flat", FLAT),
+            _strategy(tmp_path / "strategies", strategy_id, FLAT),
+        ],
+        [PackMarket(str(pack), str(sidecar))],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+        index_path=index,
+    )
+    assert result.failures == 0, (symbol, [(item.strategy_id, item.status, item.error) for item in result.results])
+    _registered(index, result.run_id, out)
+    designer = out / "designer"
+    board = read_leaderboard(designer / "leaderboard.csv")
+    assert {row["status"] for row in board} == {"ok"}
+    assert {row["strategy_id"] for row in board} == {"flat", "my_ASSET_v2"}
+    assert (designer / "my_ASSET_v2").is_dir()
+    assert not (designer / strategy_id).exists()
+    assert ticker_token_spans(_designer_text(designer), symbol) == []
+    assert_designer_clean(designer, symbol=symbol)
+    assert (out / "jobs" / strategy_id).is_dir()
+
+
+@pytest.mark.parametrize(
+    ("symbol", "strategy_id"),
+    [("SS", "my_ß_v2"), ("FI", "my_ﬁ_v2")],
+)
+def test_casefold_embedded_ids_publish(tmp_path, symbol, strategy_id):
+    from backtester.report import read_leaderboard
+
+    pack, sidecar, _built = _anon_pack(tmp_path, symbol, name="pack", price_factor=1.25)
+    index = tmp_path / "runs.json"
+    out = tmp_path / "out"
+    result = run_parallel(
+        [_strategy(tmp_path / "strategies", strategy_id, FLAT)],
+        [PackMarket(str(pack), str(sidecar))],
+        out,
+        profile="arena",
+        workers=1,
+        timeout_s=60,
+        with_benchmarks=False,
+        index_path=index,
+    )
+    assert result.failures == 0, (symbol, result.results[0].error)
+    _registered(index, result.run_id, out)
+    designer = out / "designer"
+    board = (designer / "leaderboard.csv").read_text(encoding="utf-8")
+    assert "my_ASSET_v2" in board
+    assert strategy_id not in board
+    assert all(strategy_id not in path.name for path in designer.rglob("*"))
+    assert_designer_clean(designer, symbol=symbol)
+    rows = read_leaderboard(designer / "leaderboard.csv")
+    assert rows[0]["status"] == "ok"
+    assert rows[0]["strategy_id"] == "my_ASSET_v2"
+
+
+def test_one_embedded_id_does_not_fail_the_mixed_batch(tmp_path):
+    from backtester.report import read_leaderboard
+
+    zzzx_pack, zzzx_side, _built = _anon_pack(tmp_path, "ZZZX", name="zzzx", price_factor=1.1)
+    cost_pack, cost_side, _built = _anon_pack(tmp_path, "COST", name="cost", price_factor=1.3)
+    index = tmp_path / "runs.json"
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "flat", FLAT),
+            _strategy(tmp_path / "strategies", "my_COST_v2", FLAT),
+        ],
+        [
+            PackMarket(str(zzzx_pack), str(zzzx_side)),
+            PackMarket(str(cost_pack), str(cost_side)),
+        ],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+        index_path=index,
+    )
+    assert result.failures == 0, [(item.strategy_id, item.source_id, item.status, item.error) for item in result.results]
+    _registered(index, result.run_id, out)
+    info = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert len(info["jobs"]) == 4
+    assert {job["status"] for job in info["jobs"]} == {"ok"}
+    designer = out / "designer"
+    board = read_leaderboard(designer / "leaderboard.csv")
+    assert len(board) == 4
+    assert {row["status"] for row in board} == {"ok"}
+    assert {row["strategy_id"] for row in board} == {"flat", "my_ASSET_v2"}
+    assert (designer / "flat").is_dir()
+    assert (designer / "my_ASSET_v2").is_dir()
+    assert not (designer / "my_COST_v2").exists()
+    assert any((designer / "flat").rglob("metrics.json"))
+    assert any((designer / "my_ASSET_v2").rglob("metrics.json"))
+    text = _designer_text(designer)
+    assert "my_COST_v2" not in text
+    assert "zzzx" not in text.casefold()
+    assert_designer_clean(designer, symbol="COST")
+    assert_designer_clean(designer, symbol="ZZZX")
+
+
+def test_an_id_carrying_both_batch_tickers_is_scrubbed(tmp_path):
+    """One row's symbol is not enough: COST and ZZZX are both in the id."""
+    from backtester.report import read_leaderboard
+
+    zzzx_pack, zzzx_side, _built = _anon_pack(tmp_path, "ZZZX", name="zzzx", price_factor=1.15)
+    cost_pack, cost_side, _built = _anon_pack(tmp_path, "COST", name="cost", price_factor=1.35)
+    out = tmp_path / "out"
+    result = run_parallel(
+        [_strategy(tmp_path / "strategies", "my_COST_ZZZX_v2", FLAT)],
+        [
+            PackMarket(str(zzzx_pack), str(zzzx_side)),
+            PackMarket(str(cost_pack), str(cost_side)),
+        ],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+    )
+    assert result.failures == 0, [(item.source_id, item.status, item.error) for item in result.results]
+    designer = out / "designer"
+    board = read_leaderboard(designer / "leaderboard.csv")
+    assert {row["strategy_id"] for row in board} == {"my_ASSET_ASSET_v2"}
+    assert {row["status"] for row in board} == {"ok"}
+    assert (designer / "my_ASSET_ASSET_v2").is_dir()
+    assert_designer_clean(designer, symbol="COST")
+    assert_designer_clean(designer, symbol="ZZZX")
+
+
+def test_colliding_tickers_keep_distinct_designer_ids(tmp_path):
+    from backtester.report import read_leaderboard
+
+    zzzx_pack, zzzx_side, _built = _anon_pack(tmp_path, "ZZZX", name="zzzx", price_factor=1.1)
+    cost_pack, cost_side, _built = _anon_pack(tmp_path, "COST", name="cost", price_factor=1.4)
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "COST", FLAT),
+            _strategy(tmp_path / "strategies", "ZZZX", FLAT),
+        ],
+        [
+            PackMarket(str(zzzx_pack), str(zzzx_side)),
+            PackMarket(str(cost_pack), str(cost_side)),
+        ],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+    )
+    assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
+    designer = out / "designer"
+    folders = sorted(path.name for path in designer.iterdir() if path.is_dir())
+    assert folders == ["ASSET", "ASSET-2"]
+    board = read_leaderboard(designer / "leaderboard.csv")
+    assert len(board) == 4
+    assert {row["strategy_id"] for row in board} == {"ASSET", "ASSET-2"}
+    assert {row["status"] for row in board} == {"ok"}
+    assert_designer_clean(designer, symbol="COST")
+    assert_designer_clean(designer, symbol="ZZZX")
+    assert (out / "jobs" / "COST").is_dir()
+    assert (out / "jobs" / "ZZZX").is_dir()
+
+
+def test_a_file_named_v_json_fails_only_that_job(tmp_path, monkeypatch):
+    monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_v_json)
+    pack, sidecar, _built = _anon_pack(tmp_path, "V", name="v", price_factor=1.2)
+    index = tmp_path / "runs.json"
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "flat", FLAT),
+            _strategy(tmp_path / "strategies", "leaky", FLAT),
+        ],
+        [PackMarket(str(pack), str(sidecar))],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+        index_path=index,
+    )
+    by_id = {item.strategy_id: item for item in result.results}
+    assert by_id["flat"].status == "ok", by_id["flat"].error
+    assert by_id["leaky"].status == "error"
+    assert "ticker" in (by_id["leaky"].error or "")
+    assert result.failures == 1
+    _registered(index, result.run_id, out)
+    designer = out / "designer"
+    assert (designer / "flat").is_dir()
+    assert any((designer / "flat").rglob("metrics.json"))
+    assert not (designer / "error.json").is_file()
+    assert all(path.name != "V.json" for path in designer.rglob("*"))
+    assert_designer_clean(designer, symbol="V")

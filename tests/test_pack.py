@@ -249,6 +249,15 @@ def _recompress(payload: bytes, *, mtime: int = 0, filename: str = "") -> bytes:
     return buffer.getvalue()
 
 
+def _with_fhcrc(blob: bytes, crc: bytes = b"MA") -> bytes:
+    if blob[3] & 0x02:
+        raise AssertionError("test gzip header already has FHCRC")
+    if len(crc) != 2:
+        raise AssertionError("FHCRC is two bytes")
+    flagged = blob[:3] + bytes([blob[3] | 0x02]) + blob[4:10]
+    return flagged + crc + blob[10:]
+
+
 def _with_extra(blob: bytes, extra: bytes) -> bytes:
     if blob[3] & 0x1C:
         raise AssertionError("test gzip header already has optional fields")
@@ -316,6 +325,42 @@ def test_gzip_audit_checks_every_member(tmp_path):
         assert_anonymized_pack_clean(pack, symbol="NIK")
     target.write_bytes(original)
     assert_anonymized_pack_clean(pack, symbol="NIK")
+
+
+def test_load_pack_rejects_an_anonymized_gzip_fhcrc(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    target.write_bytes(_with_fhcrc(original, b"MA"))
+    _rewrite_pack_id(pack)
+    with pytest.raises(ValueError, match="FHCRC") as caught:
+        load_pack(pack)
+    assert "pack_id" not in str(caught.value)
+    with pytest.raises(ValueError, match="FHCRC") as caught:
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    assert "pack_id" not in str(caught.value)
+    target.write_bytes(original)
+    _rewrite_pack_id(pack)
+    load_pack(pack)
+
+
+def test_pack_scan_does_not_treat_asset_substrings_as_tickers(tmp_path):
+    for symbol in ("SS", "AS", "ET", "ASS", "ID"):
+        src, registry = _series(tmp_path / symbol, 1, symbol=symbol)
+        pack = tmp_path / symbol / "pack"
+        build_pack(
+            src, symbol, pack, tmp_path / symbol / "side.json",
+            anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+        )
+        assert_anonymized_pack_clean(pack, symbol=symbol)
+        (pack / "note.txt").write_text(f"my_{symbol}_v2\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="ticker"):
+            assert_anonymized_pack_clean(pack, symbol=symbol)
 
 
 def test_load_pack_rejects_an_anonymized_gzip_extra_field(tmp_path):

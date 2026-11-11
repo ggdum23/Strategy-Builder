@@ -329,14 +329,83 @@ def _plot_equity(path: Path, profile: str, result: dict) -> None:
         plt.close(fig)
 
 
-def _ticker_pattern(symbol: str) -> str:
-    """A ticker as its own token, including inside ``my_zzzx_v2``.
+def _casefold_index(text: str) -> tuple[str, list[int]]:
+    """Casefold ``text`` and remember which original character each fold came from."""
+    folded: list[str] = []
+    origins: list[int] = []
+    for index, char in enumerate(text):
+        piece = char.casefold()
+        folded.append(piece)
+        origins.extend([index] * len(piece))
+    return "".join(folded), origins
 
-    Underscore is a separator. ``\\b`` would treat it as a word character and
-    miss that embedding. Callers pass ``re.IGNORECASE`` so ``zzzx`` matches
-    a symbol stored as ``ZZZX``.
+
+def ticker_token_spans(text: str, symbol: str) -> list[tuple[int, int]]:
+    """Original spans where ``symbol`` is its own token in ``text``.
+
+    Matching uses ``str.casefold`` on both sides, then maps the hit back onto
+    ``text``. A one-character symbol uses the same non-alphanumeric boundary
+    as a longer one, so ``V`` matches ``my_V_v2`` and does not match ``avg``
+    or ``equity``. ``ß`` matches ``SS`` and ``ﬁ`` matches ``FI``. A character
+    is a boundary when it is not alphanumeric, which is the same rule as
+    ``[A-Za-z0-9]`` for ASCII. This is the only token match. Report scrubbing,
+    the designer audit, and the pack scan all call it.
     """
-    return rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])"
+    if not text or not symbol:
+        return []
+    needle = symbol.casefold()
+    if not needle:
+        return []
+    folded, origins = _casefold_index(text)
+    spans: list[tuple[int, int]] = []
+    start = 0
+    limit = len(folded)
+    size = len(needle)
+    while start <= limit - size:
+        found = folded.find(needle, start)
+        if found < 0:
+            break
+        end = found + size
+        before = found == 0 or not folded[found - 1].isalnum()
+        after = end == limit or not folded[end].isalnum()
+        if not before or not after:
+            start = found + 1
+            continue
+        orig_start = origins[found]
+        orig_end = origins[end - 1] + 1
+        if orig_end > orig_start and (not spans or orig_start >= spans[-1][1]):
+            spans.append((orig_start, orig_end))
+        start = end
+    return spans
+
+
+def _replace_token(text: str, symbol: str, replacement: str) -> str:
+    spans = ticker_token_spans(text, symbol)
+    if not spans:
+        return text
+    pieces: list[str] = []
+    last = 0
+    for start, end in spans:
+        pieces.append(text[last:start])
+        pieces.append(replacement)
+        last = end
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+def _symbol_order(symbols) -> tuple[str, ...]:
+    """Longer symbols first, so ``GOOGL`` is considered before ``GOOG``."""
+    if isinstance(symbols, str):
+        return (symbols,) if symbols else ()
+    ordered: list[str] = []
+    seen: set[str] = set()
+    ranked = sorted((symbol for symbol in symbols if symbol), key=lambda item: len(item.casefold()), reverse=True)
+    for symbol in ranked:
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        ordered.append(symbol)
+    return tuple(ordered)
 
 
 def _float_token(text: str) -> bool:
@@ -366,10 +435,20 @@ def _scrub_text(value: str, symbol: str, *, key: str = "") -> str:
     if key and _exempt_designer_value(key, value):
         return value
     text = _ISO_DATE.sub("", value)
-    if symbol and text.casefold() == symbol.casefold():
+    if not symbol:
+        return text
+    if text.strip().casefold() == symbol.casefold():
         return "ASSET"
-    if symbol and len(symbol) >= 2:
-        text = re.sub(_ticker_pattern(symbol), "ASSET", text, flags=re.IGNORECASE)
+    return _replace_token(text, symbol, "ASSET")
+
+
+def scrub_symbols(value: str, symbols, *, key: str = "") -> str:
+    """Scrub every symbol in ``symbols``. A string is one symbol, not a list of characters."""
+    text = value
+    for symbol in _symbol_order(symbols):
+        text = _scrub_text(text, symbol, key=key)
+    if not _symbol_order(symbols):
+        text = _scrub_text(text, "", key=key)
     return text
 
 
@@ -436,6 +515,87 @@ def _scrub_result(result: dict, symbol: str) -> dict:
     return out
 
 
+def scrub_designer_tree(
+    directory,
+    symbols,
+    *,
+    strategy_id: str = "",
+    folder: str = "",
+    source_id: str = "",
+    source_name: str = "",
+) -> None:
+    """Rewrite free-text values so they use the batch's scrubbed ids.
+
+    File names are left alone. A file that is still named with a ticker fails
+    the audit. ``folder`` and ``source_name`` are the disambiguated path
+    components (``ASSET``, ``ASSET-2``). A strategy id that already scrubbed
+    to the shared base is rewritten to that component, so the text matches
+    the directory.
+    """
+    root = Path(directory)
+    strategy_base = scrub_symbols(strategy_id, symbols, key="strategy_id") if strategy_id else ""
+    source_base = scrub_symbols(source_id, symbols, key="source_id") if source_id else ""
+
+    def scrub_value(key: str, value: str) -> str:
+        if key == "strategy_id" and folder and value in {strategy_id, strategy_base}:
+            return folder
+        if key == "source_id" and source_name and value in {source_id, source_base}:
+            return source_name
+        return scrub_symbols(value, symbols, key=key)
+
+    def walk(key: str, value):
+        if isinstance(value, dict):
+            return {str(child_key): walk(str(child_key), item) for child_key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(key, item) for item in value]
+        if isinstance(value, str):
+            return scrub_value(key, value)
+        return value
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix == ".png":
+            continue
+        if suffix == ".json":
+            document = json.loads(path.read_text(encoding="utf-8"))
+            rewritten = walk("", document)
+            if rewritten != document:
+                write_json(path, rewritten)
+            continue
+        if suffix == ".csv":
+            text = path.read_text(encoding="utf-8")
+            rows = list(csv.reader(io.StringIO(text)))
+            if not rows:
+                continue
+            header = rows[0]
+            changed = False
+            rewritten_rows = [header]
+            for row in rows[1:]:
+                new_row = []
+                for index, cell in enumerate(row):
+                    key = header[index] if index < len(header) else ""
+                    updated = scrub_value(key, cell)
+                    if updated != cell:
+                        changed = True
+                    new_row.append(updated)
+                rewritten_rows.append(new_row)
+            if changed:
+                buffer = io.StringIO()
+                writer = csv.writer(buffer, lineterminator="\n")
+                writer.writerows(rewritten_rows)
+                path.write_text(buffer.getvalue(), encoding="utf-8")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        updated = scrub_value("caption", text)
+        if updated != text:
+            path.write_text(updated, encoding="utf-8")
+
+
 def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
     """Why this value cannot be shown, or None when it is safe.
 
@@ -451,13 +611,13 @@ def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
             return token
     if _ISO_DATE.search(text):
         return "a calendar date"
-    if not symbol or len(symbol) < 2:
+    if not symbol:
         return None
     if _exempt_designer_value(key, text):
         return None
     if text.strip().casefold() == symbol.casefold():
         return "the ticker"
-    if key in _FREE_TEXT_KEYS and re.search(_ticker_pattern(symbol), text, flags=re.IGNORECASE):
+    if key in _FREE_TEXT_KEYS and ticker_token_spans(text, symbol):
         return "the ticker"
     return None
 
@@ -595,9 +755,11 @@ def assert_designer_clean(directory, *, symbol: str) -> None:
     JSON and CSV are parsed. The ticker pattern is not applied to schema keys
     or CSV headers, so a column such as ``borrow_cost`` is not the ticker
     ``COST``. Free-text values and file or directory names still match an
-    embedded ticker, including ``my_zzzx_v2``. A value that is exactly the
-    ticker fails, including PNG text and metadata, unless that column is
-    where the report writes the token (``ok``, ``inf``, ``true``, a float).
+    embedded ticker, including ``my_zzzx_v2`` and a one-character symbol in
+    ``my_V_v2``. The match is casefolded, so ``ß`` is ``SS``. A value that is
+    exactly the ticker fails, including PNG text and metadata, unless that
+    column is where the report writes the token (``ok``, ``inf``, ``true``,
+    a float). A file named ``V.json`` fails.
     """
     root = Path(directory)
     paths = [root, *list(root.rglob("*"))]

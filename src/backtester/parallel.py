@@ -38,6 +38,8 @@ from .report import (
     _scrub_text,
     assert_designer_clean,
     redact_metrics,
+    scrub_designer_tree,
+    scrub_symbols,
     register_run,
     write_json,
     write_leaderboard,
@@ -830,9 +832,14 @@ def _designer_error_text(item: JobResult) -> str:
     return "the strategy failed"
 
 
-def _designer_component(value: str, symbol: str, used: set) -> str:
-    """A designer path component. A case-variant of the ticker becomes ASSET."""
-    text = _scrub_text(str(value), symbol) if symbol else str(value)
+def _designer_component(value: str, symbols, used: set) -> str:
+    """A designer path component scrubbed against every symbol in the batch.
+
+    Two ids that scrub to the same text stay distinct: the second is
+    ``ASSET-2``, then ``ASSET-3``. The same strategy id always gets the same
+    component, so the caller passes one shared ``used`` set per directory.
+    """
+    text = scrub_symbols(str(value), symbols) if symbols else str(value)
     if not text or text in {".", ".."}:
         text = "ASSET"
     candidate = text
@@ -928,16 +935,22 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
     designer.mkdir(parents=True)
     mutated = False
     placed = {}
-    used_names = set()
+    # One folder per strategy id. A second id that scrubs to the same text
+    # becomes ASSET-2. Both markets of one strategy share the folder.
+    used_folders: set[str] = set()
+    folders: dict[str, str] = {}
+    used_sources: dict[str, set[str]] = {}
     for row, assignment in selected:
         item = _result_for(results, row)
         market = assignment[1]
         symbol = market.symbol if isinstance(market, _Prepared) else ""
-        # The directory suffix and the leaderboard id are the same string.
-        # Scrubbing alone turns both ZzZx and zzzx into ASSET.
-        folder = _designer_component(row["strategy_id"], symbol, used_names)
-        source_name = _designer_component(row["source_id"], symbol, set())
-        placed[(row["strategy_id"], row["source_id"])] = (folder, source_name, symbol)
+        strategy_id = row["strategy_id"]
+        if strategy_id not in folders:
+            folders[strategy_id] = _designer_component(strategy_id, unique_symbols, used_folders)
+        folder = folders[strategy_id]
+        source_used = used_sources.setdefault(folder, set())
+        source_name = _designer_component(row["source_id"], unique_symbols, source_used)
+        placed[(strategy_id, row["source_id"])] = (folder, source_name, symbol)
         source = Path(item.out_dir) / "designer"
         if not source.is_dir():
             continue
@@ -947,6 +960,14 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             shutil.rmtree(dest)
         try:
             shutil.copytree(source, dest)
+            scrub_designer_tree(
+                dest,
+                unique_symbols,
+                strategy_id=strategy_id,
+                folder=folder,
+                source_id=row["source_id"],
+                source_name=source_name,
+            )
             _audit_job_tree(dest, unique_symbols)
         except Exception as exc:
             mutated = True
@@ -960,21 +981,23 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             key = (row["strategy_id"], row["source_id"])
             if key not in placed:
                 continue
-            folder, source_name, symbol = placed[key]
+            folder, source_name, _symbol = placed[key]
             item = _result_for(results, row)
             copied = {}
             for column, value in row.items():
                 if column == "symbol":
                     continue
                 if isinstance(value, str):
-                    copied[column] = _scrub_text(value, symbol, key=column)
+                    copied[column] = scrub_symbols(value, unique_symbols, key=column)
                 else:
                     copied[column] = value
             copied["strategy_id"] = folder
             copied["source_id"] = source_name
             if row["status"] != "ok":
                 copied["status"] = "error"
-                copied["error"] = _scrub_text(_designer_error_text(item), symbol, key="error")
+                copied["error"] = scrub_symbols(
+                    _designer_error_text(item), unique_symbols, key="error"
+                )
             violation = _cell_violation(copied, unique_symbols)
             if violation:
                 mutated = True
@@ -1003,6 +1026,48 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         for symbol in unique_symbols:
             assert_designer_clean(designer, symbol=symbol)
 
+    def isolate_dirty_folders() -> None:
+        """A failure outside one job directory fails that strategy's rows only.
+
+        The published tree is not replaced by a single error file, and a clean
+        strategy keeps its directory.
+        """
+        nonlocal mutated
+        dirty: list[tuple[str, Exception]] = []
+        seen_folders: list[str] = []
+        for folder, _source_name, _symbol in placed.values():
+            if folder not in seen_folders:
+                seen_folders.append(folder)
+        for folder in seen_folders:
+            folder_path = designer / folder
+            if not folder_path.exists():
+                continue
+            try:
+                _audit_job_tree(folder_path, unique_symbols)
+            except Exception as exc:
+                dirty.append((folder, exc))
+        if not dirty:
+            return
+        mutated = True
+        for folder, exc in dirty:
+            message = _clip(f"designer audit failed: {exc}")
+            folder_path = designer / folder
+            if folder_path.exists():
+                shutil.rmtree(folder_path)
+            for row in ranked_rows:
+                key = (row["strategy_id"], row["source_id"])
+                if key not in placed or placed[key][0] != folder:
+                    continue
+                _source_folder, source_name, symbol = placed[key]
+                _fail_published_row(results, row, message)
+                _write_clean_designer_error(
+                    designer / folder / source_name,
+                    folder,
+                    source_name,
+                    row.get("profile") or "",
+                    symbol,
+                )
+
     designer_rows()
     republish_operator()
     write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
@@ -1010,39 +1075,17 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         assert_tree()
     except Exception:
         mutated = True
-        for row in ranked_rows:
-            key = (row["strategy_id"], row["source_id"])
-            if key not in placed:
-                continue
-            folder, source_name, symbol = placed[key]
-            dest = designer / folder / source_name
-            if not dest.is_dir():
-                continue
-            try:
-                _audit_job_tree(dest, unique_symbols)
-            except Exception as exc:
-                _fail_published_row(results, row, _clip(f"designer audit failed: {exc}"))
-                _write_clean_designer_error(
-                    dest, folder, source_name, row.get("profile") or "", symbol
-                )
+        isolate_dirty_folders()
         republish_operator()
         write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
         try:
             assert_tree()
-        except Exception as exc:
-            message = _clip(f"designer audit failed: {exc}")
-            for row in ranked_rows:
-                key = (row["strategy_id"], row["source_id"])
-                if key in placed and row["status"] == "ok":
-                    _fail_published_row(results, row, message)
-            if designer.exists():
-                shutil.rmtree(designer)
-            designer.mkdir(parents=True, exist_ok=True)
-            write_json(
-                designer / "error.json",
-                {"status": "error", "error": "the strategy failed", "audience": "designer"},
-            )
+        except Exception:
+            # Still do not fail the rows whose directories are clean, and do
+            # not replace the whole designer tree.
+            isolate_dirty_folders()
             republish_operator()
+            write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
 
 
 def _order_results(results, ranked_rows) -> list[JobResult]:

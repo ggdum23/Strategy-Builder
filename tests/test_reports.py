@@ -335,3 +335,28 @@ def test_load_report_types_parallel_cells(tmp_path):
     raw = read_leaderboard(tmp_path / "leaderboard.csv")
     assert raw[0]["calmar"] == "inf"
     assert raw[0]["disqualified"] == "false"
+
+
+def test_token_match_is_casefolded_and_bounded_for_one_character(tmp_path):
+    from backtester.report import _scrub_text, scrub_symbols, ticker_token_spans
+
+    assert ticker_token_spans("my_V_v2", "V") == [(3, 4)]
+    assert _scrub_text("my_V_v2", "V") == "my_ASSET_v2"
+    assert _scrub_text("avg", "V") == "avg"
+    assert _scrub_text("equity", "V") == "equity"
+    assert _scrub_text("my_ß_v2", "SS") == "my_ASSET_v2"
+    assert _scrub_text("my_ﬁ_v2", "FI") == "my_ASSET_v2"
+    assert ticker_token_spans("ASSET", "SS") == []
+    assert ticker_token_spans("ASSET", "AS") == []
+    assert ticker_token_spans("ASSET", "ET") == []
+    assert ticker_token_spans("ASSET", "ASS") == []
+    assert scrub_symbols("my_GOOGL_v2", ["GOOG", "GOOGL"]) == "my_ASSET_v2"
+    assert scrub_symbols("my_GOOG_v2", ["GOOGL", "GOOG"]) == "my_ASSET_v2"
+    root = tmp_path / "designer"
+    root.mkdir()
+    (root / "equity.csv").write_text("equity\navg\n", encoding="utf-8")
+    (root / "avg.txt").write_text("avg\n", encoding="utf-8")
+    assert_designer_clean(root, symbol="V")
+    (root / "V.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ticker"):
+        assert_designer_clean(root, symbol="V")
