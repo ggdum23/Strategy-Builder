@@ -1281,6 +1281,24 @@ def test_grandchildren_are_reaped_after_return_error_timeout_and_cancel(tmp_path
     assert cancelled.results[0].status == "cancelled"
 
 
+def test_job_directories_keep_case_variants_apart(tmp_path):
+    from backtester.parallel import _job_directories
+
+    assignments = [
+        (StrategyRef("ZzZx", "one.py"), ("pack_same",), None),
+        (StrategyRef("zzzx", "two.py"), ("pack_same",), None),
+        (StrategyRef("flat", "three.py"), ("Pack",), None),
+        (StrategyRef("flat", "three.py"), ("pack",), None),
+    ]
+    paths = _job_directories(tmp_path, assignments)
+    folded = [str(path).casefold() for path in paths.values()]
+    assert len(folded) == len(set(folded)) == 4
+    assert paths[("ZzZx", "pack_same")] == tmp_path / "jobs" / "ZzZx" / "pack_same"
+    assert paths[("zzzx", "pack_same")] == tmp_path / "jobs" / "zzzx-2" / "pack_same"
+    assert paths[("flat", "Pack")] == tmp_path / "jobs" / "flat" / "Pack"
+    assert paths[("flat", "pack")] == tmp_path / "jobs" / "flat" / "pack-2"
+
+
 def test_designer_leaderboard_keeps_distinct_ids_for_ticker_case_variants(tmp_path):
     from backtester.report import read_leaderboard
 
@@ -1298,6 +1316,11 @@ def test_designer_leaderboard_keeps_distinct_ids_for_ticker_case_variants(tmp_pa
         with_benchmarks=False,
     )
     assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
+    job_dirs = [Path(item.out_dir) for item in result.results]
+    # A case-insensitive disk would otherwise make both workers share equity.png.
+    assert len({str(path).casefold() for path in job_dirs}) == 2
+    for path in job_dirs:
+        assert (path / "designer" / "equity.png").read_bytes().startswith(b"\x89PNG")
     designer = tmp_path / "out" / "designer"
     rows = read_leaderboard(designer / "leaderboard.csv")
     ids = [row["strategy_id"] for row in rows]

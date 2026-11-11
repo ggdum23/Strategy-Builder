@@ -273,6 +273,9 @@ def run_parallel(
         else:
             frame = None
         assignments.append((ref, market, frame))
+    # Windows folds ZzZx and zzzx onto one directory. Reserve names before the
+    # workers start so two threads never write the same equity.png.
+    job_dirs = _job_directories(out, assignments)
 
     total = len(assignments)
     progress_q = queue.Queue()
@@ -309,13 +312,14 @@ def run_parallel(
     def one(assignment):
         ref, market, frame = assignment
         source_id = _pair_source(market)
+        directory = job_dirs[(ref.strategy_id, source_id)]
         if stop.cancelled():
             emit(ref.strategy_id, source_id, "cancelled", "cancelled")
-            return _job_result(ref, source_id, "cancelled", out, None, "cancelled", timeout_s)
+            return _job_result(ref, source_id, "cancelled", directory, None, "cancelled", timeout_s)
         if not isinstance(market, _Prepared):
             emit(ref.strategy_id, source_id, "error", _first_line(market[1]))
             _write_failure(
-                out / "jobs" / ref.strategy_id / source_id,
+                directory,
                 strategy_id=ref.strategy_id,
                 source_id=source_id,
                 profile=name,
@@ -326,7 +330,7 @@ def run_parallel(
                 anonymized=True,
                 symbol=market[3],
             )
-            return _job_result(ref, source_id, "error", out, None, market[1], timeout_s)
+            return _job_result(ref, source_id, "error", directory, None, market[1], timeout_s)
         emit(ref.strategy_id, source_id, "started", "")
         try:
             books = runner_mod._isolated_books(
@@ -359,7 +363,7 @@ def run_parallel(
             if market.inspection is not None:
                 extra["inspection"] = market.inspection
             payload = runner_mod.write_books(
-                out / "jobs" / ref.strategy_id / source_id,
+                directory,
                 name,
                 market.symbol,
                 market.bar_minutes,
@@ -369,7 +373,7 @@ def run_parallel(
                 extra=extra,
             )
             emit(ref.strategy_id, source_id, "ok", "")
-            return _job_result(ref, source_id, "ok", out, payload, None, timeout_s)
+            return _job_result(ref, source_id, "ok", directory, payload, None, timeout_s)
         except Exception as exc:
             status = _classify(exc)
             text = _clip(str(exc))
@@ -381,7 +385,7 @@ def run_parallel(
                     text = _clip(text + "\n" + scrubbed[:2000])
             try:
                 _write_failure(
-                    out / "jobs" / ref.strategy_id / source_id,
+                    directory,
                     strategy_id=ref.strategy_id,
                     source_id=source_id,
                     profile=name,
@@ -396,7 +400,7 @@ def run_parallel(
                 status = "error"
                 text = _clip(text + "\n" + str(write_exc))
             emit(ref.strategy_id, source_id, status, _first_line(text))
-            return _job_result(ref, source_id, status, out, None, text, timeout_s)
+            return _job_result(ref, source_id, status, directory, None, text, timeout_s)
 
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bt-parallel")
     futures = []
@@ -426,13 +430,14 @@ def run_parallel(
             continue
         ref, market, _frame = assignment
         source_id = _pair_source(market)
+        directory = job_dirs[(ref.strategy_id, source_id)]
         if fut.cancelled() or not fut.done():
-            results.append(_job_result(ref, source_id, "cancelled", out, None, "cancelled", timeout_s))
+            results.append(_job_result(ref, source_id, "cancelled", directory, None, "cancelled", timeout_s))
             continue
         try:
             results.append(fut.result())
         except Exception as exc:
-            results.append(_job_result(ref, source_id, "error", out, None, _clip(str(exc)), timeout_s))
+            results.append(_job_result(ref, source_id, "error", directory, None, _clip(str(exc)), timeout_s))
 
     ranked_rows = _rank_rows(results, assignments, name, timeout_s)
     for index, row in enumerate(ranked_rows, start=1):
@@ -647,6 +652,40 @@ def _safe_component(value: str) -> str:
     return text
 
 
+def _reserve_case_component(value: str, used: set[str]) -> str:
+    """A directory name that stays distinct when the disk ignores case.
+
+    ``used`` holds casefolded names already reserved. ``ZzZx`` and ``zzzx``
+    would be one folder on Windows, so the second becomes ``zzzx-2``.
+    """
+    text = _safe_component(value)
+    candidate = text
+    suffix = 2
+    while candidate.casefold() in used:
+        candidate = f"{text}-{suffix}"
+        suffix += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
+def _job_directories(out: Path, assignments) -> dict[tuple[str, str], Path]:
+    """One real directory per job, including ids that differ only by case."""
+    strategy_names: dict[str, str] = {}
+    used_strategies: set[str] = set()
+    used_sources: dict[str, set[str]] = {}
+    paths: dict[tuple[str, str], Path] = {}
+    for ref, market, _frame in assignments:
+        strategy_id = ref.strategy_id
+        if strategy_id not in strategy_names:
+            strategy_names[strategy_id] = _reserve_case_component(strategy_id, used_strategies)
+        folder = strategy_names[strategy_id]
+        source_id = _pair_source(market)
+        sources = used_sources.setdefault(folder, set())
+        source_name = _reserve_case_component(source_id, sources)
+        paths[(strategy_id, source_id)] = out / "jobs" / folder / source_name
+    return paths
+
+
 def _classify(exc: BaseException) -> str:
     text = str(exc)
     if "walk-forward worker cancelled" in text:
@@ -740,7 +779,7 @@ def _snapshot(payload) -> dict | None:
     return snap
 
 
-def _job_result(ref, source_id, status, out, payload, error, timeout_s) -> JobResult:
+def _job_result(ref, source_id, status, directory, payload, error, timeout_s) -> JobResult:
     snap = _snapshot(payload)
     total = None if snap is None else snap.get("total_return")
     excess = None
@@ -750,7 +789,7 @@ def _job_result(ref, source_id, status, out, payload, error, timeout_s) -> JobRe
         strategy_id=ref.strategy_id,
         source_id=source_id,
         status=status,
-        out_dir=str(out / "jobs" / ref.strategy_id / source_id),
+        out_dir=str(directory),
         total_return=None if total is None else float(total),
         excess_total_return=excess,
         error=error,
