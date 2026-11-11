@@ -12,7 +12,16 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .audience import apply_designer, book_is_anonymized, peek_scale, peek_symbols, resolve_view
+from .audience import (
+    CSV_READ_LIMIT,
+    JSON_READ_LIMIT,
+    apply_designer,
+    book_is_anonymized,
+    peek_scale,
+    peek_symbols,
+    refuse_oversized,
+    resolve_view,
+)
 from .format import is_missing
 from .schema import (
     ACTIVITY_KEYS,
@@ -97,6 +106,7 @@ class RunReport:
 
 
 def _read_json(path: Path):
+    refuse_oversized(path, JSON_READ_LIMIT)
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -133,6 +143,7 @@ def _withhold(payload, withheld: list[str]):
 
 
 def _load_table(path: Path) -> TableData:
+    refuse_oversized(path, CSV_READ_LIMIT)
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         columns = tuple(reader.fieldnames or ())
@@ -323,12 +334,7 @@ def _load_book(directory: Path, withheld: list[str], *, designer: bool = False) 
         report.kind = "incomplete"
         report.missing.append(METRICS_FILE)
         return report
-    try:
-        raw = _read_json(metrics_path)
-    except (OSError, json.JSONDecodeError) as exc:
-        report.kind = "incomplete"
-        report.warnings.append(f"{METRICS_FILE} could not be read: {exc}")
-        return report
+    raw = _read_json(metrics_path)
     if not isinstance(raw, dict):
         report.kind = "incomplete"
         report.warnings.append(f"{METRICS_FILE} is not an object")
@@ -377,11 +383,7 @@ def _load_book(directory: Path, withheld: list[str], *, designer: bool = False) 
     liquidation = metrics.get("liquidation") if isinstance(metrics.get("liquidation"), dict) else None
     extra = _first_file(directory, LIQUIDATION_FILES)
     if extra is not None:
-        try:
-            document = _withhold(_read_json(extra), withheld)
-        except (OSError, json.JSONDecodeError) as exc:
-            report.warnings.append(f"{extra.name} could not be read: {exc}")
-            document = None
+        document = _withhold(_read_json(extra), withheld)
         if isinstance(document, dict):
             report.liquidation = document
             report.liquidation_source = extra.name
@@ -394,11 +396,7 @@ def _load_book(directory: Path, withheld: list[str], *, designer: bool = False) 
     seen = set()
     for folder in _benchmark_dirs(directory):
         seen.add(folder.name)
-        try:
-            full = _withhold(_read_json(folder / METRICS_FILE), withheld)
-        except (OSError, json.JSONDecodeError) as exc:
-            report.warnings.append(f"benchmarks/{folder.name}/{METRICS_FILE} could not be read: {exc}")
-            continue
+        full = _withhold(_read_json(folder / METRICS_FILE), withheld)
         if isinstance(full, dict):
             report.benchmarks[folder.name] = full
             _compare_summaries(folder.name, nested.get(folder.name), full, report.warnings)
@@ -424,13 +422,9 @@ def _load_book(directory: Path, withheld: list[str], *, designer: bool = False) 
         report.missing.append("benchmarks")
     config_path = directory / RUN_CONFIG_FILE
     if config_path.is_file():
-        try:
-            document = _read_json(config_path)
-        except (OSError, json.JSONDecodeError) as exc:
-            report.warnings.append(f"{RUN_CONFIG_FILE} could not be read: {exc}")
-        else:
-            if isinstance(document, dict):
-                report.config = _withhold(document, withheld)
+        document = _read_json(config_path)
+        if isinstance(document, dict):
+            report.config = _withhold(document, withheld)
     return report
 
 
@@ -442,12 +436,7 @@ def _looks_like_desk(metrics: dict) -> bool:
 
 def _load_walkforward(directory: Path, withheld: list[str], *, designer: bool = False) -> RunReport:
     report = RunReport(directory=directory, kind="walkforward")
-    try:
-        summary = _withhold(_read_json(directory / WALKFORWARD_FILE), withheld)
-    except (OSError, json.JSONDecodeError) as exc:
-        report.kind = "incomplete"
-        report.warnings.append(f"{WALKFORWARD_FILE} could not be read: {exc}")
-        return report
+    summary = _withhold(_read_json(directory / WALKFORWARD_FILE), withheld)
     if not isinstance(summary, dict):
         report.kind = "incomplete"
         report.warnings.append(f"{WALKFORWARD_FILE} is not an object")
@@ -463,12 +452,9 @@ def _load_walkforward(directory: Path, withheld: list[str], *, designer: bool = 
             report.missing.append(f"{leg}/{METRICS_FILE}")
     config_path = directory / RUN_CONFIG_FILE
     if config_path.is_file():
-        try:
-            document = _read_json(config_path)
-            if isinstance(document, dict):
-                report.config = _withhold(document, withheld)
-        except (OSError, json.JSONDecodeError) as exc:
-            report.warnings.append(f"{RUN_CONFIG_FILE} could not be read: {exc}")
+        document = _read_json(config_path)
+        if isinstance(document, dict):
+            report.config = _withhold(document, withheld)
     return report
 
 
@@ -492,21 +478,15 @@ def _assembled_leaderboard(directory: Path, children: list[Path]) -> TableData:
         metrics_path = child / METRICS_FILE
         metrics = {}
         if metrics_path.is_file():
-            try:
-                loaded = _read_json(metrics_path)
-                if isinstance(loaded, dict):
-                    metrics = loaded
-            except (OSError, json.JSONDecodeError):
-                metrics = {}
+            loaded = _read_json(metrics_path)
+            if isinstance(loaded, dict):
+                metrics = loaded
         config = {}
         config_path = child / RUN_CONFIG_FILE
         if config_path.is_file():
-            try:
-                loaded = _read_json(config_path)
-                if isinstance(loaded, dict):
-                    config = loaded
-            except (OSError, json.JSONDecodeError):
-                config = {}
+            loaded = _read_json(config_path)
+            if isinstance(loaded, dict):
+                config = loaded
         strategy = ""
         listed = config.get("strategies") if isinstance(config.get("strategies"), list) else []
         if listed and isinstance(listed[0], dict):
@@ -536,11 +516,7 @@ def _load_batch(directory: Path, withheld: list[str]) -> RunReport:
     status_path = directory / BATCH_STATUS_FILE
     failures = {}
     if status_path.is_file():
-        try:
-            status = _read_json(status_path)
-        except (OSError, json.JSONDecodeError) as exc:
-            report.warnings.append(f"{BATCH_STATUS_FILE} could not be read: {exc}")
-            status = None
+        status = _read_json(status_path)
         if isinstance(status, dict):
             for row in status.get("strategies") or []:
                 if isinstance(row, dict) and row.get("state") == "failed":
@@ -566,12 +542,9 @@ def _load_batch(directory: Path, withheld: list[str]) -> RunReport:
         report.children.append(entry)
     config_path = directory / RUN_CONFIG_FILE
     if config_path.is_file():
-        try:
-            document = _read_json(config_path)
-            if isinstance(document, dict):
-                report.config = _withhold(document, withheld)
-        except (OSError, json.JSONDecodeError) as exc:
-            report.warnings.append(f"{RUN_CONFIG_FILE} could not be read: {exc}")
+        document = _read_json(config_path)
+        if isinstance(document, dict):
+            report.config = _withhold(document, withheld)
     return report
 
 
@@ -622,11 +595,7 @@ def _job_error(directory: Path) -> str | None:
         path = directory / relative
         if not path.is_file():
             continue
-        try:
-            document = _read_json(path)
-        except (OSError, json.JSONDecodeError):
-            text = path.read_text(encoding="utf-8").strip()
-            return text or None
+        document = _read_json(path)
         if isinstance(document, dict):
             text = document.get("error")
             if isinstance(text, str) and text.strip():
@@ -675,33 +644,26 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
         report.warnings.append("No jobs/ tree and no leaderboard.csv in this batch.")
     info = directory / "run.json"
     if info.is_file():
-        try:
-            document = _read_json(info)
-        except (OSError, json.JSONDecodeError) as exc:
-            report.warnings.append(f"run.json could not be read: {exc}")
-        else:
-            if isinstance(document, dict) and not report.children:
-                for job in document.get("jobs") or []:
-                    if not isinstance(job, dict):
-                        continue
-                    report.children.append(
-                        {
-                            "path": "",
-                            "name": f"{job.get('strategy_id')}/{job.get('source_id')}",
-                            "strategy_id": job.get("strategy_id"),
-                            "source_id": job.get("source_id"),
-                            "state": "ok" if job.get("status") == "ok" else str(job.get("status") or "failed"),
-                            "error": None,
-                        }
-                    )
+        document = _read_json(info)
+        if isinstance(document, dict) and not report.children:
+            for job in document.get("jobs") or []:
+                if not isinstance(job, dict):
+                    continue
+                report.children.append(
+                    {
+                        "path": "",
+                        "name": f"{job.get('strategy_id')}/{job.get('source_id')}",
+                        "strategy_id": job.get("strategy_id"),
+                        "source_id": job.get("source_id"),
+                        "state": "ok" if job.get("status") == "ok" else str(job.get("status") or "failed"),
+                        "error": None,
+                    }
+                )
     config_path = directory / RUN_CONFIG_FILE
     if config_path.is_file():
-        try:
-            document = _read_json(config_path)
-            if isinstance(document, dict):
-                report.config = _withhold(document, withheld)
-        except (OSError, json.JSONDecodeError) as exc:
-            report.warnings.append(f"{RUN_CONFIG_FILE} could not be read: {exc}")
+        document = _read_json(config_path)
+        if isinstance(document, dict):
+            report.config = _withhold(document, withheld)
     return report
 
 

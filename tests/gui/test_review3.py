@@ -248,15 +248,15 @@ def test_negative_money_puts_the_sign_before_the_dollar():
 
 
 def test_casefold_tickers_match_on_screen_and_in_export():
-    assert scrub_text(f"held {ESZETT} overnight", ("SS",)) == "held ASSET overnight"
-    assert scrub_text("held SS overnight", (ESZETT,)) == "held ASSET overnight"
-    assert scrub_text(f"held {LIGATURE_FI} overnight", ("FI",)) == "held ASSET overnight"
-    assert scrub_text("held FI overnight", (LIGATURE_FI,)) == "held ASSET overnight"
+    assert scrub_text(f"held {ESZETT} overnight", ("SS",)) == "held RANDOM overnight"
+    assert scrub_text("held SS overnight", (ESZETT,)) == "held RANDOM overnight"
+    assert scrub_text(f"held {LIGATURE_FI} overnight", ("FI",)) == "held RANDOM overnight"
+    assert scrub_text("held FI overnight", (LIGATURE_FI,)) == "held RANDOM overnight"
     assert scrub_text("maß", ("SS",)) == "maß"
     assert scrub_text(f"{LIGATURE_FI}le", ("FI",)) == f"{LIGATURE_FI}le"
     assert scrub_text("max_drawdown", ("MA",)) == "max_drawdown"
-    assert scrub_text("QQQ1", ("QQQ",)) == "ASSET1"
-    assert scrub_text("held V overnight", ("V",)) == "held ASSET overnight"
+    assert scrub_text("QQQ1", ("QQQ",)) == "RANDOM1"
+    assert scrub_text("held V overnight", ("V",)) == "held RANDOM overnight"
     assert not export_allowed(f"held {ESZETT} overnight", symbols=("SS",), scale=None)
     assert not export_allowed(f"held {LIGATURE_FI} overnight", symbols=("FI",), scale=None)
     assert not export_allowed("held SS overnight", symbols=(ESZETT,), scale=None)

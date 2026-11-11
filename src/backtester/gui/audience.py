@@ -82,12 +82,35 @@ _MONTH_WORDS = frozenset(
 )
 _MONTH_WORD = re.compile(rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])", re.IGNORECASE)
 _NEAR_YEAR = re.compile(r"(?<![A-Za-z0-9.])(?:19|20)\d{2}(?![A-Za-z0-9.])")
-_FREE_TOKEN = re.compile(r"[A-Za-z0-9_.]+")
 _FREE_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _SESSION_ID = re.compile(r"[Ss]\d+")
 _YEAR_TOKEN = re.compile(r"(?:19|20)\d{2}")
-_PLAIN_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 _DOTTED_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+")
+# One signed number: optional $, thousands commas, a decimal, an exponent, a trailing %.
+_NUMBER_CORE = r"(?:\d{1,3}(?:,\d{3})+(?:\.\d*)?|\d+(?:\.\d*)?|\.\d+)"
+_NUMBER_SURFACE = re.compile(rf"[+-]?\$?{_NUMBER_CORE}(?:[eE][+-]?\d+)?%?")
+_HYPHEN_WORD = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)+")
+_SURFACE_TOKEN = re.compile(
+    rf"(?<![A-Za-z0-9_])[+-]?\$?{_NUMBER_CORE}(?:[eE][+-]?\d+)?%?(?![A-Za-z0-9_])"
+    rf"|{_HYPHEN_WORD.pattern}"
+    r"|[A-Za-z0-9_.]+"
+)
+_GLUED_YEAR = re.compile(r"(?i)(?:[A-Za-z](?:19|20)\d{2}|(?:19|20)\d{2}[A-Za-z])")
+_MONTH_IN_TOKEN = re.compile(rf"(?i)(?<![A-Za-z]){_MONTH}(?![A-Za-z])")
+_YEAR_IN_TOKEN = re.compile(r"(?:19|20)\d{2}")
+# Designer surfaces say RANDOM where a ticker was. The operator view keeps the ticker.
+TICKER_STAND_IN = "RANDOM"
+# Whole-file reads stop at these caps so a huge report cannot exhaust memory.
+JSON_READ_LIMIT = 16 * 1024 * 1024
+CSV_READ_LIMIT = 256 * 1024 * 1024
+PNG_READ_LIMIT = 32 * 1024 * 1024
+
+def refuse_oversized(path: Path, limit: int) -> None:
+    """Do not read a report file whole when it is over the cap."""
+    size = path.stat().st_size
+    if size > limit:
+        raise ValueError(f"{path.name} is {size} bytes, over the {limit} byte read limit")
+
 
 # Keys a designer tree is not allowed to carry. ``cost_basis`` holds the
 # invoice scale. Named operator runs still show that object.
@@ -190,7 +213,7 @@ def _replace_ticker(text: str, symbol: str) -> str:
     last = 0
     for start, end in spans:
         pieces.append(text[last:start])
-        pieces.append("ASSET")
+        pieces.append(TICKER_STAND_IN)
         last = end
     pieces.append(text[last:])
     return "".join(pieces)
@@ -217,7 +240,8 @@ def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = No
     days, ``YYYY-MM`` keys, and a bare year all count. ``2024.50``, ``0.2024``,
     and ``day 2024`` stay. ``today 2024`` does not. Session ids such as ``S01``
     stay. A one-letter ticker is a ticker.
-    A digit glued to a ticker is still that ticker. Ticker matching uses
+    A digit glued to a ticker is still that ticker, and the ticker is shown as
+    ``RANDOM``. The operator view never calls this. Ticker matching uses
     casefold, so ``ß`` and ``ﬁ`` count.
     """
     text = value
@@ -295,7 +319,7 @@ def _scrub_obj(value, symbols: tuple[str, ...], *, drop_prices: bool, scale: flo
             name = str(key)
             if name in DESIGNER_DROP_KEYS or (drop_prices and name in PRICE_COLUMNS):
                 continue
-            renamed = _unique_key(scrub_text(name, symbols, scale=scale), used)
+            renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
             clean[renamed] = _scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale)
         return clean
     if isinstance(value, list):
@@ -327,7 +351,7 @@ def _relabel_periods(value: dict, symbols: tuple[str, ...], *, drop_prices: bool
             clean[name] = nested
             used.add(name)
             continue
-        renamed = _unique_key(scrub_text(name, symbols, scale=scale), used)
+        renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
         clean[renamed] = _scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale)
     return clean
 
@@ -353,22 +377,25 @@ def _replace_table(table, columns, rows):
 def _scrub_table(table, symbols: tuple[str, ...], *, drop_prices: bool, scale: float | None = None):
     if table is None:
         return None
-    columns = []
+    pairs = []
+    used: set[str] = set()
     for column in table.columns:
         name = str(column)
         if name in DESIGNER_DROP_KEYS or (drop_prices and name in PRICE_COLUMNS):
             continue
-        columns.append(name)
+        # Headers use the same stripper as values. A ticker-only header becomes RANDOM.
+        renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
+        pairs.append((name, renamed))
     rows = []
     for row in table.rows:
         cleaned = {}
-        for column in columns:
-            value = row.get(column)
+        for original, renamed in pairs:
+            value = row.get(original)
             if isinstance(value, str):
                 value = _scrub_string(value, symbols, scale)
-            cleaned[column] = value
+            cleaned[renamed] = value
         rows.append(cleaned)
-    return _replace_table(table, columns, rows)
+    return _replace_table(table, [renamed for _, renamed in pairs], rows)
 
 
 def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: float | None = None) -> None:
@@ -444,57 +471,131 @@ def _designer_session_label(label: str, index: int, symbols: tuple[str, ...], sc
     return str(index)
 
 
-def _allow_listed_text(text: str) -> str:
-    """Keep numbers, session ids, and words. Drop everything else.
+def _wordish(token: str) -> bool:
+    return bool(_FREE_WORD.fullmatch(token) or _HYPHEN_WORD.fullmatch(token))
 
-    A month name is not a word we show. A four-digit year stays only when the
-    previous word is ``day``. This is the structural layer. The regexes have
-    already run.
+
+def _numeric_text(token: str) -> str:
+    """The number inside a surface token, without $, thousands commas, or %."""
+    text = token.strip()
+    sign = ""
+    if text[:1] in "+-":
+        sign, text = text[:1], text[1:]
+    if text.startswith("$"):
+        text = text[1:]
+    if text.endswith("%"):
+        text = text[:-1]
+    return sign + text.replace(",", "")
+
+
+def _glued_scale_number(token: str) -> str | None:
+    """A number glued to letters, as in ``scale7.777`` or ``x7.777``.
+
+    ``long_2x`` is not this shape: the digit is not the whole remainder of the token.
+    """
+    prefixed = re.fullmatch(
+        r"(?i)[A-Za-z]+_?([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)%?",
+        token,
+    )
+    if prefixed:
+        return prefixed.group(1)
+    suffixed = re.fullmatch(
+        r"(?i)([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)%?_?[A-Za-z]+",
+        token,
+    )
+    if suffixed:
+        return suffixed.group(1)
+    return None
+
+
+def _scale_in_token(token: str, scale: float | None) -> bool:
+    """True when this token's number is the invoice scale.
+
+    A standalone ``2`` and a glued ``scale7.777`` both count. ``long_2x``,
+    ``2.5``, and ``12`` do not.
+    """
+    number = _scale_number(scale)
+    if number is None:
+        return False
+    if _NUMBER_SURFACE.fullmatch(token):
+        return _same_number(_numeric_text(token), number)
+    glued = _glued_scale_number(token)
+    return glued is not None and _same_number(glued, number)
+
+
+def _keep_surface_token(token: str, *, previous: str, scale: float | None) -> bool:
+    """One decision for the screen filter and for ``export_allowed``.
+
+    A signed number stays whole. A hyphenated word stays whole. A month stem
+    plus a year, a year glued to letters, and the invoice scale do not.
+    ``2024.50`` and the pair ``day 2024`` stay.
+    """
+    if _GLUED_YEAR.search(token):
+        return False
+    if _MONTH_IN_TOKEN.search(token) and _YEAR_IN_TOKEN.search(token):
+        return False
+    if _scale_in_token(token, scale):
+        return False
+    if token.casefold() in _MONTH_WORDS or token.split(".", 1)[0].casefold() in _MONTH_WORDS:
+        return False
+    if _NUMBER_SURFACE.fullmatch(token):
+        return True
+    if _SESSION_ID.fullmatch(token):
+        return True
+    if _YEAR_TOKEN.fullmatch(token):
+        return previous.casefold() == "day"
+    if _HYPHEN_WORD.fullmatch(token):
+        return not any(part.casefold() in _MONTH_WORDS for part in token.split("-"))
+    if _FREE_WORD.fullmatch(token) or _DOTTED_WORD.fullmatch(token):
+        return True
+    return False
+
+
+def _surface_pieces(text: str, *, scale: float | None) -> tuple[list[str], bool]:
+    """Kept tokens, and whether every token was kept.
+
+    The screen joins the kept tokens. Export fails when any token was dropped.
+    Both call ``_keep_surface_token``.
     """
     pieces: list[str] = []
+    allowed = True
     previous = ""
-    for match in _FREE_TOKEN.finditer(text):
+    for match in _SURFACE_TOKEN.finditer(text):
         token = match.group(0)
-        head = token.split(".", 1)[0].casefold()
-        if head in _MONTH_WORDS:
-            previous = ""
-            continue
-        if _PLAIN_NUMBER.fullmatch(token):
+        if _keep_surface_token(token, previous=previous, scale=scale):
             pieces.append(token)
+            previous = token if _wordish(token) else ""
+        else:
+            allowed = False
             previous = ""
-            continue
-        if _SESSION_ID.fullmatch(token):
-            pieces.append(token)
-            previous = token
-            continue
-        if _YEAR_TOKEN.fullmatch(token):
-            if previous.casefold() == "day":
-                pieces.append(token)
-            previous = ""
-            continue
-        if token.casefold() in _MONTH_WORDS:
-            previous = ""
-            continue
-        if _FREE_WORD.fullmatch(token) or _DOTTED_WORD.fullmatch(token):
-            pieces.append(token)
-            previous = token if _FREE_WORD.fullmatch(token) else ""
-            continue
-        previous = ""
+    return pieces, allowed
+
+
+def _allow_listed_text(text: str, *, scale: float | None = None) -> str:
+    """Keep numbers, session ids, hyphenated words, and words. Drop the rest.
+
+    A signed number, including ``$``, thousands commas, an exponent, and a
+    trailing ``%``, is one token. ``pre-market`` stays hyphenated. A month name
+    is not a word we show. A four-digit year stays only when the previous word
+    is ``day``. This is the structural layer. The regexes have already run.
+    """
+    pieces, _allowed = _surface_pieces(text, scale=scale)
     return " ".join(pieces)
 
 
 def designer_surface_text(value: str, symbols: tuple[str, ...] = (), *, scale: float | None = None) -> str:
-    """Text a designer banner, warning, or free-text cell may show.
+    """Text a designer banner, warning, header, key, or free-text cell may show.
 
-    Paths are consumed through spaces. The remainder is limited to numbers,
-    session ids, and words, and the date, ticker, and scale regexes still run.
+    Paths are consumed through spaces. A ticker is ``RANDOM``. The remainder is
+    limited to numbers, session ids, and words, and the date, ticker, and scale
+    regexes still run.
     """
     raw = str(value)
     if "Traceback" in raw or _ABS_PATH.search(raw):
         raw = designer_error(raw)
     raw = _ABS_PATH.sub(" ", raw)
     raw = scrub_text(raw, symbols, scale=scale)
-    return _allow_listed_text(raw)
+    return _allow_listed_text(raw, scale=scale)
 
 
 def designer_error(text: str) -> str:
@@ -697,7 +798,16 @@ def export_text(path: Path) -> str:
 
     Bytes are decoded as latin-1, so a binary file cannot skip the check by
     failing a UTF-8 decode. PNG text chunks are included even when compressed.
+    A file over the read cap is refused before it is read whole.
     """
+    suffix = path.suffix.lower()
+    if suffix == ".png":
+        limit = PNG_READ_LIMIT
+    elif suffix == ".csv":
+        limit = CSV_READ_LIMIT
+    else:
+        limit = JSON_READ_LIMIT
+    refuse_oversized(path, limit)
     data = path.read_bytes()
     return data.decode("latin-1") + "\n" + _png_text(data)
 
@@ -776,4 +886,6 @@ def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) 
             return False
     if _contains_scale(text, scale):
         return False
-    return True
+    # Same token decision as the screen filter, so the two cannot drift.
+    _pieces, allowed = _surface_pieces(text, scale=scale)
+    return allowed

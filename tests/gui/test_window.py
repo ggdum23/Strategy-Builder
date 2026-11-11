@@ -265,7 +265,8 @@ def test_screenshots(qtbot, tmp_path):
     shown["sidecar_path"] = r"C:\Users\Jeu\Desktop\Strategy Builder\operator\qqq.sidecar.json"
     window.packs_page.show_build(shown)
     assert "price_factor" not in window.packs_page.summary.text()
-    assert "ASSET" in window.packs_page.summary.text()
+    assert "RANDOM" in window.packs_page.summary.text()
+    assert "ASSET" not in window.packs_page.summary.text()
     window.show_page(1)
     _grab(window, "02-packs-dark.png", tmp_path)
 
@@ -439,7 +440,7 @@ def _present_designer(window, tmp_path: Path) -> None:
     folder = write_book(tmp_path / "ZZZX" / "shot-designer", metrics, equity=_shot_equity())
     window.results_page.load_path(str(folder))
     window.results_page.path.edit.blockSignals(True)
-    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\ASSET\book")
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\RANDOM\book")
     window.results_page.path.edit.blockSignals(False)
     window.results_page.tabs.setCurrentIndex(0)
     window.results_page.overview_scroll.verticalScrollBar().setValue(0)
@@ -447,8 +448,9 @@ def _present_designer(window, tmp_path: Path) -> None:
     assert window.results_page._report.audience == "designer"
     assert _heat_has(window, "M1") and _heat_has(window, "Y2")
     blob = _visible_blob(window.results_page).casefold()
-    for needle in ("share_scale", "7.777", "qqq", "zzzx", "january", "2024"):
+    for needle in ("share_scale", "7.777", "qqq", "zzzx", "january", "2024", "asset"):
         assert needle not in blob, needle
+    assert "RANDOM" in window.results_page.path.text()
     window.show_page(4)
 
 

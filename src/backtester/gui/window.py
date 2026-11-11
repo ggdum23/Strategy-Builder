@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .audience import peek_scale, peek_symbols, scrub_text
+from .audience import designer_surface_text, peek_scale, peek_symbols
 from .pages.data_page import DataPage
 from .pages.history_page import HistoryPage
 from .pages.packs_page import PacksPage
@@ -234,7 +234,7 @@ class MainWindow(QMainWindow):
     def _public_text(self, text: str) -> str:
         if not text or not self._results_are_designer():
             return text
-        return scrub_text(text, self._chrome_symbols(), scale=self._chrome_scale())
+        return designer_surface_text(text, self._chrome_symbols(), scale=self._chrome_scale())
 
     def _publish_status(self) -> None:
         self._status.showMessage(self._public_text(self._status_text))

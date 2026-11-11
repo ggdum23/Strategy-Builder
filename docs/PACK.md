@@ -6,7 +6,7 @@
 
 Prices (open, high, low, close, wap) are multiplied by `price_factor` k. Volume is multiplied by `volume_factor`. Both factors are drawn from a log-uniform range away from 1 and away from 0.9 when the operator does not pass them. k of 1 is refused: an anonymized pack has to actually rescale.
 
-Calendar dates become session ordinals starting at 1. The session id is `S00001`, `S00002`, ... The file names are `bars_part_NNN.csv.gz`, `daily_rth.csv.gz`, and `manifest.json`. The manifest calls the asset `ASSET`.
+Calendar dates become session ordinals starting at 1. The session id is `S00001`, `S00002`, ... The file names are `bars_part_NNN.csv.gz`, `daily_rth.csv.gz`, and `manifest.json`. The manifest calls the asset `RANDOM`.
 
 The pack files do not contain the ticker, a real year in a file name, an ISO date, the date map, or a scale factor. The sidecar is the file that stores them: symbol, both factors, `share_scale` (equal to k), the ordinal-to-date map, borrow, the source path, and an operator note. The runner also gives the child engine `share_scale` so the invoice can use real share counts. That handoff is a residual leak, listed below. It is not a second copy of the sidecar.
 

@@ -31,6 +31,8 @@ ANNUALIZATION = (
 )
 
 # A finished book. Everything else is optional and may arrive with Phase 3.
+# These are the canonical names. Phase 3 rejects a symbol that collides with
+# one of them. The window does not keep an alias list for a renamed file.
 METRICS_FILE = "metrics.json"
 WALKFORWARD_FILE = "walkforward.json"
 EQUITY_FILES = ("equity_curve.csv", "equity.csv")

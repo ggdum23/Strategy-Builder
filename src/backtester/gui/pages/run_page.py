@@ -6,6 +6,8 @@ The page shows a readable summary of the draft. The stored contract is still
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -480,8 +482,7 @@ class RunPage(QWidget):
         self.progress.setFormat("Failed")
         self.log.setPlainText(text)
         clear_layout(self.banners)
-        last = text.strip().splitlines()[-1] if text.strip() else "run failed"
-        self.banners.addWidget(Banner("error", last))
+        self.banners.addWidget(Banner("error", _run_failure_line(text)))
 
     def on_cancelled(self) -> None:
         self.progress.setRange(0, 1)
@@ -492,3 +493,22 @@ class RunPage(QWidget):
         self.banners.addWidget(
             Banner("warn", "Cancelled. If the folder contains a partial file, it is not a finished report.")
         )
+
+
+def _run_failure_line(text: str) -> str:
+    """The line the Run page shows when anonymization or the worker rejects the run.
+
+    A wrapper such as ``RuntimeError: worker exited 1`` is not the message. The
+    anonymization rejection is, even when it is not the last traceback line.
+    """
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return "run failed"
+    for line in lines:
+        folded = line.casefold()
+        if "anonymiz" in folded or "reserved" in folded:
+            return line
+    for line in reversed(lines):
+        if re.search(r"\b(?:Error|Exception)\b", line):
+            return line
+    return lines[-1]

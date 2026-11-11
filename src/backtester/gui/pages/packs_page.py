@@ -73,7 +73,7 @@ class PacksPage(QWidget):
         self.minutes.setRange(1, 1440)
         self.minutes.setValue(1)
         self.named = QRadioButton("Named. Real dates, share scale 1.")
-        self.anon = QRadioButton("Anonymized. Rescale, hide the calendar, call the asset ASSET.")
+        self.anon = QRadioButton("Anonymized. Rescale, hide the calendar, call the asset RANDOM.")
         self.mode_group = QButtonGroup(self)
         self.mode_group.addButton(self.named)
         self.mode_group.addButton(self.anon)

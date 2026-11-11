@@ -250,6 +250,16 @@ def _path_samples() -> list[str]:
 
 
 def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
+    # These survive the date regex. Only the token filter removes them.
+    for glued in ("Jan2024", "January2024", "FY2024", "year2024"):
+        shown = designer_surface_text(glued, ())
+        assert glued not in shown and "2024" not in shown
+        assert not export_allowed(glued, symbols=(), scale=None)
+    for glued in ("scale7.777", "x7.777"):
+        shown = designer_surface_text(glued, (), scale=7.777)
+        assert glued not in shown and "7.777" not in shown
+        assert not export_allowed(glued, symbols=(), scale=7.777)
+    assert designer_surface_text("price 2024.50 day 2024", ()) == "price 2024.50 day 2024"
     dates = _calendar_samples()
     paths = _path_samples()
     ordinary = "long_2x 2.5 2024.50 0.2024 day 2024 count 12"

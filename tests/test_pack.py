@@ -94,7 +94,7 @@ def test_chunk_defaults_and_anonymized_scrub(tmp_path):
         assert "2024" not in name
     assert_anonymized_pack_clean(pack, symbol="NIK")
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["asset_name"] == "ASSET"
+    assert manifest["asset_name"] == "RANDOM"
     assert manifest["anonymized"] is True
     secret = load_sidecar(sidecar)
     assert secret["symbol"] == "NIK"

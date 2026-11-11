@@ -58,9 +58,9 @@ def test_pack_result_has_no_sidecar_fields(tmp_path):
     assert forbidden.isdisjoint(result)
     assert result["anonymized"] is True
     assert result["sidecar_displayed"] is False
-    assert result["manifest"]["asset_name"] == "ASSET"
+    assert result["manifest"]["asset_name"] == "RANDOM"
     manifest = read_designer_manifest(pack)
-    assert manifest["asset_name"] == "ASSET"
+    assert manifest["asset_name"] == "RANDOM"
     blob = json.dumps(result)
     assert "price_factor" not in blob
     assert "volume_factor" not in blob

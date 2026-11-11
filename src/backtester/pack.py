@@ -31,7 +31,7 @@ from .registry import get_series, load_registry, same_series
 SCHEMA_VERSION = 1
 CHUNK_SESSIONS = 250
 MAX_FILE_BYTES = 25 * 1024 * 1024
-ASSET_NAME = "ASSET"
+ASSET_NAME = "RANDOM"
 
 PACK_COLUMNS = (
     "day",
@@ -577,7 +577,7 @@ def _validate_manifest(document: dict) -> None:
     if not isinstance(document["anonymized"], bool):
         raise ValueError("pack anonymized flag is not true or false")
     if document["anonymized"] and document["asset_name"] != ASSET_NAME:
-        raise ValueError("an anonymized pack must call the asset ASSET")
+        raise ValueError("an anonymized pack must call the asset RANDOM")
     if list(document["columns"]) != list(PACK_COLUMNS):
         raise ValueError("pack columns do not match the schema")
     if not isinstance(document["chunks"], list) or not document["chunks"]:
