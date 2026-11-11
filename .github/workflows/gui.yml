@@ -11,7 +11,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # ubuntu-latest is 26.04 and its apt mirrors were not resolving.
+        # 24.04 still installs the Qt libraries the offscreen tests need.
+        os: [ubuntu-24.04, windows-latest]
         python: ["3.11", "3.12", "3.13"]
     env:
       QT_QPA_PLATFORM: offscreen
