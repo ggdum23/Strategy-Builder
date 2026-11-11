@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractTableModel, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QAbstractTableModel, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -157,8 +157,7 @@ class DictTable(QTableView):
         header.setMinimumSectionSize(72)
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.setFont(QFont(self.font().family(), 9))
-        self._model = None
-        self._proxy = None
+        self._model: DictModel | None = None
 
     def set_records(
         self,
@@ -169,38 +168,61 @@ class DictTable(QTableView):
     ) -> None:
         titles = titles or {}
         model = DictModel(list(columns), list(rows), titles, kinds or {})
-        proxy = QSortFilterProxyModel(self)
-        proxy.setSourceModel(model)
-        proxy.setSortRole(Qt.ItemDataRole.UserRole)
-        proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        proxy.setFilterKeyColumn(-1)
         self._model = model
-        self._proxy = proxy
-        self.setModel(proxy)
-        self.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        sorting = self.isSortingEnabled()
+        self.setSortingEnabled(False)
+        self.setModel(model)
+        self.setSortingEnabled(sorting)
+        self.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
 
     def set_filter(self, text: str) -> None:
-        if self._proxy is not None:
-            self._proxy.setFilterFixedString(text)
+        if self._model is not None:
+            self._model.set_filter(text)
 
     def raw_rows(self) -> list[dict]:
         if self._model is None:
             return []
         return list(self._model.rows)
 
+    def source_row(self, index) -> int:
+        if self._model is None or not index.isValid():
+            return -1
+        return self._model.source_position(index.row())
+
 
 class DictModel(QAbstractTableModel):
+    """Filter and sort in Python. Qt's proxy compared the sort tuples and crashed on Windows."""
+
     def __init__(self, columns, rows, titles, kinds=None):
         super().__init__()
         self.columns = columns
         self.rows = rows
         self.titles = titles
         self.kinds = kinds or {}
+        self._filter = ""
+        self._sort_column = 0
+        self._sort_order = Qt.SortOrder.AscendingOrder
+        self._order: list[int] = []
+        self._recompute()
+
+    def set_filter(self, text: str) -> None:
+        self._filter = (text or "").casefold()
+        self._reset()
+
+    def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
+        self._sort_column = column
+        self._sort_order = order
+        self._reset()
+
+    def source_position(self, view_row: int) -> int:
+        if not 0 <= view_row < len(self._order):
+            return -1
+        return self._order[view_row]
 
     def rowCount(self, parent=None):
         if parent is not None and parent.isValid():
             return 0
-        return len(self.rows)
+        return len(self._order)
 
     def columnCount(self, parent=None):
         if parent is not None and parent.isValid():
@@ -216,17 +238,13 @@ class DictModel(QAbstractTableModel):
         return None
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
+        if not index.isValid() or not 0 <= index.row() < len(self._order):
             return None
+        record = self.rows[self._order[index.row()]]
         key = self.columns[index.column()]
-        value = self.rows[index.row()].get(key)
+        value = record.get(key)
         if role == Qt.ItemDataRole.DisplayRole:
-            kind = self.kinds.get(key)
-            if kind:
-                return format_number(kind, value)
-            return format_cell(value)
-        if role == Qt.ItemDataRole.UserRole:
-            return sort_token(value)
+            return self._display(key, value)
         if role == Qt.ItemDataRole.TextAlignmentRole:
             token = sort_token(value)
             if token[0] == 1:
@@ -239,3 +257,32 @@ class DictModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
         return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    def _display(self, key: str, value) -> str:
+        kind = self.kinds.get(key)
+        if kind:
+            return format_number(kind, value)
+        return format_cell(value)
+
+    def _matches(self, record: dict) -> bool:
+        if not self._filter:
+            return True
+        for key in self.columns:
+            if self._filter in self._display(key, record.get(key)).casefold():
+                return True
+        return False
+
+    def _recompute(self) -> None:
+        indices = [index for index, record in enumerate(self.rows) if self._matches(record)]
+        if 0 <= self._sort_column < len(self.columns):
+            key = self.columns[self._sort_column]
+            indices.sort(
+                key=lambda index: sort_token(self.rows[index].get(key)),
+                reverse=self._sort_order == Qt.SortOrder.DescendingOrder,
+            )
+        self._order = indices
+
+    def _reset(self) -> None:
+        self.beginResetModel()
+        self._recompute()
+        self.endResetModel()

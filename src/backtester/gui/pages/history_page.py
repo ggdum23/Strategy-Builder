@@ -111,9 +111,7 @@ class HistoryPage(QWidget):
         self.host.set_status(f"History: {len(records)} run(s)")
 
     def _open(self, index) -> None:
-        proxy = index.model()
-        source = proxy.mapToSource(index)
-        row = source.row()
+        row = self.table.source_row(index)
         if not 0 <= row < len(self.table.raw_rows()):
             return
         path = self.table.raw_rows()[row].get("path")
