@@ -76,13 +76,13 @@ py -3 -m pip install -r packaging\requirements-build.txt
 powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 ```
 
-The script compiles with Inno Setup 6.7.4 only. An `ISCC.exe` whose compiler
-banner is anything else, including a copy already on the machine, is not
-used. The shipped compiler's version resource is `0.0.0.0`; the script reads
-the `Compiler engine version: Inno Setup 6.7.4` line instead. When 6.7.4 is
-missing, the script downloads `innosetup-6.7.4.exe`, checks its SHA256
-(`a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c`), and
-only then runs it. Output:
+The script compiles with Inno Setup 6.7.4 only. It always downloads
+`innosetup-6.7.4.exe` and checks its SHA256
+(`a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c`) before
+running it. A compiler already on the machine is not used. The shipped
+compiler's version resource is `0.0.0.0`; the script reads the
+`Compiler engine version: Inno Setup 6.7.4` line instead, and every part of
+that number has to match. Output:
 
 ```text
 packaging\dist\StrategyBuilder\          the one-folder bundle
@@ -131,9 +131,13 @@ script from the workflow only after that secret exists. Do not commit the
    walk-forward that spawns two children.
 5. Install again over that directory and check that an edited
    `config.json` is kept.
-6. Silent uninstall, then check that the user-data folder is still there.
-7. Install once more and uninstall with `/DELETEUSERDATA`. The user-data
-   folder goes away. The market-data folder does not.
+6. Silent uninstall. The step waits until the uninstall log says the profile
+   is being kept, the upgraded `config.json` is still there, and the
+   uninstaller's second phase has exited.
+7. Install once more and uninstall with `/DELETEUSERDATA`. The step requires
+   the uninstall log to say the profile is being deleted. Files planted in
+   the data folder and in a temp directory stay. The market-data folder is
+   not created.
 8. Upload `strategy-builder-setup` (the setup executable and `SHA256SUMS`).
 
 A tag named `v*` attaches those files to the GitHub Release. The sample

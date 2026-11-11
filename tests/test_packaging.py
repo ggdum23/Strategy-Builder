@@ -101,8 +101,11 @@ def test_installer_script_defaults_and_keeps_user_data():
     assert "DeleteUserData" in uninstall
     assert "/DELETEUSERDATA" in uninstall
     assert "DELETEUSERDATA left" in uninstall
-    assert "DELETEUSERDATA was ignored" in uninstall
-    assert "AddSeconds(20)" in uninstall
+    assert "AddSeconds(30)" in uninstall
+    assert "uninstall_guard.py" in uninstall
+    assert "_unins.tmp" in uninstall
+    assert "unins*" in uninstall
+    assert uninstall.index("uninstall_guard.py") < uninstall.index('Write-Output "kept $userRoot"')
     assert "ci-preserve.txt" in uninstall
     upgrade = (PACKAGING / "ci_upgrade.ps1").read_text(encoding="utf-8")
     assert "upgrade-keep" in upgrade
@@ -110,6 +113,8 @@ def test_installer_script_defaults_and_keeps_user_data():
     delete = (PACKAGING / "ci_delete_userdata.ps1").read_text(encoding="utf-8")
     assert "DeleteUserData" in delete
     assert "keep-uninstall removed" in delete
+    assert "ci-sentinel-keep.txt" in delete
+    assert "ci-data-root-keep.txt" in delete
     helper = (PACKAGING / "ci_process.ps1").read_text(encoding="utf-8")
     assert "WaitForExit" in helper
     assert "UseShellExecute = $false" in helper
@@ -128,6 +133,9 @@ def test_workflow_builds_installs_smokes_and_publishes():
     assert build.index("Inno Setup download hash") < build.index("Wait-GuiProcess")
     assert "Test-ExactInnoVersion" in build
     assert "Compiler engine version" in build
+    assert "function Get-LeadingVersion" not in build
+    assert "$parts.Count -ne $required.Count" in build
+    assert "preinstalled compilers are not used" in build
     for phrase in (
         "Build installer",
         "Record SHA256",
@@ -234,6 +242,41 @@ def test_version_and_placeholder_and_launcher_check(tmp_path, capsys):
     assert "Jeu" not in text
 
 
+def test_keep_check_fails_when_the_profile_is_deleted_late():
+    import uninstall_guard
+
+    sentinel = r"D:\strategy-builder-ci-upgrade"
+    original = json.dumps({"schema": 1, "data_root": sentinel, "ci_marker": "upgrade-keep"})
+    keeping = "Strategy Builder keeping C:\\Users\\runner\\AppData\\Local\\StrategyBuilder"
+    deleting = "Strategy Builder deleting C:\\Users\\runner\\AppData\\Local\\StrategyBuilder"
+    # First-phase exit: the config is still there and the second phase has not logged.
+    assert uninstall_guard.judge_keep("", original, sentinel=sentinel) == "wait"
+    late_delete = [
+        ("", original),
+        ("", None),
+    ]
+    seen = []
+    with pytest.raises(SystemExit, match="disappeared"):
+        for log_text, config_text in late_delete:
+            seen.append(uninstall_guard.judge_keep(log_text, config_text, sentinel=sentinel))
+    assert seen == ["wait"]
+    seen = []
+    with pytest.raises(SystemExit, match="deleting"):
+        for log_text, config_text in (("", original), (deleting, original)):
+            seen.append(uninstall_guard.judge_keep(log_text, config_text, sentinel=sentinel))
+    assert seen == ["wait"]
+    assert uninstall_guard.judge_keep(keeping, original, sentinel=sentinel) == "ok"
+    fresh = json.dumps({"schema": 1, "data_root": DATA_ROOT})
+    with pytest.raises(SystemExit, match="sentinel"):
+        uninstall_guard.judge_keep(keeping, fresh, sentinel=sentinel)
+    # A directory that vanished without this uninstall's deleting line is not success.
+    assert uninstall_guard.judge_delete("", root_exists=False) == "wait"
+    assert uninstall_guard.judge_delete(deleting, root_exists=True) == "wait"
+    assert uninstall_guard.judge_delete(deleting, root_exists=False) == "ok"
+    with pytest.raises(SystemExit, match="DELETEUSERDATA was ignored"):
+        uninstall_guard.judge_delete(keeping, root_exists=True)
+
+
 def test_child_surface_allowlist_and_empty_directory():
     import smoke_frozen
 
@@ -246,6 +289,10 @@ def test_child_surface_allowlist_and_empty_directory():
         smoke_frozen.assert_child_surface({"env_keys": ["PATH", "COMPUTERNAME"], "cwd_entries": []})
     with pytest.raises(SystemExit, match="not empty"):
         smoke_frozen.assert_child_surface({"env_keys": ["PATH"], "cwd_entries": ["leak.txt"]})
+    with pytest.raises(SystemExit, match="env_keys"):
+        smoke_frozen.assert_child_surface({"cwd_entries": []})
+    with pytest.raises(SystemExit, match="env_keys"):
+        smoke_frozen.assert_child_surface({"env_keys": [], "cwd_entries": []})
 
 
 def test_executable_names():

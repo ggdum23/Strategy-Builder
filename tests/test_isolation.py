@@ -174,7 +174,8 @@ def test_no_secret_paths():
         if path.suffix in {".gz", ".png", ".pyc"} or "__pycache__" in path.parts:
             continue
         # PyInstaller writes absolute paths into packaging/build and packaging/dist.
-        if "build" in path.parts or "dist" in path.parts:
+        rel_parts = path.relative_to(ROOT).parts
+        if rel_parts[:2] in {("packaging", "build"), ("packaging", "dist")}:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for token in SECRETS:

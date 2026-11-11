@@ -1,7 +1,8 @@
 # Build the one-folder bundle and the Inno Setup installer.
 # Run on Windows from any working directory. Requires the repo, Python 3.12,
-# and PyInstaller 6.22.3. The compiler must be Inno Setup 6.7.4. Any other
-# ISCC.exe is ignored. A missing 6.7.4 is downloaded and hash-checked first.
+# and PyInstaller 6.22.3. The compiler is always the pinned Inno Setup 6.7.4
+# installer. A copy already on the machine is not used. The download is
+# hash-checked before it runs.
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -17,14 +18,6 @@ $InnoUrl = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innos
 $InnoSha256 = "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c"
 
 . (Join-Path $PSScriptRoot "ci_process.ps1")
-
-function Get-LeadingVersion {
-    param([string]$Text)
-    if ($Text -match '(\d+\.\d+\.\d+(?:\.\d+)?)') {
-        return $Matches[1]
-    }
-    return ""
-}
 
 function Get-IsccVersionText {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -45,8 +38,12 @@ function Get-IsccVersionText {
 function Test-ExactInnoVersion {
     param([Parameter(Mandatory = $true)][string]$Text)
     $parts = @($Text.Split('.') | Where-Object { $_ -ne '' })
-    if ($parts.Count -lt 3) { return $false }
-    return ($parts[0] -eq '6' -and $parts[1] -eq '7' -and $parts[2] -eq '4')
+    $required = @($InnoVersion.Split('.') | Where-Object { $_ -ne '' })
+    if ($parts.Count -ne $required.Count) { return $false }
+    for ($i = 0; $i -lt $required.Count; $i++) {
+        if ($parts[$i] -ne $required[$i]) { return $false }
+    }
+    return $true
 }
 
 function Install-InnoSetup {
@@ -91,23 +88,8 @@ function Install-InnoSetup {
 }
 
 function Resolve-Iscc {
-    $candidates = @(
-        (Join-Path $Root "packaging\build\innosetup-$InnoVersion\ISCC.exe"),
-        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-    )
-    $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-    if ($command) {
-        $candidates += $command.Source
-    }
-    foreach ($candidate in $candidates) {
-        if (-not $candidate -or -not (Test-Path -LiteralPath $candidate)) { continue }
-        $version = Get-IsccVersionText $candidate
-        if (Test-ExactInnoVersion $version) {
-            return $candidate
-        }
-        Write-Host "Ignoring $candidate (version $version, required $InnoVersion)"
-    }
+    # Preinstalled compilers are not used, even when the banner says 6.7.4.
+    Write-Host "Installing pinned Inno Setup $InnoVersion (preinstalled compilers are not used)"
     return Install-InnoSetup
 }
 

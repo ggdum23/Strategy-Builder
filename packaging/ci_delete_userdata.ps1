@@ -31,7 +31,6 @@ if (-not $matched.Success) {
 $defaultRoot = $matched.Groups[1].Value
 $sentinel = "D:\strategy-builder-ci-upgrade"
 $defaultExisted = Test-Path -LiteralPath $defaultRoot
-$sentinelExisted = Test-Path -LiteralPath $sentinel
 
 $log = Join-Path $env:TEMP "strategy-builder-reinstall.log"
 if (Test-Path -LiteralPath $log) {
@@ -46,6 +45,14 @@ if ($code -ne 0) {
     throw "reinstall exited $code"
 }
 
+$sentinelFile = Join-Path $sentinel "ci-sentinel-keep.txt"
+New-Item -ItemType Directory -Force -Path $sentinel | Out-Null
+Set-Content -LiteralPath $sentinelFile -Value "survive" -Encoding ascii
+$tempRoot = Join-Path $env:TEMP "strategy-builder-data-root"
+$tempFile = Join-Path $tempRoot "ci-data-root-keep.txt"
+New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+Set-Content -LiteralPath $tempFile -Value "survive" -Encoding ascii
+
 & (Join-Path $PSScriptRoot "ci_uninstall.ps1") -Destination $Destination -DeleteUserData
 if (Test-Path -LiteralPath $userRoot) {
     throw "user data still exists: $userRoot"
@@ -53,8 +60,13 @@ if (Test-Path -LiteralPath $userRoot) {
 if (-not $defaultExisted -and (Test-Path -LiteralPath $defaultRoot)) {
     throw "DELETEUSERDATA created the market-data folder $defaultRoot"
 }
-if (-not $sentinelExisted -and (Test-Path -LiteralPath $sentinel)) {
-    throw "DELETEUSERDATA created the sentinel folder $sentinel"
+foreach ($planted in @($sentinelFile, $tempFile)) {
+    if (-not (Test-Path -LiteralPath $planted)) {
+        throw "DELETEUSERDATA removed $planted"
+    }
+    if ((Get-Content -LiteralPath $planted -Raw).Trim() -ne "survive") {
+        throw "DELETEUSERDATA changed $planted"
+    }
 }
 
 Write-Output "deleted user data"

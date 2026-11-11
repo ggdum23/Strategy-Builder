@@ -100,7 +100,10 @@ def assert_child_surface(payload: dict) -> None:
     """The strategy saw only the runner allowlist, in an empty directory."""
     from backtester.runner import _ENV_KEEP
 
-    keys = [str(key).upper() for key in payload.get("env_keys") or []]
+    reported = payload.get("env_keys")
+    if not reported:
+        raise SystemExit("child did not report env_keys")
+    keys = [str(key).upper() for key in reported]
     leaked = [name for name in FORBIDDEN_ENV if name in keys]
     if leaked:
         raise SystemExit(f"user-path variables leaked into the child: {leaked}")
