@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "r741c4e2be286b725",
+  "kind": "parallel",
+  "profile": "desk",
+  "rank_key": "excess_total_return",
+  "cancelled": false,
+  "timeout_s": 90,
+  "workers": 1,
+  "jobs": [
+    {
+      "strategy_id": "long",
+      "source_id": "book",
+      "symbol": "TEST",
+      "status": "ok",
+      "anonymized": false
+    },
+    {
+      "strategy_id": "flat",
+      "source_id": "book",
+      "symbol": "TEST",
+      "status": "ok",
+      "anonymized": false
+    },
+    {
+      "strategy_id": "crash",
+      "source_id": "book",
+      "symbol": "TEST",
+      "status": "error",
+      "anonymized": false
+    }
+  ]
+}

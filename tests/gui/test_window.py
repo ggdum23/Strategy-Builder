@@ -23,7 +23,7 @@ from backtester.gui.discover import summarize_strategy
 from backtester.gui.jobs import build_pack_job, inspect_series, record_series
 from backtester.gui.window import MainWindow
 
-from synthetic import ARENA_METRICS, DESK_METRICS, write_book, write_filled, write_parallel_run, write_strategy
+from synthetic import ARENA_METRICS, DESK_METRICS, write_book, write_filled, write_strategy
 
 ROOT = Path(__file__).resolve().parents[2]
 SHOTS = ROOT / "docs" / "screenshots"
@@ -281,40 +281,54 @@ def test_screenshots(qtbot, tmp_path):
 
     live_src = write_filled(tmp_path / "Strategy Builder" / "QQQ" / "filled")
     live_out = tmp_path / "Strategy Builder" / "out" / "D02"
-    window.run_page.src.set_text(str(live_src))
-    window.run_page.ticker.setText("QQQ")
-    window.run_page.out.set_text(str(live_out))
+    strategy_file = folder / "D02" / "strategy.py"
     window.run_page.equity.setText("1000000")
     window.run_page.fee.setText("1")
-    window.run_page.single.setChecked(True)
-    window.run_page.named.setChecked(True)
-    window.run_page.refresh()
-    assert window.run_page.run_button.isEnabled()
+    window.run_page.ticker.setText("QQQ")
     window.show_page(3)
-    windows_out = r"C:\Users\Jeu\Desktop\Strategy Builder\out\D02"
-    for field, shown in ((window.run_page.src, WINDOWS_SRC), (window.run_page.out, windows_out)):
-        field.edit.blockSignals(True)
-        field.set_text(shown)
-        field.edit.blockSignals(False)
-    strategy_file = str(folder / "D02" / "strategy.py")
-    windows_strategy = r"C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
-    for old, shown in (
-        (str(live_src), WINDOWS_SRC),
-        (str(live_out), windows_out),
-        (strategy_file, windows_strategy),
-    ):
-        window.run_page.replace_summary(old, shown)
-    window.run_page.strategy_label.setText(
-        r"Strategies: C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
-    )
+    _present_named(window, live_src, live_out, strategy_file)
     _grab(window, "04-run-dark.png", tmp_path)
+    _present_walk(window, live_src, live_out, strategy_file)
+    _grab(window, "15-run-walk-dark.png", tmp_path)
+    _present_pack(window, pack, sidecar, live_out, strategy_file)
+    _grab(window, "17-run-pack-dark.png", tmp_path)
+    window.run_page.named.setChecked(True)
+    window.run_page.single.setChecked(True)
 
     window.results_page.show_report(load_run(arena))
     window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\D02")
     window.results_page.tabs.setCurrentIndex(0)
+    window.results_page.chart.log_box.setChecked(False)
     window.results_page.chart.show_readout_at(20)
     window.show_page(4)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.chart.log_box, 12, 24)
+    assert "$" in window.results_page.chart.readout.text()
+    assert "%" in window.results_page.chart.readout.text()
     _grab(window, "05-results-dark.png", tmp_path)
+    window.results_page.chart.log_box.setChecked(True)
+    window.results_page.chart.show_readout_at(20)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.chart.log_box, 12, 24)
+    assert "$" in window.results_page.chart.readout.text()
+    assert window.results_page.chart.log_box.isChecked()
+    _grab(window, "13-results-log-dark.png", tmp_path)
+    window.results_page.chart.log_box.setChecked(False)
+
+    fee_metrics = dict(ARENA_METRICS)
+    fee_metrics["fees_total"] = 134.08
+    fee_metrics["fees_breakdown"] = {
+        "commission": 50.004,
+        "exchange": 50.004,
+        "sec": 34.074,
+        "total": 134.08,
+    }
+    fees = write_book(tmp_path / "shot-fees", fee_metrics, equity=_shot_equity())
+    window.results_page.show_report(load_run(fees))
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\fees")
+    window.results_page.tabs.setCurrentIndex(0)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.fees_footer)
+    QApplication.processEvents()
+    assert window.results_page.fees_footer.text().endswith("$134.08")
+    _grab(window, "19-fees-dark.png", tmp_path)
 
     window.results_page.show_report(load_run(desk))
     window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\desk")
@@ -345,41 +359,51 @@ def test_screenshots(qtbot, tmp_path):
     window.show_page(5)
     _grab(window, "07-history-dark.png", tmp_path)
 
-    board = write_parallel_run(tmp_path / "shot-board", anonymized=False)
+    board = ROOT / "tests" / "gui" / "fixtures" / "phase3_desk_batch"
     window.results_page.load_path(str(board), audience="operator")
     window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\board")
     window.results_page.tabs.setCurrentIndex(0)
     window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.leaderboard)
     QApplication.processEvents()
+    board_text = _table_text(window.results_page.leaderboard)
+    assert "9.98%" in board_text
+    assert "19.94%" in board_text
+    assert "964,497,042.75" in board_text
+    assert "TEST" in board_text
     window.show_page(4)
     _grab(window, "11-leaderboard-dark.png", tmp_path)
 
     window.theme_button.click()
-    window.run_page.src.set_text(str(live_src))
-    window.run_page.out.set_text(str(live_out))
     window.show_page(3)
+    window.run_page.named.setChecked(True)
+    window.run_page.single.setChecked(True)
+    _present_named(window, live_src, live_out, strategy_file)
     assert window.run_page.run_button.isEnabled()
-    for field, shown in ((window.run_page.src, WINDOWS_SRC), (window.run_page.out, windows_out)):
-        field.edit.blockSignals(True)
-        field.set_text(shown)
-        field.edit.blockSignals(False)
-    for old, shown in (
-        (str(live_src), WINDOWS_SRC),
-        (str(live_out), windows_out),
-        (strategy_file, windows_strategy),
-    ):
-        window.run_page.replace_summary(old, shown)
-    window.run_page.strategy_label.setText(
-        r"Strategies: C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
-    )
     _grab(window, "09-run-light.png", tmp_path)
+    _present_walk(window, live_src, live_out, strategy_file)
+    _grab(window, "16-run-walk-light.png", tmp_path)
+    _present_pack(window, pack, sidecar, live_out, strategy_file)
+    _grab(window, "18-run-pack-light.png", tmp_path)
     window.results_page.show_report(load_run(arena))
     window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\D02")
     window.results_page.tabs.setCurrentIndex(0)
+    window.results_page.chart.log_box.setChecked(False)
     window.results_page.chart.show_readout_at(20)
-    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.chart)
     window.show_page(4)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.chart.log_box, 12, 24)
     _grab(window, "08-results-light.png", tmp_path)
+    window.results_page.chart.log_box.setChecked(True)
+    window.results_page.chart.show_readout_at(20)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.chart.log_box, 12, 24)
+    assert window.results_page.chart.log_box.isChecked()
+    _grab(window, "14-results-log-light.png", tmp_path)
+    window.results_page.chart.log_box.setChecked(False)
+    window.results_page.show_report(load_run(fees))
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\fees")
+    window.results_page.tabs.setCurrentIndex(0)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.fees_footer)
+    QApplication.processEvents()
+    _grab(window, "20-fees-light.png", tmp_path)
     window.results_page.show_report(load_run(desk))
     window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\desk")
     window.results_page.tabs.setCurrentIndex(2)
@@ -391,6 +415,95 @@ def test_screenshots(qtbot, tmp_path):
     window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.leaderboard)
     QApplication.processEvents()
     _grab(window, "12-leaderboard-light.png", tmp_path)
+
+
+def _paint_paths(window, pairs) -> None:
+    for field, shown in pairs:
+        field.edit.blockSignals(True)
+        field.set_text(shown)
+        field.edit.blockSignals(False)
+
+
+def _present_named(window, live_src: Path, live_out: Path, strategy_file: Path) -> None:
+    window.run_page.named.setChecked(True)
+    window.run_page.single.setChecked(True)
+    window.run_page.src.set_text(str(live_src))
+    window.run_page.ticker.setText("QQQ")
+    window.run_page.out.set_text(str(live_out))
+    window.run_page.refresh()
+    assert window.run_page.run_button.isEnabled()
+    windows_out = r"C:\Users\Jeu\Desktop\Strategy Builder\out\D02"
+    windows_strategy = r"C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
+    _paint_paths(window, ((window.run_page.src, WINDOWS_SRC), (window.run_page.out, windows_out)))
+    for old, shown in (
+        (str(live_src), WINDOWS_SRC),
+        (str(live_out), windows_out),
+        (str(strategy_file), windows_strategy),
+    ):
+        window.run_page.replace_summary(old, shown)
+    window.run_page.strategy_label.setText("Strategies: " + windows_strategy)
+
+
+def _present_walk(window, live_src: Path, live_out: Path, strategy_file: Path) -> None:
+    window.run_page.named.setChecked(True)
+    window.run_page.walk.setChecked(True)
+    window.run_page.design_day.clear()
+    window.run_page.design_date.clear()
+    window.run_page.design_fraction.setText("0.6")
+    window.run_page.src.set_text(str(live_src))
+    window.run_page.ticker.setText("QQQ")
+    window.run_page.out.set_text(str(live_out))
+    window.run_page.refresh()
+    assert window.run_page.run_button.isEnabled()
+    windows_out = r"C:\Users\Jeu\Desktop\Strategy Builder\out\D02"
+    windows_strategy = r"C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
+    _paint_paths(window, ((window.run_page.src, WINDOWS_SRC), (window.run_page.out, windows_out)))
+    for old, shown in (
+        (str(live_src), WINDOWS_SRC),
+        (str(live_out), windows_out),
+        (str(strategy_file), windows_strategy),
+    ):
+        window.run_page.replace_summary(old, shown)
+    window.run_page.strategy_label.setText("Strategies: " + windows_strategy)
+
+
+def _present_pack(window, pack: Path, sidecar: Path, live_out: Path, strategy_file: Path) -> None:
+    window.run_page.single.setChecked(True)
+    window.run_page.pack.setChecked(True)
+    window.run_page.pack_dir.set_text(str(pack))
+    window.run_page.sidecar.set_text(str(sidecar))
+    window.run_page.out.set_text(str(live_out))
+    window.run_page.refresh()
+    assert window.run_page.run_button.isEnabled()
+    windows_out = r"C:\Users\Jeu\Desktop\Strategy Builder\out\D02"
+    windows_pack = r"C:\Users\Jeu\Desktop\Strategy Builder\packs\qqq"
+    windows_side = r"C:\Users\Jeu\Desktop\Strategy Builder\operator\qqq.sidecar.json"
+    windows_strategy = r"C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
+    _paint_paths(
+        window,
+        (
+            (window.run_page.pack_dir, windows_pack),
+            (window.run_page.sidecar, windows_side),
+            (window.run_page.out, windows_out),
+        ),
+    )
+    for old, shown in (
+        (str(pack), windows_pack),
+        (str(sidecar), windows_side),
+        (str(live_out), windows_out),
+        (str(strategy_file), windows_strategy),
+    ):
+        window.run_page.replace_summary(old, shown)
+    window.run_page.strategy_label.setText("Strategies: " + windows_strategy)
+
+
+def _table_text(table) -> str:
+    model = table.model()
+    chunks = []
+    for row in range(model.rowCount()):
+        for column in range(model.columnCount()):
+            chunks.append(str(model.index(row, column).data() or ""))
+    return "\n".join(chunks)
 
 
 def _shot_equity() -> list[float]:

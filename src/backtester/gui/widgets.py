@@ -169,9 +169,10 @@ class DictTable(QTableView):
         rows: list[dict],
         titles: dict | None = None,
         kinds: dict | None = None,
+        row_kinds: dict | None = None,
     ) -> None:
         titles = titles or {}
-        model = DictModel(list(columns), list(rows), titles, kinds or {})
+        model = DictModel(list(columns), list(rows), titles, kinds or {}, row_kinds or {})
         self._model = model
         sorting = self.isSortingEnabled()
         self.setSortingEnabled(False)
@@ -197,12 +198,13 @@ class DictTable(QTableView):
 class DictModel(QAbstractTableModel):
     """Filter and sort in Python. Qt's proxy compared the sort tuples and crashed on Windows."""
 
-    def __init__(self, columns, rows, titles, kinds=None):
+    def __init__(self, columns, rows, titles, kinds=None, row_kinds=None):
         super().__init__()
         self.columns = columns
         self.rows = rows
         self.titles = titles
         self.kinds = kinds or {}
+        self.row_kinds = row_kinds or {}
         self._filter = ""
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
@@ -224,7 +226,7 @@ class DictModel(QAbstractTableModel):
             parts = []
             for column in self.columns:
                 value = record.get(column)
-                text = self._display(column, value)
+                text = self._display(column, value, record)
                 shown[column] = text
                 token[column] = sort_token(value)
                 parts.append(text.casefold())
@@ -286,8 +288,11 @@ class DictModel(QAbstractTableModel):
             return Qt.ItemFlag.NoItemFlags
         return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
-    def _display(self, key: str, value) -> str:
+    def _display(self, key: str, value, record) -> str:
         kind = self.kinds.get(key)
+        source = self.row_kinds.get(key)
+        if source and record.get(source):
+            kind = record.get(source)
         if kind:
             return format_number(kind, value)
         return format_cell(value)

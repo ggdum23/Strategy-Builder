@@ -18,6 +18,8 @@ import pyqtgraph as pg
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
+from .format import format_number
+
 pg.setConfigOptions(antialias=True, useOpenGL=False)
 
 
@@ -51,15 +53,36 @@ class _NumberAxis(pg.AxisItem):
         self.enableAutoSIPrefix(False)
 
     def tickStrings(self, values, scale, spacing):
-        step = abs(float(spacing) * float(scale)) or 1.0
-        numbers = [float(value) * float(scale) for value in values]
+        numbers = []
+        for value in values:
+            try:
+                number = float(value) * float(scale)
+            except (TypeError, ValueError):
+                numbers.append(float("nan"))
+                continue
+            if self.logMode:
+                if number > 300 or number < -300:
+                    numbers.append(float("nan"))
+                else:
+                    numbers.append(10 ** number)
+            else:
+                numbers.append(number)
+        if self.percent:
+            return ["" if not math.isfinite(number) else format_number("fraction", number) for number in numbers]
+        finite = [number for number in numbers if math.isfinite(number)]
+        if self.logMode and len(finite) >= 2:
+            step = abs(finite[-1] - finite[0]) / (len(finite) - 1) or 1.0
+        elif spacing is None:
+            step = 1.0
+        else:
+            step = abs(float(spacing) * float(scale)) or 1.0
         use_millions = any(abs(number) >= 1_000_000 for number in numbers)
         out = []
         for number in numbers:
-            if self.percent:
-                digits = 1 if step >= 0.1 else 2
-                out.append(f"{number:.{digits}f}%")
-            elif use_millions:
+            if not math.isfinite(number):
+                out.append("")
+                continue
+            if use_millions:
                 digits = 2 if step >= 10_000 else 3
                 out.append(f"{number / 1_000_000:.{digits}f}M")
             elif abs(number) >= 10_000 or step >= 1_000:
@@ -80,17 +103,23 @@ def _finite_pairs(xs, ys) -> list[tuple[float, float]]:
 
 
 def _padded(low: float, high: float, *, log: bool) -> tuple[float, float]:
-    data_low = low
+    """View limits. In log mode these are log10 coordinates, padded in log space."""
+    if log:
+        low = max(float(low), 1e-300)
+        high = max(float(high), low)
+        log_low = math.log10(low)
+        log_high = math.log10(high)
+        span = log_high - log_low
+        pad = span * 0.08 if span else 0.05
+        return log_low - pad, log_high + pad
     if low == high:
         delta = abs(low) * 0.08 or 1.0
         low, high = low - delta, high + delta
     else:
         span = high - low
         low, high = low - span * 0.08, high + span * 0.08
-    if log and low <= 0 < data_low:
-        low = data_low * 0.5
     if high <= low:
-        high = low * 1.2 if low else 1.0
+        high = low + 1.0
     return low, high
 
 
@@ -375,8 +404,22 @@ class ChartPanel(QWidget):
         return problems
 
     def _coverage(self, plot, series, label: str) -> list[str]:
+        """Compare extrema in the ViewBox coordinate system.
+
+        With a log axis that system is log10. Comparing raw dollars to a log
+        range reports a false pass while the line sits outside the plot.
+        """
         problems = []
+        log_y = bool(plot.getViewBox().state.get("logMode", [False, False])[1])
         x_range, y_range = plot.viewRange()
+
+        def y_coord(value: float) -> float | None:
+            if not log_y:
+                return value
+            if value <= 0:
+                return None
+            return math.log10(value)
+
         for name, xs, ys, _color in series:
             pairs = _finite_pairs(xs, ys)
             if not pairs:
@@ -384,8 +427,11 @@ class ChartPanel(QWidget):
             x_values = [item[0] for item in pairs]
             y_values = [item[1] for item in pairs]
             x0, x1 = min(x_values), max(x_values)
-            y0, y1 = min(y_values), max(y_values)
-            if x0 < x_range[0] - 1e-6 or x1 > x_range[1] + 1e-6 or y0 < y_range[0] - 1e-6 or y1 > y_range[1] + 1e-6:
+            y0, y1 = y_coord(min(y_values)), y_coord(max(y_values))
+            outside = x0 < x_range[0] - 1e-6 or x1 > x_range[1] + 1e-6
+            outside = outside or y0 is None or y1 is None
+            outside = outside or y0 < y_range[0] - 1e-6 or y1 > y_range[1] + 1e-6
+            if outside:
                 problems.append(
                     f"{label}:{name} data [{x0}, {x1}] × [{y0}, {y1}] "
                     f"view [{x_range[0]}, {x_range[1]}] × [{y_range[0]}, {y_range[1]}]"
@@ -404,15 +450,23 @@ class ChartPanel(QWidget):
         bits = []
         if 0 <= index < len(labels) and labels[index]:
             bits.append(str(labels[index]))
-        top, _ylabel, _percent = self._series_for_top()
-        for name, xs, ys, _color in list(top) + list(study.get("drawdown") or []):
+        top, ylabel, percent = self._series_for_top()
+        if ylabel == "exposure":
+            top_kind = "ratio"
+        elif percent:
+            top_kind = "fraction"
+        else:
+            top_kind = "money"
+        series = [(name, xs, ys, top_kind) for name, xs, ys, _color in top]
+        series.extend((name, xs, ys, "fraction") for name, xs, ys, _color in study.get("drawdown") or [])
+        for name, xs, ys, kind in series:
             pairs = _finite_pairs(xs, ys)
             if not pairs:
                 continue
             nearest = min(pairs, key=lambda item: abs(item[0] - index))
             if abs(nearest[0] - index) > 1.5:
                 continue
-            bits.append(f"{name} {nearest[1]:,.4g}")
+            bits.append(f"{name} {format_number(kind, nearest[1])}")
         return "   ".join(bits) if bits else "Drag to pan. Wheel to zoom."
 
     def _moved(self, position) -> None:

@@ -9,39 +9,18 @@ from __future__ import annotations
 from ..profiles import get_profile
 
 _FILL = {
-    "next_delivered_bar": (
-        "Fills at the open of the next bar the strategy is shown. "
-        "With extended hours off, only regular-session bars are delivered, "
-        "so the last regular decision fills at the next session's first delivered bar."
-    ),
-    "next_rth_open": (
-        "Fills only at the open of the next regular-session bar, including a later "
-        "regular bar of the same session. Pre and post signals queue, and a newer "
-        "signal replaces one that has not filled."
-    ),
+    "next_delivered_bar": "Fills at the open of the next bar the strategy is shown.",
+    "next_rth_open": "Fills at the next regular-session open, and a newer signal replaces one that has not filled.",
 }
 
 _WARMUP = {
-    "rescale_keep_exposure": (
-        "Warm-up trades, then rescales the account to the starting equity and keeps exposure."
-    ),
-    "flat_until_live": (
-        "Warm-up stays flat. Targets are ignored while live is false, then the book starts flat "
-        "at the starting equity."
-    ),
+    "rescale_keep_exposure": "Warm-up trades, then the account is rescaled to the starting equity and exposure is kept.",
+    "flat_until_live": "Warm-up stays flat, and the book starts flat at the starting equity.",
 }
 
 _FEES = {
-    "arena": (
-        "Fee table is the Arena schedule in costs.py, including that file's FINRA TAF, "
-        "plus 1 bp slippage per side. Financing is 0. Dividends are not credited. "
-        "A fee multiple other than 1 is rejected."
-    ),
-    "desk": (
-        "Fee table is the Desk schedule in costs_desk.py. SEC and FINRA TAF are not the Arena "
-        "numbers. Slippage is 1 bp per side. fee_mult scales commissions, fees, and slippage. "
-        "It does not scale borrow, financing, or the share count that advances the volume tier."
-    ),
+    "arena": "Arena uses its own fee schedule plus 1 bp of slippage per side, and it rejects a fee multiple other than 1.",
+    "desk": "Desk uses its own fee schedule plus 1 bp of slippage, and the fee multiple scales commissions, fees, and slippage.",
 }
 
 
@@ -50,63 +29,58 @@ def profile_rows(name: str) -> tuple[tuple[str, str], ...]:
     profile = get_profile(name)
     cap = f"{profile.max_abs_target:g}"
     rows = [
-        ("Profile", profile.name),
-        ("Clamp", f"Target exposure is clamped to ±{cap}. An unchanged target is a hold: no drift rebalance."),
+        ("Profile", f"{profile.name}."),
+        ("Clamp", f"Target exposure is clamped to ±{cap}, and an unchanged target is a hold."),
         ("Fills", _FILL.get(profile.fill_venue, profile.fill_venue)),
         ("Fees", _FEES.get(profile.fee_table, profile.fee_table)),
         (
             "Borrow",
-            f"{profile.borrow_rate_annual:.2%} per year on short notional, charged by this profile's engine. "
-            "Leave the run field unset to pass that default through. An explicit number overrides it.",
+            f"Borrow is {profile.borrow_rate_annual:.2%} per year on short notional unless the run overrides it.",
         ),
         (
             "Financing",
-            f"{profile.financing_rate_annual:.2%} per year. "
+            f"Financing is {profile.financing_rate_annual:.2%} per year"
             + (
-                "Arena rejects any other rate in this build, so the reference loop stays unchanged."
+                ", and Arena rejects any other rate."
                 if profile.name == "arena"
-                else "Desk charges it once per session boundary on max(0, |position value| − equity). Idle cash earns 0."
+                else " on borrowed gross exposure at each session boundary."
             ),
         ),
         (
             "Dividends",
-            "Not credited." if not profile.dividends else "Cash from the dividend file, before the ex-session's first bar.",
+            "Dividends are not credited." if not profile.dividends else "Dividends are cash from the dividend file.",
         ),
     ]
     if profile.margin_call_gross is None:
-        rows.append(("Margin", "No margin call."))
+        rows.append(("Margin", "There is no margin call."))
     else:
         rows.append(
             (
                 "Margin",
-                f"Gross leverage above {profile.margin_call_gross:g}× at a regular close, with nothing pending, "
-                f"queues a fill back to sign(position) × {cap} at the next regular open.",
+                f"Gross leverage above {profile.margin_call_gross:g}× queues a reduction to ±{cap} at the next regular open.",
             )
         )
     if profile.liquidation_hwm_fraction is None:
-        rows.append(("Liquidation", "No forced liquidation."))
+        rows.append(("Liquidation", "There is no forced liquidation."))
     else:
         rows.append(
             (
                 "Liquidation",
-                f"Equity below {profile.liquidation_hwm_fraction:.0%} of the running high-water mark "
-                "flattens at that bar's close, stops trading, and flags DISQUALIFIED.",
+                f"Equity below {profile.liquidation_hwm_fraction:.0%} of the high-water mark flattens the book and flags DISQUALIFIED.",
             )
         )
     rows.append(("Warm-up", _WARMUP.get(profile.warmup, profile.warmup)))
     rows.append(
         (
             "Share count",
-            "Named raw files use share factor 1. The runner rejects any other factor. "
-            "An anonymized pack keeps its scale in the operator sidecar. The runner reads that file. "
-            "This window does not open it and does not offer 0.9 as a choice.",
+            "Named files use share factor 1, and an anonymized pack keeps its scale in the sidecar.",
         )
     )
     rows.append(
         (
             "Benchmarks",
-            "1× buy and hold through the same engine and the same costs."
-            + (" Desk also runs a constant 2× long, financed at the Desk rate." if profile.name == "desk" else ""),
+            "The benchmark is 1× buy and hold through the same engine and the same costs"
+            + (", and Desk also runs a financed 2× long." if profile.name == "desk" else "."),
         )
     )
     return tuple(rows)

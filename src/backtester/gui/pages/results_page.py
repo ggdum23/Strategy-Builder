@@ -24,11 +24,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..audience import export_allowed, peek_scale, peek_symbols
+from ..audience import export_allowed, export_text, peek_scale, peek_symbols, scrub_text
 from ..backend import RunReport, chart_overlay, drawdown_line, exposure_line, load_run
 from ..charts import ChartPanel
 from ..format import MISSING, format_number, is_missing
-from ..schema import ACTIVITY_KEYS, DESK_KEYS, KPI_KEYS, SPECS, leaderboard_kind
+from ..schema import ACTIVITY_KEYS, DESK_KEYS, FIGURE_FILES, KPI_KEYS, LEADERBOARD_LABELS, SPECS, leaderboard_kind
 from ..widgets import Banner, DictTable, MetricCard, PageHeader, PathField, PeriodHeat, Section, clear_layout
 
 
@@ -39,6 +39,7 @@ class ResultsPage(QWidget):
         self._report: RunReport | None = None
         self._cards: dict[str, MetricCard] = {}
         self._loading = False
+        self._source_path = ""
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 16)
         root.setSpacing(10)
@@ -118,6 +119,8 @@ class ResultsPage(QWidget):
         self.fees_title = Section("Fees")
         self.fees = DictTable()
         self.fees.setMinimumHeight(72)
+        self.fees_footer = QLabel("")
+        self.fees_footer.setObjectName("feesTotal")
         self.period_title = Section("Period returns")
         self.periods = PeriodHeat()
         self.jobs_title = Section("Jobs")
@@ -145,6 +148,7 @@ class ResultsPage(QWidget):
             self.benchmarks,
             self.fees_title,
             self.fees,
+            self.fees_footer,
             self.period_title,
             self.periods,
             self.jobs_title,
@@ -212,14 +216,23 @@ class ResultsPage(QWidget):
         layout.addWidget(self.figure_label, 1)
 
     def load_path(self, path: str, audience: str | None = None) -> None:
-        self.path.set_text(path or "")
+        self._source_path = path or ""
         chosen = audience or "auto"
-        report = load_run(path, audience=chosen)
+        report = load_run(self._source_path, audience=chosen) if self._source_path else load_run(path, audience=chosen)
         self._set_audience_combo(report.audience)
+        self._show_path(report)
         self.show_report(report)
 
     def load_current(self) -> None:
-        self.load_path(self.path.text(), audience=self.audience.currentData())
+        self.load_path(self._source_path or self.path.text(), audience=self.audience.currentData())
+
+    def _show_path(self, report: RunReport) -> None:
+        shown = self._source_path
+        if report.audience == "designer" and shown:
+            shown = scrub_text(shown, peek_symbols(Path(shown)))
+        self.path.edit.blockSignals(True)
+        self.path.set_text(shown)
+        self.path.edit.blockSignals(False)
 
     def _set_audience_combo(self, audience: str) -> None:
         self._loading = True
@@ -240,9 +253,10 @@ class ResultsPage(QWidget):
         for warning in report.warnings:
             severity = "error" if "disagree" in warning or "could not" in warning else "warn"
             self.banners.addWidget(Banner(severity, warning))
-        if report.missing:
+        missing = self._visible_missing(report)
+        if missing:
             self.banners.addWidget(
-                Banner("info", "Not in this report, so left blank: " + ", ".join(report.missing) + ".")
+                Banner("info", "Not in this report, so left blank: " + ", ".join(missing) + ".")
             )
         if report.kind == "walkforward":
             self.leg.blockSignals(True)
@@ -255,6 +269,17 @@ class ResultsPage(QWidget):
             self.leg.setVisible(False)
             self.leg.clear()
         self._render_active()
+
+    def _visible_missing(self, report: RunReport) -> list[str]:
+        """Drop the saved-figure name when the interactive chart already has the curve."""
+        if report.kind == "batch":
+            has_chart = False
+        elif report.kind == "walkforward":
+            has_chart = any(bool(getattr(child.get("report"), "curves", None)) for child in report.children)
+        else:
+            has_chart = bool(report.curves)
+        hidden = set(FIGURE_FILES) if has_chart else set()
+        return [item for item in report.missing if item not in hidden]
 
     def metric_text(self, key: str) -> str:
         card = self._cards.get(key)
@@ -390,10 +415,15 @@ class ResultsPage(QWidget):
 
     def _show_failures(self, report: RunReport) -> None:
         for child in report.children:
-            if child.get("state") != "ok":
-                self.banners.addWidget(
-                    Banner("error", f"{child.get('name')}: {child.get('state')}  {child.get('error') or ''}".strip())
-                )
+            if child.get("state") == "ok":
+                continue
+            detail = str(child.get("error") or "").strip()
+            lines = [line.strip() for line in detail.splitlines() if line.strip()]
+            summary = lines[-1] if lines else child.get("state")
+            banner = Banner("error", f"{child.get('name')}: {summary}")
+            if detail:
+                banner.setToolTip(detail)
+            self.banners.addWidget(banner)
 
     def _show_chart(self, visible: bool) -> None:
         self.chart.setVisible(visible)
@@ -459,11 +489,17 @@ class ResultsPage(QWidget):
             spec = SPECS.get(key)
             rows.append(
                 {
-                    "field": spec.label if spec else key,
-                    "value": format_number(spec.kind, book.metrics.get(key)) if spec else book.metrics.get(key),
+                    "metric": spec.label if spec else key,
+                    "value": book.metrics.get(key),
+                    "kind": spec.kind if spec else leaderboard_kind(key),
                 }
             )
-        self.activity.set_records(("field", "value"), rows, {"field": "Field", "value": "Stored"})
+        self.activity.set_records(
+            ("metric", "value"),
+            rows,
+            {"metric": "Metric", "value": "Value"},
+            row_kinds={"value": "kind"},
+        )
         self._fit_table(self.activity, len(rows))
         self._show_section(self.activity_title, self.activity, bool(rows))
 
@@ -494,15 +530,35 @@ class ResultsPage(QWidget):
 
     def _fill_fees(self, book: RunReport) -> None:
         payload = book.fees_breakdown if isinstance(book.fees_breakdown, dict) else {}
-        rows = [{"component": str(key), "dollars": value} for key, value in payload.items() if not isinstance(value, (dict, list))]
+        stored = None
+        for key in ("total", "fees_total", "sum"):
+            if key in payload and not isinstance(payload[key], (dict, list)):
+                stored = payload[key]
+                break
+        if stored is None and "fees_total" in book.metrics:
+            stored = book.metrics.get("fees_total")
+        skip = {"total", "fees_total", "sum"}
+        rows = [
+            {"component": str(key), "dollars": value}
+            for key, value in payload.items()
+            if key not in skip and not isinstance(value, (dict, list))
+        ]
         self.fees.set_records(
             ("component", "dollars"),
             rows,
             {"component": "Component", "dollars": "Dollars"},
             {"dollars": "money"},
         )
-        self._fit_table(self.fees, len(rows))
+        self._fit_table(self.fees, len(rows) or 1)
+        if stored is None or not rows:
+            self.fees_footer.setText("")
+            self.fees_footer.setVisible(False)
+        else:
+            self.fees_footer.setText("Stored total  " + format_number("money", stored))
+            self.fees_footer.setVisible(True)
         self._show_section(self.fees_title, self.fees, bool(rows))
+        if not rows:
+            self.fees_footer.setVisible(False)
 
     def _fill_periods(self, book: RunReport) -> None:
         payload = book.period_returns if isinstance(book.period_returns, dict) else None
@@ -533,8 +589,13 @@ class ResultsPage(QWidget):
             self.filter.setVisible(False)
             self.leaderboard.setVisible(False)
             return
-        kinds = {column: kind for column in board.columns if (kind := leaderboard_kind(column))}
-        titles = {column: SPECS[column].label for column in board.columns if column in SPECS}
+        kinds = {column: leaderboard_kind(column) for column in board.columns}
+        titles = {}
+        for column in board.columns:
+            if column in SPECS:
+                titles[column] = SPECS[column].label
+            elif column in LEADERBOARD_LABELS:
+                titles[column] = LEADERBOARD_LABELS[column]
         self.leaderboard.set_records(board.columns, list(board.rows), titles, kinds)
         self._fit_table(self.leaderboard, len(board.rows))
         self.leaderboard_title.setVisible(True)
@@ -609,11 +670,27 @@ class ResultsPage(QWidget):
         else:
             self.postmortem.setPlainText("No liquidation post-mortem in this report.")
 
+    def _figure_blocked(self, book: RunReport) -> bool:
+        report = self._report
+        if report is None or report.audience != "designer" or book.figure is None:
+            return False
+        opened = report.opened or book.directory
+        try:
+            text = export_text(book.figure)
+        except OSError:
+            return True
+        return not export_allowed(text, symbols=peek_symbols(opened), scale=peek_scale(opened))
+
     def _fill_figure(self, book: RunReport) -> None:
         if book.figure is None or not book.figure.is_file():
             self.figure_label.setPixmap(QPixmap())
             self.figure_label.setText("")
             self.figure_note.setText("equity.png is not in this run directory. The interactive chart is drawn from the equity CSV.")
+            return
+        if self._figure_blocked(book):
+            self.figure_label.setPixmap(QPixmap())
+            self.figure_label.setText("")
+            self.figure_note.setText("Saved figure withheld. It did not pass the designer check.")
             return
         pixmap = QPixmap(str(book.figure))
         self.figure_note.setText(f"Saved figure: {book.figure.name}. The interactive chart is separate and uses the CSV.")
@@ -654,7 +731,7 @@ class ResultsPage(QWidget):
         line = drawdown_line(book)
         if line is not None:
             xs, ys, dd_note = line
-            drawdown = [("drawdown", xs, [value * 100.0 for value in ys], theme.drawdown)]
+            drawdown = [("drawdown", xs, list(ys), theme.drawdown)]
         exposure = None
         raw_exposure = exposure_line(book)
         if raw_exposure is not None:
@@ -665,10 +742,12 @@ class ResultsPage(QWidget):
             equity=painted,
             drawdown=drawdown,
             sessions=sessions,
-            equity_note="Equity from the report files. " + note,
-            drawdown_note=dd_note,
+            equity_note="Equity and the benchmark, from the report files.",
+            drawdown_note=dd_note or "Drawdown is equity divided by its running peak, minus one.",
             exposure=exposure,
         )
+        self.chart.caption.setToolTip(note)
+        self.chart.dd_caption.setToolTip(dd_note)
 
     def export_current(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Export a copy of the report", self.path.text())
@@ -694,10 +773,10 @@ class ResultsPage(QWidget):
                     continue
                 if designer:
                     try:
-                        text = source.read_text(encoding="utf-8")
-                    except UnicodeDecodeError:
-                        text = ""
-                    if text and not export_allowed(text, symbols=symbols, scale=scale):
+                        text = export_text(source)
+                    except OSError:
+                        continue
+                    if not export_allowed(text, symbols=symbols, scale=scale):
                         continue
                 shutil.copy2(source, target / name)
                 written.append(name)

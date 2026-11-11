@@ -15,9 +15,23 @@ from __future__ import annotations
 import json
 import math
 import re
+import zlib
 from pathlib import Path
 
-_ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
+_MONTH = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+)
+# Longer spellings first. A bare year is last so ``2024-01`` is one token.
+_DATE_PATTERNS = (
+    re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?)?"),
+    re.compile(r"(?:19|20)\d{2}[/.]\d{1,2}[/.]\d{1,2}"),
+    re.compile(r"\d{1,2}[/-]\d{1,2}[/-](?:19|20)\d{2}"),
+    re.compile(rf"\d{{1,2}}[\s\-]+{_MONTH}[\s,\-]+(?:19|20)\d{{2}}", re.IGNORECASE),
+    re.compile(rf"{_MONTH}[\s\-]+\d{{1,2}},?[\s\-]+(?:19|20)\d{{2}}", re.IGNORECASE),
+    re.compile(r"(?:19|20)\d{2}-\d{2}(?!\d)"),
+    re.compile(r"(?<![A-Za-z0-9])(?:19|20)\d{2}(?![A-Za-z0-9])"),
+)
 
 # Keys a designer tree is not allowed to carry. ``cost_basis`` holds the
 # invoice scale. Named operator runs still show that object.
@@ -62,8 +76,14 @@ PRICE_COLUMNS = frozenset(
 
 
 def scrub_text(value: str, symbols: tuple[str, ...]) -> str:
-    """Remove calendar dates and ticker tokens from one string."""
-    text = _ISO_DATE.sub("", value)
+    """Remove calendar dates and ticker tokens from one string.
+
+    ISO dates, slash dates, month names, ``YYYY-MM`` keys, and a bare year
+    all count. Session ids such as ``S01`` do not.
+    """
+    text = value
+    for pattern in _DATE_PATTERNS:
+        text = pattern.sub("", text)
     for symbol in symbols:
         if len(symbol) < 2:
             continue
@@ -154,13 +174,37 @@ def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool) -> None:
         nested = child.get("report")
         if nested is not None and hasattr(nested, "metrics"):
             apply_designer(nested, symbols, redacted=redacted)
-            outer = {key: value for key, value in child.items() if key != "report"}
+            outer = {key: value for key, value in child.items() if key not in {"report", "path"}}
             outer = _scrub_obj(outer, symbols, drop_prices=True)
+            outer.pop("path", None)
             outer["report"] = nested
             cleaned_children.append(outer)
             continue
-        cleaned_children.append(_scrub_obj(child, symbols, drop_prices=True))
+        cleaned_children.append(_designer_child(child, symbols))
     report.children = cleaned_children
+
+
+def _leaf_token(value, symbols: tuple[str, ...]) -> str:
+    """Last path segment, with dates and tickers already removed. Not a path."""
+    text = scrub_text(str(value or ""), symbols).replace("\\", "/").strip()
+    if "/" in text:
+        text = text.rstrip("/").split("/")[-1]
+    if len(text) >= 2 and text[1] == ":":
+        text = text[2:].lstrip("/")
+    return text.strip()
+
+
+def _designer_child(child: dict, symbols: tuple[str, ...]) -> dict:
+    """A job row a designer may see. No filesystem path and no ticker."""
+    cleaned = _scrub_obj({key: value for key, value in child.items() if key != "path"}, symbols, drop_prices=True)
+    cleaned.pop("path", None)
+    strategy = _leaf_token(cleaned.get("strategy_id"), symbols)
+    source = _leaf_token(cleaned.get("source_id"), symbols)
+    if strategy or source:
+        cleaned["name"] = " · ".join(part for part in (strategy, source) if part)
+    elif cleaned.get("name"):
+        cleaned["name"] = _leaf_token(cleaned.get("name"), symbols)
+    return cleaned
 
 
 def book_is_anonymized(document) -> bool:
@@ -304,12 +348,53 @@ def resolve_view(folder: Path, audience: str) -> tuple[str, Path, bool]:
     return "operator", folder, False
 
 
+def export_text(path: Path) -> str:
+    """Text used to decide whether a designer may receive ``path``.
+
+    Bytes are decoded as latin-1, so a binary file cannot skip the check by
+    failing a UTF-8 decode. PNG text chunks are included even when compressed.
+    """
+    data = path.read_bytes()
+    return data.decode("latin-1") + "\n" + _png_text(data)
+
+
+def _png_text(data: bytes) -> str:
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ""
+    parts: list[str] = []
+    index = 8
+    while index + 8 <= len(data):
+        length = int.from_bytes(data[index : index + 4], "big")
+        kind = data[index + 4 : index + 8]
+        start = index + 8
+        end = start + length
+        if end + 4 > len(data):
+            break
+        chunk = data[start:end]
+        index = end + 4
+        if kind == b"tEXt":
+            parts.append(chunk.decode("latin-1", "replace"))
+        elif kind == b"zTXt" and b"\x00" in chunk:
+            keyword, _, rest = chunk.partition(b"\x00")
+            parts.append(keyword.decode("latin-1", "replace"))
+            if len(rest) > 1:
+                try:
+                    parts.append(zlib.decompress(rest[1:]).decode("latin-1", "replace"))
+                except zlib.error:
+                    parts.append(rest.decode("latin-1", "replace"))
+        elif kind == b"iTXt":
+            parts.append(chunk.decode("latin-1", "replace"))
+        elif kind == b"IEND":
+            break
+    return "\n".join(parts)
+
+
 def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) -> bool:
     """False when a file still contains operator-only text."""
     folded = text.casefold()
     if "share_scale" in folded or "price_factor" in folded or "volume_factor" in folded or "date_map" in folded:
         return False
-    if _ISO_DATE.search(text):
+    if any(pattern.search(text) for pattern in _DATE_PATTERNS):
         return False
     for symbol in symbols:
         if len(symbol) >= 2 and symbol.casefold() in folded:

@@ -78,9 +78,15 @@ Any other scalar in `metrics.json` is listed under "Other reported fields" so a 
 
 If `benchmarks/<name>/metrics.json` and the parent `benchmarks` object disagree on a shared number, the page warns and shows the file.
 
-The drawdown line on the chart is equity / running peak − 1 along the equity column, with `initial_equity` prepended when the file has it. It is drawn under the equity plot, with the x axis linked. The caption says so. The official max drawdown is the card, which is `max_drawdown` from `metrics.json`. The chart does not print a second max-drawdown number. Log scale applies to the equity plot only, and only when every equity point is above zero. The crosshair reads the session and each series. The view range is the padded min and max of every series on that plot.
+The drawdown line on the chart is equity / running peak − 1, stored as a fraction. The axis prints that fraction as a percent. The caption under each plot is one sentence. The official max drawdown is the card, which is `max_drawdown` from `metrics.json`. Log scale applies to the equity plot only, and only when every equity point is above zero. In log mode the view is the log10 of those points, with padding in log space, and the axis labels stay in dollars. The crosshair reads equity as money and drawdown as a percent.
 
-Benchmark curves are aligned on the session column. Rows that do not match are not drawn and are counted in the caption. There is no interpolation. If there is no shared session column, the overlay is by row order and the caption says that.
+Benchmark curves are aligned on the session column. Rows that do not match are not drawn. The count is on the caption tooltip. There is no interpolation.
+
+The fee table lists components only. The stored total is a footer under the table, not a row that has to add up to the rounded lines.
+
+The Run page hides fields the selected mode and profile do not use. A blank rate is labeled "profile default". The longer contract text is on the tooltip.
+
+A designer view scrubs calendar dates in several spellings, including `2024/01/04` and `04-Jan-2024`. A designer export skips any file, including a PNG, that still contains a ticker, a share scale, or a date.
 
 ## Screenshots
 
@@ -96,8 +102,16 @@ Rendered offscreen at 1680×1180. These are fixture reports and the real profile
 - `docs/screenshots/08-results-light.png`
 - `docs/screenshots/09-run-light.png`
 - `docs/screenshots/10-desk-risk-light.png`
-- `docs/screenshots/11-leaderboard-dark.png`
+- `docs/screenshots/11-leaderboard-dark.png` — a real Phase 3 desk batch
 - `docs/screenshots/12-leaderboard-light.png`
+- `docs/screenshots/13-results-log-dark.png`
+- `docs/screenshots/14-results-log-light.png`
+- `docs/screenshots/15-run-walk-dark.png`
+- `docs/screenshots/16-run-walk-light.png`
+- `docs/screenshots/17-run-pack-dark.png`
+- `docs/screenshots/18-run-pack-light.png`
+- `docs/screenshots/19-fees-dark.png`
+- `docs/screenshots/20-fees-light.png`
 
 ## Tests
 

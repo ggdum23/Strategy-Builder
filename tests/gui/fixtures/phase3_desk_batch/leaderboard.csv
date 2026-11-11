@@ -1,0 +1,20 @@
+rank,strategy_id,source_id,symbol,profile,status,total_return,excess_total_return,bh_total_return,long_2x_total_return,cagr,ann_vol,sharpe,sortino,max_drawdown,max_dd_duration_sessions,calmar,n_fills,round_trips,hit_rate,avg_holding_sessions,turnover_per_year,fees_total,best_day,worst_day,percent_up_days,avg_abs_exposure_close,frac_sessions_long_at_close,frac_sessions_short_at_close,long_round_trips,short_round_trips,financing_cost,borrow_cost,dividends_net,margin_calls_filled,max_gross_leverage,avg_gross_leverage,worst_equity_over_hwm,disqualified,timeout_s,error
+1,long,book,TEST,desk,ok,0.09983289787063199,0,0.09983289787063199,0.1993880179634862,161124.7527364677,1.124559441837447,11.1875370180485,6709.192696705926,-0.000167055724999976,1,964497042.7472081,1,0,,,120.0190977734263,67.055725,0.1000166619516063,-0.000167055724999976,0.5,1.000159508872221,1,0,0,0,0.04640436805555105,0,0,0,1.000167083637278,0.7501177379629018,0.999832944275,false,90,
+2,flat,book,TEST,desk,ok,0,-0.09983289787063199,0.09983289787063199,0.1993880179634862,0,0,0,0,0,0,inf,0,0,,,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,false,90,
+3,crash,book,TEST,desk,error,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,90,"Traceback (most recent call last):
+  File ""/tmp/phase3-src/src/backtester/runner.py"", line 616, in _books_worker
+    books = run_books(
+            ^^^^^^^^^^
+  File ""/tmp/phase3-src/src/backtester/runner.py"", line 989, in run_books
+    result, metrics = execute(strategy, frame, profile, share_factor=_release(billing), **common)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/tmp/phase3-src/src/backtester/runner.py"", line 214, in execute
+    result = engine_desk.run(
+             ^^^^^^^^^^^^^^^^
+  File ""/tmp/phase3-src/src/backtester/engine_desk.py"", line 596, in run
+    raw = strategy.on_bar(view, account)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/tmp/phase3-run2/s/crash/strategy.py"", line 3, in on_bar
+    raise RuntimeError('boom')
+RuntimeError: boom
+"

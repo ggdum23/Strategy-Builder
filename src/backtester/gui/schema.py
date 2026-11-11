@@ -190,13 +190,109 @@ KPI_KEYS = (
 )
 
 
-def leaderboard_kind(key: str) -> str | None:
-    """Display kind for one leaderboard column. Ratios are two decimals."""
+# Phase 3 ``leaderboard.csv`` columns (operator set; designer drops ``symbol``).
+# Kinds follow docs/METRICS.md at 3016825: a return or a session fraction is a
+# fraction, Calmar is a ratio, and dollars stay dollars.
+_LEADERBOARD_KIND = {
+    "rank": "count",
+    "strategy_id": "text",
+    "source_id": "text",
+    "symbol": "text",
+    "profile": "text",
+    "status": "text",
+    "error": "text",
+    "total_return": "fraction",
+    "excess_total_return": "fraction",
+    "bh_total_return": "fraction",
+    "long_2x_total_return": "fraction",
+    "cagr": "fraction",
+    "ann_vol": "fraction",
+    "max_drawdown": "fraction",
+    "hit_rate": "fraction",
+    "best_day": "fraction",
+    "worst_day": "fraction",
+    "percent_up_days": "fraction",
+    "frac_sessions_long_at_close": "fraction",
+    "frac_sessions_short_at_close": "fraction",
+    "frac_bars_long": "fraction",
+    "frac_bars_short": "fraction",
+    "extended_hours_fill_notional_frac": "fraction",
+    "financing_rate_annual": "fraction",
+    "borrow_rate_annual": "fraction",
+    "sharpe": "ratio2",
+    "sortino": "ratio2",
+    "calmar": "ratio2",
+    "turnover_per_year": "ratio2",
+    "avg_abs_exposure_close": "ratio2",
+    "avg_net_exposure_close": "ratio2",
+    "avg_abs_exposure_bars": "ratio2",
+    "worst_equity_over_hwm": "ratio2",
+    "fee_mult": "ratio2",
+    "share_factor": "ratio2",
+    "max_dd_duration_sessions": "count",
+    "n_fills": "count",
+    "round_trips": "count",
+    "long_round_trips": "count",
+    "short_round_trips": "count",
+    "sessions": "count",
+    "margin_calls_filled": "count",
+    "margin_calls_queued": "count",
+    "final_equity": "money",
+    "initial_equity": "money",
+    "fees_total": "money",
+    "slippage_cost": "money",
+    "borrow_cost": "money",
+    "costs_total": "money",
+    "financing_cost": "money",
+    "dividends_net": "money",
+    "avg_trade_pnl": "money",
+    "long_pnl": "money",
+    "short_pnl": "money",
+    "max_gross_leverage": "leverage",
+    "avg_gross_leverage": "leverage",
+    "avg_holding_sessions": "number",
+    "avg_holding_bars": "number",
+    "timeout_s": "number",
+    "years": "year",
+    "slippage_bps": "number",
+    "disqualified": "flag",
+    "open_position_at_end": "flag",
+}
+
+LEADERBOARD_LABELS = {
+    "rank": "Rank",
+    "strategy_id": "Strategy",
+    "source_id": "Source",
+    "symbol": "Symbol",
+    "profile": "Profile",
+    "status": "Status",
+    "error": "Error",
+    "bh_total_return": "1× return",
+    "long_2x_total_return": "2× return",
+    "avg_holding_sessions": "Avg hold",
+    "frac_sessions_long_at_close": "Sessions long",
+    "frac_sessions_short_at_close": "Sessions short",
+    "long_round_trips": "Long trips",
+    "short_round_trips": "Short trips",
+    "timeout_s": "Timeout s",
+}
+
+
+def leaderboard_kind(key: str) -> str:
+    """Display kind for one leaderboard or metric column. Ratios are two decimals.
+
+    Every Phase 3 leaderboard column has a kind, so the cell goes through
+    ``format_number`` and not a raw significant-figure dump.
+    """
+    if key in _LEADERBOARD_KIND:
+        return _LEADERBOARD_KIND[key]
+    if key.endswith("_return") or key.startswith("frac_sessions") or key.startswith("frac_bars") or key.endswith("_frac"):
+        return "fraction"
+    if key.endswith("_pnl") or key.endswith("_cost"):
+        return "money"
     spec = SPECS.get(key)
     if spec is None:
-        if key in {"rank", "n_fills", "sessions", "round_trips"}:
-            return "count"
-        return None
+        return "number"
     if spec.kind == "ratio":
         return "ratio2"
     return spec.kind

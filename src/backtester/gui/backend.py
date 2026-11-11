@@ -189,14 +189,10 @@ def _floats(values) -> list[float]:
 def _drawdown(equity: list[float], initial) -> tuple[list[float], str]:
     """Picture of the equity column. Not the official max drawdown."""
     series = list(equity)
-    note = (
-        "Drawdown line is equity / running peak − 1 along the reported equity column. "
-        "The official max drawdown is the metrics.json figure, which also seeds the peak with initial equity."
-    )
+    note = "Drawdown is equity divided by its running peak, minus one."
     if not is_missing(initial):
         try:
             series = [float(initial)] + series
-            note += " Initial equity from metrics.json was prepended for this picture only."
         except (TypeError, ValueError):
             pass
     peak = None
@@ -261,15 +257,12 @@ def _align_note(strategy: Curve, other: Curve) -> tuple[list[float], list[float]
             ys.append(other.equity[found])
         skipped = len(other.equity) - len(ys)
         if skipped > 0:
-            note = (
-                f"{other.name} aligned on the session column "
-                f"({skipped} benchmark rows had no matching session and were not drawn)."
-            )
+            note = f"{skipped} benchmark rows had no matching session and were not drawn."
         else:
-            note = f"{other.name} aligned on the session column."
+            note = "Benchmark aligned on the session column."
         return xs, ys, note
     count = min(len(strategy.equity), len(other.equity))
-    note = f"{other.name} has no shared session column; drawn by row order ({count} rows)."
+    note = f"Benchmark drawn by row order, {count} rows."
     return [float(i) for i in range(count)], list(other.equity[:count]), note
 
 

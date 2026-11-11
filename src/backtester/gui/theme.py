@@ -318,10 +318,30 @@ def build_qss(theme: Theme) -> str:
         padding: 1px 12px 1px 2px;
         min-height: 22px;
     }}
-    QRadioButton::indicator, QCheckBox::indicator {{
+    QRadioButton::indicator {{
         width: 14px;
         height: 14px;
+        border-radius: 8px;
+        border: 1.5px solid {theme.text};
+        background: transparent;
         subcontrol-origin: padding;
         subcontrol-position: left center;
+    }}
+    QRadioButton::indicator:checked {{
+        border: 1.5px solid {theme.accent};
+        background: {theme.accent};
+    }}
+    QCheckBox::indicator {{
+        width: 14px;
+        height: 14px;
+        border-radius: 2px;
+        border: 1.5px solid {theme.text};
+        background: transparent;
+        subcontrol-origin: padding;
+        subcontrol-position: left center;
+    }}
+    QCheckBox::indicator:checked {{
+        border: 1.5px solid {theme.accent};
+        background: {theme.accent};
     }}
     """

@@ -39,14 +39,16 @@ class RunPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 16)
         root.setSpacing(12)
-        root.addWidget(
-            PageHeader(
-                "04  Run",
-                "Single, walk-forward, or batch",
-                "Every argument below is passed through. A blank rate is null, which means the engine default, "
-                "not a number this window filled in. Walk-forward has no default cut.",
-            )
+        header = PageHeader(
+            "04  Run",
+            "Single, walk-forward, or batch",
+            "Set the mode and the paths, then read the summary of what will be sent.",
         )
+        header.setToolTip(
+            "A blank rate is passed as null, and the runner uses the profile default. "
+            "Walk-forward has no default cut. Workers are a process count and do not change a metric."
+        )
+        root.addWidget(header)
         self.banners = QVBoxLayout()
         root.addLayout(self.banners)
         controls = QHBoxLayout()
@@ -114,28 +116,34 @@ class RunPage(QWidget):
         self.equity = QLineEdit("1000000")
         self.equity.setToolTip("Starting capital passed to the engine. The figure in the box is the figure that is sent.")
         self.borrow = QLineEdit()
-        self.borrow.setPlaceholderText("Blank = null = profile default")
+        self.borrow.setPlaceholderText("Blank uses the profile rate.")
+        self.borrow.setToolTip("A blank borrow rate is passed as null. The runner then uses the profile default.")
         self.financing = QLineEdit()
-        self.financing.setPlaceholderText("Blank = null. Arena must stay blank.")
+        self.financing.setPlaceholderText("Blank uses the profile rate.")
+        self.financing.setToolTip("A blank financing rate is passed as null. Arena rejects any other rate.")
         self.fee = QLineEdit("1")
-        self.fee.setToolTip("Desk stress multiple. Arena accepts only 1.")
+        self.fee.setToolTip("Desk stress multiple. Arena accepts only 1, so this field is hidden on Arena.")
         self.workers = QSpinBox()
         self.workers.setObjectName("workers")
         self.workers.setRange(1, 64)
         self.workers.setValue(1)
-        self.workers.setToolTip("Process count passed to a batch. It does not change a metric. A single run does not use it.")
+        self.workers.setToolTip("Process count passed to a batch. It does not change a metric.")
         self.dividends = PathField("Dividends CSV", "session,amount. Desk only. Blank sends nothing.", kind="file")
         self.warmup_sessions = QSpinBox()
         self.warmup_sessions.setRange(0, 100000)
         self.warmup_days = QSpinBox()
         self.warmup_days.setRange(0, 100000)
         self.design_day = QLineEdit()
-        self.design_day.setPlaceholderText("design end day, integer session index")
+        self.design_day.setPlaceholderText("One cut, as a session index.")
+        self.design_day.setToolTip("Walk-forward needs exactly one cut. There is no default.")
         self.design_date = QLineEdit()
-        self.design_date.setPlaceholderText("design end date YYYY-MM-DD")
+        self.design_date.setPlaceholderText("One cut, as a date.")
+        self.design_date.setToolTip("Walk-forward needs exactly one of day, date, or fraction.")
         self.design_fraction = QLineEdit()
-        self.design_fraction.setPlaceholderText("design fraction strictly between 0 and 1")
+        self.design_fraction.setPlaceholderText("One cut, as a fraction between 0 and 1.")
+        self.design_fraction.setToolTip("Walk-forward needs exactly one cut. There is no default.")
         fields = QFormLayout()
+        self._form = fields
         fields.addRow("Ticker", self.ticker)
         fields.addRow("Bar minutes", self.minutes)
         fields.addRow("Initial equity", self.equity)
@@ -292,8 +300,13 @@ class RunPage(QWidget):
 
     def _rate_line(self, text: str) -> str:
         if text.strip() == "":
-            return "profile default (not a number this window filled in)"
+            return "profile default"
         return text.strip()
+
+    def _show(self, widget, visible: bool, *, form: bool = False) -> None:
+        widget.setVisible(visible)
+        if form:
+            self._form.setRowVisible(widget, visible)
 
     def _fill_summary(self, rows: list[tuple[str, str]]) -> None:
         clear_layout(self._summary_layout)
@@ -332,51 +345,58 @@ class RunPage(QWidget):
             shown = "\n".join(self._strategies[:6])
             extra = "" if count <= 6 else f"\n… {count - 6} more"
             self.strategy_label.setText(f"Strategies ({count}):\n{shown}{extra}")
-        arena = name == "arena"
-        self.financing.setEnabled(not arena)
-        self.dividends.setEnabled(not arena)
-        if arena:
-            self.fee.setText("1") if self.fee.text().strip() not in {"", "1", "1.0"} else None
-            self.fee.setEnabled(False)
-        else:
-            self.fee.setEnabled(True)
+        desk = name == "desk"
+        if name == "arena" and self.fee.text().strip() not in {"", "1", "1.0"}:
+            self.fee.setText("1")
         walking = self.walk.isChecked()
-        self.warmup_sessions.setEnabled(not walking)
-        self.warmup_days.setEnabled(walking)
-        self.design_day.setEnabled(walking)
-        self.design_date.setEnabled(walking)
-        self.design_fraction.setEnabled(walking)
-        packed = self.pack.isChecked()
-        self.minutes.setEnabled(not packed)
-        self.src.setEnabled(not packed)
-        self.ticker.setEnabled(not packed)
-        self.pack_dir.setEnabled(packed)
-        self.sidecar.setEnabled(packed)
+        batch = self.batch.isChecked()
+        packed = self.pack.isChecked() and not walking
+        self._show(self.src, not packed)
+        self._show(self.ticker, not packed, form=True)
+        self._show(self.minutes, not packed, form=True)
+        self._show(self.equity, True, form=True)
+        self._show(self.borrow, True, form=True)
+        self._show(self.financing, desk, form=True)
+        self._show(self.fee, desk, form=True)
+        self._show(self.workers, batch, form=True)
+        self._show(self.warmup_sessions, batch, form=True)
+        self._show(self.warmup_days, walking, form=True)
+        self._show(self.design_day, walking, form=True)
+        self._show(self.design_date, walking, form=True)
+        self._show(self.design_fraction, walking, form=True)
+        self._show(self.pack_dir, packed)
+        self._show(self.sidecar, packed)
+        self._show(self.dividends, desk)
+        self._show(self.out, True)
         draft = self.draft()
         mode = {"single": "Single", "walkforward": "Walk-forward", "batch": "Batch"}.get(draft["mode"], draft["mode"])
-        source = "Pack + sidecar" if draft["source"] == "pack" else "Named files"
+        source = "Pack + sidecar" if packed else "Named files"
         strategies = draft["strategies"] or ["none checked"]
         rows = [
             ("Profile", self._profile or "not selected"),
             ("Mode", mode),
             ("Source", source),
             ("Strategies", "\n".join(strategies)),
-            ("Data folder", draft["src"] or "—"),
-            ("Ticker", draft["ticker"] or "—"),
-            ("Pack", draft["pack"] or "—"),
-            ("Sidecar", (draft["sidecar"] + "  (file is not opened on this page)") if draft["sidecar"] else "—"),
-            ("Report", draft["out"] or "—"),
-            ("Bar minutes", str(draft["bar_minutes"])),
-            ("Initial equity", "—" if draft["initial_equity"] is None else str(draft["initial_equity"])),
-            ("Borrow", self._rate_line(self.borrow.text())),
-            ("Financing", self._rate_line(self.financing.text())),
-            ("Fee multiple", "—" if draft["fee_mult"] is None else str(draft["fee_mult"])),
-            ("Dividends", draft["dividends"] or "none"),
-            ("Warm-up sessions", str(draft["warmup_sessions"])),
-            ("Warm-up days", str(draft["warmup_days"])),
-            ("Batch workers", f"{draft['workers']}  (process count only; it does not change a metric)"),
         ]
-        if draft["mode"] == "walkforward":
+        if not packed:
+            rows.append(("Data folder", draft["src"] or "—"))
+            rows.append(("Ticker", draft["ticker"] or "—"))
+            rows.append(("Bar minutes", str(draft["bar_minutes"])))
+        if packed:
+            rows.append(("Pack", draft["pack"] or "—"))
+            rows.append(("Sidecar", draft["sidecar"] or "—"))
+        rows.append(("Report", draft["out"] or "—"))
+        rows.append(("Initial equity", "—" if draft["initial_equity"] is None else str(draft["initial_equity"])))
+        rows.append(("Borrow", self._rate_line(self.borrow.text())))
+        if desk:
+            rows.append(("Financing", self._rate_line(self.financing.text())))
+            rows.append(("Fee multiple", "—" if draft["fee_mult"] is None else str(draft["fee_mult"])))
+            rows.append(("Dividends", draft["dividends"] or "none"))
+        if batch:
+            rows.append(("Warm-up sessions", str(draft["warmup_sessions"])))
+            rows.append(("Batch workers", str(draft["workers"])))
+        if walking:
+            rows.append(("Warm-up days", str(draft["warmup_days"])))
             cut = draft["design_end_date"] or draft["design_end_day"] or draft["design_fraction"]
             rows.append(("Walk-forward cut", "—" if cut in (None, "") else str(cut)))
         self._fill_summary(rows)
