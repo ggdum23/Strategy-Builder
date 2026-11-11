@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
 
 from backtester.gui.backend import load_run
-from backtester.gui.format import MISSING, format_number
+from backtester.gui.format import MISSING, format_number, sort_token
 from backtester.gui.preferences import as_path
 from backtester.gui.schema import WITHHELD_KEYS
 from backtester.gui.validate import config_record, transcript, validate_config
 
-from synthetic import ARENA_METRICS, write_book
+from synthetic import ARENA_METRICS, write_book, write_parallel_run
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -221,3 +222,75 @@ def test_equity_csv_alias_and_desk_liquidation_file(tmp_path):
     assert "volume_factor" not in report.liquidation
     assert report.liquidation["session"] == "S00002"
     assert "CANARY" in report.withheld or any("volume_factor" in item for item in report.withheld)
+
+
+def test_infinity_and_leaderboard_shapes():
+    assert format_number("ratio", 0.8) == "0.800"
+    assert format_number("ratio2", 1.234) == "1.23"
+    assert format_number("fraction", 0.041) == "4.10%"
+    assert format_number("money", 5848.14) == "$5,848.14"
+    assert format_number("fraction", None) == "—"
+    assert format_number("ratio", float("inf")) == "∞"
+    assert format_number("ratio", float("-inf")) == "−∞"
+    order = [float("nan"), float("-inf"), -10, 2, 100, float("inf")]
+    ranked = sorted(order, key=sort_token)
+    assert math.isnan(ranked[0])
+    assert ranked[1:] == [float("-inf"), -10, 2, 100, float("inf")]
+
+
+def test_parallel_tree_loads_jobs_failures_and_designer_board(tmp_path):
+    folder = write_parallel_run(tmp_path / "batch", anonymized=True)
+    operator = load_run(folder, audience="operator")
+    assert operator.kind == "batch"
+    assert operator.audience == "operator"
+    assert any(row.get("symbol") == "QQQ" for row in operator.leaderboard.rows)
+    failed = [child for child in operator.children if child["state"] == "failed"]
+    assert failed and "boom" in (failed[0]["error"] or "")
+    assert operator.leaderboard.rows[0]["calmar"] == math.inf
+    assert operator.leaderboard.rows[0]["total_return"] == 0.041
+    designer = load_run(folder)
+    assert designer.audience == "designer"
+    blob = json.dumps({"rows": designer.leaderboard.rows, "children": designer.children}, default=str).casefold()
+    assert "qqq" not in blob
+    assert "boom" not in blob
+    assert "share_scale" not in blob
+    assert designer.leaderboard.rows[0]["calmar"] == math.inf
+    assert designer.leaderboard.rows[0]["sharpe"] == 1.234
+    assert designer.leaderboard.rows[1]["excess_total_return"] is None
+
+
+def test_anonymized_book_without_a_designer_tree_is_redacted(tmp_path):
+    metrics = {
+        "profile": "arena",
+        "symbol": "ZZZX",
+        "anonymized": True,
+        "bar_minutes": 1,
+        "total_return": 0.04,
+        "sharpe": 0.8,
+        "initial_equity": 1_000_000,
+        "final_equity": 1_040_000,
+        "last_price": 424242.42,
+        "asof": "2019-07-04",
+        "cost_basis": {"share_scale": 7.777, "note": "share_scale=7.777 ticker ZZZX"},
+        "run": {"anonymized": True},
+    }
+    folder = write_book(tmp_path / "book", metrics, benchmark=False)
+    fills = (folder / "fills.csv").read_text(encoding="utf-8")
+    fills = fills.replace("2024-01-02", "2019-07-04").replace("100.01", "424242.42")
+    (folder / "fills.csv").write_text(fills, encoding="utf-8")
+    report = load_run(folder)
+    assert report.audience == "designer"
+    assert report.redacted is True
+    blob = json.dumps(
+        {
+            "metrics": report.metrics,
+            "fills": None if report.fills is None else report.fills.rows,
+            "sessions": report.curves[0].sessions if report.curves else [],
+            "warnings": report.warnings,
+            "cost": report.cost_basis,
+        },
+        default=str,
+    ).casefold()
+    for needle in ("zzzx", "share_scale", "7.777", "2019-07-04", "424242"):
+        assert needle not in blob
+    assert "fill_price" not in (report.fills.columns if report.fills else ())

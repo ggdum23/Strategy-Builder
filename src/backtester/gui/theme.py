@@ -215,6 +215,12 @@ def build_qss(theme: Theme) -> str:
         border: 1px solid {theme.accent};
         font-weight: 600;
     }}
+    QPushButton#primary:disabled, QPushButton#runButton:disabled {{
+        background: {theme.elevated};
+        color: {theme.muted};
+        border: 1px solid {theme.border};
+        font-weight: 500;
+    }}
     QPushButton#danger {{
         background: transparent;
         color: {theme.negative};
@@ -308,6 +314,14 @@ def build_qss(theme: Theme) -> str:
     }}
     QRadioButton, QCheckBox {{
         background: transparent;
-        spacing: 6px;
+        spacing: 8px;
+        padding: 1px 12px 1px 2px;
+        min-height: 22px;
+    }}
+    QRadioButton::indicator, QCheckBox::indicator {{
+        width: 14px;
+        height: 14px;
+        subcontrol-origin: padding;
+        subcontrol-position: left center;
     }}
     """

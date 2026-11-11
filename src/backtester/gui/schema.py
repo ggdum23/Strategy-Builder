@@ -47,7 +47,8 @@ EXPOSURE_COLUMNS = ("exposure", "position")
 SESSION_COLUMNS = ("date", "session", "day")
 
 # Operator sidecar keys. A designer-facing view must not render these.
-# ``share_scale`` inside cost_basis is a reported invoice field and is allowed.
+# Named operator runs still show ``cost_basis`` (the invoice, scale 1).
+# An anonymized or designer view drops that object. See ``gui.audience``.
 WITHHELD_KEYS = frozenset(
     {
         "date_map",
@@ -115,7 +116,14 @@ METRICS: tuple[MetricSpec, ...] = (
         "headline",
         "Longest run of sessions from a peak until equity recovers. Unit: sessions.",
     ),
-    MetricSpec("calmar", "Calmar", "ratio", "headline", _ann("CAGR / |max drawdown|.")),
+    MetricSpec("calmar", "Calmar", "ratio", "headline", _ann("CAGR / |max drawdown|. No drawdown is stored as infinity.")),
+    MetricSpec(
+        "excess_total_return",
+        "Excess vs 1×",
+        "fraction",
+        "kpi",
+        "Stored strategy total return minus the 1× book. The window does not subtract the two figures.",
+    ),
     MetricSpec("final_equity", "Final equity", "money", "headline", "Account equity at the last session mark. Unit: dollars."),
     MetricSpec("initial_equity", "Initial equity", "money", "activity", "Starting capital recorded by the engine. Unit: dollars."),
     MetricSpec("n_fills", "Fills", "count", "activity", "Number of fills the engine recorded."),
@@ -169,6 +177,29 @@ SPECS = {spec.key: spec for spec in METRICS}
 HEADLINE_KEYS = tuple(spec.key for spec in METRICS if spec.group == "headline")
 ACTIVITY_KEYS = tuple(spec.key for spec in METRICS if spec.group == "activity")
 DESK_KEYS = tuple(spec.key for spec in METRICS if spec.group == "desk")
+
+# The results page leads with these seven stored fields, in this order.
+KPI_KEYS = (
+    "total_return",
+    "cagr",
+    "sharpe",
+    "sortino",
+    "max_drawdown",
+    "calmar",
+    "excess_total_return",
+)
+
+
+def leaderboard_kind(key: str) -> str | None:
+    """Display kind for one leaderboard column. Ratios are two decimals."""
+    spec = SPECS.get(key)
+    if spec is None:
+        if key in {"rank", "n_fills", "sessions", "round_trips"}:
+            return "count"
+        return None
+    if spec.kind == "ratio":
+        return "ratio2"
+    return spec.kind
 
 # Columns used when a batch has no leaderboard.csv. Each cell is copied from
 # that run's metrics.json. The window does not rank by a formula of its own.

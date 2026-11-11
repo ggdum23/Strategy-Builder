@@ -15,14 +15,15 @@ pytest.importorskip("pyqtgraph")
 pytest.importorskip("pytestqt")
 
 from PySide6.QtCore import QEvent, Qt
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from backtester.gui.backend import HistoryRow, load_run, scan_history
 from backtester.gui.discover import summarize_strategy
 from backtester.gui.jobs import build_pack_job, inspect_series, record_series
 from backtester.gui.window import MainWindow
 
-from synthetic import ARENA_METRICS, DESK_METRICS, write_book, write_filled, write_strategy
+from synthetic import ARENA_METRICS, DESK_METRICS, write_book, write_filled, write_parallel_run, write_strategy
 
 ROOT = Path(__file__).resolve().parents[2]
 SHOTS = ROOT / "docs" / "screenshots"
@@ -105,10 +106,15 @@ def test_pages_theme_profile_and_path_with_spaces(qtbot, tmp_path):
     window.show_page(3)
     window.run_page.src.set_text(str(tmp_path / "Strategy Builder" / "QQQ" / "filled"))
     window.run_page.out.set_text(str(tmp_path / "Strategy Builder" / "out"))
-    rendered = window.run_page.preview.toPlainText()
+    rendered = window.run_page.summary_text()
     assert "Strategy Builder" in rendered
-    assert "null" in rendered
+    assert "profile default" in rendered
     assert not window.run_page.run_button.isEnabled()
+    button = window.run_page.run_button.grab().toImage()
+    center = button.pixelColor(button.width() // 2, button.height() // 2)
+    accent = QColor(window.theme.accent)
+    distance = abs(center.red() - accent.red()) + abs(center.green() - accent.green()) + abs(center.blue() - accent.blue())
+    assert distance > 40
 
 
 def test_inspect_click_shows_the_gap_banner(qtbot, tmp_path):
@@ -143,9 +149,13 @@ def test_results_filter_sort_and_export_use_the_file(qtbot, tmp_path):
     QApplication.processEvents()
     assert window.results_page.fills.model().rowCount() == 1
     window.results_page.fills_filter.clear()
-    window.results_page.chart_mode.setCurrentIndex(1)
     QApplication.processEvents()
-    assert "running peak" in window.results_page.chart.caption.text()
+    assert "running peak" in window.results_page.chart.dd_caption.text()
+    fee_model = window.results_page.fees.model()
+    fee_text = " ".join(str(fee_model.index(row, 1).data() or "") for row in range(fee_model.rowCount()))
+    assert "$1.00" in fee_text
+    assert _heat_has(window, "S01")
+    assert _heat_has(window, "4.00%")
     exported = tmp_path / "export"
     written = window.results_page.export_to(exported)
     assert "metrics.json" in written
@@ -156,6 +166,7 @@ def test_results_filter_sort_and_export_use_the_file(qtbot, tmp_path):
     assert "DISQUALIFIED" in window.results_page.identity.text()
     assert "2024-03-14" in window.results_page.postmortem.toPlainText()
     assert window.results_page.desk_cards["financing_cost"].value.text() == "$2,100.00"
+    assert window.results_page.desk_cards["long_2x_financing"].value.text() == "$5,848.14"
     assert "volume_factor" not in window.results_page.postmortem.toPlainText()
 
 
@@ -177,7 +188,7 @@ def test_run_click_matches_metrics_file(qtbot, tmp_path):
     window.run_page.named.setChecked(True)
     window.run_page.refresh()
     assert window.run_page.run_button.isEnabled()
-    assert "Strategy Builder" in window.run_page.preview.toPlainText()
+    assert "Strategy Builder" in window.run_page.summary_text()
     _click(qtbot, window.run_page.run_button)
     qtbot.waitUntil(lambda: (out / "metrics.json").is_file() and not window.run_in_progress(), timeout=120000)
     qtbot.waitUntil(lambda: window.results_page._report is not None and window.results_page._report.kind == "book", timeout=10000)
@@ -287,13 +298,12 @@ def test_screenshots(qtbot, tmp_path):
         field.edit.blockSignals(False)
     strategy_file = str(folder / "D02" / "strategy.py")
     windows_strategy = r"C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
-    preview = (
-        window.run_page.preview.toPlainText()
-        .replace(str(live_src), WINDOWS_SRC)
-        .replace(str(live_out), windows_out)
-        .replace(strategy_file, windows_strategy)
-    )
-    window.run_page.preview.setPlainText(preview)
+    for old, shown in (
+        (str(live_src), WINDOWS_SRC),
+        (str(live_out), windows_out),
+        (strategy_file, windows_strategy),
+    ):
+        window.run_page.replace_summary(old, shown)
     window.run_page.strategy_label.setText(
         r"Strategies: C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
     )
@@ -302,11 +312,12 @@ def test_screenshots(qtbot, tmp_path):
     window.results_page.show_report(load_run(arena))
     window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\D02")
     window.results_page.tabs.setCurrentIndex(0)
-    window.results_page.chart_mode.setCurrentIndex(0)
+    window.results_page.chart.show_readout_at(20)
     window.show_page(4)
     _grab(window, "05-results-dark.png", tmp_path)
 
     window.results_page.show_report(load_run(desk))
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\desk")
     window.results_page.tabs.setCurrentIndex(2)
     QApplication.processEvents()
     _grab(window, "06-desk-risk-dark.png", tmp_path)
@@ -334,11 +345,52 @@ def test_screenshots(qtbot, tmp_path):
     window.show_page(5)
     _grab(window, "07-history-dark.png", tmp_path)
 
-    window.theme_button.click()
-    window.results_page.show_report(load_run(arena))
+    board = write_parallel_run(tmp_path / "shot-board", anonymized=False)
+    window.results_page.load_path(str(board), audience="operator")
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\board")
     window.results_page.tabs.setCurrentIndex(0)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.leaderboard)
+    QApplication.processEvents()
+    window.show_page(4)
+    _grab(window, "11-leaderboard-dark.png", tmp_path)
+
+    window.theme_button.click()
+    window.run_page.src.set_text(str(live_src))
+    window.run_page.out.set_text(str(live_out))
+    window.show_page(3)
+    assert window.run_page.run_button.isEnabled()
+    for field, shown in ((window.run_page.src, WINDOWS_SRC), (window.run_page.out, windows_out)):
+        field.edit.blockSignals(True)
+        field.set_text(shown)
+        field.edit.blockSignals(False)
+    for old, shown in (
+        (str(live_src), WINDOWS_SRC),
+        (str(live_out), windows_out),
+        (strategy_file, windows_strategy),
+    ):
+        window.run_page.replace_summary(old, shown)
+    window.run_page.strategy_label.setText(
+        r"Strategies: C:\Users\Jeu\Desktop\Strategy Builder\examples\strategies\D02\strategy.py"
+    )
+    _grab(window, "09-run-light.png", tmp_path)
+    window.results_page.show_report(load_run(arena))
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\D02")
+    window.results_page.tabs.setCurrentIndex(0)
+    window.results_page.chart.show_readout_at(20)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.chart)
     window.show_page(4)
     _grab(window, "08-results-light.png", tmp_path)
+    window.results_page.show_report(load_run(desk))
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\desk")
+    window.results_page.tabs.setCurrentIndex(2)
+    QApplication.processEvents()
+    _grab(window, "10-desk-risk-light.png", tmp_path)
+    window.results_page.load_path(str(board), audience="operator")
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\board")
+    window.results_page.tabs.setCurrentIndex(0)
+    window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.leaderboard)
+    QApplication.processEvents()
+    _grab(window, "12-leaderboard-light.png", tmp_path)
 
 
 def _shot_equity() -> list[float]:
@@ -353,6 +405,110 @@ def _shot_equity() -> list[float]:
             trough = 977_500
             values.append(trough + (index - 25) * ((1_040_000 - trough) / 14))
     return values
+
+
+def _heat_has(window, needle: str) -> bool:
+    for label in window.results_page.periods.findChildren(QWidget):
+        text = getattr(label, "text", None)
+        if callable(text) and needle in text():
+            return True
+    return False
+
+
+def _visible_blob(window) -> str:
+    chunks = [window.windowTitle() or "", window.statusBar().currentMessage() or ""]
+    for widget in window.findChildren(QWidget):
+        for method in ("text", "toolTip", "statusTip", "whatsThis", "placeholderText", "windowTitle"):
+            fn = getattr(widget, method, None)
+            if not callable(fn):
+                continue
+            try:
+                value = fn()
+            except Exception:
+                continue
+            if isinstance(value, str) and value:
+                chunks.append(value)
+        plain = getattr(widget, "toPlainText", None)
+        if callable(plain):
+            try:
+                chunks.append(plain())
+            except Exception:
+                pass
+        model_fn = getattr(widget, "model", None)
+        if not callable(model_fn):
+            continue
+        try:
+            model = model_fn()
+        except Exception:
+            continue
+        if model is None:
+            continue
+        try:
+            rows = model.rowCount()
+            cols = model.columnCount()
+        except Exception:
+            continue
+        for row in range(rows):
+            for column in range(cols):
+                index = model.index(row, column)
+                for role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
+                    value = model.data(index, role)
+                    if isinstance(value, str) and value:
+                        chunks.append(value)
+    return "\n".join(chunks).casefold()
+
+
+def _assert_clean(blob: str) -> None:
+    for needle in ("zzzx", "share_scale", "7.777", "2019-07-04", "424242"):
+        assert needle not in blob, needle
+
+
+def test_designer_view_hides_the_canary(qtbot, tmp_path):
+    metrics = {
+        "profile": "arena",
+        "symbol": "ZZZX",
+        "anonymized": True,
+        "bar_minutes": 1,
+        "total_return": 0.04,
+        "sharpe": 0.8,
+        "initial_equity": 1_000_000,
+        "final_equity": 1_040_000,
+        "last_price": 424242.42,
+        "asof": "2019-07-04",
+        "cost_basis": {"share_scale": 7.777, "note": "share_scale=7.777 ticker ZZZX"},
+        "run": {"anonymized": True},
+    }
+    folder = write_book(tmp_path / "book", metrics, benchmark=False)
+    fills = (folder / "fills.csv").read_text(encoding="utf-8").replace("2024-01-02", "2019-07-04").replace("100.01", "424242.42")
+    (folder / "fills.csv").write_text(fills, encoding="utf-8")
+    equity = (folder / "equity_curve.csv").read_text(encoding="utf-8").replace("2024-01-02", "2019-07-04")
+    (folder / "equity_curve.csv").write_text(equity, encoding="utf-8")
+    designer = folder / "designer"
+    clean = {
+        "profile": "arena",
+        "bar_minutes": 1,
+        "total_return": 0.04,
+        "sharpe": 0.8,
+        "initial_equity": 1_000_000,
+        "final_equity": 1_040_000,
+    }
+    write_book(designer, clean, benchmark=False)
+    designer_equity = (designer / "equity_curve.csv").read_text(encoding="utf-8")
+    designer_equity = designer_equity.replace("2024-01-02", "S0001").replace("2024-01-03", "S0002").replace("2024-01-04", "S0003").replace("2024-01-05", "S0004")
+    (designer / "equity_curve.csv").write_text(designer_equity, encoding="utf-8")
+    window = _window(qtbot, tmp_path)
+    window.results_page.load_path(str(folder))
+    assert window.results_page._report.audience == "designer"
+    _assert_clean(_visible_blob(window))
+    exported = tmp_path / "export"
+    window.results_page.export_to(exported)
+    exported_text = []
+    for path in exported.rglob("*"):
+        if path.is_file():
+            exported_text.append(path.read_text(encoding="utf-8", errors="ignore"))
+    _assert_clean("\n".join(exported_text).casefold())
+    window.results_page.load_path(str(folder), audience="designer")
+    _assert_clean(_visible_blob(window))
 
 
 def _percent(value: float) -> str:

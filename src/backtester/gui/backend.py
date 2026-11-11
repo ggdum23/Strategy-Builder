@@ -12,6 +12,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .audience import apply_designer, book_is_anonymized, peek_symbols, resolve_view
 from .format import is_missing
 from .schema import (
     ACTIVITY_KEYS,
@@ -88,6 +89,11 @@ class RunReport:
     children: list[dict] = field(default_factory=list)
     other_fields: dict = field(default_factory=dict)
     withheld: list[str] = field(default_factory=list)
+    audience: str = "operator"
+    opened: Path | None = None
+    redacted: bool = False
+    fees_breakdown: dict | None = None
+    period_returns: dict | None = None
 
 
 def _read_json(path: Path):
@@ -153,6 +159,12 @@ def _coerce(value):
         return True
     if lowered == "false":
         return False
+    if lowered in {"inf", "+inf", "infinity"}:
+        return float("inf")
+    if lowered in {"-inf", "-infinity"}:
+        return float("-inf")
+    if lowered == "nan":
+        return float("nan")
     try:
         if any(mark in text for mark in (".", "e", "E")):
             return float(text)
@@ -319,6 +331,12 @@ def _load_book(directory: Path, withheld: list[str]) -> RunReport:
     metrics = _withhold(raw, withheld)
     report.metrics = metrics
     report.other_fields = _other_fields(metrics)
+    fees = metrics.get("fees_breakdown")
+    if isinstance(fees, dict):
+        report.fees_breakdown = fees
+    periods = metrics.get("period_returns")
+    if isinstance(periods, dict):
+        report.period_returns = periods
     basis = metrics.get("cost_basis")
     if isinstance(basis, dict):
         report.cost_basis = basis
@@ -547,25 +565,171 @@ def _load_batch(directory: Path, withheld: list[str]) -> RunReport:
     return report
 
 
-def load_run(directory) -> RunReport:
-    """Classify ``directory`` and read the report files that are there."""
+def _nested_job_dirs(folder: Path) -> list[tuple[str, str, Path]]:
+    """``jobs/<strategy>/<source>/`` or a designer bundle ``<strategy>/<source>/``."""
+    found = []
+    try:
+        strategies = sorted(path for path in folder.iterdir() if path.is_dir() and path.name not in _SKIP_DIRS)
+    except OSError:
+        return found
+    for strategy in strategies:
+        if strategy.name == "benchmarks":
+            continue
+        try:
+            sources = sorted(path for path in strategy.iterdir() if path.is_dir())
+        except OSError:
+            continue
+        for source in sources:
+            if source.name in {"benchmarks", "designer"}:
+                continue
+            if (
+                (source / METRICS_FILE).is_file()
+                or (source / "error.json").is_file()
+                or (source / "designer" / "error.json").is_file()
+            ):
+                found.append((strategy.name, source.name, source))
+    return found
+
+
+def _is_parallel_tree(folder: Path) -> bool:
+    document = None
+    info = folder / "run.json"
+    if info.is_file():
+        try:
+            loaded = _read_json(info)
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            document = loaded
+    if isinstance(document, dict) and document.get("kind") == "parallel":
+        return True
+    jobs = folder / "jobs"
+    return jobs.is_dir() and bool(_nested_job_dirs(jobs))
+
+
+def _job_error(directory: Path) -> str | None:
+    for relative in ("error.json", Path("designer") / "error.json"):
+        path = directory / relative
+        if not path.is_file():
+            continue
+        try:
+            document = _read_json(path)
+        except (OSError, json.JSONDecodeError):
+            text = path.read_text(encoding="utf-8").strip()
+            return text or None
+        if isinstance(document, dict):
+            text = document.get("error")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            return json.dumps(document)
+    legacy = directory / "error.txt"
+    if legacy.is_file():
+        return legacy.read_text(encoding="utf-8").strip() or None
+    return None
+
+
+def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
+    """Phase 3 tree: ``jobs/<id>/<source>/`` plus ``designer/`` and ``error.json``."""
+    report = RunReport(directory=directory, kind="batch")
+    jobs_root = directory / "jobs"
+    pairs = _nested_job_dirs(jobs_root) if jobs_root.is_dir() else []
+    if not pairs:
+        pairs = _nested_job_dirs(directory)
+    for strategy_id, source_id, job in pairs:
+        metrics_path = job / METRICS_FILE
+        error = _job_error(job)
+        if metrics_path.is_file():
+            state = "ok"
+        elif error:
+            state = "failed"
+        else:
+            state = "incomplete"
+        report.children.append(
+            {
+                "path": str(job),
+                "name": f"{strategy_id}/{source_id}",
+                "strategy_id": strategy_id,
+                "source_id": source_id,
+                "state": state,
+                "error": None if state == "ok" else error,
+            }
+        )
+    board_path = directory / LEADERBOARD_FILE
+    if board_path.is_file():
+        table = _load_table(board_path)
+        report.leaderboard = TableData(table.columns, table.rows, board_path.name)
+    elif pairs:
+        report.missing.append(LEADERBOARD_FILE)
+    else:
+        report.missing.append(LEADERBOARD_FILE)
+        report.warnings.append("No jobs/ tree and no leaderboard.csv in this batch.")
+    info = directory / "run.json"
+    if info.is_file():
+        try:
+            document = _read_json(info)
+        except (OSError, json.JSONDecodeError) as exc:
+            report.warnings.append(f"run.json could not be read: {exc}")
+        else:
+            if isinstance(document, dict) and not report.children:
+                for job in document.get("jobs") or []:
+                    if not isinstance(job, dict):
+                        continue
+                    report.children.append(
+                        {
+                            "path": "",
+                            "name": f"{job.get('strategy_id')}/{job.get('source_id')}",
+                            "strategy_id": job.get("strategy_id"),
+                            "source_id": job.get("source_id"),
+                            "state": "ok" if job.get("status") == "ok" else str(job.get("status") or "failed"),
+                            "error": None,
+                        }
+                    )
+    config_path = directory / RUN_CONFIG_FILE
+    if config_path.is_file():
+        try:
+            document = _read_json(config_path)
+            if isinstance(document, dict):
+                report.config = _withhold(document, withheld)
+        except (OSError, json.JSONDecodeError) as exc:
+            report.warnings.append(f"{RUN_CONFIG_FILE} could not be read: {exc}")
+    return report
+
+
+def _dispatch(folder: Path, withheld: list[str]) -> RunReport:
+    if _is_parallel_tree(folder) or (folder / LEADERBOARD_FILE).is_file() and _nested_job_dirs(folder):
+        return _load_parallel(folder, withheld)
+    if (folder / WALKFORWARD_FILE).is_file():
+        return _load_walkforward(folder, withheld)
+    if (folder / METRICS_FILE).is_file():
+        return _load_book(folder, withheld)
+    if (folder / BATCH_STATUS_FILE).is_file() or (folder / LEADERBOARD_FILE).is_file() or _child_dirs(folder):
+        return _load_batch(folder, withheld)
+    report = RunReport(directory=folder, kind="incomplete")
+    report.missing.append(METRICS_FILE)
+    return report
+
+
+def load_run(directory, *, audience: str = "auto") -> RunReport:
+    """Classify ``directory`` and read the report files that audience may see.
+
+    ``auto`` opens an anonymized book, or any folder that published ``designer/``,
+    as a designer view. Pass ``operator`` to read the operator files on purpose.
+    """
     folder = Path(directory)
-    withheld: list[str] = []
     if not folder.is_dir():
-        report = RunReport(directory=folder, kind="incomplete")
+        report = RunReport(directory=folder, kind="incomplete", audience="operator", opened=folder)
         report.warnings.append(f"report directory not found: {folder}")
         return report
-    if (folder / WALKFORWARD_FILE).is_file():
-        report = _load_walkforward(folder, withheld)
-    elif (folder / METRICS_FILE).is_file():
-        report = _load_book(folder, withheld)
-    elif (folder / BATCH_STATUS_FILE).is_file() or (folder / LEADERBOARD_FILE).is_file() or _child_dirs(folder):
-        report = _load_batch(folder, withheld)
-    else:
-        report = RunReport(directory=folder, kind="incomplete")
-        report.missing.append(METRICS_FILE)
+    chosen, root, redacted = resolve_view(folder, audience)
+    withheld: list[str] = []
+    report = _dispatch(root, withheld)
+    report.audience = chosen
+    report.opened = folder
+    report.redacted = redacted
     report.withheld = withheld
-    if withheld:
+    if chosen == "designer":
+        apply_designer(report, peek_symbols(folder), redacted=redacted)
+    elif withheld:
         report.warnings.append(
             "Withheld operator fields that were present in a report file: " + ", ".join(withheld) + "."
         )
@@ -634,6 +798,11 @@ class HistoryRow:
     disqualified: bool | None
 
 
+def _history_hides_symbol(metrics: dict) -> bool:
+    """An anonymized book does not contribute its ticker to the history list."""
+    return book_is_anonymized(metrics)
+
+
 def _history_from_metrics(folder: Path, kind: str) -> HistoryRow:
     metrics = {}
     metrics_path = folder / METRICS_FILE
@@ -687,7 +856,7 @@ def _history_from_metrics(folder: Path, kind: str) -> HistoryRow:
         path=str(folder),
         kind=kind,
         profile=metrics.get("profile") or arguments.get("profile"),
-        symbol=metrics.get("symbol") or arguments.get("ticker"),
+        symbol=None if _history_hides_symbol(metrics) else (metrics.get("symbol") or arguments.get("ticker")),
         strategy=None if strategy is None else str(strategy),
         modified=modified_text,
         total_return=_num("total_return"),

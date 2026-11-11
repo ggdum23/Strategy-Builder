@@ -8,7 +8,10 @@ starts. Status files receive paths and headlines only.
 from __future__ import annotations
 
 import json
+import threading
+import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..data import load_dividends, load_named
@@ -334,7 +337,79 @@ def _slug(path: str, used: set[str]) -> str:
     return candidate
 
 
+@dataclass(frozen=True)
+class _StrategyRef:
+    strategy_id: str
+    path: str
+
+
+@dataclass(frozen=True)
+class _NamedMarket:
+    src: str
+    symbol: str
+    bar_minutes: int = 1
+    source_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _PackMarket:
+    pack_dir: str
+    sidecar_path: str
+    source_id: str | None = None
+
+
+class _CancelToken:
+    """Same two methods as ``backtester.parallel.CancelToken`` when Phase 3 is absent."""
+
+    def __init__(self) -> None:
+        self._flag = threading.Event()
+
+    def cancel(self) -> None:
+        self._flag.set()
+
+    def cancelled(self) -> bool:
+        return self._flag.is_set()
+
+
+def _parallel_types():
+    """Prefer the Phase 3 types. Fall back to local stand-ins so the call still happens."""
+    try:
+        from backtester.parallel import CancelToken, NamedMarket, PackMarket, StrategyRef
+    except ImportError:
+        return _StrategyRef, _NamedMarket, _PackMarket, _CancelToken
+    return StrategyRef, NamedMarket, PackMarket, CancelToken
+
+
+def _watch_cancel(status_path, token) -> None:
+    while not token.cancelled():
+        if _cancelled(status_path):
+            token.cancel()
+            return
+        time.sleep(0.05)
+
+
+def _progress_fields(event) -> dict:
+    if isinstance(event, dict):
+        return event
+    return {
+        "completed": getattr(event, "completed", None),
+        "total": getattr(event, "total", None),
+        "strategy_id": getattr(event, "strategy_id", ""),
+        "source_id": getattr(event, "source_id", ""),
+        "status": getattr(event, "status", ""),
+        "message": getattr(event, "message", ""),
+    }
+
+
 def _run_batch(config: dict, status_path) -> dict:
+    """One call to ``runner.run_parallel``. This file does not score the books itself.
+
+    Phase 3 still owns the function body. Until that lands, the runner raises
+    ``NotImplementedError`` and the window shows that message. A test can
+    replace ``backtester.runner.run_parallel``.
+    """
+    from ..runner import run_parallel
+
     issues = validate_config(config)
     if issues:
         raise ValueError("; ".join(issues))
@@ -342,43 +417,89 @@ def _run_batch(config: dict, status_path) -> dict:
     parent = as_path(config["out"])
     parent.mkdir(parents=True, exist_ok=True)
     _write_record(parent, config)
-    rows = []
+    strategy_type, named_type, pack_type, cancel_type = _parallel_types()
     used: set[str] = set()
-    strategies = list(config["strategies"])
-    for index, path in enumerate(strategies, start=1):
-        if _cancelled(status_path):
-            rows.append({"strategy": path, "state": "cancelled", "out": None, "error": "cancelled before start"})
-            continue
-        slug = _slug(path, used)
-        out = parent / slug
+    strategies = []
+    for path in config["strategies"]:
+        strategies.append(strategy_type(strategy_id=_slug(path, used), path=str(as_path(path))))
+    if config["source"] == "pack":
+        markets = [pack_type(pack_dir=str(as_path(config["pack"])), sidecar_path=str(as_path(config["sidecar"])))]
+    else:
+        markets = [
+            named_type(
+                src=str(as_path(config["src"])),
+                symbol=str(config["ticker"]),
+                bar_minutes=int(config["bar_minutes"]),
+                source_id=str(config["ticker"] or "named"),
+            )
+        ]
+    workers = int(config.get("workers") or 1)
+    token = cancel_type()
+    watcher = None
+    if status_path:
+        watcher = threading.Thread(
+            target=_watch_cancel,
+            args=(status_path, token),
+            name="backtester-gui-cancel",
+            daemon=True,
+        )
+        watcher.start()
+
+    def on_progress(event) -> None:
+        fields = _progress_fields(event)
+        completed = fields.get("completed")
+        total = fields.get("total")
+        message = str(fields.get("message") or "").strip()
+        if not message:
+            message = f"{fields.get('strategy_id') or ''} {fields.get('status') or ''}".strip()
+        message = f"{message}  workers {workers}".strip()
         _status(
             status_path,
             {
                 "state": "running",
-                "message": f"{index}/{len(strategies)} {as_path(path).name}",
-                "index": index,
-                "count": len(strategies),
-                "strategies": rows,
+                "message": message or "running",
+                "index": completed if isinstance(completed, int) else 0,
+                "count": total if isinstance(total, int) else 0,
             },
         )
-        child = dict(config)
-        child["mode"] = "single"
-        child["strategies"] = [path]
-        child["out"] = str(out)
-        try:
-            result = _run_single(child, None)
-            rows.append({"strategy": path, "state": "ok", "out": result["out"], "error": None})
-        except Exception as exc:
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "error.txt").write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
-            rows.append({"strategy": path, "state": "failed", "out": str(out), "error": f"{type(exc).__name__}: {exc}"})
-    document = {"schema": "strategy-builder.batch_status.v1", "strategies": rows}
-    (parent / "batch_status.json").write_text(
-        json.dumps(json_ready(document), indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
+
+    result = run_parallel(
+        strategies,
+        markets,
+        str(parent),
+        profile=config["profile"],
+        workers=workers,
+        on_progress=on_progress,
+        cancel=token,
+        borrow_rate_annual=_optional_float(config["borrow_rate_annual"]),
+        financing_rate_annual=_optional_float(config["financing_rate_annual"]),
+        fee_mult=float(config["fee_mult"]),
+        dividends=_dividends(config),
+        warmup_sessions=int(config.get("warmup_sessions") or 0),
+        initial_equity=float(config["initial_equity"]),
+        with_benchmarks=True,
     )
-    failed = sum(1 for row in rows if row["state"] == "failed")
-    return {"out": str(parent), "strategies": rows, "failed": failed, "count": len(rows)}
+    rows = []
+    for item in getattr(result, "results", ()) or ():
+        status = getattr(item, "status", None) or "ok"
+        rows.append(
+            {
+                "strategy": getattr(item, "strategy_id", ""),
+                "state": "ok" if status == "ok" else status,
+                "out": getattr(item, "out_dir", None),
+                "error": getattr(item, "error", None),
+            }
+        )
+    failed = getattr(result, "failures", None)
+    if failed is None:
+        failed = sum(1 for row in rows if row["state"] not in {"ok", "success"})
+    return {
+        "out": str(getattr(result, "out_dir", parent)),
+        "strategies": rows,
+        "failed": failed,
+        "count": len(rows) or len(strategies),
+        "workers": workers,
+    }
 
 
 def execute_run(config: dict, status_path=None) -> dict:

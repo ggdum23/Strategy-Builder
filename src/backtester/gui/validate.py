@@ -88,6 +88,7 @@ def normalize(raw: dict) -> dict:
         "design_end_day": raw.get("design_end_day"),
         "design_end_date": "" if _blank(raw.get("design_end_date")) else str(raw.get("design_end_date")).strip(),
         "design_fraction": raw.get("design_fraction"),
+        "workers": raw.get("workers", 1),
     }
 
 
@@ -97,6 +98,9 @@ def validate_config(raw: dict) -> list[str]:
     issues: list[str] = []
     if config["mode"] not in _MODES:
         issues.append("choose single, walk-forward, or batch")
+    workers = config.get("workers", 1)
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        issues.append("workers must be an integer of at least 1")
     if config["source"] not in _SOURCES:
         issues.append("choose a named folder or a pack")
     profile = None
@@ -209,6 +213,8 @@ def validate_config(raw: dict) -> list[str]:
 
 def api_name(config: dict) -> str:
     config = normalize(config)
+    if config["mode"] == "batch":
+        return "backtester.runner.run_parallel"
     if config["mode"] == "walkforward":
         return "backtester.runner.walk_forward"
     if config["source"] == "pack":
@@ -254,6 +260,7 @@ def config_record(raw: dict) -> dict:
         "design_fraction": config["design_fraction"] if config["mode"] == "walkforward" else None,
         "with_benchmarks": True,
         "share_factor": None,
+        "workers": config["workers"] if config["mode"] == "batch" else None,
     }
     notes = [
         "null borrow_rate_annual is passed through. The runner uses the profile default. This window did not substitute a number.",
@@ -261,6 +268,7 @@ def config_record(raw: dict) -> dict:
         "share_factor null means a named run does not override the loader's 1.0. A pack run reads scale from the sidecar inside the runner.",
         "with_benchmarks is true: the same engine and costs, 1x buy-and-hold, and on Desk also constant 2x.",
         "The sidecar file is named above and is not copied into this record.",
+        "workers is the process count a batch passes to run_parallel. It does not change a metric. A single run leaves it null.",
     ]
     return {
         "schema": CONFIG_SCHEMA,

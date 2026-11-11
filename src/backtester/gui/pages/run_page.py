@@ -1,7 +1,12 @@
-"""Launch a single run, a walk-forward, or a batch. The transcript is the contract."""
+"""Launch a single run, a walk-forward, or a batch.
+
+The page shows a readable summary of the draft. The stored contract is still
+``run_config.json``, written by the worker before the engine starts.
+"""
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFormLayout,
@@ -21,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..disclosures import profile_rows
-from ..validate import transcript, validate_config
+from ..validate import validate_config
 from ..widgets import Banner, DictTable, PageHeader, PathField, Section, clear_layout
 
 
@@ -71,24 +76,32 @@ class RunPage(QWidget):
         self.strategy_label = QLabel("Strategies: none checked")
         self.strategy_label.setWordWrap(True)
         modes = QHBoxLayout()
+        modes.setSpacing(18)
+        modes.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.single = QRadioButton("Single")
         self.walk = QRadioButton("Walk-forward")
         self.batch = QRadioButton("Batch")
         self.single.setChecked(True)
         self.mode_group = QButtonGroup(self)
         for button in (self.single, self.walk, self.batch):
+            button.setMinimumHeight(24)
             self.mode_group.addButton(button)
             modes.addWidget(button)
             button.toggled.connect(self.refresh)
+        modes.addStretch(1)
         sources = QHBoxLayout()
+        sources.setSpacing(18)
+        sources.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.named = QRadioButton("Named files")
         self.pack = QRadioButton("Pack + sidecar")
         self.named.setChecked(True)
         self.source_group = QButtonGroup(self)
         for button in (self.named, self.pack):
+            button.setMinimumHeight(24)
             self.source_group.addButton(button)
             sources.addWidget(button)
             button.toggled.connect(self.refresh)
+        sources.addStretch(1)
         self.src = PathField("Filled-file folder", "Named runs only")
         self.ticker = QLineEdit()
         self.ticker.setPlaceholderText("Ticker as in the file name")
@@ -106,6 +119,11 @@ class RunPage(QWidget):
         self.financing.setPlaceholderText("Blank = null. Arena must stay blank.")
         self.fee = QLineEdit("1")
         self.fee.setToolTip("Desk stress multiple. Arena accepts only 1.")
+        self.workers = QSpinBox()
+        self.workers.setObjectName("workers")
+        self.workers.setRange(1, 64)
+        self.workers.setValue(1)
+        self.workers.setToolTip("Process count passed to a batch. It does not change a metric. A single run does not use it.")
         self.dividends = PathField("Dividends CSV", "session,amount. Desk only. Blank sends nothing.", kind="file")
         self.warmup_sessions = QSpinBox()
         self.warmup_sessions.setRange(0, 100000)
@@ -124,6 +142,7 @@ class RunPage(QWidget):
         fields.addRow("Borrow override", self.borrow)
         fields.addRow("Financing override", self.financing)
         fields.addRow("Fee multiple", self.fee)
+        fields.addRow("Batch workers", self.workers)
         fields.addRow("Warm-up sessions", self.warmup_sessions)
         fields.addRow("Warm-up days", self.warmup_days)
         fields.addRow("Design end day", self.design_day)
@@ -162,11 +181,18 @@ class RunPage(QWidget):
         rules_scroll.setWidget(self.rules)
         rules_scroll.setMaximumHeight(168)
         side_layout.addWidget(rules_scroll)
-        side_layout.addWidget(Section("What will be passed"))
-        self.preview = QPlainTextEdit()
-        self.preview.setObjectName("transcript")
-        self.preview.setReadOnly(True)
-        side_layout.addWidget(self.preview, 1)
+        side_layout.addWidget(Section("Run summary"))
+        self.summary = QWidget()
+        self.summary.setObjectName("runSummary")
+        self._summary_layout = QFormLayout(self.summary)
+        self._summary_layout.setContentsMargins(0, 0, 0, 0)
+        self._summary_layout.setSpacing(4)
+        self._summary_labels: list[tuple[str, QLabel]] = []
+        summary_scroll = QScrollArea()
+        summary_scroll.setWidgetResizable(True)
+        summary_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        summary_scroll.setWidget(self.summary)
+        side_layout.addWidget(summary_scroll, 1)
         side_layout.addWidget(Section("Worker"))
         self.log = QPlainTextEdit()
         self.log.setObjectName("runLog")
@@ -193,6 +219,7 @@ class RunPage(QWidget):
         ):
             widget.textChanged.connect(self.refresh)
         self.minutes.valueChanged.connect(self.refresh)
+        self.workers.valueChanged.connect(self.refresh)
         self.warmup_sessions.valueChanged.connect(self.refresh)
         self.warmup_days.valueChanged.connect(self.refresh)
         for field in (self.src, self.pack_dir, self.sidecar, self.out, self.dividends):
@@ -260,7 +287,34 @@ class RunPage(QWidget):
             "design_end_day": blank_number(self.design_day.text(), integer=True),
             "design_end_date": self.design_date.text().strip(),
             "design_fraction": blank_number(self.design_fraction.text()),
+            "workers": int(self.workers.value()),
         }
+
+    def _rate_line(self, text: str) -> str:
+        if text.strip() == "":
+            return "profile default (not a number this window filled in)"
+        return text.strip()
+
+    def _fill_summary(self, rows: list[tuple[str, str]]) -> None:
+        clear_layout(self._summary_layout)
+        self._summary_labels = []
+        for key, value in rows:
+            label = QLabel(value)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setObjectName("summaryValue")
+            self._summary_layout.addRow(key, label)
+            self._summary_labels.append((key, label))
+
+    def summary_text(self) -> str:
+        return "\n".join(f"{key}: {label.text()}" for key, label in self._summary_labels)
+
+    def replace_summary(self, old: str, new: str) -> None:
+        """Swap displayed paths after validation, for the screenshot fixtures."""
+        if not old:
+            return
+        for _key, label in self._summary_labels:
+            label.setText(label.text().replace(old, new))
 
     def refresh(self) -> None:
         name = self._profile
@@ -298,9 +352,35 @@ class RunPage(QWidget):
         self.ticker.setEnabled(not packed)
         self.pack_dir.setEnabled(packed)
         self.sidecar.setEnabled(packed)
-        text = transcript(self.draft())
-        self.preview.setPlainText(text)
-        issues = validate_config(self.draft())
+        draft = self.draft()
+        mode = {"single": "Single", "walkforward": "Walk-forward", "batch": "Batch"}.get(draft["mode"], draft["mode"])
+        source = "Pack + sidecar" if draft["source"] == "pack" else "Named files"
+        strategies = draft["strategies"] or ["none checked"]
+        rows = [
+            ("Profile", self._profile or "not selected"),
+            ("Mode", mode),
+            ("Source", source),
+            ("Strategies", "\n".join(strategies)),
+            ("Data folder", draft["src"] or "—"),
+            ("Ticker", draft["ticker"] or "—"),
+            ("Pack", draft["pack"] or "—"),
+            ("Sidecar", (draft["sidecar"] + "  (file is not opened on this page)") if draft["sidecar"] else "—"),
+            ("Report", draft["out"] or "—"),
+            ("Bar minutes", str(draft["bar_minutes"])),
+            ("Initial equity", "—" if draft["initial_equity"] is None else str(draft["initial_equity"])),
+            ("Borrow", self._rate_line(self.borrow.text())),
+            ("Financing", self._rate_line(self.financing.text())),
+            ("Fee multiple", "—" if draft["fee_mult"] is None else str(draft["fee_mult"])),
+            ("Dividends", draft["dividends"] or "none"),
+            ("Warm-up sessions", str(draft["warmup_sessions"])),
+            ("Warm-up days", str(draft["warmup_days"])),
+            ("Batch workers", f"{draft['workers']}  (process count only; it does not change a metric)"),
+        ]
+        if draft["mode"] == "walkforward":
+            cut = draft["design_end_date"] or draft["design_end_day"] or draft["design_fraction"]
+            rows.append(("Walk-forward cut", "—" if cut in (None, "") else str(cut)))
+        self._fill_summary(rows)
+        issues = validate_config(draft)
         self.run_button.setEnabled(not issues and not self.host.run_in_progress())
         clear_layout(self.banners)
         if issues:

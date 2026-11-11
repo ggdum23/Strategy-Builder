@@ -148,12 +148,62 @@ def test_walkforward_writes_two_legs(tmp_path):
     assert design["total_return"] == summary["design"]["total_return"]
 
 
-def test_batch_keeps_going_after_one_failure(tmp_path):
+def test_batch_calls_run_parallel_with_progress_and_cancel(tmp_path, monkeypatch):
     src = _series(tmp_path)
     good = write_strategy(tmp_path / "strategies" / "good.py", 1.0)
     bad = tmp_path / "strategies" / "bad.py"
     bad.write_text("raise RuntimeError('boom')\n", encoding="utf-8")
     out = tmp_path / "batch"
+    status = tmp_path / "status.json"
+    seen = {}
+
+    def fake(strategies, markets, out_dir, **kwargs):
+        seen["strategies"] = list(strategies)
+        seen["markets"] = list(markets)
+        seen["kwargs"] = kwargs
+        alpha = Path(out_dir) / "jobs" / strategies[1].strategy_id / "QQQ"
+        alpha.mkdir(parents=True)
+        (alpha / "metrics.json").write_text(
+            json.dumps({"profile": "arena", "symbol": "QQQ", "total_return": 0.01}) + "\n",
+            encoding="utf-8",
+        )
+        beta = Path(out_dir) / "jobs" / strategies[0].strategy_id / "QQQ"
+        beta.mkdir(parents=True)
+        (beta / "error.json").write_text(
+            json.dumps({"strategy_id": strategies[0].strategy_id, "source_id": "QQQ", "status": "error", "error": "boom"})
+            + "\n",
+            encoding="utf-8",
+        )
+        (Path(out_dir) / "run.json").write_text(json.dumps({"kind": "parallel", "jobs": []}) + "\n", encoding="utf-8")
+        (Path(out_dir) / "leaderboard.csv").write_text(
+            "rank,strategy_id,total_return\n1," + strategies[1].strategy_id + ",0.01\n",
+            encoding="utf-8",
+        )
+        kwargs["on_progress"](
+            type("E", (), {"completed": 1, "total": 2, "strategy_id": "bad", "source_id": "QQQ", "status": "error", "message": "boom"})()
+        )
+        Path(str(status) + ".cancel").write_text("cancel\n", encoding="utf-8")
+        for _ in range(40):
+            if kwargs["cancel"].cancelled():
+                break
+            import time
+
+            time.sleep(0.05)
+        assert kwargs["cancel"].cancelled()
+        return type(
+            "R",
+            (),
+            {
+                "out_dir": str(out_dir),
+                "failures": 1,
+                "results": (
+                    type("J", (), {"strategy_id": strategies[0].strategy_id, "status": "error", "out_dir": str(beta), "error": "boom"})(),
+                    type("J", (), {"strategy_id": strategies[1].strategy_id, "status": "ok", "out_dir": str(alpha), "error": None})(),
+                ),
+            },
+        )()
+
+    monkeypatch.setattr("backtester.runner.run_parallel", fake)
     result = execute_run(
         {
             "mode": "batch",
@@ -174,13 +224,21 @@ def test_batch_keeps_going_after_one_failure(tmp_path):
             "design_end_day": None,
             "design_end_date": "",
             "design_fraction": None,
-        }
+            "workers": 1,
+        },
+        status_path=status,
     )
-    states = {Path(row["strategy"]).name: row["state"] for row in result["strategies"]}
-    assert states["bad.py"] == "failed"
-    assert states["good.py"] == "ok"
-    assert "boom" in next(row["error"] for row in result["strategies"] if row["state"] == "failed")
-    report = load_run(out)
+    ids = [item.strategy_id for item in seen["strategies"]]
+    assert len(ids) == 2
+    assert seen["markets"][0].symbol == "QQQ"
+    assert seen["kwargs"]["workers"] == 1
+    assert seen["kwargs"]["on_progress"] is not None
+    assert result["failed"] == 1
+    payload = json.loads(status.read_text(encoding="utf-8"))
+    assert payload["count"] == 2
+    assert "boom" in payload["message"]
+    report = load_run(out, audience="operator")
     assert report.kind == "batch"
     failed = [child for child in report.children if child["state"] == "failed"]
     assert failed and "boom" in (failed[0]["error"] or "")
+    assert any(child["state"] == "ok" for child in report.children)

@@ -119,7 +119,15 @@ ARENA_METRICS = {
     "max_drawdown": -0.08,
     "max_dd_duration_sessions": 3,
     "calmar": 1.5,
+    "excess_total_return": 0.02,
     "n_fills": 2,
+    "fees_breakdown": {"commission": 1.0, "sec": 0.2, "taf": 0.3},
+    "period_returns": {
+        "S01": 0.04,
+        "S02": -0.012,
+        "monthly": {"2024-01": 0.021},
+        "yearly": {"2024": 0.04},
+    },
     "fees_total": 1.5,
     "borrow_cost": 0.0,
     "sessions": 4,
@@ -185,6 +193,85 @@ DESK_METRICS = {
     },
     "benchmarks": {
         "buy_and_hold_1x": {"total_return": 0.04, "final_equity": 1_040_000, "sharpe": 0.5, "n_fills": 1, "fees_total": 1.0},
-        "long_2x": {"total_return": 0.05, "final_equity": 1_050_000, "financing_cost": 4000.0, "n_fills": 1, "fees_total": 1.2},
+        "long_2x": {"total_return": 0.05, "final_equity": 1_050_000, "financing_cost": 5848.14, "n_fills": 1, "fees_total": 1.2},
     },
 }
+
+
+def write_parallel_run(directory: Path, *, anonymized: bool = False) -> Path:
+    """A Phase 3 output tree: jobs/, error.json, run.json, and an optional designer/."""
+    directory.mkdir(parents=True, exist_ok=True)
+    ok_metrics = {
+        "profile": "arena",
+        "symbol": "QQQ",
+        "bar_minutes": 1,
+        "initial_equity": 1_000_000,
+        "final_equity": 1_100_000,
+        "total_return": 0.041,
+        "sharpe": 1.234,
+        "calmar": float("inf"),
+        "excess_total_return": 0.01,
+        "anonymized": anonymized,
+    }
+    write_book(directory / "jobs" / "alpha" / "QQQ", ok_metrics, benchmark=False)
+    failed = directory / "jobs" / "beta" / "QQQ"
+    failed.mkdir(parents=True, exist_ok=True)
+    (failed / "error.json").write_text(
+        json.dumps(
+            {
+                "strategy_id": "beta",
+                "source_id": "QQQ",
+                "status": "error",
+                "error": "RuntimeError: boom",
+                "symbol": "QQQ",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (directory / "leaderboard.csv").write_text(
+        "rank,strategy_id,source_id,symbol,total_return,sharpe,calmar,final_equity,excess_total_return\n"
+        "1,alpha,QQQ,QQQ,0.041,1.234,inf,1100000,0.01\n"
+        "2,beta,QQQ,QQQ,,,,,\n",
+        encoding="utf-8",
+    )
+    if anonymized:
+        clean = {key: value for key, value in ok_metrics.items() if key not in {"symbol", "anonymized"}}
+        clean["profile"] = "arena"
+        write_book(directory / "designer" / "alpha" / "QQQ", clean, benchmark=False)
+        designer_failed = directory / "designer" / "beta" / "QQQ"
+        designer_failed.mkdir(parents=True, exist_ok=True)
+        (designer_failed / "error.json").write_text(
+            json.dumps(
+                {
+                    "strategy_id": "beta",
+                    "source_id": "QQQ",
+                    "status": "error",
+                    "error": "the strategy failed",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (directory / "designer" / "leaderboard.csv").write_text(
+            "rank,strategy_id,source_id,total_return,sharpe,calmar,final_equity,excess_total_return\n"
+            "1,alpha,QQQ,0.041,1.234,inf,1100000,\n"
+            "2,beta,QQQ,,,,,\n",
+            encoding="utf-8",
+        )
+    (directory / "run.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "parallel",
+                "profile": "arena",
+                "jobs": [
+                    {"strategy_id": "alpha", "source_id": "QQQ", "symbol": "QQQ", "status": "ok", "anonymized": anonymized},
+                    {"strategy_id": "beta", "source_id": "QQQ", "symbol": "QQQ", "status": "error", "anonymized": anonymized},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return directory

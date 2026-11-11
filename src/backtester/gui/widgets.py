@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import math
+import re
+
 from PySide6.QtCore import QAbstractTableModel, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -203,7 +207,33 @@ class DictModel(QAbstractTableModel):
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
         self._order: list[int] = []
+        self._cache: list[dict] = []
+        self._tokens: list[dict] = []
+        self._blob: list[str] = []
+        self._build_cache()
         self._recompute()
+
+    def _build_cache(self) -> None:
+        """Format each cell once. Filtering a large fill list must not format it again."""
+        cache = []
+        tokens = []
+        blobs = []
+        for record in self.rows:
+            shown = {}
+            token = {}
+            parts = []
+            for column in self.columns:
+                value = record.get(column)
+                text = self._display(column, value)
+                shown[column] = text
+                token[column] = sort_token(value)
+                parts.append(text.casefold())
+            cache.append(shown)
+            tokens.append(token)
+            blobs.append("\n".join(parts))
+        self._cache = cache
+        self._tokens = tokens
+        self._blob = blobs
 
     def set_filter(self, text: str) -> None:
         self._filter = (text or "").casefold()
@@ -240,17 +270,15 @@ class DictModel(QAbstractTableModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or not 0 <= index.row() < len(self._order):
             return None
-        record = self.rows[self._order[index.row()]]
+        source = self._order[index.row()]
         key = self.columns[index.column()]
-        value = record.get(key)
         if role == Qt.ItemDataRole.DisplayRole:
-            return self._display(key, value)
+            return self._cache[source][key]
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            token = sort_token(value)
-            if token[0] == 1:
+            if self._tokens[source][key][0] == 1:
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.ToolTipRole:
-            return "" if value is None else str(value)
+            return self._cache[source][key]
         return None
 
     def flags(self, index):
@@ -264,20 +292,17 @@ class DictModel(QAbstractTableModel):
             return format_number(kind, value)
         return format_cell(value)
 
-    def _matches(self, record: dict) -> bool:
+    def _matches(self, index: int) -> bool:
         if not self._filter:
             return True
-        for key in self.columns:
-            if self._filter in self._display(key, record.get(key)).casefold():
-                return True
-        return False
+        return self._filter in self._blob[index]
 
     def _recompute(self) -> None:
-        indices = [index for index, record in enumerate(self.rows) if self._matches(record)]
+        indices = [index for index in range(len(self.rows)) if self._matches(index)]
         if 0 <= self._sort_column < len(self.columns):
             key = self.columns[self._sort_column]
             indices.sort(
-                key=lambda index: sort_token(self.rows[index].get(key)),
+                key=lambda index: self._tokens[index][key],
                 reverse=self._sort_order == Qt.SortOrder.DescendingOrder,
             )
         self._order = indices
@@ -286,3 +311,84 @@ class DictModel(QAbstractTableModel):
         self.beginResetModel()
         self._recompute()
         self.endResetModel()
+
+
+_MONTH = re.compile(r"\d{4}-\d{2}")
+_YEAR = re.compile(r"\d{4}")
+
+
+def period_sections(payload) -> list[tuple[str, dict]]:
+    """Split a stored ``period_returns`` object into blocks, months, and years."""
+    monthly: dict = {}
+    yearly: dict = {}
+    blocks: dict = {}
+
+    def take(key, value, hint: str = "") -> None:
+        if isinstance(value, dict):
+            child_hint = str(key).lower()
+            for child_key, child in value.items():
+                take(child_key, child, child_hint)
+            return
+        label = str(key)
+        if hint in {"monthly", "month", "months"} or _MONTH.fullmatch(label):
+            monthly[label] = value
+        elif hint in {"yearly", "year", "years", "annual"} or _YEAR.fullmatch(label):
+            yearly[label] = value
+        else:
+            blocks[label] = value
+
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            take(key, value)
+    sections = []
+    if blocks:
+        sections.append(("Session blocks", blocks))
+    if monthly:
+        sections.append(("Monthly", monthly))
+    if yearly:
+        sections.append(("Yearly", yearly))
+    return sections
+
+
+class PeriodHeat(QWidget):
+    """Color is the sign of the stored return. It is not a new metric."""
+
+    def __init__(self):
+        super().__init__()
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(6)
+        self.setObjectName("periodHeat")
+
+    def set_periods(self, payload, theme) -> None:
+        clear_layout(self._layout)
+        sections = period_sections(payload)
+        if not sections:
+            note = QLabel("No period_returns object in this report.")
+            note.setObjectName("muted")
+            self._layout.addWidget(note)
+            return
+        for title, mapping in sections:
+            self._layout.addWidget(Section(title))
+            grid = QGridLayout()
+            grid.setSpacing(4)
+            columns = 6
+            for index, (label, value) in enumerate(mapping.items()):
+                cell = QLabel(f"{label}\n{format_number('fraction', value)}")
+                cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell.setToolTip("Stored period return. This window did not recompute it.")
+                cell.setMinimumWidth(76)
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    number = float("nan")
+                if math.isfinite(number) and number > 0:
+                    cell.setStyleSheet(f"background: {theme.ok_bg}; color: {theme.positive}; padding: 6px;")
+                elif math.isfinite(number) and number < 0:
+                    cell.setStyleSheet(f"background: {theme.danger_bg}; color: {theme.negative}; padding: 6px;")
+                else:
+                    cell.setStyleSheet(f"background: {theme.elevated}; color: {theme.muted}; padding: 6px;")
+                grid.addWidget(cell, index // columns, index % columns)
+            holder = QWidget()
+            holder.setLayout(grid)
+            self._layout.addWidget(holder)
