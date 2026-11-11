@@ -36,6 +36,10 @@ def test_versions_match_and_inno_form():
     assert versions.inno_version("1.2") == "1.2.0"
     assert versions.inno_version("1.2.3a1") == "1.2.3"
     assert versions.version_info("0.1.0") == "0.1.0.0"
+    info = versions.version_info_text("0.1.0")
+    assert "filevers=(0, 1, 0, 0)" in info
+    assert "FileVersion', '0.1.0.0'" in info
+    assert "ProductVersion', '0.1.0.0'" in info
     assert versions.assert_versions_match() == versions.project_version()
 
 
@@ -94,8 +98,16 @@ def test_installer_script_defaults_and_keeps_user_data():
     assert "/VERYSILENT" in install and "/CURRENTUSER" in install
     assert 'must contain a space' in install
     assert "Wait-GuiProcess" in install and "Wait-GuiProcess" in uninstall
-    assert "/DELETEUSERDATA" not in uninstall
+    assert "DeleteUserData" in uninstall
+    assert "/DELETEUSERDATA" in uninstall
+    assert "DELETEUSERDATA left" in uninstall
     assert "ci-preserve.txt" in uninstall
+    upgrade = (PACKAGING / "ci_upgrade.ps1").read_text(encoding="utf-8")
+    assert "upgrade-keep" in upgrade
+    assert "ci_marker" in upgrade
+    delete = (PACKAGING / "ci_delete_userdata.ps1").read_text(encoding="utf-8")
+    assert "DeleteUserData" in delete
+    assert "keep-uninstall removed" in delete
     helper = (PACKAGING / "ci_process.ps1").read_text(encoding="utf-8")
     assert "WaitForExit" in helper
     assert "UseShellExecute = $false" in helper
@@ -108,12 +120,17 @@ def test_workflow_builds_installs_smokes_and_publishes():
     build = (PACKAGING / "build_windows.ps1").read_text(encoding="utf-8")
     assert '$InnoVersion = "6.7.4"' in build
     assert "innosetup-$InnoVersion.exe" in build
+    assert "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c" in build
+    assert build.index("Inno Setup download hash") < build.index("Wait-GuiProcess")
+    assert "Test-ExactInnoVersion" in build
     for phrase in (
         "Build installer",
         "Record SHA256",
         "Silent install",
         "Smoke tests",
+        "Upgrade over existing install",
         "Silent uninstall",
+        "Delete user data",
         "Upload setup.exe",
         "strategy-builder-setup",
         "softprops/action-gh-release",
@@ -130,6 +147,8 @@ def test_workflow_builds_installs_smokes_and_publishes():
     probe = (PACKAGING / "smoke" / "probe_strategy.py").read_text(encoding="utf-8")
     assert "GetCommandLineW.restype" in probe
     assert "c_wchar_p" in probe
+    assert "cwd_entries" in probe
+    assert "env_keys" in probe
 
 
 def test_spec_is_one_folder_and_collects_optional_gui_stack():
@@ -138,6 +157,8 @@ def test_spec_is_one_folder_and_collects_optional_gui_stack():
     assert 'name="backtester"' in text
     assert 'name="Strategy Builder"' in text
     assert "console=False" in text
+    assert "version=str(VERSION_FILE)" in text
+    assert '["Agg"]' in text
     assert 'contents_directory="_internal"' in text
     assert "onefile" not in text.lower()
     optional = (PACKAGING / "collect_optional.py").read_text(encoding="utf-8")
@@ -171,10 +192,17 @@ def test_freeze_support_runs_before_the_application():
     calls = []
     for statement in main_if.body:
         for child in ast.walk(statement):
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+            if not isinstance(child, ast.Call):
+                continue
+            if isinstance(child.func, ast.Attribute):
                 calls.append(child.func.attr)
-                break
-    assert calls[:2] == ["freeze_support", "freeze_support"]
+            elif isinstance(child.func, ast.Name):
+                calls.append(child.func.id)
+            else:
+                continue
+            break
+    assert calls[:3] == ["_prefer_agg_backend", "freeze_support", "freeze_support"]
+    assert "main" not in calls[:3]
 
 
 def test_version_and_placeholder_and_launcher_check(tmp_path, capsys):
@@ -199,6 +227,20 @@ def test_version_and_placeholder_and_launcher_check(tmp_path, capsys):
     assert "not part of this build" in text
     assert str(market) in text
     assert "Jeu" not in text
+
+
+def test_child_surface_allowlist_and_empty_directory():
+    import smoke_frozen
+
+    smoke_frozen.assert_child_surface({"env_keys": ["PATH", "SystemRoot", "LC_TIME"], "cwd_entries": []})
+    with pytest.raises(SystemExit, match="user-path"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH", "USERPROFILE"], "cwd_entries": []})
+    with pytest.raises(SystemExit, match="user-path"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH", "LOCALAPPDATA", "APPDATA"], "cwd_entries": []})
+    with pytest.raises(SystemExit, match="allowlist"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH", "COMPUTERNAME"], "cwd_entries": []})
+    with pytest.raises(SystemExit, match="not empty"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH"], "cwd_entries": ["leak.txt"]})
 
 
 def test_executable_names():

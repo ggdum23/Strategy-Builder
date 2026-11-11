@@ -21,8 +21,9 @@ the same directory and share `_internal`:
 | `README.md`, `LICENSE.txt`, `INSTALLER.md` | The copies shown by setup. |
 
 `backtester.exe --version` and `backtester.exe version` print the package
-version. `backtester test` still needs a source checkout; it is not part of
-the frozen program.
+version. Both executables also carry that version as a Windows version
+resource (`0.1.0.0` while the package is `0.1.0`). `backtester test` still
+needs a source checkout; it is not part of the frozen program.
 
 User data is not installed under Program Files or the per-user Programs
 directory. It lives in `%LOCALAPPDATA%\StrategyBuilder`:
@@ -75,8 +76,11 @@ py -3 -m pip install -r packaging\requirements-build.txt
 powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 ```
 
-The script installs Inno Setup 6.7.4 if `ISCC.exe` is not already on the
-machine. Output:
+The script compiles with Inno Setup 6.7.4 only. An `ISCC.exe` whose version
+is anything else, including a copy already on the machine, is not used.
+When 6.7.4 is missing, the script downloads `innosetup-6.7.4.exe`, checks
+its SHA256 (`a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c`),
+and only then runs it. Output:
 
 ```text
 packaging\dist\StrategyBuilder\          the one-folder bundle
@@ -120,10 +124,15 @@ script from the workflow only after that secret exists. Do not commit the
 2. Print the SHA256, size, and file name.
 3. Silent per-user install (`/VERYSILENT /CURRENTUSER`) into a directory
    whose path contains a space.
-4. Smoke-test the installed `backtester.exe`: `--version`, ingest, a short
-   arena run, and a walk-forward that spawns two children.
-5. Silent uninstall, then check that the user-data folder is still there.
-6. Upload `strategy-builder-setup` (the setup executable and `SHA256SUMS`).
+4. Smoke-test the installed `backtester.exe`: `--version`, the PE version
+   resource on both executables, ingest, a short arena run, and a
+   walk-forward that spawns two children.
+5. Install again over that directory and check that an edited
+   `config.json` is kept.
+6. Silent uninstall, then check that the user-data folder is still there.
+7. Install once more and uninstall with `/DELETEUSERDATA`. The user-data
+   folder goes away. The market-data folder does not.
+8. Upload `strategy-builder-setup` (the setup executable and `SHA256SUMS`).
 
 A tag named `v*` attaches those files to the GitHub Release. The sample
 month used by the smoke test is the checkout's `assets/sample` tree (or
@@ -175,8 +184,13 @@ modules under that package.
 
 **Parallel runner and reports**
 
-- Import matplotlib normally. The Agg and PDF backends and `mpl-data` are
-  collected. Headless PNG output does not need a Qt backend.
+- Import matplotlib normally. The frozen entry calls `matplotlib.use("Agg")`
+  before `freeze_support`, so a report worker that later imports pyplot
+  stays headless even when PySide6 is installed and even after the
+  walk-forward scrub drops `MPLBACKEND`. The spec collects the Agg backend
+  only (`hooksconfig` `matplotlib.backends` is `["Agg"]`). A window that
+  needs the Qt canvas calls `matplotlib.use("QtAgg")` before importing
+  pyplot and adds `QtAgg` to that list.
 - Spawn workers with the standard library `multiprocessing` spawn context
   (or a pool built on it). Other frameworks are not supported in the
   frozen executable.

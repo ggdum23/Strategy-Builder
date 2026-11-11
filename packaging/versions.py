@@ -68,6 +68,49 @@ def version_info(version: str) -> str:
     return ".".join(parts[:4])
 
 
+def version_info_text(version: str | None = None) -> str:
+    """PyInstaller version-info file for both frozen executables.
+
+    ``EXE(version=...)`` evaluates this text into a ``VSVersionInfo``.
+    A bare ``0.1.0.0`` string is not a version resource.
+    """
+    text = version_info(project_version() if version is None else version)
+    parts = tuple(int(part) for part in text.split("."))
+    filevers = "(%d, %d, %d, %d)" % parts
+    return (
+        "# UTF-8\n"
+        "VSVersionInfo(\n"
+        "  ffi=FixedFileInfo(\n"
+        f"    filevers={filevers},\n"
+        f"    prodvers={filevers},\n"
+        "    mask=0x3f,\n"
+        "    flags=0x0,\n"
+        "    OS=0x40004,\n"
+        "    fileType=0x1,\n"
+        "    subtype=0x0,\n"
+        "    date=(0, 0)\n"
+        "  ),\n"
+        "  kids=[\n"
+        "    StringFileInfo([\n"
+        "      StringTable(\n"
+        "        '040904B0',\n"
+        "        [\n"
+        "          StringStruct('CompanyName', 'Strategy Builder'),\n"
+        "          StringStruct('FileDescription', 'Strategy Builder'),\n"
+        "          StringStruct('FileVersion', '%s'),\n"
+        "          StringStruct('InternalName', 'backtester'),\n"
+        "          StringStruct('OriginalFilename', 'backtester.exe'),\n"
+        "          StringStruct('ProductName', 'Strategy Builder'),\n"
+        "          StringStruct('ProductVersion', '%s')\n"
+        "        ]\n"
+        "      )\n"
+        "    ]),\n"
+        "    VarFileInfo([VarStruct('Translation', [1033, 1200])])\n"
+        "  ]\n"
+        ")\n"
+    ) % (text, text)
+
+
 def has_extra(name: str, path: Path | None = None) -> bool:
     extras = load_project(path).get("project", {}).get("optional-dependencies", {})
     return name in extras

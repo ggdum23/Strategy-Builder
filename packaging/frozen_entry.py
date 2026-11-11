@@ -17,6 +17,29 @@ import sys
 from pathlib import Path
 
 
+def _prefer_agg_backend() -> None:
+    """Keep frozen reports on Agg when PySide6 is in the same bundle.
+
+    Matplotlib's default becomes a Qt backend once PySide6 is installed.
+    Report workers import pyplot only after ``freeze_support`` has entered
+    the child, and a walk-forward child then replaces the environment, so
+    an ``MPLBACKEND`` value set by the parent does not survive. Selecting
+    Agg here sticks for the process. Desktop code can still call
+    ``matplotlib.use`` with another backend before it imports pyplot.
+    The resource-tracker process does not import pyplot; skip the matplotlib
+    import there.
+    """
+    import os
+
+    os.environ["MPLBACKEND"] = "Agg"
+    argv = sys.argv[1:]
+    if "-c" in argv and any("resource_tracker" in part or "forkserver" in part for part in argv):
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+
 def _emit(text: str) -> None:
     stream = sys.stdout
     if stream is None:
@@ -223,6 +246,10 @@ if __name__ == "__main__":
     import multiprocessing
     import multiprocessing.spawn
 
+    # Before freeze_support, so a spawn child (including a report worker)
+    # has selected Agg before it imports pyplot. The resource tracker is
+    # the exception inside _prefer_agg_backend.
+    _prefer_agg_backend()
     # Spawn children and the resource tracker re-enter this executable.
     # PyInstaller's runtime hook has already replaced these functions.
     # Calling the spawn one first also covers a build where that hook did

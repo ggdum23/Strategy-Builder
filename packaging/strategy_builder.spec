@@ -18,10 +18,16 @@ from PyInstaller.building.build_main import Analysis
 
 sys.path.insert(0, SPECPATH)
 import collect_optional
+import versions
 
 ROOT = Path(SPECPATH).resolve().parent
 ENTRY = str(ROOT / "packaging" / "frozen_entry.py")
 ICON = str(ROOT / "packaging" / "assets" / "strategy_builder.ico")
+# EXE(version=) loads a VSVersionInfo file. versions.version_info() is the
+# four-part string (0.1.0.0); the file is that string turned into a resource.
+VERSION_FILE = ROOT / "packaging" / "build" / "file_version_info.txt"
+VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+VERSION_FILE.write_text(versions.version_info_text(), encoding="utf-8")
 
 datas = collect_optional.matplotlib_datas()
 binaries = collect_optional.qt_plugin_binaries()
@@ -34,7 +40,10 @@ a = Analysis(
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],
-    hooksconfig={},
+    # Agg only. Automatic discovery selects QtAgg once PySide6 is installed,
+    # and report workers must stay headless. The GUI can add QtAgg here if
+    # it calls matplotlib.use("QtAgg") before importing pyplot.
+    hooksconfig={"matplotlib": {"backends": ["Agg"]}},
     runtime_hooks=[],
     excludes=collect_optional.excludes(),
     noarchive=False,
@@ -49,6 +58,7 @@ _exe_common = dict(
     contents_directory="_internal",
     icon=ICON,
     bootloader_ignore_signals=False,
+    version=str(VERSION_FILE),
 )
 
 exe_cli = EXE(

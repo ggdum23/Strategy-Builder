@@ -1,7 +1,9 @@
-# Silent uninstall. User data under %LOCALAPPDATA%\StrategyBuilder stays.
+# Silent uninstall. User data under %LOCALAPPDATA%\StrategyBuilder stays,
+# unless -DeleteUserData is passed (the /DELETEUSERDATA switch).
 
 param(
-    [Parameter(Mandatory = $true)][string]$Destination
+    [Parameter(Mandatory = $true)][string]$Destination,
+    [switch]$DeleteUserData
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,16 +17,22 @@ if (-not (Test-Path -LiteralPath $unins)) {
 
 $userRoot = Join-Path $env:LOCALAPPDATA "StrategyBuilder"
 $runs = Join-Path $userRoot "runs"
-New-Item -ItemType Directory -Force -Path $runs | Out-Null
 $marker = Join-Path $runs "ci-preserve.txt"
-Set-Content -LiteralPath $marker -Value "keep" -Encoding ascii
+if (-not $DeleteUserData) {
+    New-Item -ItemType Directory -Force -Path $runs | Out-Null
+    Set-Content -LiteralPath $marker -Value "keep" -Encoding ascii
+}
 
 $log = Join-Path $env:TEMP "strategy-builder-uninstall.log"
 if (Test-Path -LiteralPath $log) {
     Remove-Item -LiteralPath $log -Force
 }
 
-$arguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=""$log"""
+$flag = ""
+if ($DeleteUserData) {
+    $flag = " /DELETEUSERDATA"
+}
+$arguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART$flag /LOG=""$log"""
 $code = Wait-GuiProcess -File $unins -Arguments $arguments
 Write-Output "uninstaller exit $code"
 
@@ -40,6 +48,14 @@ if (Test-Path -LiteralPath $cli) {
 if ($code -ne 0) {
     if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
     throw "uninstaller exited $code"
+}
+if ($DeleteUserData) {
+    if (Test-Path -LiteralPath $userRoot) {
+        throw "DELETEUSERDATA left $userRoot"
+    }
+    Write-Output "uninstalled $Destination"
+    Write-Output "deleted $userRoot"
+    return
 }
 if (-not (Test-Path -LiteralPath $marker)) {
     throw "uninstall deleted $marker"

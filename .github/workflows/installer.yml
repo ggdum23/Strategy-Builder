@@ -68,6 +68,13 @@ jobs:
           SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
           SB_SMOKE_DIR: ${{ runner.temp }}\smoke results
         run: python packaging/smoke_frozen.py --exe "$env:SB_INSTALL_DIR\backtester.exe" --repo . --work $env:SB_SMOKE_DIR
+      - name: Upgrade over existing install
+        shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
+        run: |
+          $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
+          ./packaging/ci_upgrade.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
       - name: Silent uninstall
         if: always()
         shell: pwsh
@@ -80,6 +87,13 @@ jobs:
             exit 0
           }
           ./packaging/ci_uninstall.ps1 -Destination $env:SB_INSTALL_DIR
+      - name: Delete user data
+        shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
+        run: |
+          $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
+          ./packaging/ci_delete_userdata.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
       - name: Upload setup.exe
         if: always()
         uses: actions/upload-artifact@v4

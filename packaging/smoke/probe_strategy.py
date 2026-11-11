@@ -43,10 +43,13 @@ class Strategy:
     def _record(self) -> None:
         here = Path(__file__).resolve().parent
         destination = here / f"probe_{os.getpid()}.json"
+        cwd = os.getcwd()
         payload = {
             "argv": list(sys.argv),
-            "cwd": os.getcwd(),
-            "cwd_name": Path(os.getcwd()).name,
+            "cwd": cwd,
+            "cwd_name": Path(cwd).name,
+            "cwd_entries": sorted(os.listdir(cwd)),
+            "env_keys": sorted(os.environ),
             "sentinel": os.environ.get("STRATEGY_BUILDER_SENTINEL"),
             "market_data_root": os.environ.get("MARKET_DATA_ROOT"),
             "os_command_line": _os_command_line(),
