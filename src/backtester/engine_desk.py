@@ -13,6 +13,7 @@ import math
 from dataclasses import dataclass
 
 from . import costs_desk as D
+from .accounting import dividend_cash, idle_base, require_annual_rate, require_withholding_rate, session_accrual
 
 
 @dataclass
@@ -26,6 +27,8 @@ class DeskConfig:
     share_factor: float = 1.0
     borrow_rate_annual: float = D.BORROW_RATE_ANNUAL
     financing_rate_annual: float = D.FINANCING_RATE_ANNUAL
+    cash_rate_annual: float = 0.0
+    withholding_rate: float = 0.0
     sessions_per_year: int = D.SESSIONS_PER_YEAR
     sessions_per_month: int = D.SESSIONS_PER_MONTH
     fee_mult: float = 1.0
@@ -45,6 +48,9 @@ class DeskConfig:
             raise ValueError("share_factor must be positive")
         if self.borrow_rate_annual < 0.0 or self.financing_rate_annual < 0.0:
             raise ValueError("borrow and financing rates cannot be negative")
+        self.financing_rate_annual = require_annual_rate("financing_rate_annual", self.financing_rate_annual)
+        self.cash_rate_annual = require_annual_rate("cash_rate_annual", self.cash_rate_annual)
+        self.withholding_rate = require_withholding_rate("withholding_rate", self.withholding_rate)
         if self.sessions_per_year <= 0 or self.sessions_per_month <= 0:
             raise ValueError("session counts must be positive")
         if self.fee_mult <= 0.0 or self.slippage_bps < 0.0:
@@ -201,6 +207,7 @@ class _Book:
         self.fees = {key: 0.0 for key in ("commission", "exchange", "clearing", "pass_through", "cat", "sec", "taf", "total")}
         self.slippage = 0.0
         self.financing = 0.0
+        self.cash_interest = 0.0
         self.borrow = 0.0
         self.dividends = 0.0
         self.traded_notional = 0.0
@@ -210,6 +217,7 @@ class _Book:
         self.fills = []
         self.daily = []
         self.financing_events = []
+        self.cash_interest_events = []
         self.borrow_events = []
         self.dividend_events = []
         self.worst_ratio = 1.0
@@ -241,6 +249,7 @@ class _Book:
         self.fees = {key: 0.0 for key in self.fees}
         self.slippage = 0.0
         self.financing = 0.0
+        self.cash_interest = 0.0
         self.borrow = 0.0
         self.dividends = 0.0
         self.traded_notional = 0.0
@@ -250,6 +259,7 @@ class _Book:
         self.fills = []
         self.daily = []
         self.financing_events = []
+        self.cash_interest_events = []
         self.borrow_events = []
         self.dividend_events = []
         self.worst_ratio = 1.0
@@ -306,7 +316,10 @@ class _Book:
             sessions_per_year=self.cfg.sessions_per_year,
         )
         amount = float(self.cfg.dividends.get(session_id, 0.0))
-        div = snap["shares"] * amount
+        if self.cfg.withholding_rate == 0.0:
+            div = snap["shares"] * amount
+        else:
+            div = dividend_cash(snap["shares"], amount, self.cfg.withholding_rate)
         self.cash -= fin
         self.cash -= bor
         self.cash += div
@@ -335,6 +348,25 @@ class _Book:
             }
         )
         self.dividend_events.append({"session": session_id, "amount": div, "per_share": amount, "shares": snap["shares"]})
+        if self.cfg.cash_rate_annual != 0.0:
+            interest = session_accrual(
+                self.cfg.cash_rate_annual,
+                idle_base(snap["shares"], snap["price"], snap["equity"]),
+                self.cfg.sessions_per_year,
+            )
+            self.cash += interest
+            self.cash_interest += interest
+            if self.ep is not None:
+                self.ep["cf"] += interest
+            self.cash_interest_events.append(
+                {
+                    "session": session_id,
+                    "amount": interest,
+                    "shares": snap["shares"],
+                    "price": snap["price"],
+                    "equity": snap["equity"],
+                }
+            )
 
     def take_snap(self, close):
         equity = self.cash + self.shares * close
@@ -635,6 +667,7 @@ def run(strategy, bars, config=None):
         "slippage": book.slippage,
         "borrow": book.borrow,
         "financing": book.financing,
+        "cash_interest": book.cash_interest,
         "dividends": book.dividends,
         "traded_notional": book.traded_notional,
         "n_fills": book.n_fills,
@@ -648,6 +681,7 @@ def run(strategy, bars, config=None):
         "episodes": book.episodes,
         "open_episode": open_episode,
         "financing_events": book.financing_events,
+        "cash_interest_events": book.cash_interest_events,
         "borrow_events": book.borrow_events,
         "dividend_events": book.dividend_events,
         "bar_exposure": {
@@ -660,6 +694,8 @@ def run(strategy, bars, config=None):
             "share_factor": cfg.share_factor,
             "borrow_rate_annual": cfg.borrow_rate_annual,
             "financing_rate_annual": cfg.financing_rate_annual,
+            "cash_rate_annual": cfg.cash_rate_annual,
+            "withholding_rate": cfg.withholding_rate,
             "fee_mult": cfg.fee_mult,
             "slippage_bps": cfg.slippage_bps,
             "max_abs_target": cfg.max_abs_target,
@@ -805,6 +841,7 @@ def metrics(res):
         "slippage_cost": res["slippage"],
         "borrow_cost": res["borrow"],
         "financing_cost": res["financing"],
+        "cash_interest": float(res.get("cash_interest", 0.0)),
         "dividends_net": res["dividends"],
         "costs_total": res["fees"]["total"] + res["slippage"] + res["borrow"] + res["financing"],
         "margin_calls_queued": res["margin_calls_queued"],
@@ -824,6 +861,8 @@ def metrics(res):
         "share_factor": res["config"]["share_factor"],
         "borrow_rate_annual": res["config"]["borrow_rate_annual"],
         "financing_rate_annual": res["config"]["financing_rate_annual"],
+        "cash_rate_annual": float(res["config"].get("cash_rate_annual", 0.0)),
+        "withholding_rate": float(res["config"].get("withholding_rate", 0.0)),
         "fee_mult": res["config"]["fee_mult"],
         "period_returns": {
             label: _session_return(per[label][1], per[label][0]) for label in per

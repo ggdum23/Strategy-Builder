@@ -208,3 +208,27 @@ contract. An encoder may stamp the file.
 Post-fee cash still determines `share_scale`. That residual is unchanged and
 is described in `docs/PACK.md`. Redaction removes the factor fields. It does
 not promise that the numeric factor is absent from a scaled price.
+
+## Accounting switches
+
+Every book records the price basis and the rates that produced it. The keys are flat on `metrics.json` and repeated under `accounting`:
+
+| Key | Meaning |
+| --- | --- |
+| `price_basis` | `raw` or `total_return` |
+| `total_return_method` | `none`, `profile_dividends`, `cash_dividends`, or `registry_series` |
+| `series_kind` | `raw` or `total_return`, the kind the file was declared as |
+| `cash_rate_annual` | Decimal earned by idle cash. 0 is the default |
+| `financing_rate_annual` | Decimal charged on borrowed money. Arena default 0, Desk default 0.07 |
+| `withholding_rate` | Fraction of a positive long dividend withheld. Default 0 |
+| `accrual` | `session_boundary_1_252` |
+| `sessions_per_year` | 252 |
+| `dividends_applied` | True when a dividend file was credited |
+
+`cash_interest` is the dollars credited. `financing_cost` is the dollars charged. `dividends_net` is the cash dividend after withholding. Cash interest is income, not part of `costs_total`. Financing is.
+
+The same keys are on `run.json`, the leaderboard, and (for `price_basis` only, as the series kind) the pack manifest and sidecar. `write_leaderboard` raises when stamped rows disagree. A row with no `price_basis` is an older board and is not part of that check.
+
+Designer files may contain the closed tokens `raw`, `total_return`, `none`, `profile_dividends`, `cash_dividends`, `registry_series`, and `session_boundary_1_252`. Those cells are vocabulary, not a ticker. A symbol that casefolds to one of those whole values, or to one of the accounting keys, is rejected before an anonymized pack or designer tree is written. The match is the whole symbol: `session_boundary_1_252` does not reserve `1`. The stand-in for a real ticker is still `RANDOM`.
+
+The carry snap is the previous session's last bar, after that bar's fill. Arena borrow remains on the last regular bar. A warm-up reset drops the snap and the accrued totals, so the first live mark is the reset equity and N live sessions pay N-1 charges.
