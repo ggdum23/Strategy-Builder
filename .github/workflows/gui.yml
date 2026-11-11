@@ -29,29 +29,49 @@ jobs:
         run: |
           set -eu
           packages="libegl1 libgl1 libglib2.0-0 libdbus-1-3 libxkbcommon0 libfontconfig1 libx11-xcb1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0 libxrender1 libxi6 libsm6 libice6 fonts-dejavu-core"
-          # Canonical's DNS was down on 2026-11-11, so azure.archive.ubuntu.com,
-          # archive.ubuntu.com, and security.ubuntu.com did not resolve on
-          # hosted runners. A non-Canonical mirror still serves the signed
-          # Ubuntu archive. Rewrite only after a short DNS probe so a healthy
-          # runner keeps the image sources.
-          use_mirror() {
-            sudo python3 - "$1" <<'PY'
-          import pathlib, sys
+          # Hosted Ubuntu images do not list azure.archive.ubuntu.com in
+          # sources.list. configure-apt-sources.sh points apt at
+          # mirror+file:/etc/apt/apt-mirrors.txt, and that file lists the
+          # Canonical names. When Canonical DNS is down, rewrite the mirror
+          # file. A direct URI rewrite is only the fallback.
+          show_sources() {
+            echo "--- apt sources ---"
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              echo "apt-mirrors.txt:"
+              cat /etc/apt/apt-mirrors.txt
+            else
+              echo "no /etc/apt/apt-mirrors.txt"
+            fi
+            grep -R -n -E "URIs:|^deb " /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true
+          }
+          cat > /tmp/rewrite-apt-sources.py << 'PY'
+          import pathlib
+          import sys
+
           mirror = sys.argv[1]
+          if not mirror.endswith("/"):
+              mirror += "/"
           needles = (
+              "mirror+file:/etc/apt/apt-mirrors.txt",
+              "https://mirrors.edge.kernel.org/ubuntu/",
+              "https://ftp.osuosl.org/pub/ubuntu/",
+              "http://azure.archive.ubuntu.com/ubuntu/",
+              "https://azure.archive.ubuntu.com/ubuntu/",
               "http://azure.archive.ubuntu.com/ubuntu",
               "https://azure.archive.ubuntu.com/ubuntu",
+              "http://archive.ubuntu.com/ubuntu/",
+              "https://archive.ubuntu.com/ubuntu/",
               "http://archive.ubuntu.com/ubuntu",
               "https://archive.ubuntu.com/ubuntu",
+              "http://security.ubuntu.com/ubuntu/",
+              "https://security.ubuntu.com/ubuntu/",
               "http://security.ubuntu.com/ubuntu",
               "https://security.ubuntu.com/ubuntu",
-              "https://mirrors.edge.kernel.org/ubuntu",
-              "https://ftp.osuosl.org/pub/ubuntu",
           )
           roots = [pathlib.Path("/etc/apt/sources.list")]
           extra = pathlib.Path("/etc/apt/sources.list.d")
           if extra.is_dir():
-              roots.extend(sorted(p for p in extra.iterdir() if p.is_file()))
+              roots.extend(sorted(path for path in extra.iterdir() if path.is_file()))
           for path in roots:
               if not path.is_file():
                   continue
@@ -63,10 +83,21 @@ jobs:
                   path.write_text(rewritten)
                   print(f"rewrote {path} -> {mirror}")
           PY
+          use_direct_mirror() {
+            sudo python3 /tmp/rewrite-apt-sources.py "$1"
+          }
+          use_mirror_file() {
+            printf '%s\n' \
+              'https://mirrors.edge.kernel.org/ubuntu/	priority:1' \
+              'https://ftp.osuosl.org/pub/ubuntu/	priority:2' \
+              | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            sudo rm -rf /var/lib/apt/lists/*
+            sudo mkdir -p /var/lib/apt/lists/partial
           }
           install_qt() {
             sudo timeout 180 apt-get update && sudo timeout 180 apt-get install -y --no-install-recommends $packages
           }
+          show_sources
           ok=0
           if timeout 8 getent hosts archive.ubuntu.com >/dev/null 2>&1; then
             if install_qt; then
@@ -78,9 +109,20 @@ jobs:
             echo "archive.ubuntu.com did not resolve"
           fi
           if [ "$ok" != 1 ]; then
+            echo "switching /etc/apt/apt-mirrors.txt to non-Canonical mirrors"
+            use_mirror_file
+            show_sources
+            if install_qt; then
+              ok=1
+            else
+              echo "apt via apt-mirrors.txt failed"
+            fi
+          fi
+          if [ "$ok" != 1 ]; then
             for mirror in https://mirrors.edge.kernel.org/ubuntu https://ftp.osuosl.org/pub/ubuntu; do
-              echo "retrying via ${mirror}"
-              use_mirror "$mirror"
+              echo "retrying with a direct URI ${mirror}"
+              use_direct_mirror "$mirror"
+              show_sources
               if install_qt; then
                 ok=1
                 break
