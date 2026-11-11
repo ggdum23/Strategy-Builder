@@ -1,12 +1,98 @@
-"""Write metrics.json, the equity curve, and the fill and trade files."""
+"""Write metrics.json, the equity curve, the fill and trade files, and the PNG.
+
+An anonymized run also gets a ``designer/`` tree. That tree is what a strategy
+designer may be shown. The files beside it are the operator copy.
+"""
 
 from __future__ import annotations
 
+import csv
 import json
 import math
+import re
+import shutil
 from pathlib import Path
 
 import pandas as pd
+
+_ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
+_BANNED_DESIGNER_KEYS = frozenset(
+    {
+        "symbol",
+        "share_factor",
+        "share_scale",
+        "price_factor",
+        "volume_factor",
+        "date_map",
+        "source_root",
+        "source_glob",
+        "operator_note",
+        "cost_basis",
+        "inspection",
+        "sidecar",
+        "sidecar_path",
+    }
+)
+_BANNED_DESIGNER_TEXT = (
+    "price_factor",
+    "volume_factor",
+    "share_scale",
+    "share_factor",
+    "date_map",
+    "operator_note",
+    "source_root",
+    "source_glob",
+    "sidecar",
+)
+
+# Rank is assigned after sorting. The sort is excess total return, then id.
+# Desk and Arena both use that excess. Sharpe is not the rank.
+OPERATOR_LEADERBOARD_COLUMNS = (
+    "rank",
+    "strategy_id",
+    "source_id",
+    "symbol",
+    "profile",
+    "status",
+    "total_return",
+    "excess_total_return",
+    "bh_total_return",
+    "long_2x_total_return",
+    "cagr",
+    "ann_vol",
+    "sharpe",
+    "sortino",
+    "max_drawdown",
+    "max_dd_duration_sessions",
+    "calmar",
+    "n_fills",
+    "round_trips",
+    "hit_rate",
+    "avg_holding_sessions",
+    "turnover_per_year",
+    "fees_total",
+    "best_day",
+    "worst_day",
+    "percent_up_days",
+    "avg_abs_exposure_close",
+    "frac_sessions_long_at_close",
+    "frac_sessions_short_at_close",
+    "long_round_trips",
+    "short_round_trips",
+    "financing_cost",
+    "borrow_cost",
+    "dividends_net",
+    "margin_calls_filled",
+    "max_gross_leverage",
+    "avg_gross_leverage",
+    "worst_equity_over_hwm",
+    "disqualified",
+    "timeout_s",
+    "error",
+)
+DESIGNER_LEADERBOARD_COLUMNS = tuple(
+    column for column in OPERATOR_LEADERBOARD_COLUMNS if column != "symbol"
+)
 
 
 def percent_up_days(equity, initial):
@@ -48,7 +134,7 @@ def write_json(path: Path, payload) -> None:
 
 def _dates_by_day(frame) -> dict:
     out = {}
-    if frame is None:
+    if frame is None or "day" not in frame.columns or "date" not in frame.columns:
         return out
     for day, date in zip(frame["day"].tolist(), frame["date"].tolist()):
         out.setdefault(int(day), str(date))
@@ -71,6 +157,7 @@ def write_arena_curves(directory: Path, result: dict, frame) -> None:
             }
         )
     pd.DataFrame(equity_rows).to_csv(directory / "equity_curve.csv", index=False)
+    _mirror_equity_csv(directory)
     fills = []
     for day, minute, session, delta, open_, fill_price, fees, shares_after in result["fills"]:
         fills.append(
@@ -93,6 +180,7 @@ def write_arena_curves(directory: Path, result: dict, frame) -> None:
 def write_desk_curves(directory: Path, result: dict) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(result["daily"]).to_csv(directory / "equity_curve.csv", index=False)
+    _mirror_equity_csv(directory)
     fill_columns = [
         "session",
         "time",
@@ -134,3 +222,310 @@ def write_book(directory: Path, profile: str, result: dict, metrics: dict, frame
     else:
         raise ValueError(f"unknown profile {profile}")
     write_json(directory / "metrics.json", metrics)
+    _plot_equity(directory / "equity.png", profile, result)
+    if profile == "desk" and result.get("liquidation"):
+        write_json(directory / "liquidation.json", result["liquidation"])
+
+
+def _mirror_equity_csv(directory: Path) -> None:
+    source = directory / "equity_curve.csv"
+    (directory / "equity.csv").write_bytes(source.read_bytes())
+
+
+def _equity_points(profile: str, result: dict) -> list[float]:
+    daily = result.get("daily") or []
+    if profile == "arena":
+        return [float(row[1]) for row in daily]
+    if profile == "desk":
+        return [float(row["equity"]) for row in daily]
+    raise ValueError(f"unknown profile {profile}")
+
+
+def _plot_equity(path: Path, profile: str, result: dict) -> None:
+    """Equity against the session index. The chart has no ticker and no date."""
+    points = _equity_points(profile, result)
+    if not points:
+        return
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8.0, 4.5), dpi=120)
+    try:
+        ax.plot(range(1, len(points) + 1), points, color="#0B3A5B", linewidth=1.25)
+        ax.set_xlabel("session")
+        ax.set_ylabel("equity")
+        ax.set_title("equity")
+        ax.grid(True, color="#D0D7DE", linewidth=0.6)
+        fig.tight_layout()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(
+            path,
+            format="png",
+            facecolor="white",
+            metadata={"Title": "equity", "Software": "strategy-builder"},
+        )
+    finally:
+        plt.close(fig)
+
+
+def _scrub_text(value: str, symbol: str) -> str:
+    text = _ISO_DATE.sub("", value)
+    if symbol and text == symbol:
+        return "ASSET"
+    if symbol and len(symbol) >= 2:
+        text = re.sub(rf"\b{re.escape(symbol)}\b", "ASSET", text)
+    return text
+
+
+def redact_metrics(payload, *, symbol: str = ""):
+    """Drop the ticker, calendar dates, and scale factors from a report object."""
+
+    def walk(value):
+        if isinstance(value, dict):
+            out = {}
+            for key, item in value.items():
+                if str(key) in _BANNED_DESIGNER_KEYS:
+                    continue
+                out[str(key)] = walk(item)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [walk(item) for item in value]
+        if isinstance(value, str):
+            return _scrub_text(value, symbol)
+        return value
+
+    redacted = walk(payload)
+    if isinstance(redacted, dict):
+        redacted["audience"] = "designer"
+    return redacted
+
+
+def scrub_frame_dates(frame):
+    """Blank ISO dates. Session ids such as ``S00001`` stay."""
+    if frame is None or "date" not in getattr(frame, "columns", ()):
+        return frame
+    out = frame.copy(deep=True)
+    out["date"] = [
+        "" if _ISO_DATE.search(str(value)) else str(value) for value in out["date"].tolist()
+    ]
+    return out
+
+
+def _scrub_result(result: dict, symbol: str) -> dict:
+    out = dict(result)
+    liquidation = out.get("liquidation")
+    if isinstance(liquidation, dict):
+        cleaned = redact_metrics(liquidation, symbol=symbol)
+        cleaned.pop("audience", None)
+        out["liquidation"] = cleaned
+    fills = out.get("fills")
+    if fills and isinstance(fills[0], dict):
+        cleaned_fills = []
+        for row in fills:
+            item = dict(row)
+            for key in ("session", "time"):
+                if isinstance(item.get(key), str):
+                    item[key] = _scrub_text(item[key], symbol)
+            cleaned_fills.append(item)
+        out["fills"] = cleaned_fills
+    daily = out.get("daily")
+    if daily and isinstance(daily[0], dict):
+        cleaned_daily = []
+        for row in daily:
+            item = dict(row)
+            if isinstance(item.get("session"), str):
+                item["session"] = _scrub_text(item["session"], symbol)
+            cleaned_daily.append(item)
+        out["daily"] = cleaned_daily
+    return out
+
+
+def assert_designer_clean(directory, *, symbol: str) -> None:
+    """Raise if a designer tree still carries a ticker, a date, or a factor."""
+    root = Path(directory)
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() == ".png":
+            continue
+        text = path.read_text(encoding="utf-8")
+        for token in _BANNED_DESIGNER_TEXT:
+            if token in text:
+                raise RuntimeError(f"{path.name} contains {token}")
+        if _ISO_DATE.search(text):
+            raise RuntimeError(f"{path.name} contains a calendar date")
+        if symbol and len(symbol) >= 2 and re.search(rf"\b{re.escape(symbol)}\b", text):
+            raise RuntimeError(f"{path.name} contains the ticker")
+
+
+def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str) -> Path:
+    """Write the designer-facing copy under ``out_dir/designer``."""
+    root = Path(out_dir) / "designer"
+    if root.exists():
+        shutil.rmtree(root)
+    safe_frame = scrub_frame_dates(frame)
+    for label, (result, metrics) in books.items():
+        dest = root if label == "strategy" else root / "benchmarks" / label
+        write_book(
+            dest,
+            profile,
+            _scrub_result(result, symbol),
+            redact_metrics(metrics, symbol=symbol),
+            safe_frame,
+        )
+    write_json(root / "metrics.json", redact_metrics(wrapper, symbol=symbol))
+    assert_designer_clean(root, symbol=symbol)
+    return root
+
+
+def _csv_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ""
+        if math.isinf(value):
+            return "inf" if value > 0.0 else "-inf"
+        return format(value, ".16g")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return str(value)
+
+
+def write_leaderboard(path, rows, *, audience: str = "operator") -> None:
+    """Write ``leaderboard.csv``. ``rows`` are already in rank order."""
+    if audience == "operator":
+        columns = OPERATOR_LEADERBOARD_COLUMNS
+    elif audience == "designer":
+        columns = DESIGNER_LEADERBOARD_COLUMNS
+    else:
+        raise ValueError("audience must be operator or designer")
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow([_csv_cell(row.get(column)) for column in columns])
+
+
+def read_leaderboard(path) -> list[dict]:
+    with Path(path).open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def register_run(index_path, run_id: str, run_dir, *, kind: str, profile: str) -> None:
+    """Record ``run_id`` → directory. The index is an operator file."""
+    path = Path(index_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {"schema_version": 1, "runs": {}}
+    if path.is_file():
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document.get("runs"), dict):
+            raise ValueError(f"{path} is not a run index")
+    document["runs"][str(run_id)] = {
+        "path": str(Path(run_dir).resolve()),
+        "kind": kind,
+        "profile": profile,
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def resolve_run(run, *, index_path=None) -> Path:
+    """A directory with a report, or an id stored in the run index."""
+    candidate = Path(run)
+    if candidate.is_dir() and (
+        (candidate / "run.json").is_file() or (candidate / "metrics.json").is_file()
+    ):
+        return candidate
+    index = Path(index_path) if index_path is not None else Path.cwd() / ".backtester-runs.json"
+    if index.is_file():
+        document = json.loads(index.read_text(encoding="utf-8"))
+        entry = (document.get("runs") or {}).get(str(run))
+        if entry:
+            found = Path(entry["path"])
+            if found.is_dir():
+                return found
+    raise FileNotFoundError(f"no run {run!r}")
+
+
+def _redact_row(row: dict, symbol: str) -> dict:
+    cleaned = {}
+    for key, value in row.items():
+        if key in _BANNED_DESIGNER_KEYS:
+            continue
+        if isinstance(value, str):
+            cleaned[key] = _scrub_text(value, symbol)
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
+    """Structured view of one run. ``designer`` never includes the operator secrets."""
+    if audience not in {"operator", "designer"}:
+        raise ValueError("audience must be operator or designer")
+    directory = resolve_run(run, index_path=index_path)
+    info_path = directory / "run.json"
+    info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.is_file() else {}
+    kind = info.get("kind")
+    if kind is None:
+        if (directory / "leaderboard.csv").is_file():
+            kind = "parallel"
+        elif (directory / "walkforward.json").is_file():
+            kind = "walkforward"
+        else:
+            kind = "book"
+    symbol = str(info.get("symbol") or "")
+    designer_root = directory / "designer"
+    root = designer_root if audience == "designer" and designer_root.is_dir() else directory
+    if kind == "walkforward":
+        summary_path = directory / "walkforward.json"
+        if not summary_path.is_file():
+            raise FileNotFoundError(f"no walkforward.json in {directory}")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if audience == "designer":
+            summary = redact_metrics(summary, symbol=symbol or str(summary.get("symbol") or ""))
+        return {
+            "audience": audience,
+            "kind": "walkforward",
+            "id": info.get("id"),
+            "profile": info.get("profile") or summary.get("profile"),
+            "summary": summary,
+            "cancelled": False,
+            "directory_name": directory.name if audience == "operator" else "designer",
+        }
+    if kind == "parallel":
+        board = root / "leaderboard.csv"
+        if audience == "designer" and (designer_root / "leaderboard.csv").is_file():
+            board = designer_root / "leaderboard.csv"
+        rows = read_leaderboard(board) if board.is_file() else []
+        if audience == "designer" and root is directory:
+            rows = [_redact_row(row, symbol) for row in rows]
+        return {
+            "audience": audience,
+            "kind": "parallel",
+            "id": info.get("id"),
+            "profile": info.get("profile"),
+            "rows": rows,
+            "cancelled": bool(info.get("cancelled")),
+            "directory_name": root.name,
+        }
+    metrics_path = root / "metrics.json"
+    if not metrics_path.is_file():
+        raise FileNotFoundError(f"no metrics.json in {directory}")
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    if audience == "designer" and root is directory:
+        metrics = redact_metrics(metrics, symbol=symbol or str(metrics.get("symbol") or ""))
+    return {
+        "audience": audience,
+        "kind": "book",
+        "id": info.get("id") or metrics.get("run_id"),
+        "profile": metrics.get("profile") or info.get("profile"),
+        "metrics": metrics,
+        "directory_name": root.name,
+    }

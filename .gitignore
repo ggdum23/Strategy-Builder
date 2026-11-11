@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.backtester-runs.json
 .mypy_cache/
 *.egg-info/
 .venv/

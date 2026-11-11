@@ -26,6 +26,8 @@ Per-share fees (commission, the monthly tier count, exchange, clearing, CAT, TAF
 
 `metrics.json` records the cost basis that was used: share scale, profile, schedule, and that per-share fees were real share counts. The report does not include the date map or the volume factor.
 
+An anonymized run also writes `designer/`. That directory is the copy to hand a strategy designer. It has no ticker, no calendar date, and no scale-factor field. The operator `metrics.json` next to it still has `cost_basis.share_scale`. A parallel batch does the same split: operator files under `jobs/`, and one designer bundle under `designer/` with the leaderboard and each anonymized job. Hand over that `designer/` directory only.
+
 If the series borrow was recorded as the profile default, the run uses the borrow rate of the profile you select. One pack can be run on Arena and on Desk. An explicit borrow overrides both.
 
 Dividends are real dollars per real share, keyed by calendar date. On an anonymized pack the parent multiplies each amount by `share_scale` and remaps the date through the sidecar date map to the pack session id (`S00001`, ...). The child receives only that dict: no calendar key and no unscaled amount. A date that is not in the pack is an error. Dividends are not written into the pack.

@@ -77,6 +77,25 @@ frame as the argument and does not keep another name for it. A caller that
 keeps its own variable still has that object. The design child still does not
 receive it.
 
+## Parallel runner
+
+`backtester parallel` scores each strategy in a new spawned process. The process
+is the same one a pack run uses: argv `['backtester-design']`, an empty working
+directory, and the environment allowlist. The parent keeps the sidecar, the
+date map, and the unscaled dividend amounts. `share_scale` is passed the same
+way `run_pack` passes it. Desk dividends are remapped in the parent before the
+child starts.
+
+Spawn copies the parent environment at `Process.start`. A launch lock holds
+the argv, cwd, and environment scrub so two jobs cannot snapshot a cleared
+environment. The lock is not a sandbox.
+
+A crash, a hang, or a resident-set overrun is one failed row. The other jobs
+keep running. The Linux non-dumpable flag is not set on this path. `run_pack`
+does not set it either. Phase 4 owns that jail, the Windows job-object sandbox,
+and the one-bar referee. The job object used here, when Windows allows it, is
+only a higher memory ceiling than the resident-set poll.
+
 ## What Phase 1 does not isolate
 
 These three probes are Phase 4 acceptance tests. Phase 1 does not stop them.

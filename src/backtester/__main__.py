@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import secrets
+import signal
 import sys
 from pathlib import Path
 
@@ -122,13 +124,32 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("test", help="Run the unit suite")
 
-    for name, help_text in (
-        ("parallel", "Process-pool scoring (later phase)"),
-        ("referee", "One-bar replay (later phase)"),
-        ("report", "Report viewer (later phase)"),
-    ):
-        stub = sub.add_parser(name, help=help_text)
-        stub.add_argument("rest", nargs=argparse.REMAINDER)
+    parallel = sub.add_parser("parallel", help="Score many strategies, each in its own process")
+    parallel.add_argument("--strategies", required=True, help="Directory of strategy.py files")
+    parallel.add_argument("--workers", required=True, type=int, help="How many strategy processes at once")
+    parallel.add_argument("--profile", required=True, choices=("arena", "desk"))
+    parallel.add_argument("--out", required=True)
+    parallel.add_argument("--ticker", action="append", default=None, help="Repeat for each named symbol")
+    parallel.add_argument("--src", action="append", default=None, help="One directory for every ticker, or one per ticker")
+    parallel.add_argument("--pack", action="append", default=None)
+    parallel.add_argument("--sidecar", action="append", default=None)
+    parallel.add_argument("--bar-minutes", type=int, default=1, help="Named files only. A pack keeps the bar size it was built with.")
+    parallel.add_argument("--timeout", type=float, default=600.0, help="Seconds for one strategy after its process has started")
+    parallel.add_argument("--memory-mb", type=int, default=None, help="Resident-set cap for one strategy process")
+    parallel.add_argument("--borrow-rate", type=float, default=None)
+    parallel.add_argument("--financing-rate", type=float, default=None)
+    parallel.add_argument("--fee-mult", type=float, default=1.0)
+    parallel.add_argument("--dividends", default=None, help="One CSV for the whole batch. Desk only.")
+    parallel.add_argument("--initial-equity", type=float, default=1_000_000.0)
+    parallel.add_argument("--warmup-sessions", type=int, default=0)
+    parallel.add_argument("--no-benchmarks", action="store_true")
+
+    report = sub.add_parser("report", help="Read a run by id or by directory")
+    report.add_argument("--run", required=True, help="Run id or the directory that contains run.json")
+    report.add_argument("--audience", choices=("operator", "designer"), default="operator")
+
+    referee = sub.add_parser("referee", help="One-bar replay (later phase)")
+    referee.add_argument("rest", nargs=argparse.REMAINDER)
 
     return parser
 
@@ -197,6 +218,13 @@ def _cmd_run(args) -> int:
         )
         _print_headline(args.profile, payload)
         print(f"wrote {args.out}")
+        _remember(
+            args.out,
+            kind="book",
+            profile=payload.get("profile") or args.profile,
+            symbol=payload.get("symbol"),
+            anonymized=bool((payload.get("run") or {}).get("anonymized")),
+        )
         return 0
     if not args.src or not args.ticker:
         raise ValueError("a named run needs --src and --ticker")
@@ -218,6 +246,7 @@ def _cmd_run(args) -> int:
     _print_headline(args.profile, payload)
     _print_data_notes(((payload.get("run") or {}).get("inspection") or {}).get("notes"))
     print(f"wrote {args.out}")
+    _remember(args.out, kind="book", profile=payload.get("profile") or args.profile, symbol=payload.get("symbol"))
     return 0
 
 
@@ -275,6 +304,7 @@ def _cmd_walk(args) -> int:
         f"rule={summary['warmup_rule']}"
     )
     print(f"wrote {args.out}")
+    _remember(args.out, kind="walkforward", profile=args.profile, symbol=args.ticker)
     return 0
 
 
@@ -382,6 +412,155 @@ def _cmd_pack(args) -> int:
     return 0
 
 
+def _remember(out, *, kind: str, profile: str, symbol: str | None = None, anonymized: bool = False) -> str:
+    from .report import register_run
+
+    run_id = "r" + secrets.token_hex(8)
+    document = {
+        "schema_version": 1,
+        "id": run_id,
+        "kind": kind,
+        "profile": profile,
+        "anonymized": bool(anonymized),
+    }
+    if symbol:
+        document["symbol"] = symbol
+    write_json(Path(out) / "run.json", document)
+    register_run(Path.cwd() / ".backtester-runs.json", run_id, out, kind=kind, profile=profile)
+    print(f"run {run_id}")
+    return run_id
+
+
+def _markets(args):
+    from .parallel import NamedMarket, PackMarket
+
+    tickers = list(args.ticker or [])
+    srcs = list(args.src or [])
+    packs = list(args.pack or [])
+    sidecars = list(args.sidecar or [])
+    if packs or sidecars:
+        if tickers or srcs:
+            raise ValueError("pass --pack/--sidecar or --ticker/--src, not both")
+        if len(packs) != len(sidecars) or not packs:
+            raise ValueError("each --pack needs one --sidecar, in the same order")
+        if args.bar_minutes != 1:
+            raise ValueError("bar size is fixed when the pack is built. Build another pack to change it.")
+        return [PackMarket(pack, sidecar) for pack, sidecar in zip(packs, sidecars)]
+    if not tickers:
+        raise ValueError("parallel needs --ticker or --pack")
+    if len(srcs) == 1:
+        srcs = srcs * len(tickers)
+    if len(srcs) != len(tickers):
+        raise ValueError("pass one --src for every ticker, or one --src used for all of them")
+    return [
+        NamedMarket(src, ticker, bar_minutes=args.bar_minutes)
+        for src, ticker in zip(srcs, tickers)
+    ]
+
+
+def _print_progress(event) -> None:
+    tail = f" {event.message}" if event.message else ""
+    print(f"[{event.completed}/{event.total}] {event.strategy_id} {event.source_id} {event.status}{tail}")
+
+
+def _cmd_parallel(args) -> int:
+    from .parallel import discover_strategies, run_parallel, CancelToken
+
+    token = CancelToken()
+    previous = signal.getsignal(signal.SIGINT)
+
+    def _stop(_signum, _frame):
+        token.cancel()
+
+    signal.signal(signal.SIGINT, _stop)
+    try:
+        result = run_parallel(
+            discover_strategies(args.strategies),
+            _markets(args),
+            args.out,
+            profile=args.profile,
+            workers=args.workers,
+            timeout_s=args.timeout,
+            memory_bytes=None if args.memory_mb is None else args.memory_mb * 1024 * 1024,
+            on_progress=_print_progress,
+            cancel=token,
+            borrow_rate_annual=args.borrow_rate,
+            financing_rate_annual=args.financing_rate,
+            fee_mult=args.fee_mult,
+            dividends=_dividends(args.dividends),
+            warmup_sessions=args.warmup_sessions,
+            initial_equity=args.initial_equity,
+            with_benchmarks=not args.no_benchmarks,
+            index_path=Path.cwd() / ".backtester-runs.json",
+        )
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    print(f"run {result.run_id}")
+    print(f"leaderboard {result.leaderboard_path}")
+    print(f"failures {result.failures}")
+    if result.cancelled:
+        print("cancelled")
+        return 1
+    return 1 if result.failures else 0
+
+
+def _cmd_report(args) -> int:
+    from .report import load_report
+
+    view = load_report(args.run, audience=args.audience, index_path=Path.cwd() / ".backtester-runs.json")
+    print(
+        f"audience={view['audience']} kind={view['kind']} "
+        f"id={view.get('id')} profile={view.get('profile')}"
+    )
+    if view["kind"] == "parallel":
+        for row in view["rows"]:
+            bits = [
+                f"rank={row.get('rank', '')}",
+                f"strategy={row.get('strategy_id', '')}",
+                f"source={row.get('source_id', '')}",
+                f"status={row.get('status', '')}",
+                f"total_return={row.get('total_return', '')}",
+                f"excess={row.get('excess_total_return', '')}",
+            ]
+            if args.audience == "operator":
+                bits.insert(3, f"symbol={row.get('symbol', '')}")
+            print(" ".join(bits))
+        if view.get("cancelled"):
+            print("cancelled")
+        return 0
+    if view["kind"] == "walkforward":
+        summary = view["summary"]
+        for key in ("design_end_date", "locked_start_date", "design_sessions", "locked_sessions", "warmup_rule"):
+            if key in summary and not (args.audience == "designer" and key.endswith("_date")):
+                print(f"{key}={summary[key]}")
+        for label in ("design", "locked"):
+            block = summary.get(label) or {}
+            if block.get("total_return") is not None:
+                print(f"{label} total_return={block['total_return']}")
+        return 0
+    metrics = view["metrics"]
+    for key in (
+        "total_return",
+        "cagr",
+        "sharpe",
+        "sortino",
+        "max_drawdown",
+        "n_fills",
+        "disqualified",
+        "financing_cost",
+    ):
+        if key in metrics and metrics[key] is not None:
+            print(f"{key}={metrics[key]}")
+    benches = metrics.get("benchmarks") or {}
+    for label in ("buy_and_hold_1x", "long_2x"):
+        block = benches.get(label) or {}
+        if block.get("total_return") is not None:
+            print(f"{label} total_return={block['total_return']}")
+    if args.audience == "operator" and metrics.get("symbol"):
+        print(f"symbol={metrics['symbol']}")
+    return 0
+
+
 def _cmd_test() -> int:
     import pytest
 
@@ -406,11 +585,11 @@ def main(argv=None) -> int:
         if args.command == "test":
             return _cmd_test()
         if args.command == "parallel":
-            raise NotImplementedError("Parallel scoring is a later phase.")
+            return _cmd_parallel(args)
         if args.command == "referee":
             raise NotImplementedError("The one-bar referee is a later phase.")
         if args.command == "report":
-            raise NotImplementedError("A separate report command is a later phase. `run` already writes metrics.json.")
+            return _cmd_report(args)
         parser.error(f"unknown command {args.command}")
         return 2
     except (ValueError, FileNotFoundError, NotImplementedError, AttributeError, KeyError) as exc:

@@ -1,7 +1,9 @@
 """Seam for a later desktop window.
 
-Phase 1 does not draw a GUI. A future front end imports runner, data, and
-report. Those modules do not import this one, and they do not need a console.
+This phase does not draw a GUI. A future front end calls
+``backtester.parallel.run_parallel`` and ``backtester.report.load_report``.
+Those functions take a progress callback, a cancel token, and return
+structured results. They do not print, and they do not import this module.
 """
 
 

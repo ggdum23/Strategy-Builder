@@ -19,6 +19,7 @@ import pickle
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ from .data import WalkSlices, frame_to_desk_bars, load_named, slice_walkforward
 from .engine_desk import BuyAndHold as DeskBuyAndHold
 from .engine_desk import DeskConfig, TwoXLong
 from .profiles import get_profile
-from .report import enrich_arena_metrics, write_book, write_json
+from .report import enrich_arena_metrics, publish_designer, write_book, write_json
 
 _ARENA_KEYS = (
     "total_return",
@@ -280,19 +281,45 @@ def _tag_observer(result, strategy):
     return tagged
 
 
+class _ObserverView:
+    """Picklable copy of a strategy instance loaded from a file.
+
+    The child imports that file under a generated module name. The parent has
+    not imported it, so the instance itself cannot cross the queue. The
+    attributes can. A class the parent already imported is left as it is.
+    """
+
+    def __init__(self, values: dict):
+        self.__dict__.update(values)
+
+
+def _observer_view(observer):
+    module = getattr(type(observer), "__module__", "")
+    if not str(module).startswith("backtester_user_strategy_"):
+        return observer
+    values = {}
+    for key, value in getattr(observer, "__dict__", {}).items():
+        try:
+            pickle.dumps(value)
+        except Exception:
+            continue
+        values[key] = value
+    return _ObserverView(values)
+
+
 def _picklable_books(books):
-    """Drop an observer the child cannot send back. The books themselves must travel."""
+    """Send books the parent can unpickle. A file strategy comes back as data."""
     portable = {}
     for label, (result, metrics) in books.items():
+        plain = dict(result)
+        if plain.get("observer") is not None:
+            plain["observer"] = _observer_view(plain["observer"])
         try:
-            pickle.dumps((result, metrics))
+            pickle.dumps((plain, metrics))
         except Exception:
-            plain = dict(result)
             plain.pop("observer", None)
             pickle.dumps((plain, metrics))
-            portable[label] = (plain, metrics)
-        else:
-            portable[label] = (result, metrics)
+        portable[label] = (plain, metrics)
     return portable
 
 
@@ -331,6 +358,9 @@ _ENV_KEEP = frozenset(
     }
 )
 _CHILD_ARGV = ["backtester-design"]
+# Spawn copies the parent argv, cwd, and environment at Process.start.
+# Two books starting together must not interleave that scrub.
+_LAUNCH_LOCK = threading.Lock()
 
 
 def _child_environ(source) -> dict:
@@ -361,30 +391,32 @@ def _launch_book(ctx, queue, job):
     """Start one book. Spawn copies argv and cwd at start, so set them first.
 
     The parent directory, argv, and environment are restored before this
-    returns, including when start fails.
+    returns, including when start fails. The scrub is serialized: a second
+    book must not snapshot the environment while it is cleared.
     """
     cwd = tempfile.mkdtemp(prefix="bt-book-")
-    job["cwd"] = cwd
-    job["env"] = _child_environ(os.environ)
     proc = ctx.Process(target=_books_worker, args=(queue, job), name="walk-forward-book")
-    old_argv = list(sys.argv)
-    old_cwd = os.getcwd()
-    old_env = dict(os.environ)
-    sys.argv = list(_CHILD_ARGV)
-    os.chdir(cwd)
-    os.environ.clear()
-    os.environ.update(job["env"])
-    started = False
-    try:
-        proc.start()
-        started = True
-    finally:
-        sys.argv = old_argv
-        os.chdir(old_cwd)
+    with _LAUNCH_LOCK:
+        job["cwd"] = cwd
+        job["env"] = _child_environ(os.environ)
+        old_argv = list(sys.argv)
+        old_cwd = os.getcwd()
+        old_env = dict(os.environ)
+        sys.argv = list(_CHILD_ARGV)
+        os.chdir(cwd)
         os.environ.clear()
-        os.environ.update(old_env)
-        if not started:
-            shutil.rmtree(cwd, ignore_errors=True)
+        os.environ.update(job["env"])
+        started = False
+        try:
+            proc.start()
+            started = True
+        finally:
+            sys.argv = old_argv
+            os.chdir(old_cwd)
+            os.environ.clear()
+            os.environ.update(old_env)
+            if not started:
+                shutil.rmtree(cwd, ignore_errors=True)
     return proc, cwd
 
 
@@ -456,11 +488,34 @@ def _note_child(books, inherited_argv, inherited_cwd) -> None:
     observer.inherited_cwd = inherited_cwd
 
 
-def _wait_until_started(proc, event, queue, timeout: float) -> None:
+def _stop_process(proc) -> None:
+    """End a worker. SIGTERM first, then a kill if it is still alive."""
+    if proc is None or not proc.is_alive():
+        return
+    proc.terminate()
+    proc.join(timeout=2)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=5)
+
+
+def _cancelled(stop) -> bool:
+    if stop is None:
+        return False
+    fn = getattr(stop, "cancelled", None)
+    if fn is None:
+        return False
+    return bool(fn())
+
+
+def _wait_until_started(proc, event, queue, timeout: float, stop=None) -> None:
     import queue as queue_mod
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if _cancelled(stop):
+            _stop_process(proc)
+            raise RuntimeError("walk-forward worker cancelled")
         if event.wait(0.05):
             return
         if not proc.is_alive():
@@ -475,31 +530,27 @@ def _wait_until_started(proc, event, queue, timeout: float) -> None:
     raise RuntimeError("walk-forward worker did not start")
 
 
-def _take_result(proc, queue, timeout: float):
+def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None):
     """Read the result, or raise as soon as the child exits without one.
 
     A dead child used to block on ``queue.get`` until the 600s timeout.
-    The process sentinel and the queue are waited together.
+    The process sentinel and the queue are waited together. ``memory_bytes``
+    and ``stop`` are watched in this process. They are not sent to the child.
     """
     import queue as queue_mod
     from multiprocessing.connection import wait
 
+    from .limits import process_tree_rss_bytes
+
     deadline = time.monotonic() + timeout
     reader = queue._reader
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            if proc.is_alive():
-                proc.terminate()
-            proc.join(timeout=30)
-            raise RuntimeError(f"walk-forward worker timed out (exit {proc.exitcode})")
-        ready = wait([reader, proc.sentinel], timeout=remaining)
-        if reader in ready:
+        if wait([reader], timeout=0):
             try:
                 return queue.get_nowait()
             except queue_mod.Empty:
                 pass
-        if proc.sentinel in ready or not proc.is_alive():
+        if not proc.is_alive():
             proc.join(timeout=30)
             try:
                 return queue.get_nowait()
@@ -507,9 +558,35 @@ def _take_result(proc, queue, timeout: float):
                 raise RuntimeError(
                     f"walk-forward worker exited {proc.exitcode} without a result"
                 ) from None
+        if _cancelled(stop):
+            _stop_process(proc)
+            raise RuntimeError("walk-forward worker cancelled")
+        if memory_bytes is not None:
+            rss = process_tree_rss_bytes(proc.pid)
+            if rss is not None and rss > int(memory_bytes):
+                _stop_process(proc)
+                raise RuntimeError(
+                    f"walk-forward worker exceeded memory limit ({rss} > {int(memory_bytes)})"
+                )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _stop_process(proc)
+            raise RuntimeError(f"walk-forward worker timed out (exit {proc.exitcode})")
+        wait([reader, proc.sentinel], timeout=min(0.2, remaining))
 
 
-def _isolated_books(strategy_cls, frame, profile, *, during=None, **kwargs):
+def _isolated_books(
+    strategy_cls,
+    frame,
+    profile,
+    *,
+    during=None,
+    timeout=600,
+    memory_bytes=None,
+    stop=None,
+    strategy_path=None,
+    **kwargs,
+):
     """Run ``run_books`` in a fresh spawned interpreter.
 
     The child receives this frame, the strategy, and the run kwargs. Its argv
@@ -517,16 +594,29 @@ def _isolated_books(strategy_cls, frame, profile, *, during=None, **kwargs):
     its environment is the allowlist in ``_child_environ``. ``during``, when
     given, runs in the parent after the child is up and before the child
     continues. A long-lived process is not reused.
+
+    ``timeout`` starts after the child has entered, so interpreter startup is
+    not part of the strategy budget. ``memory_bytes`` and ``stop`` stay in
+    the parent. ``strategy_path``, when set, is loaded in the child so an
+    import error belongs to that strategy.
     """
     import multiprocessing
 
+    from .limits import limit_process_memory
+
+    if strategy_path is not None:
+        spec = {"kind": "path", "path": str(strategy_path)}
+    elif strategy_cls is None:
+        raise ValueError("strategy is missing")
+    else:
+        spec = _strategy_spec(strategy_cls)
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     gate = None
     if during is not None:
         gate = {"started": ctx.Event(), "release": ctx.Event()}
     job = {
-        "strategy": _strategy_spec(strategy_cls),
+        "strategy": spec,
         "frame": _standalone_frame(frame),
         "profile": profile,
         "kwargs": _plain_kwargs(kwargs),
@@ -534,15 +624,20 @@ def _isolated_books(strategy_cls, frame, profile, *, during=None, **kwargs):
     }
     proc = None
     cwd = None
+    cap = None
     try:
         proc, cwd = _launch_book(ctx, result_queue, job)
+        if memory_bytes is not None:
+            cap = limit_process_memory(proc.pid, int(memory_bytes))
         if gate is not None:
-            _wait_until_started(proc, gate["started"], result_queue, 60)
+            _wait_until_started(proc, gate["started"], result_queue, 60, stop)
             try:
                 during()
             finally:
                 gate["release"].set()
-        message = _take_result(proc, result_queue, 600)
+        message = _take_result(
+            proc, result_queue, timeout, memory_bytes=memory_bytes, stop=stop
+        )
         proc.join(timeout=60)
         if proc.exitcode != 0:
             detail = "" if message[0] == "ok" else message[1]
@@ -552,8 +647,9 @@ def _isolated_books(strategy_cls, frame, profile, *, during=None, **kwargs):
         raise RuntimeError(message[1])
     finally:
         if proc is not None and proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=10)
+            _stop_process(proc)
+        if cap is not None:
+            cap.close()
         result_queue.close()
         result_queue.join_thread()
         if cwd is not None:
@@ -606,8 +702,23 @@ def run_books(
     return books
 
 
-def write_books(out_dir, profile: str, symbol: str, bar_minutes: int, frame, books, *, extra: dict | None = None) -> dict:
-    """Write the strategy curves at the top of ``out_dir`` and benchmarks underneath."""
+def write_books(
+    out_dir,
+    profile: str,
+    symbol: str,
+    bar_minutes: int,
+    frame,
+    books,
+    *,
+    extra: dict | None = None,
+    anonymized: bool = False,
+) -> dict:
+    """Write the strategy curves at the top of ``out_dir`` and benchmarks underneath.
+
+    An anonymized run also writes ``designer/``. That tree is the copy a
+    strategy designer may see. It has no ticker, no calendar date, and no
+    scale factor. The files next to it are the operator copy and may have those.
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     strategy_result, strategy_metrics = books["strategy"]
@@ -626,6 +737,8 @@ def write_books(out_dir, profile: str, symbol: str, bar_minutes: int, frame, boo
     if extra:
         payload["run"] = extra
     write_json(out / "metrics.json", payload)
+    if anonymized:
+        publish_designer(out, profile, frame, books, payload, symbol=symbol)
     return payload
 
 
@@ -980,6 +1093,7 @@ def run_pack(
         loaded.bar_minutes,
         loaded.frame,
         books,
+        anonymized=anonymized,
         extra={
             "warnings": [],
             "pack_id": loaded.pack_id,
@@ -993,8 +1107,8 @@ def run_pack(
     return payload
 
 
-def run_parallel(*_args, **_kwargs):
-    raise NotImplementedError(
-        "Parallel scoring is a later phase. Each worker will be its own process, "
-        "one strategy and one symbol at a time."
-    )
+def run_parallel(*args, **kwargs):
+    """Score many strategies. See ``backtester.parallel.run_parallel``."""
+    from .parallel import run_parallel as _run
+
+    return _run(*args, **kwargs)

@@ -208,7 +208,9 @@ def test_import_is_side_effect_free(tmp_path):
     code = (
         "import backtester, backtester.engine_arena, backtester.engine_desk, "
         "backtester.data, backtester.registry, backtester.pack, backtester.runner, "
-        "backtester.costs, backtester.costs_desk, backtester.arena_runner"
+        "backtester.parallel, backtester.limits, "
+        "backtester.costs, backtester.costs_desk, backtester.arena_runner; "
+        "import sys; assert 'matplotlib' not in sys.modules"
     )
     subprocess.check_call([sys.executable, "-c", code], cwd=tmp_path, env=env)
     assert list(tmp_path.iterdir()) == []

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -29,8 +30,11 @@ def _run(args, cwd: Path):
 
 
 def test_stubs_return_2_without_writing():
-    for command in ("parallel", "referee", "report"):
-        assert main([command]) == 2
+    assert main(["referee"]) == 2
+    for command in ("parallel", "report"):
+        with pytest.raises(SystemExit) as caught:
+            main([command])
+        assert caught.value.code == 2
 
 
 def test_pack_without_arguments_exits():
@@ -61,6 +65,15 @@ def test_arena_sample_month(tmp_path):
     curve = (out / "equity_curve.csv").read_text(encoding="utf-8").strip().splitlines()
     assert len(curve) == 23  # header + 22 sessions
     assert "2026-10-01" in curve[1]
+    assert (out / "equity.csv").read_bytes() == (out / "equity_curve.csv").read_bytes()
+    assert (out / "equity.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert not (out / "liquidation.json").is_file()
+    match = re.search(r"run (r[0-9a-f]{16})", proc.stdout)
+    assert match
+    reported = _run(["report", "--run", match.group(1)], tmp_path)
+    assert reported.returncode == 0, reported.stderr
+    assert "total_return=" in reported.stdout
+    assert "buy_and_hold_1x" in reported.stdout
     fills = (out / "fills.csv").read_text(encoding="utf-8")
     assert "shares_delta" in fills
     assert (out / "trades.csv").is_file()
@@ -95,6 +108,10 @@ def test_desk_sample_month_benchmarks(tmp_path):
     curve = (out / "equity_curve.csv").read_text(encoding="utf-8").strip().splitlines()
     assert len(curve) == 23
     assert "2026-10-01" in curve[1]
+    assert (out / "equity.csv").read_bytes() == (out / "equity_curve.csv").read_bytes()
+    assert (out / "equity.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert not (out / "liquidation.json").is_file()
+    assert re.search(r"run r[0-9a-f]{16}", proc.stdout)
 
 
 def test_walkforward_on_the_sample_has_no_default_cut(tmp_path):
