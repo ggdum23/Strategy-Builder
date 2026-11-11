@@ -1123,6 +1123,55 @@ def _with_profile_lock(action):
             pass
 
 
+def _win_block_network(sid_text: str) -> None:
+    """Block every inbound and outbound connection for this package SID.
+
+    An AppContainer with no capabilities still reaches loopback far enough
+    for a connect to time out instead of failing with access denied. A
+    firewall block on the package SID fails that connect with 10013.
+    """
+    system = os.environ.get("SystemRoot", "")
+    netsh = Path(system) / "System32" / "netsh.exe" if system else None
+    if netsh is None or not netsh.is_file():
+        raise SandboxError("netsh is not available; refusing to run without a network block")
+    for name, direction in (
+        ("strategybuilderjail-block-out", "out"),
+        ("strategybuilderjail-block-in", "in"),
+    ):
+        subprocess.run(
+            [str(netsh), "advfirewall", "firewall", "delete", "rule", f"name={name}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        try:
+            proc = subprocess.run(
+                [
+                    str(netsh),
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    f"name={name}",
+                    f"dir={direction}",
+                    "action=block",
+                    f"package={sid_text}",
+                    "profile=any",
+                    "enable=yes",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxError(f"the AppContainer firewall block was not added: {exc}") from exc
+        if proc.returncode != 0:
+            detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            raise SandboxError(f"the AppContainer firewall block was not added: {detail[-500:]}")
+
+
 def _clear_loopback(name: str, sid_text: str) -> None:
     """Drop a loopback exemption for this profile. Missing entries are fine."""
     system = os.environ.get("SystemRoot", "")
@@ -1152,7 +1201,8 @@ def _recorded_grants(sid_text: str):
         return None
     if payload.get("sid") != sid_text:
         return None
-    if payload.get("roots") != [str(path) for path in _windows_grant_roots()]:
+    recorded_roots = [os.path.normcase(str(item)) for item in payload.get("roots") or []]
+    if recorded_roots != [os.path.normcase(str(path)) for path in _windows_grant_roots()]:
         return None
     if not payload.get("local_denied"):
         return None
@@ -1171,6 +1221,7 @@ def _write_grant_marker(sid_text: str, grants, *, local_denied: bool, loopback_c
         "grants": [[str(path), bool(recurse)] for path, recurse in grants],
         "local_denied": bool(local_denied),
         "loopback_cleared": bool(loopback_cleared),
+        "firewall_blocked": True,
     }
     path = _grant_marker_path()
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1236,12 +1287,18 @@ def _win_lease_open(lease: _WinLease) -> None:
             marker = json.loads(_grant_marker_path().read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             marker = {}
-        if recorded is not None and marker.get("loopback_cleared") and marker.get("sid") == sid_text:
+        if (
+            recorded is not None
+            and marker.get("loopback_cleared")
+            and marker.get("firewall_blocked")
+            and marker.get("sid") == sid_text
+        ):
             lease.grant_paths = recorded
             return
-        # Once per machine. CheckNetIsolation can take longer than a strategy
-        # timeout, so a later process must not run it again.
+        # Once per machine. CheckNetIsolation and netsh can take longer than
+        # a strategy timeout, so a later process must not run them again.
         _clear_loopback(name, sid_text)
+        _win_block_network(sid_text)
         if recorded is not None:
             lease.grant_paths = recorded
             _write_grant_marker(
@@ -1292,21 +1349,32 @@ def _system_root() -> Path | None:
 
 
 def _windows_grant_roots() -> list[Path]:
+    """Interpreter directories the AppContainer may read.
+
+    User-site from ``site.getusersitepackages`` is not included. It depends
+    on the process environment, so a scrubbed worker would miss the marker
+    and walk the Python tree with ``icacls /T`` on every launch. A package
+    that lives outside the prefix is added on its own.
+    """
     roots: list[Path] = []
     frozen_root = getattr(sys, "_MEIPASS", None)
-    candidates = (sys.base_prefix, sys.prefix, os.path.dirname(sys.executable), frozen_root)
+    candidates = [sys.base_prefix, sys.prefix, os.path.dirname(sys.executable), frozen_root]
+    system = _system_root()
+    if system is not None:
+        candidates.append(str(system))
     for raw in candidates:
         if not raw:
             continue
         path = Path(raw).resolve()
         if path.is_dir() and path not in roots:
             roots.append(path)
-    system = _system_root()
-    if system is not None and system not in roots:
-        roots.append(system)
-    for directory in _site_dirs():
-        if directory not in roots:
+    for package in _runtime_package_dirs():
+        directory = package if package.is_dir() else package.parent
+        if any(directory == root or root in directory.parents for root in roots):
+            continue
+        if directory.is_dir() and directory not in roots:
             roots.append(directory)
+    roots.sort(key=lambda path: os.path.normcase(str(path)))
     return roots
 
 

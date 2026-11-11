@@ -479,14 +479,16 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
         "            except OSError:\n"
         "                text = ''\n"
         "        network = 'open'\n"
+        "        detail = ''\n"
         "        try:\n"
         "            sock = socket.socket()\n"
         "            sock.settimeout(3)\n"
         "            sock.connect(('127.0.0.1', 44123))\n"
         "            sock.close()\n"
         "        except OSError as exc:\n"
-        "            network = exc.errno\n"
-        "        self.surface = {'secret_seen': bool(seen), 'read': text, 'network': network}\n"
+        "            detail = str(exc)\n"
+        "            network = exc.winerror if getattr(exc, 'winerror', None) is not None else exc.errno\n"
+        "        self.surface = {'secret_seen': bool(seen), 'read': text, 'network': network, 'network_error': detail}\n"
         "        return None\n",
         encoding="utf-8",
     )

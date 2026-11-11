@@ -60,18 +60,24 @@ def _token_ok() -> bool:
     return facts["is_app_container"] == 1 and facts["capability_count"] == 0
 
 
+def _blocked(exc: OSError) -> bool:
+    if exc.errno in _BLOCKED:
+        return True
+    return getattr(exc, "winerror", None) in _BLOCKED
+
+
 def _access_denied(host, port) -> bool:
     import socket
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     except OSError as exc:
-        return exc.errno in _BLOCKED
+        return _blocked(exc)
     try:
         sock.settimeout(3)
         sock.connect((host, port))
     except OSError as exc:
-        return exc.errno in _BLOCKED
+        return _blocked(exc)
     except Exception:
         return False
     else:
