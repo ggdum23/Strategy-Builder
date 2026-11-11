@@ -1,0 +1,11 @@
+Strategy Builder
+
+Copyright (c) 2026
+
+Permission is granted to install and run this software on machines operated
+by the copyright holder and the people they designate.
+
+The software is provided as is, without warranty of any kind.
+
+The market-data files the program reads are not part of this license and are
+not distributed by the installer.

@@ -17,6 +17,8 @@ data/
 *.xz
 **/.cache/
 
+packaging/smoke/probe_*.json
+
 # Market data stays on disk. The only tracked bars are assets/sample.
 *.csv.gz
 !assets/sample/**/*.csv.gz

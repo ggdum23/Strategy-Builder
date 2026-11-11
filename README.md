@@ -18,8 +18,8 @@ The same target is not rebalanced for drift. Costs, splits, data roots, share fa
 and borrow are configuration. The two fee schedules are not.
 
 Phase 2 adds the series registry, session-anchored resampling, and the pack
-builder on top of the engines. The desktop window and the Windows installer are
-not built yet. See `packaging/README.md`. The registry schema is `docs/REGISTRY.md`.
+builder on top of the engines. The desktop window is still a later phase.
+The Windows installer is `docs/INSTALLER.md`. The registry schema is `docs/REGISTRY.md`.
 Packs, the sidecar, and the residual leaks are `docs/PACK.md`.
 
 ## Install
@@ -171,11 +171,13 @@ fees used real share counts). `metrics.json` carries the same record.
 
 `python -m backtester test` runs pytest on this checkout. It needs the source tree.
 
-## What this phase does not do
+## What this checkout does not do yet
 
-No window, no `setup.exe`, no one-bar referee, and no Arena financing switch.
-The parallel runner and the report files are in place for a later GUI. The
-engines, the registry, and the pack builder stay importable. Interpretations
-that the Desk spec left open are in `docs/DESK_SPEC_DECISIONS.md`. The Arena
-port is in `docs/ARENA_PORT_NOTES.md`. Walk-forward and parallel isolation are
-`docs/ISOLATION.md`. Metric definitions are `docs/METRICS.md`.
+No desktop window and no one-bar referee. The parallel runner, the report
+files, and the equity PNG are in place for a later GUI. The Windows
+`setup.exe` is built by the installer workflow. See `docs/INSTALLER.md`.
+No Arena financing switch. The engines, the registry, and the pack builder
+stay importable. Interpretations that the Desk spec left open are in
+`docs/DESK_SPEC_DECISIONS.md`. The Arena port is in `docs/ARENA_PORT_NOTES.md`.
+Walk-forward and parallel isolation are `docs/ISOLATION.md`. Metric
+definitions are `docs/METRICS.md`.

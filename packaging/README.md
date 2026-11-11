@@ -1,19 +1,22 @@
-# Packaging seam
+# Packaging
 
-Phase 1 does not build an installer. The layout is meant to take one later.
+The Windows installer lives here. Build and install steps are in
+`docs/INSTALLER.md`.
 
-- Library entry: import `backtester.runner`, `backtester.parallel`, `backtester.report`,
-  `backtester.data`, `backtester.registry`, `backtester.pack`, `backtester.engine_arena`,
-  `backtester.engine_desk`. Importing them does not read the working directory, does
-  not print, and does not load market data. The GUI should call `run_parallel` and
-  `load_report` (progress callback, cancel token, structured results). Printing stays
-  in `backtester.__main__`.
-- CLI entry for PyInstaller: `backtester.__main__:main`.
-- Window entry, still empty: `backtester.desktop:main`.
-- A Windows build should bundle its own Python. The operator machine's system
-  Python is 3.14 and is not a dependency of the installed app.
-- Inno Setup is a later step. It should run the bundled executable. It should
-  not copy or unzip market data onto the Desktop; `--src` points at the tree
-  that is already there.
-- Console scripts: `backtester` from the installed package, and `run.ps1` / `run.bat`
-  from a source checkout.
+Library code stays importable without printing, without reading the working
+directory, and without loading market data. The GUI calls `run_parallel` and
+`load_report` (progress callback, cancel token, structured results). Printing
+stays in `backtester.__main__`.
+
+- Console entry for PyInstaller: `packaging/frozen_entry.py`, which calls
+  `backtester.__main__:main` after `multiprocessing.freeze_support()`.
+  The installed program is `backtester.exe`.
+- Windowed entry, same file: `Strategy Builder.exe` runs `backtester gui`
+  when the `backtester.gui` package exists, and a short placeholder until then.
+- `backtester.desktop:main` is the older empty seam. The launcher does not
+  call it.
+- The bundle carries its own Python. The machine interpreter is not required.
+- Inno Setup runs the bundled executables. It does not copy or unzip market
+  data. `--src` points at files that are already on disk.
+- `run.ps1` and `run.bat` remain the source-checkout helpers. They are not
+  what the installed program runs.

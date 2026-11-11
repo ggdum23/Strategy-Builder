@@ -1,0 +1,122 @@
+name: installer
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: installer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: build-install-smoke-uninstall
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # runner.temp is not available in a job-level env block. The install and
+      # smoke steps set the paths, and both paths contain a space on purpose.
+      STRATEGY_BUILDER_HEADLESS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            packaging/requirements-build.txt
+      - name: Install application and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip install -r packaging/requirements-build.txt
+      - name: Build installer
+        shell: pwsh
+        run: ./packaging/build_windows.ps1
+      - name: Record SHA256
+        shell: pwsh
+        run: |
+          Get-Content -LiteralPath packaging/dist/SHA256SUMS
+          $file = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
+          $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output "SHA256 $hash"
+          Write-Output "SIZE $($file.Length)"
+          Write-Output "ARTIFACT $($file.Name)"
+          @"
+          ### Installer artifact
+
+          - Name: ``$($file.Name)``
+          - Size: $($file.Length) bytes
+          - SHA256: ``$hash``
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+      - name: Silent install
+        shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
+        run: |
+          $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
+          ./packaging/ci_install.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
+      - name: Smoke tests
+        shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
+          SB_SMOKE_DIR: ${{ runner.temp }}\smoke results
+        run: python packaging/smoke_frozen.py --exe "$env:SB_INSTALL_DIR\backtester.exe" --repo . --work $env:SB_SMOKE_DIR
+      - name: Upgrade over existing install
+        shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
+        run: |
+          $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
+          ./packaging/ci_upgrade.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
+      - name: Silent uninstall
+        if: always()
+        shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
+        run: |
+          $unins = Join-Path $env:SB_INSTALL_DIR "unins000.exe"
+          if (-not (Test-Path -LiteralPath $unins)) {
+            Write-Output "uninstall skipped; nothing was installed"
+            exit 0
+          }
+          ./packaging/ci_uninstall.ps1 -Destination $env:SB_INSTALL_DIR
+      - name: Delete user data
+        shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
+        run: |
+          $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
+          ./packaging/ci_delete_userdata.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
+      - name: Upload setup.exe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-builder-setup
+          if-no-files-found: warn
+          path: |
+            packaging/dist/StrategyBuilder-Setup-*.exe
+            packaging/dist/SHA256SUMS
+
+  release:
+    name: attach-to-release
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v') && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: strategy-builder-setup
+          path: release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
