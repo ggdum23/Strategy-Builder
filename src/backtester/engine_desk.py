@@ -673,12 +673,27 @@ def run(strategy, bars, config=None):
     }
 
 
+def _session_return(current, previous):
+    """Session return. A previous mark of 0 is undefined and is stored as 0.
+
+    It is not an up day, and it does not raise. A positive previous mark uses
+    ``current / previous - 1``.
+    """
+    if previous == 0:
+        return 0.0
+    return current / previous - 1.0
+
+
 def _cagr(final, initial, years):
     """Compound growth. A finite equity path that overflows the power returns a non-finite CAGR.
 
     Arena's numpy power does the same: the value is infinite rather than an exception,
     and the JSON writer stores that as null. One huge session must not kill a walk-forward.
+    A zero initial equity has no defined growth rate. That case is -1, the same
+    value a non-positive final equity already uses, not an infinite gain.
     """
+    if initial == 0:
+        return -1.0
     if not final > 0.0:
         return -1.0
     if not years > 0.0:
@@ -704,8 +719,8 @@ def metrics(res):
     n = len(equity)
     years = n / 252.0
     previous = [initial] + equity[:-1]
-    returns = [equity[i] / previous[i] - 1.0 for i in range(n)]
-    total = equity[-1] / initial - 1.0
+    returns = [_session_return(equity[i], previous[i]) for i in range(n)]
+    total = _session_return(equity[-1], initial)
     cagr = _cagr(equity[-1], initial, years)
     if n > 1:
         mean = sum(returns) / n
@@ -724,7 +739,10 @@ def metrics(res):
     for value in path:
         if value > peak:
             peak = value
-        drawdowns.append(value / peak - 1.0)
+        if peak == 0:
+            drawdowns.append(0.0)
+        else:
+            drawdowns.append(value / peak - 1.0)
     max_dd = min(drawdowns)
     longest = 0
     current = 0
@@ -807,7 +825,9 @@ def metrics(res):
         "borrow_rate_annual": res["config"]["borrow_rate_annual"],
         "financing_rate_annual": res["config"]["financing_rate_annual"],
         "fee_mult": res["config"]["fee_mult"],
-        "period_returns": {label: per[label][1] / per[label][0] - 1.0 for label in per},
+        "period_returns": {
+            label: _session_return(per[label][1], per[label][0]) for label in per
+        },
     }
 
 

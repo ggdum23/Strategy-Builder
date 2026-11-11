@@ -2,6 +2,8 @@
 
 The implementation lives in ``backtester.gui``. Importing this module does not
 import Qt; ``main`` does, so a CLI install without the gui extra still imports.
+The window calls ``backtester.parallel.run_parallel`` and reads the files
+``backtester.report`` writes. Those functions do not import this module.
 """
 
 from __future__ import annotations

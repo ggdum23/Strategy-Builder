@@ -14,6 +14,7 @@ from backtester.data import load_named
 from backtester.pack import (
     CHUNK_SESSIONS,
     MAX_FILE_BYTES,
+    _pack_id,
     assert_anonymized_pack_clean,
     build_pack,
     load_pack,
@@ -141,6 +142,43 @@ def test_a_session_is_not_split_and_a_failed_build_keeps_an_old_sidecar(tmp_path
         )
 
 
+def test_symbol_asset_publishes_as_random(tmp_path):
+    src, registry = _series(tmp_path, 1, symbol="asset")
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "secret.json"
+    build_pack(
+        src,
+        "asset",
+        pack,
+        sidecar,
+        anonymize=True,
+        registry_path=registry,
+        profile="arena",
+        price_factor=1.5,
+        volume_factor=0.5,
+    )
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["asset_name"] == "RANDOM"
+    loaded = load_pack(pack)
+    assert loaded.manifest["asset_name"] == "RANDOM"
+    assert_anonymized_pack_clean(pack, symbol="asset")
+
+
+def test_named_pack_keeps_a_reserved_ticker(tmp_path):
+    src, registry = _series(tmp_path, 1, symbol="CSV")
+    pack = tmp_path / "named"
+    sidecar = tmp_path / "named.json"
+    build_pack(
+        src, "CSV", pack, sidecar, anonymize=False, registry_path=registry, profile="arena",
+    )
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["asset_name"] == "CSV"
+    assert manifest["anonymized"] is False
+    assert (pack / "bars_part_001.csv.gz").is_file()
+    assert (pack / "daily_rth.csv.gz").is_file()
+    assert (pack / "manifest.json").is_file()
+
+
 def test_named_pack_is_unscaled_and_factors_of_one_are_refused(tmp_path):
     src, registry = _series(tmp_path, 1)
     pack = tmp_path / "named"
@@ -248,6 +286,23 @@ def _recompress(payload: bytes, *, mtime: int = 0, filename: str = "") -> bytes:
     return buffer.getvalue()
 
 
+def _with_fhcrc(blob: bytes, crc: bytes = b"MA") -> bytes:
+    if blob[3] & 0x02:
+        raise AssertionError("test gzip header already has FHCRC")
+    if len(crc) != 2:
+        raise AssertionError("FHCRC is two bytes")
+    flagged = blob[:3] + bytes([blob[3] | 0x02]) + blob[4:10]
+    return flagged + crc + blob[10:]
+
+
+def _with_extra(blob: bytes, extra: bytes) -> bytes:
+    if blob[3] & 0x1C:
+        raise AssertionError("test gzip header already has optional fields")
+    flagged = blob[:3] + bytes([blob[3] | 0x04]) + blob[4:10]
+    length = len(extra).to_bytes(2, "little")
+    return flagged + length + extra + blob[10:]
+
+
 def _with_comment(blob: bytes, comment: bytes) -> bytes:
     if blob[3] & 0x1C:
         raise AssertionError("test gzip header already has optional fields")
@@ -277,3 +332,135 @@ def test_gzip_members_carry_no_name_comment_or_mtime(tmp_path):
             assert_anonymized_pack_clean(pack, symbol="NIK")
         target.write_bytes(original)
     assert_anonymized_pack_clean(pack, symbol="NIK")
+
+
+def test_volume_is_scaled_and_trade_count_is_not(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=1.7, volume_factor=0.42,
+    )
+    loaded = load_pack(pack)
+    assert float(loaded.frame.iloc[0]["volume"]) == pytest.approx(100 * 0.42)
+    assert int(loaded.frame.iloc[0]["count"]) == 3
+    assert float(loaded.frame.iloc[0]["open"]) == pytest.approx(10.0 * 1.7)
+
+
+def test_gzip_audit_checks_every_member(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    hidden = _recompress(b"hidden\n", filename="QQQ.csv")
+    target.write_bytes(original + hidden)
+    with pytest.raises(ValueError, match="gzip"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    target.write_bytes(original)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+
+
+def test_load_pack_rejects_an_anonymized_gzip_fhcrc(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    target.write_bytes(_with_fhcrc(original, b"MA"))
+    _rewrite_pack_id(pack)
+    with pytest.raises(ValueError, match="FHCRC") as caught:
+        load_pack(pack)
+    assert "pack_id" not in str(caught.value)
+    with pytest.raises(ValueError, match="FHCRC") as caught:
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    assert "pack_id" not in str(caught.value)
+    target.write_bytes(original)
+    _rewrite_pack_id(pack)
+    load_pack(pack)
+
+
+def test_pack_scan_does_not_treat_asset_substrings_as_tickers(tmp_path):
+    for symbol in ("SS", "AS", "ET", "ASS", "ID"):
+        src, registry = _series(tmp_path / symbol, 1, symbol=symbol)
+        pack = tmp_path / symbol / "pack"
+        build_pack(
+            src, symbol, pack, tmp_path / symbol / "side.json",
+            anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+        )
+        assert_anonymized_pack_clean(pack, symbol=symbol)
+        (pack / "note.txt").write_text(f"my_{symbol}_v2\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="ticker"):
+            assert_anonymized_pack_clean(pack, symbol=symbol)
+
+
+def test_load_pack_rejects_an_anonymized_gzip_extra_field(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    target.write_bytes(_with_extra(original, b"ZZZX"))
+    with pytest.raises(ValueError, match="FEXTRA"):
+        load_pack(pack)
+    with pytest.raises(ValueError, match="FEXTRA"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    target.write_bytes(original)
+    load_pack(pack)
+
+
+def _rewrite_pack_id(pack: Path) -> None:
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    hashed = [(chunk["file"], (pack / chunk["file"]).read_bytes()) for chunk in manifest["chunks"]]
+    hashed.append((manifest["daily_file"], (pack / manifest["daily_file"]).read_bytes()))
+    manifest["pack_id"] = _pack_id(hashed)
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def test_load_pack_rejects_a_second_clean_gzip_member(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    payload = gzip.decompress(original)
+    second = _recompress(payload, mtime=0, filename="")
+    target.write_bytes(original + second)
+    _rewrite_pack_id(pack)
+    with pytest.raises(ValueError, match="members") as caught:
+        load_pack(pack)
+    assert "pack_id" not in str(caught.value)
+    with pytest.raises(ValueError, match="members") as caught:
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    assert "pack_id" not in str(caught.value)
+    target.write_bytes(original)
+    _rewrite_pack_id(pack)
+    loaded = load_pack(pack)
+    assert len(loaded.frame) == len(gzip.decompress(original).splitlines()) - 1
+
+
+def test_load_pack_rejects_duplicate_manifest_keys(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    manifest = pack / "manifest.json"
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text("{\n  \"schema_version\": 9," + text[1:], encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate JSON key 'schema_version'"):
+        load_pack(pack)

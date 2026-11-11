@@ -153,7 +153,8 @@ def test_posix_paths_with_spaces_leave_the_banner(qtbot, tmp_path):
     paused = designer_error(
         "OSError: cannot open /home/jeu/Strategy Builder/QQQ/data.csv, permission denied"
     )
-    assert "permission denied" in paused
+    assert "OSError" in paused
+    assert "permission denied" not in paused
     assert "Builder" not in paused and "QQQ" not in paused
 
     folder = write_book(tmp_path / "book", _metrics(anonymized=True, symbol="QQQ"), benchmark=False)
@@ -285,8 +286,9 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
     assert not export_allowed(f"held QQQ overnight {ordinary}", symbols=("QQQ",), scale=2)
     assert not export_allowed("scale 2", symbols=(), scale=2)
 
-    # A path runs to the next comma. The numbers sit after that comma so the
-    # path stripper cannot treat them as the tail of the path.
+    # A path consumes the rest of the field, commas included. The ordinary
+    # tokens sit after that path, so this line does not keep them. The check
+    # above keeps the same tokens when the line has no path.
     comment = "held QQQ " + " ".join(dates[:12]) + ", " + " ".join(paths[:4]) + ", " + ordinary + " scale 2"
     metrics = _metrics(
         anonymized=True,
@@ -317,8 +319,9 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
     assert "scale 2" not in blob
     for sample in dates[:12] + paths[:4]:
         assert sample not in blob, sample
+    assert "held" in shown and "RANDOM" in shown
     for piece in ("long_2x", "2.5", "2024.50", "0.2024", "day 2024"):
-        assert piece in shown, piece
+        assert piece not in shown, piece
     exported = tmp_path / "copy"
     written = page.export_to(exported)
     assert "metrics.json" in written
@@ -328,4 +331,4 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
         assert sample not in sheet
     assert "QQQ" not in sheet
     for piece in ("long_2x", "2.5", "2024.50", "day 2024"):
-        assert piece in sheet
+        assert piece not in sheet

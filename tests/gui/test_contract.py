@@ -194,7 +194,7 @@ def test_leaderboard_csv_is_preferred_and_batch_assembly_copies_metrics(tmp_path
     assert official.leaderboard.rows[0]["phase3_note"] == "kept"
 
 
-def test_equity_csv_alias_and_desk_liquidation_file(tmp_path):
+def test_curve_is_equity_curve_csv_and_liquidation_is_canonical(tmp_path):
     folder = tmp_path / "desk"
     folder.mkdir()
     metrics = {
@@ -208,6 +208,20 @@ def test_equity_csv_alias_and_desk_liquidation_file(tmp_path):
     }
     (folder / "metrics.json").write_text(json.dumps(metrics) + "\n", encoding="utf-8")
     (folder / "equity.csv").write_text(
+        "session,equity,exposure\nS00001,5,0\n",
+        encoding="utf-8",
+    )
+    (folder / "equity_curve.png").write_bytes(b"\x89PNG\r\nnot-the-figure")
+    (folder / "liquidation_postmortem.json").write_text(
+        json.dumps({"session": "S00009", "equity": 1}) + "\n",
+        encoding="utf-8",
+    )
+    mirror_only = load_run(folder)
+    assert not mirror_only.curves
+    assert "equity_curve.csv" in mirror_only.missing
+    assert mirror_only.figure is None
+    assert mirror_only.liquidation is None
+    (folder / "equity_curve.csv").write_text(
         "session,equity,exposure\nS00001,1000000,1\nS00002,900000,0\n",
         encoding="utf-8",
     )
@@ -216,9 +230,13 @@ def test_equity_csv_alias_and_desk_liquidation_file(tmp_path):
         encoding="utf-8",
     )
     report = load_run(folder)
-    assert report.curves and report.curves[0].source.endswith("equity.csv")
+    assert report.curves and report.curves[0].source.endswith("equity_curve.csv")
+    assert not report.curves[0].source.endswith("equity.csv")
+    assert report.curves[0].equity == [1_000_000.0, 900_000.0]
     assert report.curves[0].exposure == [1.0, 0.0]
+    assert report.figure is None
     assert report.liquidation is not None
+    assert report.liquidation_source == "liquidation.json"
     assert "volume_factor" not in report.liquidation
     assert report.liquidation["session"] == "S00002"
     assert "CANARY" in report.withheld or any("volume_factor" in item for item in report.withheld)

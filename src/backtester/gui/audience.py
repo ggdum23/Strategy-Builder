@@ -62,19 +62,34 @@ _SECRET_TOKENS = ("share_scale", "share_factor", "price_factor", "volume_factor"
 _SECRET_WORDS = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:share_scale|share_factor|price_factor|volume_factor|date_map)(?![A-Za-z0-9_])"
 )
-# A path may contain spaces (``Strategy Builder/QQQ/data.csv``). After the drive,
-# UNC, or POSIX prefix, keep going until a quote, a comma, or the end of the line.
+# A path may contain spaces and commas (``Strategy Builder, Inc\QQQ\data.csv``).
+# ``\\?\UNC\``, ``\\?\``, and the slash forms ``//?/UNC/`` and ``//?/`` are paths.
+# After that prefix the rest of the field belongs to the path, including commas,
+# and it stops at a quote or the end of the line. A slash date such as 2024/1/4
+# is not a path: a POSIX path needs a letter in it.
+_PATH_TAIL = r"[^'\"\r\n]*"
 _ABS_PATH = re.compile(
-    r"(?:[A-Za-z]:[\\/][^'\"<>|*?,\r\n]*)"
-    r"|(?:\\\\[^\\/'\"<>|*?,\r\n]+[\\/][^'\"<>|*?,\r\n]*)"
-    r"|(?:[/]{2}[^/'\"<>|*?,\r\n]+/[^'\"<>|*?,\r\n]*)"
-    # A letter in the final segment keeps a slash date such as 2024/1/4 from
-    # being read as a path. Spaces still belong to the path, through a comma.
-    r"|(?:/(?:[^/'\"<>|*?,\r\n]+/)+[^/'\"<>|*?,\r\n]*[A-Za-z][^/'\"<>|*?,\r\n]*)"
+    "|".join(
+        (
+            r"\\\\\?\\UNC\\" + _PATH_TAIL,
+            r"//\?/UNC/" + _PATH_TAIL,
+            r"\\\\\?\\" + _PATH_TAIL,
+            r"//\?/" + _PATH_TAIL,
+            r"[A-Za-z]:[\\/]" + _PATH_TAIL,
+            r"\\\\[^\\/'\"<>|*?\r\n]+[\\/]" + _PATH_TAIL,
+            r"//[^/'\"<>|*?\r\n]+/" + _PATH_TAIL,
+            r"/(?:[^/'\"<>|*?\r\n]+/)+[^/'\"<>|*?\r\n]*[A-Za-z]" + _PATH_TAIL,
+        )
+    )
 )
 # A scale value is its own number, not a digit inside ``long_2x`` or ``2.5``.
 _NUMBER_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9_])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![A-Za-z0-9_])"
+    r"(?<![A-Za-z0-9_])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?(?![A-Za-z0-9_])"
+)
+# A decimal or a scientific literal inside a larger token (``build2_7.777``, ``v2_1e7.777``).
+# A bare integer is not this shape, so ``long_2x`` stays.
+_EMBEDDED_SCALE = re.compile(
+    r"(?<![0-9.])([+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?|[+-]?\d+[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))"
 )
 _MONTH_WORDS = frozenset(
     "jan january feb february mar march apr april may jun june jul july aug august "
@@ -87,11 +102,13 @@ _SESSION_ID = re.compile(r"[Ss]\d+")
 _YEAR_TOKEN = re.compile(r"(?:19|20)\d{2}")
 _DOTTED_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+")
 # One signed number: optional $, thousands commas, a decimal, an exponent, a trailing %.
+# The exponent may itself be a decimal (``1e7.777``) so it stays one token.
 _NUMBER_CORE = r"(?:\d{1,3}(?:,\d{3})+(?:\.\d*)?|\d+(?:\.\d*)?|\.\d+)"
-_NUMBER_SURFACE = re.compile(rf"[+-]?\$?{_NUMBER_CORE}(?:[eE][+-]?\d+)?%?")
+_NUMBER_EXP = r"(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?"
+_NUMBER_SURFACE = re.compile(rf"[+-]?\$?{_NUMBER_CORE}{_NUMBER_EXP}%?")
 _HYPHEN_WORD = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)+")
 _SURFACE_TOKEN = re.compile(
-    rf"(?<![A-Za-z0-9_])[+-]?\$?{_NUMBER_CORE}(?:[eE][+-]?\d+)?%?(?![A-Za-z0-9_])"
+    rf"(?<![A-Za-z0-9_])[+-]?\$?{_NUMBER_CORE}{_NUMBER_EXP}%?(?![A-Za-z0-9_])"
     rf"|{_HYPHEN_WORD.pattern}"
     r"|[A-Za-z0-9_.]+"
 )
@@ -152,6 +169,21 @@ PRICE_COLUMNS = frozenset(
         "raw_price",
     }
 )
+# Share counts let equity and exposure be inverted back into a price.
+# A redacted view drops them with the price columns. A published designer/
+# tree keeps the scaled counts Phase 3 wrote.
+SHARE_COLUMNS = frozenset({"shares", "shares_delta", "shares_after", "position_shares"})
+
+
+def _hide_column(name: str, *, drop_prices: bool) -> bool:
+    if name in DESIGNER_DROP_KEYS:
+        return True
+    return bool(drop_prices and (name in PRICE_COLUMNS or name in SHARE_COLUMNS))
+
+
+def _consume_paths(text: str, replacement: str = " ") -> str:
+    """Remove absolute paths. The screen filter and ``export_allowed`` both call this."""
+    return _ABS_PATH.sub(replacement, text)
 
 
 def _casefold_index(text: str) -> tuple[str, list[int]]:
@@ -293,10 +325,10 @@ def _scrub_scale_number(text: str, scale: float | None) -> str:
 
 
 def _contains_scale(text: str, scale: float | None) -> bool:
-    number = _scale_number(scale)
-    if number is None:
+    """True when a surface token is the invoice scale. Same decision as the screen."""
+    if _scale_number(scale) is None:
         return False
-    return any(_same_number(match.group(0), number) for match in _NUMBER_TOKEN.finditer(text))
+    return any(_scale_in_token(match.group(0), scale) for match in _SURFACE_TOKEN.finditer(text))
 
 
 def _month_near_year(text: str) -> bool:
@@ -317,7 +349,7 @@ def _scrub_obj(value, symbols: tuple[str, ...], *, drop_prices: bool, scale: flo
         used: set[str] = set()
         for key, item in value.items():
             name = str(key)
-            if name in DESIGNER_DROP_KEYS or (drop_prices and name in PRICE_COLUMNS):
+            if _hide_column(name, drop_prices=drop_prices):
                 continue
             renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
             clean[renamed] = _scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale)
@@ -381,7 +413,7 @@ def _scrub_table(table, symbols: tuple[str, ...], *, drop_prices: bool, scale: f
     used: set[str] = set()
     for column in table.columns:
         name = str(column)
-        if name in DESIGNER_DROP_KEYS or (drop_prices and name in PRICE_COLUMNS):
+        if _hide_column(name, drop_prices=drop_prices):
             continue
         # Headers use the same stripper as values. A ticker-only header becomes RANDOM.
         renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
@@ -508,19 +540,38 @@ def _glued_scale_number(token: str) -> str | None:
     return None
 
 
-def _scale_in_token(token: str, scale: float | None) -> bool:
-    """True when this token's number is the invoice scale.
+def _exponent_text(token: str) -> str | None:
+    match = re.search(r"[eE]([+-]?(?:\d+(?:\.\d*)?|\.\d+))$", token)
+    if match is None:
+        return None
+    return match.group(1)
 
-    A standalone ``2`` and a glued ``scale7.777`` both count. ``long_2x``,
-    ``2.5``, and ``12`` do not.
+
+def _scale_in_token(token: str, scale: float | None) -> bool:
+    """True when this token's number, decimal, or exponent is the invoice scale.
+
+    A standalone ``2``, a glued ``scale7.777``, and ``build2_7.777`` all count
+    when that number equals the scale. ``long_2x``, ``2.5``, and ``12`` do not.
     """
     number = _scale_number(scale)
     if number is None:
         return False
     if _NUMBER_SURFACE.fullmatch(token):
-        return _same_number(_numeric_text(token), number)
+        if _same_number(_numeric_text(token), number):
+            return True
+        exponent = _exponent_text(_numeric_text(token))
+        return exponent is not None and _same_number(exponent, number)
     glued = _glued_scale_number(token)
-    return glued is not None and _same_number(glued, number)
+    if glued is not None and _same_number(glued, number):
+        return True
+    for match in _EMBEDDED_SCALE.finditer(token):
+        piece = match.group(1)
+        if _same_number(piece, number):
+            return True
+        exponent = _exponent_text(piece)
+        if exponent is not None and _same_number(exponent, number):
+            return True
+    return False
 
 
 def _keep_surface_token(token: str, *, previous: str, scale: float | None) -> bool:
@@ -591,9 +642,9 @@ def designer_surface_text(value: str, symbols: tuple[str, ...] = (), *, scale: f
     regexes still run.
     """
     raw = str(value)
-    if "Traceback" in raw or _ABS_PATH.search(raw):
+    if "Traceback" in raw or _consume_paths(raw, "") != raw:
         raw = designer_error(raw)
-    raw = _ABS_PATH.sub(" ", raw)
+    raw = _consume_paths(raw, " ")
     raw = scrub_text(raw, symbols, scale=scale)
     return _allow_listed_text(raw, scale=scale)
 
@@ -604,7 +655,7 @@ def designer_error(text: str) -> str:
     The operator view keeps the traceback. A designer cell and its tooltip
     show this summary instead.
     """
-    cleaned = _ABS_PATH.sub("", text)
+    cleaned = _consume_paths(text, "")
     lines = []
     for raw in cleaned.splitlines():
         line = re.sub(r"\s+", " ", raw).strip(" \"',")
@@ -879,7 +930,7 @@ def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) 
         return False
     if any(pattern.search(text) for pattern in _EXPORT_DATE_PATTERNS):
         return False
-    if _month_near_year(text) or _ABS_PATH.search(text):
+    if _month_near_year(text) or _consume_paths(text, "") != text:
         return False
     for symbol in symbols:
         if symbol and _ticker_spans(text, symbol):

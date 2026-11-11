@@ -42,11 +42,15 @@ from ..format import MISSING, format_number, is_missing
 from ..schema import (
     ACTIVITY_KEYS,
     BENCHMARK_TITLES,
+    COPY_FILES,
     DESK_KEYS,
-    FIGURE_FILES,
+    EQUITY_CURVE_FILE,
+    FIGURE_FILE,
+    FILLS_FILE,
     KPI_KEYS,
     LEADERBOARD_LABELS,
     SPECS,
+    TRADES_FILE,
     leaderboard_kind,
 )
 from ..widgets import Banner, DictTable, MetricCard, PageHeader, PathField, PeriodHeat, Section, clear_layout
@@ -333,7 +337,7 @@ class ResultsPage(QWidget):
             has_chart = any(bool(getattr(child.get("report"), "curves", None)) for child in report.children)
         else:
             has_chart = bool(report.curves)
-        hidden = set(FIGURE_FILES) if has_chart else set()
+        hidden = {FIGURE_FILE} if has_chart else set()
         return [item for item in report.missing if item not in hidden]
 
     def metric_text(self, key: str) -> str:
@@ -868,20 +872,24 @@ class ResultsPage(QWidget):
         symbols = peek_symbols(opened) if designer and opened is not None else ()
         scale = peek_scale(opened) if designer and opened is not None else None
         if book is not None:
-            folder = book.directory
-            for name in ("metrics.json", "equity_curve.csv", "equity.csv", "fills.csv", "trades.csv", "equity.png"):
-                source = folder / name
-                if not source.is_file():
-                    continue
-                if designer:
-                    try:
-                        text = export_text(source)
-                    except OSError:
+            redacted = bool(designer and report is not None and report.redacted)
+            if redacted:
+                self._export_shown(target, book, symbols, scale, written)
+            else:
+                folder = book.directory
+                for name in COPY_FILES:
+                    source = folder / name
+                    if not source.is_file():
                         continue
-                    if not export_allowed(text, symbols=symbols, scale=scale):
-                        continue
-                shutil.copy2(source, target / name)
-                written.append(name)
+                    if designer:
+                        try:
+                            text = export_text(source)
+                        except OSError:
+                            continue
+                        if not export_allowed(text, symbols=symbols, scale=scale):
+                            continue
+                    shutil.copy2(source, target / name)
+                    written.append(name)
             if designer:
                 sheet = target / "metrics.json"
                 sheet.write_text(json.dumps(book.metrics, indent=2, default=str) + "\n", encoding="utf-8")
@@ -914,6 +922,48 @@ class ResultsPage(QWidget):
                     written.append(board.name)
         self.host.set_status("Exported " + ", ".join(written) if written else "Nothing to export")
         return written
+
+    def _export_shown(self, target: Path, book, symbols, scale, written: list[str]) -> None:
+        """Write the scrubbed columns on screen. Do not copy the operator CSVs.
+
+        ``equity.csv`` is the raw curve's byte copy, so it is not written here.
+        A published ``designer/`` tree is copied by name instead of taking this path.
+        """
+        if book.curves:
+            curve = book.curves[0]
+            columns = ["session", "equity"]
+            rows = []
+            for index, equity in enumerate(curve.equity):
+                session = curve.sessions[index] if index < len(curve.sessions) else index
+                row = [session, equity]
+                if curve.exposure is not None:
+                    row.append(curve.exposure[index] if index < len(curve.exposure) else "")
+                rows.append(row)
+            if curve.exposure is not None:
+                columns.append("exposure")
+            path = target / EQUITY_CURVE_FILE
+            _write_csv(path, columns, rows)
+            if self._keep_export(path, symbols=symbols, scale=scale):
+                written.append(path.name)
+        if book.fills is not None and book.fills.columns:
+            path = target / FILLS_FILE
+            _write_csv(path, book.fills.columns, book.fills.rows)
+            if self._keep_export(path, symbols=symbols, scale=scale):
+                written.append(path.name)
+        if book.episodes is not None and book.episodes.columns:
+            path = target / TRADES_FILE
+            _write_csv(path, book.episodes.columns, book.episodes.rows)
+            if self._keep_export(path, symbols=symbols, scale=scale):
+                written.append(path.name)
+        figure = book.directory / FIGURE_FILE
+        if figure.is_file():
+            try:
+                text = export_text(figure)
+            except OSError:
+                text = None
+            if text is not None and export_allowed(text, symbols=symbols, scale=scale):
+                shutil.copy2(figure, target / FIGURE_FILE)
+                written.append(FIGURE_FILE)
 
     def _keep_export(self, path: Path, *, symbols, scale, designer: bool = True) -> bool:
         """Run the allow-list on a file this export just wrote. A failure is deleted."""
@@ -973,6 +1023,17 @@ def _benchmark_row(label: str, metrics: dict) -> dict:
     ):
         row[key] = metrics.get(key) if isinstance(metrics, dict) and key in metrics else None
     return row
+
+
+def _write_csv(path: Path, columns, rows) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(list(columns))
+        for row in rows:
+            if isinstance(row, dict):
+                writer.writerow(["" if row.get(column) is None else row.get(column) for column in columns])
+            else:
+                writer.writerow(list(row))
 
 
 def _csv(value) -> str:

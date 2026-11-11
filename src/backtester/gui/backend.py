@@ -31,21 +31,21 @@ from .schema import (
     CONTRACT,
     DESK_KEYS,
     EQUITY_COLUMNS,
-    EQUITY_FILES,
+    EQUITY_CURVE_FILE,
     EPISODE_COLUMNS,
     EXPOSURE_COLUMNS,
-    FIGURE_FILES,
+    FIGURE_FILE,
     FILL_COLUMNS,
-    FILLS_FILES,
+    FILLS_FILE,
     HEADLINE_KEYS,
     LEADERBOARD_FILE,
-    LIQUIDATION_FILES,
+    LIQUIDATION_FILE,
     METRICS_FILE,
     PANEL_KEYS,
     RUN_CONFIG_FILE,
     SESSION_COLUMNS,
     SPECS,
-    TRADES_FILES,
+    TRADES_FILE,
     WALKFORWARD_FILE,
     WITHHELD_KEYS,
 )
@@ -110,12 +110,10 @@ def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _first_file(directory: Path, names: tuple[str, ...]) -> Path | None:
-    for name in names:
-        candidate = directory / name
-        if candidate.is_file():
-            return candidate
-    return None
+def _report_file(directory: Path, name: str) -> Path | None:
+    """The one canonical file, or nothing. A different spelling is not a substitute."""
+    candidate = directory / name
+    return candidate if candidate.is_file() else None
 
 
 def _pick(columns, candidates: tuple[str, ...]) -> str | None:
@@ -352,36 +350,36 @@ def _load_book(directory: Path, withheld: list[str], *, designer: bool = False) 
     if isinstance(basis, dict):
         report.cost_basis = basis
     initial = metrics.get("initial_equity")
-    equity_path = _first_file(directory, EQUITY_FILES)
+    equity_path = _report_file(directory, EQUITY_CURVE_FILE)
     if equity_path is None:
-        report.missing.append(" or ".join(EQUITY_FILES))
+        report.missing.append(EQUITY_CURVE_FILE)
     else:
         curve = _curve(equity_path, "Strategy", initial, designer=designer)
         if curve is None:
             report.warnings.append(f"{equity_path.name} has no equity column")
         else:
             report.curves.append(curve)
-    fills_path = _first_file(directory, FILLS_FILES)
+    fills_path = _report_file(directory, FILLS_FILE)
     if fills_path is None:
-        report.missing.append(FILLS_FILES[0])
+        report.missing.append(FILLS_FILE)
     else:
         table = _load_table(fills_path)
         if FILL_COLUMNS & set(table.columns) or not (EPISODE_COLUMNS & set(table.columns)):
             report.fills = table
         else:
             report.episodes = table
-            report.missing.append(FILLS_FILES[0])
-    trades_path = _first_file(directory, TRADES_FILES)
+            report.missing.append(FILLS_FILE)
+    trades_path = _report_file(directory, TRADES_FILE)
     if trades_path is not None and (report.fills is None or trades_path != fills_path):
         table = _load_table(trades_path)
         if report.episodes is None:
             report.episodes = table
-    figure = _first_file(directory, FIGURE_FILES)
+    figure = _report_file(directory, FIGURE_FILE)
     report.figure = figure
     if figure is None:
-        report.missing.append(FIGURE_FILES[0])
+        report.missing.append(FIGURE_FILE)
     liquidation = metrics.get("liquidation") if isinstance(metrics.get("liquidation"), dict) else None
-    extra = _first_file(directory, LIQUIDATION_FILES)
+    extra = _report_file(directory, LIQUIDATION_FILE)
     if extra is not None:
         document = _withhold(_read_json(extra), withheld)
         if isinstance(document, dict):
@@ -400,7 +398,7 @@ def _load_book(directory: Path, withheld: list[str], *, designer: bool = False) 
         if isinstance(full, dict):
             report.benchmarks[folder.name] = full
             _compare_summaries(folder.name, nested.get(folder.name), full, report.warnings)
-            path = _first_file(folder, EQUITY_FILES)
+            path = _report_file(folder, EQUITY_CURVE_FILE)
             if path is not None:
                 curve = _curve(
                     path,

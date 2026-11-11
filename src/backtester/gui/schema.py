@@ -30,19 +30,31 @@ ANNUALIZATION = (
     "The window displays the number stored in the report. It does not recompute it."
 )
 
-# A finished book. Everything else is optional and may arrive with Phase 3.
-# These are the canonical names. Phase 3 rejects a symbol that collides with
-# one of them. The window does not keep an alias list for a renamed file.
+# A finished book. Everything else is optional.
+# These are the names ``backtester.report`` writes. Each file has one role.
+# ``equity.csv`` is the byte copy of ``equity_curve.csv``. It is not a second
+# curve, and a renamed file is not read in its place.
 METRICS_FILE = "metrics.json"
 WALKFORWARD_FILE = "walkforward.json"
-EQUITY_FILES = ("equity_curve.csv", "equity.csv")
-FILLS_FILES = ("fills.csv",)
-TRADES_FILES = ("trades.csv",)
-FIGURE_FILES = ("equity.png", "equity_curve.png")
-LIQUIDATION_FILES = ("liquidation.json", "liquidation_postmortem.json")
+EQUITY_CURVE_FILE = "equity_curve.csv"
+EQUITY_MIRROR_FILE = "equity.csv"
+FILLS_FILE = "fills.csv"
+TRADES_FILE = "trades.csv"
+FIGURE_FILE = "equity.png"
+LIQUIDATION_FILE = "liquidation.json"
 LEADERBOARD_FILE = "leaderboard.csv"
 RUN_CONFIG_FILE = "run_config.json"
 BATCH_STATUS_FILE = "batch_status.json"
+# Operator export, and a published ``designer/`` tree, copy these names only.
+COPY_FILES = (
+    METRICS_FILE,
+    EQUITY_CURVE_FILE,
+    EQUITY_MIRROR_FILE,
+    FILLS_FILE,
+    TRADES_FILE,
+    FIGURE_FILE,
+    LIQUIDATION_FILE,
+)
 
 EQUITY_COLUMNS = ("equity",)
 EXPOSURE_COLUMNS = ("exposure", "position")

@@ -12,10 +12,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYTEST_QT_API", "pyside6")
 os.environ.setdefault("MPLBACKEND", "Agg")
 
-# CPython 3.11 still reference-counts True. On Linux, PySide drops some of
-# those references when a window is torn down. The GUI suite opens enough
-# windows that True can reach zero during a later paint, and bool_dealloc
-# aborts the process before pytest_sessionfinish can exit cleanly. 3.12 made
+# CPython 3.11 still reference-counts True. PySide6 6.12.0 drops some of those
+# references when a window is torn down, and the GUI suite can then abort in
+# bool_dealloc. pyproject.toml keeps 3.11 on PySide6 below 6.12. These spare
+# references remain so a process forced onto 6.12.0 still finishes. 3.12 made
 # True immortal, so the spare references are only needed here.
 if sys.version_info < (3, 12):
     _true_anchor = (True,) * 20000

@@ -25,8 +25,11 @@ Phase 1 does not build that jail.
   a fresh interpreter. A flag set on a class during the design run is not set
   in the locked run.
 - **Environment.** The child receives an allowlist (`PATH`, the Windows
-  system-directory variables, `TEMP`/`TMP`/`TMPDIR`, `PYTHON*`, `VIRTUAL_ENV`,
-  the dynamic-linker path variables, `LANG`/`LC_*`, and `TZ`). Every other
+  system-directory variables, `TEMP`/`TMP`/`TMPDIR`, `PYTHONHOME`,
+  `PYTHONNOUSERSITE`, `PYTHONHASHSEED`, `PYTHONUTF8`, `PYTHONIOENCODING`,
+  `PYTHONUNBUFFERED`, `PYTHONSAFEPATH`, `PYTHONLEGACYWINDOWSSTDIO`,
+  `PYTHONMALLOC`, `VIRTUAL_ENV`, the dynamic-linker path variables,
+  `LANG`/`LC_*`, and `TZ`). `PYTHONPATH` is not on that list. Every other
   variable is dropped, including a data-root variable. `PATH` is kept because
   the interpreter and native libraries may need it. A data directory that
   someone has placed on `PATH` is not removed.
@@ -72,10 +75,75 @@ identity cue. `count` stays the source trade count.
 Heap, environment, argv, and cwd are the in-scope checks. A hardcoded absolute
 path can still open a file. That is the Phase 4 jail.
 
+Phase 4 also still owns these reads, which this phase does not stop:
+
+- `/proc/<ppid>/cmdline`
+- `/proc/<ppid>/environ`
+- `/proc/<ppid>/cwd`, and the Windows handle equivalents
+- `share_scale` on the child engine frame. The parent passes it so per-share
+  fees use real share counts. Post-fee cash determines it as well. See
+  `docs/PACK.md`.
+
 `walk_forward` deletes the frame it was given. The command line passes that
 frame as the argument and does not keep another name for it. A caller that
 keeps its own variable still has that object. The design child still does not
 receive it.
+
+## Parallel runner
+
+`backtester parallel` scores each strategy in a new spawned process. The process
+is the same one a pack run uses: argv `['backtester-design']`, an empty working
+directory, and the environment allowlist. The parent keeps the sidecar, the
+date map, and the unscaled dividend amounts. `share_scale` is passed the same
+way `run_pack` passes it. Desk dividends are remapped in the parent before the
+child starts.
+
+Spawn copies the parent environment at `Process.start`. A launch lock holds
+the argv, cwd, and environment scrub so two jobs cannot snapshot a cleared
+environment. The lock is not a sandbox. The worker scrubs argv and the
+environment again after it starts, so a spawn that copied the operator
+process does not keep them. It also points
+`multiprocessing.process.ORIGINAL_DIR` at the empty temp directory and drops
+the operator directory from `sys.path`. Install paths stay. `PYTHONPATH` is
+not copied into the child. If the parent had that variable, any entry that is
+not the installed `backtester` package is also removed from the child's
+`sys.path`. A directory that only holds another job's `metrics.json` is one
+of those entries.
+
+The worker calls `setsid` on Linux before it waits for the parent, so it is
+its own process-group leader and the group id is the worker pid. The parent
+records that id when the child reports it has entered. A normal return, a
+strategy exception, a timeout, a cancel, a resident-set kill, and the final
+cleanup all signal that saved group: SIGTERM, then SIGKILL. The signal does
+not ask `getpgid` again, so it still works after the leader has been reaped.
+A grandchild that ignores SIGTERM dies on the SIGKILL. A grandchild that
+calls `setsid` itself leaves the group; that is the Phase 4 jail. On Windows
+every worker is placed in a job object before the parent releases it. The job
+sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Every exit path, including a
+normal return, calls `TerminateJobObject` and then closes the handle. If the
+job cannot be assigned, the book fails. It does not fall back to signaling
+only the worker pid. A memory cap, when one was requested, is an additional
+commit-charge ceiling. The resident-set poll is separate from a `MemoryError`
+the strategy raises.
+
+The worker redirects file descriptors 1 and 2 to a file in its temp directory,
+capped at 256 KiB. Further output is discarded without blocking the writer.
+A short scrubbed tail of that output can be attached to the operator error
+row. It is not written into `designer/`.
+
+The child returns equity, fills, and the statistics it computed. The parent
+recomputes those statistics from the returned result and runs the benchmarks
+itself. The published metrics are the parent's. If the child's copy does not
+match, the row fails. A strategy can still patch a cost constant while its
+own `on_bar` runs, because that loop is in the child; the parent's check
+catches a rewritten metric function and a rewritten benchmark. Moving the
+engine loop into the parent is the Phase 4 one-bar referee.
+
+A crash, a hang, or a resident-set overrun is one failed row. The other jobs
+keep running. The Linux non-dumpable flag is not set on this path. `run_pack`
+does not set it either. Phase 4 owns the OS jail and the one-bar referee.
+The Windows job object on this path is the process tree and, when requested,
+the commit-charge ceiling. It is not the restricted-token sandbox.
 
 ## What Phase 1 does not isolate
 

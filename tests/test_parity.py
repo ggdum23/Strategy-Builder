@@ -73,6 +73,29 @@ def load_reference():
     return ref_backtest
 
 
+def _canon(value) -> str:
+    """Sorted-key serialization. Floats use repr of the Python float."""
+    if isinstance(value, dict):
+        body = ",".join(f"{key!r}:{_canon(value[key])}" for key in sorted(value, key=str))
+        return "{" + body + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_canon(item) for item in value) + "]"
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return _canon(value.item())
+        except Exception:
+            pass
+    if isinstance(value, float):
+        return repr(float(value))
+    if isinstance(value, int):
+        return str(int(value))
+    return repr(value)
+
+
 def _same(ref_result, port_result, ref_mod, label):
     for key in RESULT_KEYS:
         left = ref_result[key]
@@ -84,6 +107,10 @@ def _same(ref_result, port_result, ref_mod, label):
     if left_m != right_m:
         mismatched = [key for key in left_m if left_m[key] != right_m.get(key)]
         raise AssertionError(f"{label} metrics diverged on {mismatched}")
+    left_bytes = _canon(left_m).encode("utf-8")
+    right_bytes = _canon(right_m).encode("utf-8")
+    if left_bytes != right_bytes:
+        raise AssertionError(f"{label} metric bytes diverged")
 
 
 class ShortOne:

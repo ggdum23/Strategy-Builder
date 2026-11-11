@@ -9,6 +9,8 @@ py -3 -m pip install -e ".[gui]"
 py -3 -m backtester gui
 ```
 
+On Python 3.11 that extra installs PySide6 6.6 or newer, and not 6.12. PySide6 6.12.0 aborts a 3.11 process during widget teardown. Python 3.12 and 3.13 may use 6.12. The Windows installer stays on Python 3.12.
+
 The same entry is `backtester.desktop:main`, which a frozen executable can call. Qt is imported only when that function runs.
 
 ## What it is for
@@ -47,13 +49,14 @@ A finished book directory:
 | File | Required now | Role |
 | --- | --- | --- |
 | `metrics.json` | yes | Scalar metrics, nested `benchmarks`, `cost_basis`, `run` |
-| `equity_curve.csv` or `equity.csv` | expected | Session equity. Column `equity`. Exposure from `exposure` or `position`. The operator session label comes from `date`, `session`, or `day`, in that order. A designer chart uses `day` or `session`, then the row index. |
+| `equity_curve.csv` | expected | Session curve the chart reads. Column `equity`. Exposure from `exposure` or `position`. The operator session label comes from `date`, `session`, or `day`, in that order. A designer chart uses `day` or `session`, then the row index. |
+| `equity.csv` | written beside the curve | Byte copy of `equity_curve.csv`. Not a substitute when the curve file is missing. |
 | `fills.csv` | expected | Fills. Recognized by `shares_delta`, `fill_price`, `fees`, `price`, or `shares_after`. |
 | `trades.csv` | optional | Round trips when it is not the fills file. |
 | `benchmarks/buy_and_hold_1x/` | expected | Same files for the 1× book. |
 | `benchmarks/long_2x/` | Desk | Same files for the constant 2× book. |
-| `equity.png` or `equity_curve.png` | optional | Saved figure. Shown as an image. The interactive chart uses the CSV. |
-| `liquidation.json` or `liquidation_postmortem.json` | optional | Desk post-mortem. If absent, `metrics.json`'s `liquidation` object is shown. |
+| `equity.png` | optional | Saved figure. Shown as an image. The interactive chart uses `equity_curve.csv`. |
+| `liquidation.json` | optional | Desk post-mortem. If absent, `metrics.json`'s `liquidation` object is shown. |
 | `leaderboard.csv` | optional | Batch board. Fractions as percents, ratios to two decimals, currency, null as —, infinity as ∞. |
 | `run_config.json` | written by the window | Launch record. Not required to display an older run. |
 | `walkforward.json` | walk-forward | Summary. Legs are `design/` and `locked/`, each a book. The window does not blend them. |
@@ -90,7 +93,7 @@ A designer view scrubs calendar dates in several spellings, including `2024/01/0
 
 The page title follows the audience (`Operator report` or `Designer report`). While a designer report is open, the status bar and the data-root chip, including the chip tooltip, go through the same designer text filter, so an earlier `Inspected QQQ` becomes `Inspected RANDOM` and a POSIX path does not stay on screen. A failed load clears the previous book. That includes a file that cannot be decoded, a truncated `metrics.json` in a walk-forward leg, a `MemoryError`, and a report file over the read cap (16 MB JSON, 256 MB CSV, 32 MB PNG). The invoice line, the chart and its caption, the readout, and the activity, benchmark, fee, period, and detail tables all go. The banner says the report could not be read. A saved figure that does not decode says `figure could not be read`. The Run page shows an anonymization rejection when Phase 3 refuses a symbol, instead of only the last wrapper line.
 
-Load keeps the real directory. The field may show a scrubbed path. Switching audience reloads the real directory, and Load follows the field when it was edited. A designer export runs the same allow-list on `metrics.json`, `displayed_metrics.csv`, and `leaderboard_view.csv` after writing them, and withholds a file that fails. `share_factor` fails that check the same way `share_scale` does. PNG text is checked after decompression, including a compressed `iTXt` chunk. A percent that would print as eight zeros is shown in scientific form.
+Load keeps the real directory. The field may show a scrubbed path. Switching audience reloads the real directory, and Load follows the field when it was edited. A redacted designer export writes the columns on screen. It does not copy `equity_curve.csv`, `equity.csv`, or `fills.csv`, and it drops close, price, and the share-count columns. A published `designer/` tree is copied under those same file names, scaled prices included. `metrics.json`, `displayed_metrics.csv`, and `leaderboard_view.csv` still go through the allow-list, and a file that fails is withheld. `share_factor` fails that check the same way `share_scale` does. PNG text is checked after decompression, including a compressed `iTXt` chunk. A percent that would print as eight zeros is shown in scientific form. The path check and the scale check are the same functions the screen uses. `\\?\` and `\\?\UNC\` count as paths, and once a path starts the rest of that field is consumed, commas included. A token whose decimal or exponent equals the invoice scale (`build2_7.777`, `v2_7.777`, `scale__7.777`) is dropped. `long_2x` and `2.5` stay when the scale is 2.
 
 ## Screenshots
 

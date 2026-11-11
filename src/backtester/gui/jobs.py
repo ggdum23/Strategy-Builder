@@ -402,11 +402,10 @@ def _progress_fields(event) -> dict:
 
 
 def _run_batch(config: dict, status_path) -> dict:
-    """One call to ``runner.run_parallel``. This file does not score the books itself.
+    """One call to ``runner.run_parallel``, which runs ``backtester.parallel``.
 
-    Phase 3 still owns the function body. Until that lands, the runner raises
-    ``NotImplementedError`` and the window shows that message. A test can
-    replace ``backtester.runner.run_parallel``.
+    This file does not score the books. It reads the report files the runner wrote.
+    A test can replace ``backtester.runner.run_parallel``.
     """
     from ..runner import run_parallel
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -439,18 +440,18 @@ def _present_designer(window, tmp_path: Path) -> None:
     }
     folder = write_book(tmp_path / "ZZZX" / "shot-designer", metrics, equity=_shot_equity())
     window.results_page.load_path(str(folder))
-    window.results_page.path.edit.blockSignals(True)
-    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\RANDOM\book")
-    window.results_page.path.edit.blockSignals(False)
     window.results_page.tabs.setCurrentIndex(0)
     window.results_page.overview_scroll.verticalScrollBar().setValue(0)
     QApplication.processEvents()
     assert window.results_page._report.audience == "designer"
     assert _heat_has(window, "M1") and _heat_has(window, "Y2")
-    blob = _visible_blob(window.results_page).casefold()
-    for needle in ("share_scale", "7.777", "qqq", "zzzx", "january", "2024", "asset"):
+    blob = _designer_surfaces(window).casefold()
+    for needle in ("share_scale", "7.777", "qqq", "zzzx", "january", "2024", "asset", "jeu", "users"):
         assert needle not in blob, needle
-    assert "RANDOM" in window.results_page.path.text()
+    assert not re.search(r"[a-z]:[\\/]", blob)
+    assert "\\\\?\\" not in blob
+    assert str(folder).casefold() not in blob
+    assert "random" in blob
     window.show_page(4)
 
 
@@ -563,6 +564,18 @@ def _heat_has(window, needle: str) -> bool:
         if callable(text) and needle in text():
             return True
     return False
+
+
+def _designer_surfaces(window) -> str:
+    """Text a designer can see: the results page, the status bar, and the root chip."""
+    chunks = [_visible_blob(window.results_page)]
+    status = window.statusBar()
+    if status is not None:
+        chunks.append(status.currentMessage() or "")
+    chip = window.root_chip
+    chunks.append(chip.text() or "")
+    chunks.append(chip.toolTip() or "")
+    return "\n".join(chunks)
 
 
 def _visible_blob(window) -> str:

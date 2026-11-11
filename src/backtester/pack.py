@@ -12,6 +12,7 @@ engine so per-share fees use real share counts. The pack files do not contain it
 
 from __future__ import annotations
 
+import csv
 import gzip
 import hashlib
 import io
@@ -20,6 +21,8 @@ import math
 import re
 import secrets
 import shutil
+import struct
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,11 +30,11 @@ import pandas as pd
 
 from .data import load_named
 from .registry import get_series, load_registry, same_series
+from .report import TICKER_STAND_IN, require_anonymizable_symbol, ticker_token_spans
 
 SCHEMA_VERSION = 1
 CHUNK_SESSIONS = 250
 MAX_FILE_BYTES = 25 * 1024 * 1024
-ASSET_NAME = "RANDOM"
 
 PACK_COLUMNS = (
     "day",
@@ -224,34 +227,145 @@ def _read_csv_gz(path: Path) -> pd.DataFrame:
 
 
 def _token_present(symbol: str, text: str) -> bool:
-    if len(symbol) >= 2:
-        return symbol in text
-    return re.search(rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])", text) is not None
+    """The report token rule. A raw substring would treat ``SS`` as present in ``RANDOM``."""
+    return bool(ticker_token_spans(text, symbol))
 
 
-def _gzip_member(blob: bytes) -> tuple[int, bytes, bool]:
-    """mtime, file name, and whether an FCOMMENT is present.
+def _json_values_have_ticker(value, symbol: str) -> bool:
+    """String values only. Keys and pack column names are schema labels.
+
+    The manifest stores ``session_id`` in ``columns``. That label is not the
+    ticker ``ID``, which is the same exemption the report audit gives a CSV
+    header. Any other string still uses the token rule.
+    """
+    if isinstance(value, dict):
+        return any(_json_values_have_ticker(item, symbol) for item in value.values())
+    if isinstance(value, list):
+        return any(_json_values_have_ticker(item, symbol) for item in value)
+    if isinstance(value, str):
+        if value in PACK_COLUMNS:
+            return False
+        return _token_present(symbol, value)
+    return False
+
+
+def _text_has_ticker(name: str, text: str, symbol: str) -> bool:
+    """Apply the token rule the way the report audit does.
+
+    CSV headers and JSON keys are not tickers, so ``session_id`` is not the
+    symbol ``ID``. Every other string is.
+    """
+    lower = name.lower()
+    if lower.endswith(".json"):
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError:
+            return _token_present(symbol, text)
+        return _json_values_have_ticker(document, symbol)
+    if ".csv" in lower:
+        rows = list(csv.reader(io.StringIO(text)))
+        for row in rows[1:]:
+            if any(_token_present(symbol, cell) for cell in row):
+                return True
+        return False
+    return _token_present(symbol, text)
+
+
+def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, bool, bool, int]:
+    """mtime, file name, FCOMMENT, FEXTRA, FHCRC, and the deflate offset.
 
     RFC 1952 order after the 10-byte header is FEXTRA, FNAME, FCOMMENT, FHCRC.
+    ``blob`` is one member, or a member followed by further members. Only the
+    first header is read here. The offset is where the raw deflate stream
+    begins, so a later member is not swallowed with this one.
     """
     if len(blob) < 10 or blob[:2] != b"\x1f\x8b":
         raise ValueError("gzip member is not gzip")
     flags = blob[3]
     mtime = int.from_bytes(blob[4:8], "little")
+    has_extra = bool(flags & 0x04)
+    has_hcrc = bool(flags & 0x02)
     pos = 10
     if flags & 0x04:
         if pos + 2 > len(blob):
             raise ValueError("gzip extra field is truncated")
         extra = int.from_bytes(blob[pos : pos + 2], "little")
         pos += 2 + extra
+        if pos > len(blob):
+            raise ValueError("gzip extra field is truncated")
     fname = b""
     if flags & 0x08:
         end = blob.find(b"\x00", pos)
         if end < 0:
             raise ValueError("gzip file name is truncated")
         fname = blob[pos:end]
+        pos = end + 1
     has_comment = bool(flags & 0x10)
-    return mtime, fname, has_comment
+    if flags & 0x10:
+        end = blob.find(b"\x00", pos)
+        if end < 0:
+            raise ValueError("gzip comment is truncated")
+        pos = end + 1
+    if flags & 0x02:
+        pos += 2
+    if pos > len(blob):
+        raise ValueError("gzip member is truncated")
+    return mtime, fname, has_comment, has_extra, has_hcrc, pos
+
+
+def _gzip_members(blob: bytes):
+    """Every gzip member in ``blob``, not only the first.
+
+    A concatenated second member can carry a file name or a comment that the
+    first header does not. Each header is checked. The payloads are returned
+    in order so the caller can scan the text. ``GzipFile.read`` follows every
+    member in one call, so each member is inflated on its own with zlib.
+    """
+    rest = blob
+    while True:
+        rest = rest.lstrip(b"\x00")
+        if not rest:
+            return
+        mtime, fname, has_comment, has_extra, has_hcrc, start = _gzip_member(rest)
+        inflator = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
+        payload = inflator.decompress(rest[start:])
+        unused = inflator.unused_data
+        if not inflator.eof or len(unused) < 8:
+            raise ValueError("gzip member is truncated")
+        crc, length = struct.unpack("<II", unused[:8])
+        if crc != zlib.crc32(payload) or length != (len(payload) & 0xFFFFFFFF):
+            raise ValueError("gzip member failed its checksum")
+        yield (mtime, fname, has_comment, has_extra, has_hcrc), payload
+        rest = unused[8:]
+
+
+def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
+    """One clean gzip member, inflated.
+
+    A second member is rejected even when its header is clean. ``GzipFile``
+    concatenates members, and duplicate rows still pass the unique-day check,
+    so the loaded book would be longer than the pack that was built. The
+    builder writes a single member.
+    """
+    payloads = []
+    for (mtime, fname, has_comment, has_extra, has_hcrc), payload in _gzip_members(blob):
+        if mtime != 0:
+            raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
+        if fname:
+            shown = fname.decode("utf-8", "replace")
+            raise ValueError(f"{name} gzip file name is {shown!r}")
+        if has_comment:
+            raise ValueError(f"{name} gzip member has an FCOMMENT")
+        if has_extra:
+            raise ValueError(f"{name} gzip member has an FEXTRA")
+        if has_hcrc:
+            raise ValueError(f"{name} gzip member has an FHCRC")
+        payloads.append(payload)
+    if not payloads:
+        raise ValueError(f"{name} gzip member is not gzip")
+    if len(payloads) != 1:
+        raise ValueError(f"{name} gzip has {len(payloads)} members; expected 1")
+    return payloads
 
 
 def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
@@ -268,21 +382,17 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
             raise ValueError(f"{name} leaks identity in the file name")
         raw = path.read_bytes()
         if path.suffix == ".gz":
-            mtime, fname, has_comment = _gzip_member(raw)
-            if mtime != 0:
-                raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
-            if fname:
-                shown = fname.decode("utf-8", "replace")
-                raise ValueError(f"{name} gzip file name is {shown!r}")
-            if has_comment:
-                raise ValueError(f"{name} gzip member has an FCOMMENT")
-            text = gzip.decompress(raw).decode("utf-8")
+            try:
+                parts = [payload.decode("utf-8") for payload in _anonymized_gzip_payloads(name, raw)]
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{name} is not text; refusing to ship it") from exc
+            text = "".join(parts)
         else:
             try:
                 text = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError(f"{name} is not text; refusing to ship it") from exc
-        if _token_present(symbol, text):
+        if _text_has_ticker(name, text, symbol):
             raise ValueError(f"{name} contains the ticker")
         for key in _BANNED_TEXT:
             if key in text:
@@ -427,6 +537,8 @@ def build_pack(
         raise ValueError("max_bytes must be a positive integer")
     if not isinstance(operator_note, str):
         raise ValueError("operator_note must be a string")
+    if anonymize:
+        require_anonymizable_symbol(symbol)
     destination = Path(out_dir)
     sidecar = Path(sidecar_path)
     if destination == sidecar or _inside(sidecar, destination):
@@ -490,7 +602,7 @@ def build_pack(
             "schema_version": SCHEMA_VERSION,
             "anonymized": bool(anonymize),
             "bar_minutes": int(bar_minutes),
-            "asset_name": ASSET_NAME if anonymize else symbol,
+            "asset_name": TICKER_STAND_IN if anonymize else symbol,
             "pack_id": pack_id,
             "columns": list(PACK_COLUMNS),
             "chunks": [
@@ -576,8 +688,8 @@ def _validate_manifest(document: dict) -> None:
         raise ValueError(f"pack schema_version {document['schema_version']!r} is not supported")
     if not isinstance(document["anonymized"], bool):
         raise ValueError("pack anonymized flag is not true or false")
-    if document["anonymized"] and document["asset_name"] != ASSET_NAME:
-        raise ValueError("an anonymized pack must call the asset RANDOM")
+    if document["anonymized"] and document["asset_name"] != TICKER_STAND_IN:
+        raise ValueError(f"an anonymized pack must call the asset {TICKER_STAND_IN}")
     if list(document["columns"]) != list(PACK_COLUMNS):
         raise ValueError("pack columns do not match the schema")
     if not isinstance(document["chunks"], list) or not document["chunks"]:
@@ -595,13 +707,27 @@ def _validate_manifest(document: dict) -> None:
         previous = chunk["last_day"]
 
 
+def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
+    """The same gzip rules as the designer-pack audit.
+
+    One member, mtime 0, no file name, no comment, no FEXTRA, and no FHCRC.
+    A second member is rejected here as well, including one whose header is clean.
+    ``load_pack`` repeats the check so a pack that bypassed the builder still
+    fails closed.
+    """
+    _anonymized_gzip_payloads(name, blob)
+
+
 def load_pack(pack_dir) -> LoadedPack:
     """Read a pack. This does not open a sidecar."""
     root = Path(pack_dir)
     manifest_path = root / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"pack manifest is missing: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"), object_pairs_hook=_json_pairs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"pack manifest is not JSON: {exc}") from exc
     _validate_manifest(manifest)
     frames = []
     hashed = []
@@ -610,6 +736,8 @@ def load_pack(pack_dir) -> LoadedPack:
         blob = path.read_bytes()
         if len(blob) >= MAX_FILE_BYTES:
             raise ValueError(f"{chunk['file']} is not under {MAX_FILE_BYTES} bytes")
+        if manifest["anonymized"]:
+            _reject_anonymized_gzip(chunk["file"], blob)
         hashed.append((chunk["file"], blob))
         frame = _read_csv_gz(path)
         days = sorted(int(day) for day in frame["day"].unique())
@@ -618,6 +746,8 @@ def load_pack(pack_dir) -> LoadedPack:
         frames.append(frame)
     daily_path = root / manifest["daily_file"]
     daily_blob = daily_path.read_bytes()
+    if manifest["anonymized"]:
+        _reject_anonymized_gzip(manifest["daily_file"], daily_blob)
     hashed.append((manifest["daily_file"], daily_blob))
     pack_id = _pack_id(hashed)
     if pack_id != manifest["pack_id"]:

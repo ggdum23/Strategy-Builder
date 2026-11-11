@@ -193,8 +193,13 @@ def test_share_factor_is_withheld_like_share_scale(qtbot, tmp_path):
     exported = tmp_path / "copy"
     written = page.export_to(exported)
     assert "trades.csv" in written
-    assert "fills.csv" not in written
-    assert not (exported / "fills.csv").exists()
+    assert "plain row" in (exported / "trades.csv").read_text(encoding="utf-8")
+    blob = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in exported.rglob("*")
+        if path.is_file() and path.suffix != ".png"
+    )
+    assert "share_factor" not in blob.casefold()
     assert "equity.png" not in written
     assert not (exported / "equity.png").exists()
     assert "share_factor" in export_text(folder / "equity.png").casefold()
@@ -228,7 +233,7 @@ def test_windows_paths_with_spaces_do_not_leak_the_tail():
         "OSError: cannot open C:\\Users\\Jeu\\Desktop\\Strategy Builder\\QQQ\\data.csv, permission denied"
     )
     assert "OSError" in comma
-    assert "permission denied" in comma
+    assert "permission denied" not in comma
     assert "Builder" not in comma and "QQQ" not in comma
     unix = designer_error("RuntimeError: boom /tmp/strategy/QQQ/data.csv")
     assert "RuntimeError" in unix

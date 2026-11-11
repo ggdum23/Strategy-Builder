@@ -540,5 +540,5 @@ def test_strategy_process_cannot_see_the_sidecar(tmp_path, monkeypatch):
     assert "SB_PACK_SECRET" not in observer.env_keys
     assert canary not in observer.cwd
     assert canary not in observer.inherited_cwd
-    assert observer.files == []
+    assert observer.files == ["stdio.log"]
     assert canary not in (tmp_path / "out" / "equity_curve.csv").read_text(encoding="utf-8")

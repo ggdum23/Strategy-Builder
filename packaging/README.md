@@ -4,8 +4,9 @@ The Windows installer lives here. Build and install steps are in
 `docs/INSTALLER.md`.
 
 Library code stays importable without printing, without reading the working
-directory, and without loading market data. The GUI calls those modules.
-Printing stays in `backtester.__main__`.
+directory, and without loading market data. The GUI calls `run_parallel` and
+`load_report` (progress callback, cancel token, structured results). Printing
+stays in `backtester.__main__`.
 
 - Console entry for PyInstaller: `packaging/frozen_entry.py`, which calls
   `backtester.__main__:main` after `multiprocessing.freeze_support()`.

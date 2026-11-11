@@ -293,6 +293,9 @@ def test_child_surface_allowlist_and_empty_directory():
     import smoke_frozen
 
     smoke_frozen.assert_child_surface({"env_keys": ["PATH", "SystemRoot", "LC_TIME"], "cwd_entries": []})
+    smoke_frozen.assert_child_surface(
+        {"env_keys": ["PATH", "SystemRoot", "LC_TIME"], "cwd_entries": ["stdio.log"]}
+    )
     with pytest.raises(SystemExit, match="user-path"):
         smoke_frozen.assert_child_surface({"env_keys": ["PATH", "USERPROFILE"], "cwd_entries": []})
     with pytest.raises(SystemExit, match="user-path"):
@@ -301,6 +304,16 @@ def test_child_surface_allowlist_and_empty_directory():
         smoke_frozen.assert_child_surface({"env_keys": ["PATH", "COMPUTERNAME"], "cwd_entries": []})
     with pytest.raises(SystemExit, match="not empty"):
         smoke_frozen.assert_child_surface({"env_keys": ["PATH"], "cwd_entries": ["leak.txt"]})
+    with pytest.raises(SystemExit, match="not empty"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH"], "cwd_entries": ["stdio.log", "leak.txt"]})
+    with pytest.raises(SystemExit, match="not empty"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH"], "cwd_entries": ["STDIO.LOG"]})
+    with pytest.raises(SystemExit, match="not a list"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH", "SystemRoot"]})
+    with pytest.raises(SystemExit, match="not a list"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH", "SystemRoot"], "cwd_entries": "stdio.log"})
+    with pytest.raises(SystemExit, match="not a list"):
+        smoke_frozen.assert_child_surface({"env_keys": ["PATH", "SystemRoot"], "cwd_entries": None})
     with pytest.raises(SystemExit, match="env_keys"):
         smoke_frozen.assert_child_surface({"cwd_entries": []})
     with pytest.raises(SystemExit, match="env_keys"):
