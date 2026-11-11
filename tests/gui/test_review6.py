@@ -128,11 +128,13 @@ def test_redacted_export_cannot_rebuild_close(qtbot, tmp_path):
     (published / "equity.csv").write_bytes((published / "equity_curve.csv").read_bytes())
     page.load_path(str(folder))
     QApplication.processEvents()
-    assert page._report.redacted is False
+    assert page._report.redacted is True
     copied = tmp_path / "published"
     page.export_to(copied)
     published_text = (copied / "equity_curve.csv").read_text(encoding="utf-8")
-    assert "17.25" in published_text
+    assert "1000000" in published_text or "1000000.0" in published_text
+    assert "17.25" not in published_text
+    assert not _number_present(published_text, "80")
     assert not _number_present(published_text, "500")
 
 
@@ -194,7 +196,7 @@ def test_phase3_pack_loads_in_operator_and_designer_views(qtbot, tmp_path):
     assert operator.metrics.get("symbol") == "QQQ"
     assert operator.curves and operator.curves[0].source.endswith("equity_curve.csv")
     assert designer.audience == "designer"
-    assert designer.redacted is False
+    assert designer.redacted is True
     assert "designer" in Path(designer.curves[0].source).parts
     assert designer.curves[0].source.endswith("equity_curve.csv")
     designer_blob = json.dumps(designer.metrics, default=str)

@@ -2,22 +2,26 @@
 
 ``strategy-builder.report.v1`` has two audiences. ``operator`` reads the folder
 the runner wrote. ``designer`` reads ``designer/`` when that tree was published,
-and otherwise drops operator-only fields from the same files. Ticker, calendar
-dates, share scale, and raw prices are not part of a designer view.
+and otherwise reads the operator files. Every designer surface then keeps only
+the shared allow-list. There is no unredacted designer path.
 
-This module does not import the runner or ``report.py``. Phase 3 owns
-``load_report``. The window follows the same rule so a designer screen cannot
-drift ahead of that function.
+This module does not import the runner or ``report.py``. The allow-list lives
+in ``designer_allow``, which ``report.py`` imports as well.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import re
+import unicodedata
 import zlib
 from decimal import Decimal
 from pathlib import Path
+
+from ..designer_allow import redacted_key_allowed, with_cost_drag
 
 _MONTH = (
     r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
@@ -170,9 +174,8 @@ DESIGNER_DROP_KEYS = frozenset(
     }
 )
 
-# Raw print columns. A published designer tree may contain the scaled pack
-# prices the designer is meant to see. An operator folder opened as a designer
-# view drops these instead of relabeling them.
+# Raw print columns. The allow-list drops these on every designer surface,
+# including a published ``designer/`` tree.
 PRICE_COLUMNS = frozenset(
     {
         "open",
@@ -188,130 +191,27 @@ PRICE_COLUMNS = frozenset(
     }
 )
 # Share counts let equity and exposure be inverted back into a price.
-# A published designer/ tree keeps the scaled counts Phase 3 wrote.
-# A redacted view does not use this list: it keeps only REDACTED_KEYS.
 SHARE_COLUMNS = frozenset({"shares", "shares_delta", "shares_after", "position_shares"})
 
-# A redacted designer surface (screen and export) keeps these names and drops
-# every other key. A new field is hidden until it is added here. Safe by
-# construction: returns, ratios, exposure, drawdowns, counts, bar indices,
-# and a single fee total. No share counts, prices, notionals, or per-component
-# fees. ``open`` is a fill price, so it is not listed; ``open_position_at_end`` is.
-REDACTED_KEYS = frozenset(
+# Unicode minus and dash characters that NFKC leaves unchanged, mapped to ASCII
+# before a numeric literal is read. Fullwidth digits fold under NFKC itself.
+_DASH_TO_HYPHEN = str.maketrans(
     {
-        "total_return",
-        "cagr",
-        "ann_vol",
-        "max_drawdown",
-        "worst_day",
-        "best_day",
-        "hit_rate",
-        "percent_up_days",
-        "excess_total_return",
-        "bh_total_return",
-        "long_2x_total_return",
-        "frac_bars_long",
-        "frac_bars_short",
-        "frac_sessions_long_at_close",
-        "frac_sessions_short_at_close",
-        "extended_hours_fill_notional_frac",
-        "borrow_rate_annual",
-        "financing_rate_annual",
-        "cash_rate_annual",
-        "withholding_rate",
-        "sharpe",
-        "sortino",
-        "calmar",
-        "turnover_per_year",
-        "avg_abs_exposure_close",
-        "avg_net_exposure_close",
-        "avg_abs_exposure_bars",
-        "worst_equity_over_hwm",
-        "max_gross_leverage",
-        "avg_gross_leverage",
-        "fee_mult",
-        "years",
-        "sessions_per_year",
-        "equity",
-        "exposure",
-        "position",
-        "initial_equity",
-        "final_equity",
-        "sessions",
-        "n_fills",
-        "round_trips",
-        "long_round_trips",
-        "short_round_trips",
-        "max_dd_duration_sessions",
-        "margin_calls_queued",
-        "margin_calls_filled",
-        "avg_holding_sessions",
-        "avg_holding_bars",
-        "rank",
-        "bar_minutes",
-        "timeout_s",
-        "disqualified",
-        "busted",
-        "open_position_at_end",
-        "anonymized",
-        "cancelled",
-        "dividends_applied",
-        "first_session",
-        "last_session",
-        "first_day",
-        "last_day",
-        "session",
-        "ordinal",
-        "day",
-        "minute",
-        "bars",
-        "start_ordinal",
-        "end_ordinal",
-        "start_day",
-        "end_day",
-        "fees_total",
-        "total",
-        "fees_breakdown",
-        "period_returns",
-        "monthly",
-        "yearly",
-        "liquidation",
-        "benchmarks",
-        "buy_and_hold_1x",
-        "long_2x",
-        "profile",
-        "audience",
-        "accounting",
-        "price_basis",
-        "total_return_method",
-        "series_kind",
-        "accrual",
-        "status",
-        "error",
-        "state",
-        "name",
-        "strategy_id",
-        "source_id",
-        "kind",
-        "phase",
-        "time",
-        "side",
-        "leg",
-        "message",
+        "\u2212": "-",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\ufe63": "-",
+        "\uff0d": "-",
     }
 )
-# Period stand-ins written by the engines and by the month/year relabel.
-_PERIOD_KEY = re.compile(r"[SBMY]\d+")
 
 
-def redacted_key_allowed(name: str) -> bool:
-    """True when a redacted designer surface may keep this field name.
-
-    Screen and export both go through ``_hide_column(..., allow_list=True)``,
-    which calls this. A key that is not listed is dropped.
-    """
-    key = str(name)
-    return key in REDACTED_KEYS or _PERIOD_KEY.fullmatch(key) is not None
+def normalize_surface(text: str) -> str:
+    """NFKC, then unicode minus and dash characters become ASCII ``-``."""
+    return unicodedata.normalize("NFKC", str(text)).translate(_DASH_TO_HYPHEN)
 
 
 def _hide_column(name: str, *, drop_prices: bool, allow_list: bool = False) -> bool:
@@ -606,37 +506,41 @@ def _scrub_table(
 
 
 def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: float | None = None) -> None:
-    """Mutate ``report`` so a designer screen cannot render operator secrets."""
+    """Mutate ``report`` so a designer screen cannot render operator secrets.
+
+    ``redacted`` is retained for callers. Every designer surface uses the
+    allow-list, whether or not a published ``designer/`` tree is what was read.
+    """
     report.audience = "designer"
     report.metrics = _scrub_obj(
-        report.metrics, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        with_cost_drag(report.metrics), symbols, drop_prices=True, scale=scale, allow_list=True
     )
     report.other_fields = _scrub_obj(
-        report.other_fields, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        report.other_fields, symbols, drop_prices=True, scale=scale, allow_list=True
     )
     report.benchmarks = _scrub_obj(
-        report.benchmarks, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        with_cost_drag(report.benchmarks), symbols, drop_prices=True, scale=scale, allow_list=True
     )
     report.cost_basis = None
     if report.liquidation is not None:
         report.liquidation = _scrub_obj(
-            report.liquidation, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+            report.liquidation, symbols, drop_prices=redacted, scale=scale, allow_list=True
         )
     if report.config is not None:
         report.config = _scrub_obj(
-            report.config, symbols, drop_prices=True, scale=scale, allow_list=redacted
+            report.config, symbols, drop_prices=True, scale=scale, allow_list=True
         )
     if report.walkforward is not None:
         report.walkforward = _scrub_obj(
-            report.walkforward, symbols, drop_prices=True, scale=scale, allow_list=redacted
+            report.walkforward, symbols, drop_prices=True, scale=scale, allow_list=True
         )
     if report.fees_breakdown is not None:
         report.fees_breakdown = _scrub_obj(
-            report.fees_breakdown, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+            report.fees_breakdown, symbols, drop_prices=redacted, scale=scale, allow_list=True
         )
     if report.period_returns is not None:
         report.period_returns = _scrub_obj(
-            report.period_returns, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+            report.period_returns, symbols, drop_prices=redacted, scale=scale, allow_list=True
         )
     report.warnings = [designer_surface_text(str(item), symbols, scale=scale) for item in report.warnings]
     report.missing = [designer_surface_text(str(item), symbols, scale=scale) for item in report.missing]
@@ -648,14 +552,14 @@ def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: f
             curve.name = designer_surface_text(str(curve.name), symbols, scale=scale)
         curve.drawdown_note = designer_surface_text(str(curve.drawdown_note), symbols, scale=scale)
     report.fills = _scrub_table(
-        report.fills, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        report.fills, symbols, drop_prices=redacted, scale=scale, allow_list=True
     )
     report.episodes = _scrub_table(
-        report.episodes, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        report.episodes, symbols, drop_prices=redacted, scale=scale, allow_list=True
     )
     if report.leaderboard is not None:
         report.leaderboard = _scrub_table(
-            report.leaderboard, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+            report.leaderboard, symbols, drop_prices=redacted, scale=scale, allow_list=True
         )
     cleaned_children = []
     for child in report.children:
@@ -666,13 +570,13 @@ def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: f
         if nested is not None and hasattr(nested, "metrics"):
             apply_designer(nested, symbols, redacted=redacted, scale=scale)
             outer = {key: value for key, value in child.items() if key not in {"report", "path"}}
-            outer = _scrub_obj(outer, symbols, drop_prices=True, scale=scale, allow_list=redacted)
+            outer = _scrub_obj(outer, symbols, drop_prices=True, scale=scale, allow_list=True)
             outer.pop("path", None)
             _strip_child_error(outer, symbols, scale)
             outer["report"] = nested
             cleaned_children.append(outer)
             continue
-        cleaned_children.append(_designer_child(child, symbols, scale=scale, allow_list=redacted))
+        cleaned_children.append(_designer_child(child, symbols, scale=scale, allow_list=True))
     report.children = cleaned_children
 
 
@@ -862,9 +766,10 @@ def designer_surface_text(value: str, symbols: tuple[str, ...] = (), *, scale: f
 
     Paths are consumed through spaces. A ticker is ``RANDOM``. The remainder is
     limited to numbers, session ids, and words, and the date, ticker, and scale
-    regexes still run.
+    regexes still run. Text is NFKC-normalized first, and unicode minus and
+    dash characters are ASCII ``-`` before a literal is read.
     """
-    raw = str(value)
+    raw = normalize_surface(value)
     if "Traceback" in raw or _consume_paths(raw, "") != raw:
         raw = designer_error(raw)
     raw = _consume_paths(raw, " ")
@@ -878,7 +783,7 @@ def designer_error(text: str) -> str:
     The operator view keeps the traceback. A designer cell and its tooltip
     show this summary instead.
     """
-    cleaned = _consume_paths(text, "")
+    cleaned = _consume_paths(normalize_surface(text), "")
     lines = []
     for raw in cleaned.splitlines():
         line = re.sub(r"\s+", " ", raw).strip(" \"',")
@@ -1058,8 +963,9 @@ def default_audience(folder: Path) -> str:
 def resolve_view(folder: Path, audience: str) -> tuple[str, Path, bool]:
     """Return ``(audience, directory to read, redacted)``.
 
-    ``redacted`` is true when the designer view has no published ``designer/``
-    tree and the operator files themselves must be filtered.
+    A designer audience is always redacted. ``designer/`` is the directory
+    when that tree was published. The operator folder is read otherwise.
+    Both go through the same allow-list.
     """
     chosen = (audience or "auto").strip().lower()
     if chosen == "auto":
@@ -1069,7 +975,7 @@ def resolve_view(folder: Path, audience: str) -> tuple[str, Path, bool]:
     if chosen == "designer":
         published = folder / "designer"
         if designer_tree(published):
-            return "designer", published, False
+            return "designer", published, True
         return "designer", folder, True
     return "operator", folder, False
 
@@ -1153,9 +1059,27 @@ def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) 
     The date and path regexes are the second layer. A month word next to a
     year, a path, or the scale as its own number fails even when the spelling
     is one the date list has not named yet.
+
+    JSON and CSV are structured. A numeric value of an allow-listed key is
+    not scale-scanned. Free text, identifiers, filenames, labels, and string
+    values still are. Text is NFKC-normalized, and unicode minus and dash
+    characters are ASCII ``-``, before that scan.
     """
+    text = normalize_surface(text)
+    structured = _structured_document(text)
+    if structured is None:
+        return _free_text_allowed(text, symbols, scale)
+    if not _preamble_allowed(text, symbols):
+        return False
+    kind, payload = structured
+    if kind == "json":
+        return _json_allowed(payload, symbols, scale)
+    return _csv_allowed(payload, symbols, scale)
+
+
+def _preamble_allowed(text: str, symbols: tuple[str, ...]) -> bool:
+    """Secrets, dates, paths, and tickers. Scale is a separate pass."""
     folded = text.casefold()
-    # Same case-insensitive token check for every invoice word, including share_factor.
     if any(token in folded for token in _SECRET_TOKENS):
         return False
     if any(pattern.search(text) for pattern in _EXPORT_DATE_PATTERNS):
@@ -1165,8 +1089,114 @@ def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) 
     for symbol in symbols:
         if symbol and _ticker_spans(text, symbol):
             return False
+    return True
+
+
+def _free_text_allowed(text: str, symbols: tuple[str, ...], scale: float | None) -> bool:
+    if not _preamble_allowed(text, symbols):
+        return False
     if _contains_scale(text, scale):
         return False
-    # Same token decision as the screen filter, so the two cannot drift.
     _pieces, allowed = _surface_pieces(text, scale=scale)
     return allowed
+
+
+def _structured_document(text: str):
+    """``("json", value)`` or ``("csv", rows)`` when the file is a table."""
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(value, (dict, list)):
+            return ("json", value)
+        return None
+    first, _sep, _rest = text.partition("\n")
+    if "\n" in text and "," in first:
+        try:
+            rows = list(csv.reader(io.StringIO(text)))
+        except csv.Error:
+            return None
+        if rows and rows[0]:
+            return ("csv", rows)
+    return None
+
+
+def _numeric_cell(cell: str) -> bool:
+    token = cell.strip()
+    if not token:
+        return False
+    try:
+        number = float(token)
+    except ValueError:
+        return False
+    return math.isfinite(number)
+
+
+def _formatted_number(cell: str) -> bool:
+    """A rendered allow-listed number: dollars, percent, or basis points."""
+    token = cell.strip().replace(",", "").replace("$", "").replace("%", "")
+    if token.endswith(" bp"):
+        token = token[: -len(" bp")]
+    token = token.strip()
+    if token in {"", "—", "-", "∞", "-∞"}:
+        return True
+    return _numeric_cell(token)
+
+
+def _json_allowed(value, symbols: tuple[str, ...], scale: float | None, *, key: str | None = None) -> bool:
+    if isinstance(value, dict):
+        for child_key, item in value.items():
+            name = str(child_key)
+            if not _free_text_allowed(name, symbols, scale):
+                return False
+            if not _json_allowed(item, symbols, scale, key=name):
+                return False
+        return True
+    if isinstance(value, list):
+        return all(_json_allowed(item, symbols, scale, key=key) for item in value)
+    if isinstance(value, str):
+        return _free_text_allowed(value, symbols, scale)
+    if isinstance(value, bool) or value is None:
+        return True
+    if isinstance(value, (int, float)):
+        if key is not None and redacted_key_allowed(key):
+            return True
+        return not _contains_scale(str(value), scale)
+    return _free_text_allowed(str(value), symbols, scale)
+
+
+def _csv_allowed(rows: list[list[str]], symbols: tuple[str, ...], scale: float | None) -> bool:
+    header = [cell.strip() for cell in rows[0]]
+    if header == ["key", "raw", "display"]:
+        for name in header:
+            if not _free_text_allowed(name, symbols, scale):
+                return False
+        for row in rows[1:]:
+            if not row:
+                continue
+            metric = row[0]
+            if not _free_text_allowed(metric, symbols, scale):
+                return False
+            listed = redacted_key_allowed(metric)
+            for cell in row[1:]:
+                if listed and (_numeric_cell(cell) or _formatted_number(cell)):
+                    if not _preamble_allowed(cell, symbols):
+                        return False
+                    continue
+                if not _free_text_allowed(cell, symbols, scale):
+                    return False
+        return True
+    for name in header:
+        if not _free_text_allowed(name, symbols, scale):
+            return False
+    listed = [redacted_key_allowed(name) for name in header]
+    for row in rows[1:]:
+        for index, cell in enumerate(row):
+            safe = index < len(listed) and listed[index] and _numeric_cell(cell)
+            if safe:
+                continue
+            if not _free_text_allowed(cell, symbols, scale):
+                return False
+    return True

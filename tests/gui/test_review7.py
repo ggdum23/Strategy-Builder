@@ -84,6 +84,7 @@ def _plant(folder: Path) -> dict:
     path = folder / "metrics.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["surprise_price"] = 123.45
+    payload["S99"] = 123.45
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     return payload
 
@@ -260,6 +261,10 @@ def _assert_redacted(qtbot, tmp_path: Path, folder: Path, targets: list[float], 
     assert leaked == [], leaked
     assert "surprise_price" not in report.metrics
     assert "final_shares" not in report.metrics
+    assert "S99" not in _surface_keys(report)
+    assert "fees_total" not in report.metrics
+    if "fees_total" in raw and (raw.get("initial_equity") or raw.get("final_equity")):
+        assert "cost_drag_bps" in report.metrics
     fees = report.fees_breakdown or {}
     for key in ("exchange", "sec", "commission", "counted_shares", "tier_shares", "taf", "cat"):
         assert key not in fees
@@ -274,8 +279,22 @@ def _assert_redacted(qtbot, tmp_path: Path, folder: Path, targets: list[float], 
     leaked = sorted(key for key in exported_keys if not redacted_key_allowed(key))
     assert leaked == [], leaked
     numbers = _surface_numbers(report)
+    # The rounded cost drag is a coarse bps figure. Pairing it with a public
+    # annual rate can land on an unrelated price, which is not the fee inversion.
+    drag = report.metrics.get("cost_drag_bps") if isinstance(report.metrics, dict) else None
+    ratio_numbers = numbers
+    if isinstance(drag, (int, float)) and not isinstance(drag, bool):
+        ratio_numbers = [number for number in numbers if not math.isclose(number, float(drag))]
     for target in targets:
-        hits = _reconstructions(numbers, target)
+        hits = _reconstructions(ratio_numbers, target)
+        if (
+            isinstance(drag, (int, float))
+            and not isinstance(drag, bool)
+            and math.isfinite(target)
+            and abs(target) >= 5
+            and math.isclose(float(drag), target, rel_tol=1e-6, abs_tol=1e-4)
+        ):
+            hits.append(f"cost_drag_bps {drag} == {target}")
         assert hits == [], (target, hits[:8])
     for key in ("cash_interest", "financing_cost", "dividends_net", "dividend_per_share"):
         assert key not in report.metrics
@@ -515,3 +534,131 @@ def test_accounting_dollars_are_dropped_and_operator_shows_them(qtbot, tmp_path)
     assert "Dividends" not in hidden
     for amount in (interest, financing, dividends, per_share, idle, borrowed, close, shares):
         assert format_number("money", amount) not in hidden
+
+
+def _price_frame(price: float):
+    import pandas as pd
+
+    rows = []
+    for day in (0, 1):
+        for minute in (570, 571):
+            rows.append(
+                {
+                    "date": f"2026-03-0{2 + day}",
+                    "day": day,
+                    "weekday": 0,
+                    "minute": minute,
+                    "time": f"{minute // 60:02d}:{minute % 60:02d}",
+                    "session": "rth",
+                    "open": price,
+                    "high": price + 1.0,
+                    "low": price - 1.0,
+                    "close": price,
+                    "volume": 1000.0,
+                    "wap": price,
+                    "count": 1,
+                    "filled": 0,
+                    "short_session": 0,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+class _Hold:
+    def on_bar(self, _row, _account):
+        return 1.0
+
+
+def _designer_keys(root: Path) -> set[str]:
+    found: set[str] = set()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix == ".json":
+            _walk_keys(json.loads(path.read_text(encoding="utf-8")), found)
+        elif path.suffix == ".csv":
+            rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
+            if rows:
+                found.update(cell for cell in rows[0] if cell)
+    return found
+
+
+def test_published_designer_books_use_the_allow_list(qtbot, tmp_path):
+    """Anonymized Desk and Arena books go through run_books and publish_designer.
+
+    Desk at price 777.7 and share factor 7.777 recovers that factor from
+    ``exchange / (0.003 * final_shares)`` on the operator book. The designer
+    tree has neither input. A planted ``S99`` does not survive the screen or
+    the export. A normal designer metrics file still exports at the scales
+    whose digits collide with ordinary rates.
+    """
+    from backtester.gui.audience import export_allowed
+    from backtester.runner import run_books, write_books
+
+    frame = _price_frame(777.7)
+    for profile in ("desk", "arena"):
+        out = tmp_path / profile
+        books = run_books(
+            _Hold,
+            frame,
+            profile,
+            share_factor=7.777,
+            cash_rate_annual=0.05,
+        )
+        write_books(out, profile, "QQQ", 1, frame, books, anonymized=True)
+        operator_bytes = {
+            path.relative_to(out): path.read_bytes()
+            for path in out.rglob("*")
+            if path.is_file() and "designer" not in path.parts
+        }
+        designer_root = out / "designer"
+        leaked = sorted(key for key in _designer_keys(designer_root) if not redacted_key_allowed(key))
+        assert leaked == [], (profile, leaked)
+        designer_metrics = json.loads((designer_root / "metrics.json").read_text(encoding="utf-8"))
+        blob = json.dumps(designer_metrics)
+        for banned in ("final_shares", "fees_total", "fees_breakdown", "exchange", "fill_price", "traded_notional"):
+            assert banned not in designer_metrics
+            assert f'"{banned}"' not in blob
+        assert "cost_drag_bps" in designer_metrics
+        if profile == "desk":
+            assert math.isclose(designer_metrics["borrow_rate_annual"], 0.0025)
+            assert math.isclose(designer_metrics["cash_rate_annual"], 0.05)
+            assert math.isclose(designer_metrics["financing_rate_annual"], 0.07)
+        assert "equity" in (designer_root / "equity_curve.csv").read_text(encoding="utf-8").splitlines()[0]
+        operator_curve = (out / "equity_curve.csv").read_text(encoding="utf-8").splitlines()
+        designer_curve = (designer_root / "equity_curve.csv").read_text(encoding="utf-8").splitlines()
+        operator_header = operator_curve[0].split(",")
+        designer_header = designer_curve[0].split(",")
+        operator_equity = [row.split(",")[operator_header.index("equity")] for row in operator_curve[1:] if row]
+        designer_equity = [row.split(",")[designer_header.index("equity")] for row in designer_curve[1:] if row]
+        assert designer_equity == operator_equity
+        fills = (out / "fills.csv").read_text(encoding="utf-8").splitlines()[0]
+        assert "fill_price" in fills.split(",")
+        designer_fills = (designer_root / "fills.csv").read_text(encoding="utf-8").splitlines()[0]
+        assert "fill_price" not in designer_fills.split(",")
+        text = (designer_root / "metrics.json").read_text(encoding="utf-8")
+        for scale in (0.25, 0.5, 0.7, 2, 7.777):
+            assert export_allowed(text, symbols=("QQQ",), scale=scale), (profile, scale)
+        assert not export_allowed(
+            json.dumps({"message": "build2_1e\u22127"}, ensure_ascii=False), symbols=(), scale=1e-7
+        )
+        assert not export_allowed(
+            json.dumps({"message": "\uff17\uff0e\uff17\uff17\uff17"}, ensure_ascii=False), symbols=(), scale=7.777
+        )
+
+        planted = json.loads((designer_root / "metrics.json").read_text(encoding="utf-8"))
+        planted["S99"] = 777.7
+        (designer_root / "metrics.json").write_text(json.dumps(planted) + "\n", encoding="utf-8")
+        _assert_redacted(qtbot, tmp_path, out, [777.7], keep_operator="final_shares" if profile == "desk" else "total_return")
+        assert operator_bytes == {
+            path.relative_to(out): path.read_bytes()
+            for path in out.rglob("*")
+            if path.is_file() and "designer" not in path.parts
+        }
+
+    desk = json.loads((tmp_path / "desk" / "metrics.json").read_text(encoding="utf-8"))
+    exchange = desk["fees_breakdown"]["exchange"]
+    final_shares = desk["final_shares"]
+    assert final_shares
+    assert math.isclose(exchange / (_EXCHANGE_PER_SHARE * final_shares), 7.777, rel_tol=1e-6)
+    assert "QQQ" not in (tmp_path / "desk" / "designer" / "metrics.json").read_text(encoding="utf-8")

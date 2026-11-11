@@ -23,6 +23,7 @@ from pathlib import Path
 import pandas as pd
 
 from .accounting import EXACT_RESERVED, LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
+from .designer_allow import project_designer, redacted_key_allowed
 
 _ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
 _BANNED_DESIGNER_KEYS = frozenset(
@@ -141,7 +142,9 @@ OPERATOR_LEADERBOARD_COLUMNS = (
     "error",
 )
 DESIGNER_LEADERBOARD_COLUMNS = tuple(
-    column for column in OPERATOR_LEADERBOARD_COLUMNS if column != "symbol"
+    column
+    for column in OPERATOR_LEADERBOARD_COLUMNS
+    if column != "symbol" and redacted_key_allowed(column)
 )
 
 # What ``load_report`` returns. The desktop window reads this shape.
@@ -952,7 +955,11 @@ def assert_designer_clean(directory, *, symbol: str) -> None:
 
 
 def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str) -> Path:
-    """Write the designer-facing copy under ``out_dir/designer``."""
+    """Write the designer-facing copy under ``out_dir/designer``.
+
+    Metrics, fills, trades, liquidation, and benchmarks keep the shared
+    allow-list. The operator files next to this tree are not rewritten.
+    """
     root = Path(out_dir) / "designer"
     if root.exists():
         shutil.rmtree(root)
@@ -963,12 +970,44 @@ def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symb
             dest,
             profile,
             _scrub_result(result, symbol),
-            redact_metrics(metrics, symbol=symbol),
+            project_designer(redact_metrics(metrics, symbol=symbol)),
             safe_frame,
         )
-    write_json(root / "metrics.json", redact_metrics(wrapper, symbol=symbol))
+        _restrict_designer_book(dest)
+    write_json(root / "metrics.json", project_designer(redact_metrics(wrapper, symbol=symbol)))
     assert_designer_clean(root, symbol=symbol)
     return root
+
+
+def _restrict_designer_book(dest: Path) -> None:
+    """Drop columns the allow-list does not name. Equity values stay exact."""
+    for name in ("equity_curve.csv", "fills.csv", "trades.csv"):
+        _filter_designer_csv(dest / name)
+    curve = dest / "equity_curve.csv"
+    mirror = dest / "equity.csv"
+    if curve.is_file() and mirror.is_file():
+        mirror.write_bytes(curve.read_bytes())
+    liquidation = dest / "liquidation.json"
+    if liquidation.is_file():
+        payload = json.loads(liquidation.read_text(encoding="utf-8"))
+        write_json(liquidation, project_designer(payload))
+
+
+def _filter_designer_csv(path: Path) -> None:
+    if not path.is_file():
+        return
+    with path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle))
+    if not rows:
+        return
+    keep = [index for index, name in enumerate(rows[0]) if redacted_key_allowed(name)]
+    filtered = [[row[index] if index < len(row) else "" for index in keep] for row in rows]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        if filtered and filtered[0]:
+            writer.writerows(filtered)
+        else:
+            handle.write("\n")
 
 
 def _csv_cell(value) -> str:

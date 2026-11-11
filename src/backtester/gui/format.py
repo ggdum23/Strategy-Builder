@@ -75,6 +75,8 @@ def format_number(kind: str, value: Any) -> str:
         return _grouped(number, 3)
     if kind == "ratio2":
         return _grouped(number, 2)
+    if kind == "bps":
+        return _grouped(number, 1) + " bp"
     if kind == "number":
         if float(number).is_integer() and abs(number) < 1e15:
             return f"{int(number):,}"

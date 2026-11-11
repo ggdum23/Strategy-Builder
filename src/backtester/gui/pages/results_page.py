@@ -584,6 +584,10 @@ class ResultsPage(QWidget):
             "financing_cost",
             "n_fills",
         )
+        if book.audience == "designer":
+            columns = tuple(
+                column for column in columns if column not in {"fees_total", "financing_cost"}
+            ) + ("cost_drag_bps",)
         rows = [_benchmark_row("strategy", book.metrics)]
         for label, metrics in book.benchmarks.items():
             title = BENCHMARK_TITLES.get(str(label), str(label))
@@ -598,6 +602,24 @@ class ResultsPage(QWidget):
         self._show_section(self.benchmark_title, self.benchmarks, bool(book.benchmarks) or bool(book.metrics))
 
     def _fill_fees(self, book: RunReport) -> None:
+        if book.audience == "designer":
+            drag = None
+            if isinstance(book.metrics, dict):
+                drag = book.metrics.get("cost_drag_bps")
+            rows = []
+            if drag is not None and not isinstance(drag, (dict, list)):
+                rows = [{"component": "Cost drag", "of_equity": drag}]
+            self.fees.set_records(
+                ("component", "of_equity"),
+                rows,
+                {"component": "Component", "of_equity": "Of equity"},
+                {"of_equity": "bps"},
+            )
+            self._fit_table(self.fees, len(rows) or 1)
+            self.fees_footer.setText("")
+            self.fees_footer.setVisible(False)
+            self._show_section(self.fees_title, self.fees, bool(rows))
+            return
         payload = book.fees_breakdown if isinstance(book.fees_breakdown, dict) else {}
         stored = None
         for key in ("total", "fees_total", "sum"):
@@ -923,8 +945,7 @@ class ResultsPage(QWidget):
         symbols = peek_symbols(opened) if designer and opened is not None else ()
         scale = peek_scale(opened) if designer and opened is not None else None
         if book is not None:
-            redacted = bool(designer and report is not None and report.redacted)
-            if redacted:
+            if designer:
                 self._export_shown(target, book, symbols, scale, written)
             else:
                 folder = book.directory
@@ -1070,6 +1091,7 @@ def _benchmark_row(label: str, metrics: dict) -> dict:
         "final_equity",
         "fees_total",
         "financing_cost",
+        "cost_drag_bps",
         "n_fills",
     ):
         row[key] = metrics.get(key) if isinstance(metrics, dict) and key in metrics else None

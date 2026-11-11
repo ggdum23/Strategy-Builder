@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from backtester.gui.audience import designer_surface_text, export_allowed, redacted_key_allowed
+from backtester.gui.audience import designer_surface_text, export_allowed, normalize_surface, redacted_key_allowed
 
 # (scale, token, dropped)
 _SCALE_CASES = (
@@ -25,15 +25,19 @@ _SCALE_CASES = (
     (2, "build2_7.777", False),
     (2, "2", True),
     (2, "2.0", True),
+    (1e-7, "build2_1e\u22127", True),
+    (7.777, "\uff17\uff0e\uff17\uff17\uff17", True),
 )
 
 
 @pytest.mark.parametrize(("scale", "token", "dropped"), _SCALE_CASES)
 def test_scale_literals_match_value_significand_reciprocal_and_powers(scale, token, dropped):
     shown = designer_surface_text(f"see {token} now", (), scale=scale)
+    folded = normalize_surface(token)
     if dropped:
         assert token not in shown
-        assert token not in shown.replace(" ", "")
+        assert folded not in shown
+        assert folded not in shown.replace(" ", "")
         assert not export_allowed(token, symbols=(), scale=scale)
         assert not export_allowed(f"see {token} now", symbols=(), scale=scale)
     else:
@@ -82,11 +86,14 @@ def test_a_bare_secret_word_and_a_harmless_backslash_stay():
 
 def test_new_metric_keys_are_hidden_unless_listed():
     assert redacted_key_allowed("total_return")
-    assert redacted_key_allowed("fees_total")
-    assert redacted_key_allowed("total")
+    assert redacted_key_allowed("cost_drag_bps")
+    assert not redacted_key_allowed("fees_total")
+    assert not redacted_key_allowed("total")
     assert redacted_key_allowed("B01")
     assert redacted_key_allowed("S01")
     assert redacted_key_allowed("M1")
+    assert redacted_key_allowed("Y2")
+    assert not redacted_key_allowed("S99")
     assert not redacted_key_allowed("final_shares")
     assert not redacted_key_allowed("shares_before")
     assert not redacted_key_allowed("exchange")
@@ -113,3 +120,33 @@ def test_new_metric_keys_are_hidden_unless_listed():
     # Dollars and a per-share dividend amount can be inverted.
     for key in ("cash_interest", "financing_cost", "dividends_net", "dividend_per_share", "amount"):
         assert not redacted_key_allowed(key), key
+
+
+def test_allow_listed_numbers_are_not_scale_scanned():
+    """Ordinary Desk figures share significand digits with common invoice scales.
+
+    The number under an allow-listed key stays. The same digits in free text
+    are still a leak.
+    """
+    import json
+
+    payload = {
+        "audience": "designer",
+        "borrow_rate_annual": 0.0025,
+        "cash_rate_annual": 0.05,
+        "financing_rate_annual": 0.07,
+        "total_return": 0.2,
+        "n_fills": 2,
+        "accrual": "session_boundary_1_252",
+        "initial_equity": 1_000_000,
+        "cost_drag_bps": 1.2,
+    }
+    text = json.dumps(payload)
+    for scale in (0.25, 0.5, 0.7, 2):
+        assert export_allowed(text, symbols=(), scale=scale), scale
+    assert not export_allowed("borrow 0.0025", symbols=(), scale=0.25)
+    assert not export_allowed("cash 0.05", symbols=(), scale=0.5)
+    assert not export_allowed("financing 0.07", symbols=(), scale=0.7)
+    assert not export_allowed("return 0.2", symbols=(), scale=2)
+    leaked = dict(payload, message="build2_7777e-3")
+    assert not export_allowed(json.dumps(leaked), symbols=(), scale=7.777)

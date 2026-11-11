@@ -45,7 +45,8 @@ LIQUIDATION_FILE = "liquidation.json"
 LEADERBOARD_FILE = "leaderboard.csv"
 RUN_CONFIG_FILE = "run_config.json"
 BATCH_STATUS_FILE = "batch_status.json"
-# Operator export, and a published ``designer/`` tree, copy these names only.
+# Operator export copies these names. A designer export writes the on-screen
+# columns instead, including when the folder is a published ``designer/`` tree.
 COPY_FILES = (
     METRICS_FILE,
     EQUITY_CURVE_FILE,
@@ -143,6 +144,14 @@ METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("initial_equity", "Initial equity", "money", "activity", "Starting capital recorded by the engine. Unit: dollars."),
     MetricSpec("n_fills", "Fills", "count", "activity", "Number of fills the engine recorded."),
     MetricSpec("fees_total", "Fees", "money", "activity", "Commission and exchange fees recorded by the engine. Slippage is separate. Unit: dollars."),
+    MetricSpec(
+        "cost_drag_bps",
+        "Cost drag",
+        "bps",
+        "activity",
+        "Fees divided by initial equity, in basis points, rounded half-up to 0.1 bp. "
+        "Designer surfaces show this figure. The dollar fee total is an operator field.",
+    ),
     MetricSpec("slippage_cost", "Slippage", "money", "activity", "Slippage dollars recorded by the engine. Unit: dollars."),
     MetricSpec("borrow_cost", "Borrow", "money", "activity", "Short-borrow dollars recorded by the engine. Unit: dollars."),
     MetricSpec("costs_total", "Costs", "money", "activity", "Fees, slippage, borrow, and (Desk) financing, as stored. Unit: dollars."),
@@ -321,6 +330,7 @@ _LEADERBOARD_KIND = {
     "final_equity": "money",
     "initial_equity": "money",
     "fees_total": "money",
+    "cost_drag_bps": "bps",
     "slippage_cost": "money",
     "borrow_cost": "money",
     "costs_total": "money",

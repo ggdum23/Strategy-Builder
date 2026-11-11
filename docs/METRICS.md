@@ -205,9 +205,14 @@ The equity chart is session index against equity. The title is `equity`.
 It has no ticker and no date axis. PNG bytes are not part of the determinism
 contract. An encoder may stamp the file.
 
-Post-fee cash still determines `share_scale`. That residual is unchanged and
-is described in `docs/PACK.md`. Redaction removes the factor fields. It does
-not promise that the numeric factor is absent from a scaled price.
+The designer tree is an allow-list. Share counts, prices, notionals,
+per-component fees, the dollar `fees_total`, and accounting dollars are not
+in it. Fees are a cost drag in basis points of equity, rounded half-up to
+0.1 bp. Exact equity stays. A public per-share fee schedule plus that equity
+still lets a determined designer infer the share count. That residual is
+accepted and is described in `docs/PACK.md`. Redaction removes the factor
+fields. It does not promise that the numeric factor is absent from the
+equity path.
 
 ## Accounting switches
 
