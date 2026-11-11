@@ -225,6 +225,8 @@ These are the readings that were not fixed by a single sentence in the spec.
     squared negative returns, risk-free rate 0. Same definitions as the Arena
     `metrics` function, applied to Desk's last-RTH-close marks. Non-finite
     numbers (a Calmar ratio with no drawdown) are written as JSON null.
+    Every field, the 1x and 2x benchmarks, and the leaderboard key are defined
+    in docs/METRICS.md.
 
 35. **Account when equity is not positive.** `exposure` and `gross_leverage` are
     null in the dict handed to the strategy. `position_shares` is the position.

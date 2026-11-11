@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import json
 import os
 import pickle
 import random
@@ -498,12 +499,54 @@ def test_design_child_has_no_source_path_and_parent_drops_the_locked_close(tmp_p
     assert token not in observer.cwd
     assert token not in observer.inherited_cwd
     assert os.path.normcase(observer.cwd) != os.path.normcase(str(source))
-    assert observer.cwd_listing == []
+    assert observer.cwd_listing == ["stdio.log"]
     assert token not in observer.env_text
     assert "MARKET_DATA_ROOT" not in observer.env_text
     assert needle in set(slices.locked["close"].tolist())
     assert needle not in set(slices.design["close"].tolist())
     assert summary["inspection_notes"] == []
+
+
+def test_walk_forward_keeps_a_reserved_ticker_on_the_operator_book(tmp_path):
+    frame = make_frame(6, price_of=lambda _day: 100.0)
+    out = tmp_path / "walk"
+    summary, _slices, _design, _locked = walk_forward(
+        ArenaProbe,
+        frame,
+        "arena",
+        out,
+        symbol="CSV",
+        bar_minutes=1,
+        design_end_day=3,
+        warmup_days=1,
+        with_benchmarks=False,
+    )
+    assert summary["symbol"] == "CSV"
+    metrics = json.loads((out / "design" / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["symbol"] == "CSV"
+    assert (out / "design" / "equity_curve.csv").is_file()
+    assert (out / "locked" / "equity.png").is_file()
+    assert not (out / "designer").exists()
+    assert not (out / "design" / "designer").exists()
+
+
+def test_walk_forward_rejects_a_share_factor_other_than_one(tmp_path):
+    class Flat:
+        def on_bar(self, _bar, _state):
+            return None
+
+    with pytest.raises(ValueError, match="share_factor"):
+        walk_forward(
+            Flat,
+            make_frame(4),
+            "arena",
+            tmp_path,
+            symbol="TEST",
+            bar_minutes=1,
+            design_end_day=1,
+            share_factor=0.9,
+            with_benchmarks=False,
+        )
 
 
 def test_systemexit_in_the_child_fails_fast(tmp_path):

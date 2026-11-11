@@ -6,7 +6,7 @@
 
 Prices (open, high, low, close, wap) are multiplied by `price_factor` k. Volume is multiplied by `volume_factor`. Both factors are drawn from a log-uniform range away from 1 and away from 0.9 when the operator does not pass them. k of 1 is refused: an anonymized pack has to actually rescale.
 
-Calendar dates become session ordinals starting at 1. The session id is `S00001`, `S00002`, ... The file names are `bars_part_NNN.csv.gz`, `daily_rth.csv.gz`, and `manifest.json`. The manifest calls the asset `ASSET`.
+Calendar dates become session ordinals starting at 1. The session id is `S00001`, `S00002`, ... The file names are `bars_part_NNN.csv.gz`, `daily_rth.csv.gz`, and `manifest.json`. The manifest calls the asset `RANDOM`. A ticker that matches a reserved report token is refused before any pack file is written. The README lists those tokens. The command exits 2.
 
 The pack files do not contain the ticker, a real year in a file name, an ISO date, the date map, or a scale factor. The sidecar is the file that stores them: symbol, both factors, `share_scale` (equal to k), the ordinal-to-date map, borrow, the source path, and an operator note. The runner also gives the child engine `share_scale` so the invoice can use real share counts. That handoff is a residual leak, listed below. It is not a second copy of the sidecar.
 
@@ -25,6 +25,8 @@ Prices times k means `share_scale` = k. Pack share counts are about 1/k of the r
 Per-share fees (commission, the monthly tier count, exchange, clearing, CAT, TAF) use real share counts: `abs(pack shares) * k`. Value-based fees (SEC, and the commission and clearing caps) use pack shares times pack price, which is the real trade value. `fee_mult` is still the Desk stress switch and does not scale borrow, financing, or the tier count.
 
 `metrics.json` records the cost basis that was used: share scale, profile, schedule, and that per-share fees were real share counts. The report does not include the date map or the volume factor.
+
+An anonymized run also writes `designer/`. That directory is the copy to hand a strategy designer. It has no ticker, no calendar date, and no scale-factor field. The operator `metrics.json` next to it still has `cost_basis.share_scale`. A parallel batch does the same split: operator files under `jobs/`, and one designer bundle under `designer/` with the leaderboard and each anonymized job. Hand over that `designer/` directory only.
 
 If the series borrow was recorded as the profile default, the run uses the borrow rate of the profile you select. One pack can be run on Arena and on Desk. An explicit borrow overrides both.
 

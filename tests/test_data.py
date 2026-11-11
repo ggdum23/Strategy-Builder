@@ -382,6 +382,16 @@ def test_hours_are_inferred_and_not_a_us_template(tmp_path):
     assert "04:00" not in segment.as_dict()["start_clock"]
 
 
+def test_epoch_utc_must_match_the_timestamp(tmp_path):
+    day = datetime(2026, 4, 2)
+    row = minute_row(day, 570, "rth", 10.0)
+    row["epoch_utc"] = int(row["epoch_utc"]) + 60
+    path = tmp_path / "NIK_1min_filled_2026-04.csv.gz"
+    write_month(path, [row])
+    with pytest.raises(ValueError, match="epoch_utc does not match"):
+        load_named(path, "NIK")
+
+
 def test_ambiguous_series_fail_loudly(tmp_path):
     day = datetime(2026, 4, 1)
     foreign = [minute_row(day, 480, "rth", 10.0)]

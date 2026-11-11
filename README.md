@@ -71,11 +71,14 @@ month, October 2026, for QQQ and SPY, under `assets/sample/`.
   --out .\out\spy
 ```
 
-`run` writes `metrics.json`, `equity_curve.csv`, `fills.csv`, and `trades.csv`.
-Benchmarks are in `benchmarks/`. Arena's benchmark is 100% long through the Arena
-engine and costs. Desk also writes `benchmarks/long_2x/`, a constant 2x long
-financed at 7% through the Desk engine. Judge a Desk book on total return against
-the 1x book. A higher Sharpe by itself is not the ranking.
+`run` writes `metrics.json`, `equity_curve.csv` (also copied to `equity.csv`),
+`fills.csv`, `trades.csv`, and `equity.png`. Benchmarks are in `benchmarks/`.
+Arena's only benchmark is 1x buy-and-hold through the Arena engine and the Arena
+costs. Desk writes that 1x book and `benchmarks/long_2x/`, a constant 2x long
+financed at 7% through the Desk engine and the Desk costs. Judge a Desk book on
+total return against the 1x book. The leaderboard sorts by that excess total
+return, then by strategy id. A higher Sharpe by itself is not the ranking.
+Definitions are in `docs/METRICS.md`.
 
 Inspect a tree before trusting it, and record the series when you want to run it
 again. Adding a ticker is a registry entry plus an ingest. It is not a code change.
@@ -119,11 +122,35 @@ CLI above. Reports are yours.
 
 **Blind designers.** `pack --anonymize` writes a chunked pack and an operator
 sidecar. The pack has no ticker, no real year in a file name, and no scale
-factor. The sidecar stays on the operator machine. `run --pack` loads that
-sidecar itself and passes `share_scale` into the engine. Do not put operator
-paths in a strategy. `parallel` and `referee` still raise, on purpose. The
-twenty designer strategies under `examples/strategies/` are the Arena examples.
+factor. The sidecar stays on the operator machine. `run --pack` and `parallel`
+load that sidecar in the parent and pass `share_scale` into the engine. The
+operator `metrics.json` still records that cost basis and the original ticker.
+`designer/` is the copy to hand a strategy designer: no ticker, no calendar
+date, and no scale field. The designer-facing stand-in for a ticker is
+`RANDOM`. Strategy and source directory names use that spelling, with a
+`-2`, `-3`, ... suffix when two ids would be the same folder. Do not put
+operator paths in a strategy. `referee` still raises, on purpose.
+The twenty designer strategies under `examples/strategies/` are the Arena examples.
 Desk examples are under `examples/desk/`.
+
+Fixed report names stay canonical: `metrics.json`, `equity_curve.csv`,
+`equity.csv`, `equity.png`, `fills.csv`, `trades.csv`, `liquidation.json`,
+`error.json`, `leaderboard.csv`, `benchmarks/buy_and_hold_1x`,
+`benchmarks/long_2x`, `manifest.json`, `bars_part_NNN.csv.gz`, and
+`daily_rth.csv.gz`. An anonymized symbol is rejected when it matches one of
+the reserved tokens below (casefolded, as its own token, so `MA` is not
+`manifest` and `2` is not `2x`). `pack`, `run --pack`, and `parallel` on an
+anonymized pack print the reason. The command exits 2. They do not write the pack or
+the report, and they do not print a traceback. Run that symbol as an operator
+(raw) book, or rename it in the data. A raw run, including `walkforward`,
+keeps the original ticker and is not checked against this list.
+
+Reserved tokens: `001`, `1x`, `2x`, `and`, `arena`, `bars`, `benchmarks`,
+`builder`, `buy`, `csv`, `curve`, `daily`, `designer`, `desk`, `equity`,
+`error`, `failed`, `fills`, `gz`, `hold`, `json`, `leaderboard`,
+`liquidation`, `long`, `manifest`, `margin`, `metrics`, `not`, `part`, `png`,
+`post`, `pre`, `published`, `random`, `rth`, `software`, `stopped`,
+`strategy`, `tbl`, `the`, `title`, `trades`, `withheld`.
 
 ## Commands
 
@@ -135,8 +162,22 @@ python -m backtester ingest --ticker SYM --src DIR --registry FILE.json --profil
 python -m backtester registry list --registry FILE.json
 python -m backtester registry show --registry FILE.json --ticker SYM
 python -m backtester pack --ticker SYM --src DIR --registry FILE.json --out DIR --sidecar FILE (--anonymize | --named)
+python -m backtester parallel --strategies DIR --workers N --profile arena|desk --ticker SYM --src DIR --out DIR
+python -m backtester parallel --strategies DIR --workers N --profile desk --pack DIR --sidecar FILE --out DIR
+python -m backtester report --run RUN_ID
 python -m backtester test
 ```
+
+`parallel` runs one process per job. The worker count does not change a result.
+A strategy that crashes, hangs, or exceeds `--memory-mb` is one failed row, and
+the rest of the batch still finishes. A process that strategy starts is stopped
+with it, including when the strategy returns or raises. `--timeout` starts after that process is up. One `--dividends` file
+applies to the whole batch. Arena rejects it. On an anonymized Desk pack the
+parent remaps each date and scales the amount before the child starts. The
+parent recomputes the statistics and runs the benchmarks; a child that rewrites
+those figures fails that row. `report --run` reads a run id from this
+directory's `.backtester-runs.json`, or a directory that contains `run.json`.
+`--share-factor` is refused on a pack run. The sidecar holds the scale.
 
 `--borrow-rate` overrides that profile's borrow. `--financing-rate` and
 `--fee-mult` are Desk switches. Arena rejects a financing rate, a fee multiplier
@@ -154,9 +195,11 @@ fees used real share counts). `metrics.json` carries the same record.
 
 ## What this checkout does not do yet
 
-No desktop window, no one-bar referee, no process pool, and no equity PNG.
-The Windows `setup.exe` is built by the installer workflow. See `docs/INSTALLER.md`.
-No Arena financing switch. The engines, the registry, and the pack builder are
-importable so those can sit on top without another rewrite. Interpretations that
-the Desk spec left open are in `docs/DESK_SPEC_DECISIONS.md`. The Arena port is
-in `docs/ARENA_PORT_NOTES.md`. Walk-forward isolation is `docs/ISOLATION.md`.
+No desktop window and no one-bar referee. The parallel runner, the report
+files, and the equity PNG are in place for a later GUI. The Windows
+`setup.exe` is built by the installer workflow. See `docs/INSTALLER.md`.
+No Arena financing switch. The engines, the registry, and the pack builder
+stay importable. Interpretations that the Desk spec left open are in
+`docs/DESK_SPEC_DECISIONS.md`. The Arena port is in `docs/ARENA_PORT_NOTES.md`.
+Walk-forward and parallel isolation are `docs/ISOLATION.md`. Metric
+definitions are `docs/METRICS.md`.
