@@ -201,10 +201,13 @@ leaderboard and each anonymized job under one `designer/` directory. Hand
 over that directory. Named runs are the operator's own data and are not
 rewritten into that tree.
 
-The equity chart is session index against equity. The title is `equity`.
-It has no ticker and no date axis. PNG bytes are not part of the determinism
-contract. An encoder may stamp the file. The designer check reads the PNG
-text chunks only, not the pixel bytes.
+The equity chart is session index against equity. The title drawn on the
+axes is `equity`. It has no ticker and no date axis. PNG bytes are not part
+of the determinism contract. The designer file is rewritten to the chunks a
+renderer needs, with no text chunk and nothing after `IEND`. The check still
+reads any text chunk that remains (`iTXt` as UTF-8, then NFKC) and it does
+not read pixel bytes. A `pack_` source id whose tail is hex is rewritten to
+an opaque id on this tree. The operator copy keeps the original id.
 
 A string on an allow-listed key has to match that key: a phase, a session
 label, a clock time, an accounting enum, or a safe id (`strategy_id`,

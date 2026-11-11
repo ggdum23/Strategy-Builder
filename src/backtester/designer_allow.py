@@ -13,8 +13,10 @@ residual.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
+import zlib
 from decimal import Decimal, ROUND_HALF_UP
 
 # Returns, ratios, exposure, drawdowns, counts, bar and session indices, and
@@ -267,6 +269,86 @@ def project_designer(value):
     return _keep(with_cost_drag(value))
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# Chunks a renderer needs. Text and unknown ancillary chunks are not in this set.
+_PNG_KEEP = frozenset(
+    {b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"gAMA", b"sRGB", b"pHYs"}
+)
+_PACK_HEX = re.compile(r"pack_([0-9a-fA-F]{8,64})\Z")
+# 0-9 then a-f. The result has no digits, so it cannot be read as a number.
+_NIBBLE_LETTER = "abcdefghijklmnop"
+
+
+def designer_source_id(source_id: str) -> str:
+    """Opaque id for a ``pack_`` plus hex source id. Anything else is unchanged.
+
+    The designer tree stores this form. The operator tree keeps the original
+    id. Hex such as ``185e2`` is scientific notation to a scale check; the
+    mapped id is letters only.
+    """
+    match = _PACK_HEX.fullmatch(str(source_id))
+    if match is None:
+        return str(source_id)
+    hex_id = match.group(1).lower()
+    if len(hex_id) > 59:
+        hex_id = hashlib.sha256(hex_id.encode("ascii")).hexdigest()[:16]
+    letters = "".join(_NIBBLE_LETTER[int(char, 16)] for char in hex_id)
+    return "pack-" + letters
+
+
+def canonical_png(data: bytes) -> bytes:
+    """A PNG with only the chunks a renderer needs, and nothing after IEND.
+
+    ``tEXt``, ``zTXt``, ``iTXt``, ``eXIf``, and any other ancillary chunk are
+    dropped. An unknown critical chunk, a bad checksum, or a file that is not
+    a PNG raises ``ValueError``. Kept chunks are copied unchanged, so the
+    decoded pixels stay the same.
+    """
+    if isinstance(data, bytearray):
+        data = bytes(data)
+    if not isinstance(data, bytes) or not data.startswith(_PNG_SIGNATURE):
+        raise ValueError("not a png")
+    pos = len(_PNG_SIGNATURE)
+    kept: list[bytes] = []
+    saw_ihdr = False
+    saw_idat = False
+    saw_iend = False
+    while pos + 12 <= len(data):
+        length = int.from_bytes(data[pos : pos + 4], "big")
+        kind = data[pos + 4 : pos + 8]
+        end = pos + 8 + length
+        if end + 4 > len(data):
+            break
+        chunk = data[pos + 8 : end]
+        crc = int.from_bytes(data[end : end + 4], "big")
+        if (zlib.crc32(kind + chunk) & 0xFFFFFFFF) != crc:
+            raise ValueError("bad png crc")
+        if kind == b"IEND":
+            if length != 0 or not saw_ihdr or not saw_idat:
+                raise ValueError("malformed png")
+            kept.append(data[pos : end + 4])
+            saw_iend = True
+            break
+        if kind == b"IHDR":
+            if saw_ihdr or length != 13:
+                raise ValueError("malformed png")
+            saw_ihdr = True
+        elif not saw_ihdr:
+            raise ValueError("malformed png")
+        if kind == b"IDAT":
+            saw_idat = True
+        if kind not in _PNG_KEEP:
+            if kind[:1].isupper():
+                raise ValueError("unknown critical png chunk")
+            pos = end + 4
+            continue
+        kept.append(data[pos : end + 4])
+        pos = end + 4
+    if not saw_iend:
+        raise ValueError("malformed png")
+    return _PNG_SIGNATURE + b"".join(kept)
+
+
 def designer_csv_cell(key: str, cell: str) -> str:
     """The cell ``publish_designer`` may write, or empty when it is free text.
 
@@ -300,6 +382,8 @@ def accept_string(key: str, text: str):
     if key in _ENUM_VALUES:
         return text if text in _ENUM_VALUES[key] else None
     if key in _ID_KEYS:
+        if key == "source_id":
+            text = designer_source_id(text)
         return text if _SAFE_ID.fullmatch(text) else None
     if key in _TIME_KEYS:
         return text if CLOCK_TEXT.fullmatch(text) else None

@@ -49,13 +49,15 @@ def test_scale_literals_match_value_significand_reciprocal_and_powers(scale, tok
         assert not export_allowed(f"see {token} now", symbols=(), scale=scale)
     else:
         assert token in shown
-        assert export_allowed(token, symbols=(), scale=scale)
-        assert export_allowed(f"see {token} now", symbols=(), scale=scale)
+        # A decimal of at least 1 is a free-text price even when it is not the scale.
+        priced = token in {"2.5", "build2_7.777"}
+        assert export_allowed(token, symbols=(), scale=scale) is not priced
+        assert export_allowed(f"see {token} now", symbols=(), scale=scale) is not priced
 
 
 def test_long_2x_and_2_5_stay_together_at_scale_2():
     assert designer_surface_text("long_2x and 2.5", (), scale=2) == "long_2x and 2.5"
-    assert export_allowed("long_2x and 2.5", symbols=(), scale=2)
+    assert not export_allowed("long_2x and 2.5", symbols=(), scale=2)
     assert not export_allowed("held 2 shares", symbols=(), scale=2)
     assert not export_allowed("scale 2", symbols=(), scale=2)
 

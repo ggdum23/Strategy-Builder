@@ -269,13 +269,15 @@ def test_designer_export_skips_a_poisoned_png_and_scrubs_dates(qtbot, tmp_path):
     window.results_page.tabs.setCurrentIndex(4)
     QApplication.processEvents()
     note = window.results_page.figure_note.text().casefold()
-    assert "withheld" in note
+    assert "withheld" not in note
+    assert note.startswith("saved figure")
     pixmap = window.results_page.figure_label.pixmap()
-    assert pixmap is None or pixmap.isNull()
+    assert pixmap is not None and not pixmap.isNull()
     exported = tmp_path / "export"
     written = window.results_page.export_to(exported)
-    assert "equity.png" not in written
-    assert not (exported / "equity.png").exists()
+    assert "equity.png" in written
+    assert b"share_scale" not in (exported / "equity.png").read_bytes()
+    assert b"7.777" not in (exported / "equity.png").read_bytes()
     exported_blob = []
     for path in exported.rglob("*"):
         if path.is_file():

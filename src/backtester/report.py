@@ -24,7 +24,7 @@ from pathlib import Path
 import pandas as pd
 
 from .accounting import EXACT_RESERVED, LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
-from .designer_allow import designer_csv_cell, project_designer, redacted_key_allowed
+from .designer_allow import canonical_png, designer_csv_cell, project_designer, redacted_key_allowed
 
 _ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
 _BANNED_DESIGNER_KEYS = frozenset(
@@ -280,7 +280,7 @@ def enrich_arena_metrics(result: dict, metrics: dict) -> dict:
     return out
 
 
-def write_book(directory: Path, profile: str, result: dict, metrics: dict, frame) -> None:
+def write_book(directory: Path, profile: str, result: dict, metrics: dict, frame, *, designer: bool = False) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     if profile == "arena":
         write_arena_curves(directory, result, frame)
@@ -289,7 +289,7 @@ def write_book(directory: Path, profile: str, result: dict, metrics: dict, frame
     else:
         raise ValueError(f"unknown profile {profile}")
     write_json(directory / "metrics.json", metrics)
-    _plot_equity(directory / "equity.png", profile, result)
+    _plot_equity(directory / "equity.png", profile, result, designer=designer)
     if profile == "desk" and result.get("liquidation"):
         write_json(directory / "liquidation.json", result["liquidation"])
 
@@ -308,8 +308,13 @@ def _equity_points(profile: str, result: dict) -> list[float]:
     raise ValueError(f"unknown profile {profile}")
 
 
-def _plot_equity(path: Path, profile: str, result: dict) -> None:
-    """Equity against the session index. The chart has no ticker and no date."""
+def _plot_equity(path: Path, profile: str, result: dict, *, designer: bool = False) -> None:
+    """Equity against the session index. The chart has no ticker and no date.
+
+    The operator file keeps a title and a software tag. A designer file asks
+    matplotlib to write neither, and ``publish_designer`` then drops every
+    text chunk.
+    """
     points = _equity_points(profile, result)
     if not points:
         return
@@ -331,7 +336,7 @@ def _plot_equity(path: Path, profile: str, result: dict) -> None:
             path,
             format="png",
             facecolor="white",
-            metadata={"Title": "equity", "Software": "strategy-builder"},
+            metadata={"Software": None} if designer else {"Title": "equity", "Software": "strategy-builder"},
         )
     finally:
         plt.close(fig)
@@ -777,6 +782,7 @@ def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
     """
     if not isinstance(text, str) or text == "":
         return None
+    text = unicodedata.normalize("NFKC", text)
     for token in _BANNED_DESIGNER_TEXT:
         if token in text:
             return token
@@ -810,6 +816,7 @@ def _raise_designer_name(name: str, symbol: str) -> None:
 
 def _raise_schema_label(filename: str, label: str) -> None:
     """A JSON key or a CSV header. The ticker pattern does not apply."""
+    label = unicodedata.normalize("NFKC", label)
     for token in _BANNED_DESIGNER_TEXT:
         if token in label:
             raise RuntimeError(f"{filename} contains {token}")
@@ -906,6 +913,9 @@ def _png_metadata_texts(blob: bytes) -> list[str]:
         elif kind == b"iTXt":
             texts.extend(_itxt_strings(data))
         elif kind == b"IEND":
+            pos = end + 4
+            if pos < len(blob):
+                texts.append(blob[pos:].decode("utf-8", "replace"))
             return texts
         pos = end + 4
     raise ValueError("png ended without IEND")
@@ -1035,6 +1045,7 @@ def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symb
                 _scrub_result(result, symbol),
                 project_designer(redact_metrics(metrics, symbol=symbol)),
                 safe_frame,
+                designer=True,
             )
             _restrict_designer_book(dest)
         write_json(root / "metrics.json", project_designer(redact_metrics(wrapper, symbol=symbol)))
@@ -1058,6 +1069,9 @@ def _restrict_designer_book(dest: Path) -> None:
     if liquidation.is_file():
         payload = json.loads(liquidation.read_text(encoding="utf-8"))
         write_json(liquidation, project_designer(payload))
+    figure = dest / "equity.png"
+    if figure.is_file():
+        figure.write_bytes(canonical_png(figure.read_bytes()))
 
 
 def _filter_designer_csv(path: Path) -> None:

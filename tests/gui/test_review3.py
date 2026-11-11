@@ -167,7 +167,7 @@ def test_dotted_unpadded_and_ordinal_dates_are_scrubbed_in_both_places():
         assert not export_allowed(sample, symbols=(), scale=None), sample
     kept = "price 2024.50 ratio 0.2024 day 2024"
     assert scrub_text(kept, ()) == kept
-    assert export_allowed(kept, symbols=(), scale=None)
+    assert not export_allowed(kept, symbols=(), scale=None)
     sentence = scrub_text("on 2024-1-4.", ())
     assert "2024" not in sentence
     assert "-1-4" not in sentence
@@ -200,8 +200,9 @@ def test_share_factor_is_withheld_like_share_scale(qtbot, tmp_path):
         if path.is_file() and path.suffix != ".png"
     )
     assert "share_factor" not in blob.casefold()
-    assert "equity.png" not in written
-    assert not (exported / "equity.png").exists()
+    assert "equity.png" in written
+    exported_png = (exported / "equity.png").read_bytes()
+    assert b"share_factor" not in exported_png
     assert "share_factor" in export_text(folder / "equity.png").casefold()
     assert not export_allowed(export_text(folder / "equity.png"), symbols=(), scale=None)
 

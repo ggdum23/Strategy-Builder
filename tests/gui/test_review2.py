@@ -103,7 +103,7 @@ def test_scrub_keeps_numbers_and_uses_one_ticker_rule():
     assert "share_scale" not in folded
     assert "7.777" not in folded
     assert "qqq" not in folded
-    assert export_allowed("max_drawdown 0.2 and price 2024.50 and day 2024", symbols=("MA",), scale=None)
+    assert not export_allowed("max_drawdown 0.2 and price 2024.50 and day 2024", symbols=("MA",), scale=None)
     assert not export_allowed("held MA overnight", symbols=("MA",), scale=None)
     assert not export_allowed("QQQ1", symbols=("QQQ",), scale=None)
 

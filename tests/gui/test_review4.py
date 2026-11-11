@@ -193,7 +193,7 @@ def test_bare_year_stays_only_after_the_word_day():
     assert "holiday" in scrub_text("holiday 2024", ())
     kept = "price 2024.50 ratio 0.2024 day 2024"
     assert scrub_text(kept, ()) == kept
-    assert export_allowed(kept, symbols=(), scale=None)
+    assert not export_allowed(kept, symbols=(), scale=None)
 
 
 def test_scale_matches_only_a_standalone_number():
@@ -203,9 +203,9 @@ def test_scale_matches_only_a_standalone_number():
     assert "2" not in scrub_text("held 2 shares", (), scale=2)
     assert scrub_text("scale 7.777", (), scale=7.777) == "scale "
     assert export_allowed("long_2x", symbols=(), scale=2)
-    assert export_allowed("2.5", symbols=(), scale=2)
+    assert not export_allowed("2.5", symbols=(), scale=2)
     assert export_allowed("12", symbols=(), scale=2)
-    assert export_allowed("2024.50", symbols=(), scale=2)
+    assert not export_allowed("2024.50", symbols=(), scale=2)
     assert not export_allowed("held 2 shares", symbols=(), scale=2)
     assert not export_allowed("scale 2", symbols=(), scale=2)
     assert not export_allowed("share count 2.0", symbols=(), scale=2)
@@ -282,7 +282,7 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
     kept = designer_surface_text(ordinary, ("QQQ",), scale=2)
     for piece in ("long_2x", "2.5", "2024.50", "0.2024", "day 2024", "12"):
         assert piece in kept, piece
-    assert export_allowed(ordinary, symbols=("QQQ",), scale=2)
+    assert not export_allowed(ordinary, symbols=("QQQ",), scale=2)
     assert not export_allowed(f"held QQQ overnight {ordinary}", symbols=("QQQ",), scale=2)
     assert not export_allowed("scale 2", symbols=(), scale=2)
 

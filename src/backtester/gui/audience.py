@@ -21,7 +21,13 @@ import zlib
 from decimal import Decimal
 from pathlib import Path
 
-from ..designer_allow import CLOCK_BODY, CLOCK_TEXT, redacted_key_allowed, with_cost_drag
+from ..designer_allow import (
+    CLOCK_BODY,
+    CLOCK_TEXT,
+    designer_source_id,
+    redacted_key_allowed,
+    with_cost_drag,
+)
 
 _MONTH = (
     r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
@@ -393,6 +399,7 @@ def _scrub_obj(
     drop_prices: bool,
     scale: float | None = None,
     allow_list: bool = False,
+    key: str | None = None,
 ):
     if isinstance(value, dict):
         if _is_period_map(value):
@@ -407,15 +414,17 @@ def _scrub_obj(
                 continue
             renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
             clean[renamed] = _scrub_obj(
-                item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list
+                item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list, key=name
             )
         return clean
     if isinstance(value, list):
         return [
-            _scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list)
+            _scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list, key=key)
             for item in value
         ]
     if isinstance(value, str):
+        if key == "source_id":
+            value = designer_source_id(value)
         return _scrub_string(value, symbols, scale)
     return value
 
@@ -446,7 +455,7 @@ def _relabel_periods(
             nested = {}
             for index, child in enumerate(item.values(), start=1):
                 nested[f"{prefix}{index}"] = _scrub_obj(
-                    child, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list
+                    child, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list, key=name
                 )
             clean[name] = nested
             used.add(name)
@@ -455,7 +464,7 @@ def _relabel_periods(
             continue
         renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
         clean[renamed] = _scrub_obj(
-            item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list
+            item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list, key=name
         )
     return clean
 
@@ -502,6 +511,8 @@ def _scrub_table(
         cleaned = {}
         for original, renamed in pairs:
             value = row.get(original)
+            if original == "source_id" and isinstance(value, str):
+                value = designer_source_id(value)
             if isinstance(value, str):
                 value = _scrub_string(value, symbols, scale)
             cleaned[renamed] = value
@@ -625,11 +636,19 @@ def _numeric_text(token: str) -> str:
     return sign + text.replace(",", "")
 
 
-def _exponent_text(token: str) -> str | None:
-    match = re.search(r"[eE]([+-]?(?:\d+(?:\.\d*)?|\.\d+))$", token)
+def _scientific_parts(literal: str) -> tuple[str, str] | None:
+    """Significand and exponent of one scientific literal, or None."""
+    match = re.fullmatch(r"(.+?)[eE]([+-]?(?:\d+(?:\.\d*)?|\.\d+))", literal)
     if match is None:
         return None
-    return match.group(1)
+    return match.group(1), match.group(2)
+
+
+def _recurse_exponent(significand: str, exponent: str) -> bool:
+    """An unsigned integer exponent is not itself a scale, unless the significand is 1."""
+    if exponent[:1] in "+-" or "." in exponent:
+        return True
+    return _significand_digits(significand) == "1"
 
 
 def _significand_digits(literal: str) -> str:
@@ -648,31 +667,54 @@ def _scale_digits(number: float) -> str:
 def _power_of_ten_multiple(value: float, base: float) -> bool:
     if value == 0 or base == 0 or not math.isfinite(value) or not math.isfinite(base):
         return False
-    ratio = abs(value / base)
-    log = math.log10(ratio)
-    nearest = round(log)
+    try:
+        ratio = abs(value / base)
+    except OverflowError:
+        return False
+    if not math.isfinite(ratio) or ratio == 0:
+        return False
+    try:
+        log = math.log10(ratio)
+    except (OverflowError, ValueError):
+        return False
+    if not math.isfinite(log):
+        return False
+    try:
+        nearest = round(log)
+    except (OverflowError, ValueError):
+        return False
     if abs(nearest) > 24:
         return False
-    return math.isclose(ratio, 10.0**nearest, rel_tol=1e-6, abs_tol=0.0)
+    try:
+        target = 10.0**nearest
+    except OverflowError:
+        return False
+    if not math.isfinite(target):
+        return False
+    return math.isclose(ratio, target, rel_tol=1e-6, abs_tol=0.0)
 
 
 def _literal_is_scale(literal: str, scale: float) -> bool:
     """True when this literal is the scale, its reciprocal, or the scale times 10^k.
 
-    The exponent is the same kind of literal. The parsed value is compared
-    with the scale, with the reciprocal, and with the scale scaled by powers
-    of ten. Those three match at any length. A match that is only the
-    significand digits, with no agreement in magnitude, needs at least three
-    significant digits. ``25`` is still the scale ``0.25`` because it is that
-    scale times one hundred. ``25e0.5`` is not, and a one- or two-digit
-    significand is also an ordinary number.
+    A signed or decimal exponent is the same kind of literal, and so is the
+    exponent of a significand of 1. An unsigned integer exponent is not
+    recursed into: ``7.777e3`` still matches by its value, and ``185e2``
+    inside a hex id does not match because the exponent is 2. The parsed
+    value is compared with the scale, with the reciprocal, and with the scale
+    scaled by powers of ten. Those three match at any length. A match that is
+    only the significand digits, with no agreement in magnitude, needs at
+    least three significant digits. ``25`` is still the scale ``0.25`` because
+    it is that scale times one hundred. ``25e0.5`` is not, and a one- or
+    two-digit significand is also an ordinary number. A non-finite or
+    overflowing value is not a match.
     """
-    exponent = _exponent_text(literal)
-    if exponent is not None and exponent != literal and _literal_is_scale(exponent, scale):
+    parts = _scientific_parts(literal)
+    if parts is not None and _recurse_exponent(*parts) and _literal_is_scale(parts[1], scale):
         return True
     try:
         value = abs(float(literal))
-    except ValueError:
+    except (ValueError, OverflowError):
         value = None
     if value is not None and math.isfinite(value):
         if scale != 0 and math.isclose(value, abs(1.0 / scale), rel_tol=1e-9, abs_tol=1e-12):
@@ -705,6 +747,17 @@ def _scale_in_token(token: str, scale: float | None) -> bool:
         bare_integer = re.fullmatch(r"[+-]?\d+", literal) is not None
         whole = match.start() == 0 and match.end() == len(probed)
         if bare_integer and not whole:
+            continue
+        # ``185e2`` inside ``pack_185e2…`` is an identifier, not a scale.
+        # A decimal significand (``7.777e3``) and a signed exponent still count.
+        parts = _scientific_parts(literal)
+        if (
+            parts is not None
+            and not whole
+            and "." not in parts[0]
+            and parts[1][:1] not in "+-"
+            and "." not in parts[1]
+        ):
             continue
         if _literal_is_scale(literal, number):
             return True
@@ -995,10 +1048,11 @@ def resolve_view(folder: Path, audience: str) -> tuple[str, Path, bool]:
 def export_text(path: Path) -> str:
     """Text used to decide whether a designer may receive ``path``.
 
-    A PNG is its text chunks only (``tEXt``, ``zTXt``, ``iTXt``), including a
-    compressed chunk. Pixel bytes are not text. Any other file is decoded as
-    latin-1, so a binary file cannot skip the check by failing a UTF-8 decode.
-    A file over the read cap is refused before it is read whole.
+    A PNG contributes its text chunks (``tEXt``, ``zTXt``, ``iTXt``), including
+    a compressed chunk, plus any bytes after ``IEND``. ``iTXt`` text is UTF-8.
+    Pixel bytes are not text. Any other file is decoded as latin-1, so a
+    binary file cannot skip the check by failing a UTF-8 decode. A file over
+    the read cap is refused before it is read whole.
     """
     suffix = path.suffix.lower()
     if suffix == ".png":
@@ -1041,14 +1095,24 @@ def _png_text(data: bytes) -> str:
         elif kind == b"iTXt":
             parts.append(_itxt_text(chunk))
         elif kind == b"IEND":
+            if index < len(data):
+                parts.append(data[index:].decode("utf-8", "replace"))
             break
     return "\n".join(parts)
 
 
+def png_caption(data: bytes) -> str:
+    """Text chunks and anything after IEND. Pixel bytes are not included."""
+    return _png_text(data)
+
+
 def _itxt_text(chunk: bytes) -> str:
-    """PNG iTXt. Flag 1 means the text is zlib, the same rule as zTXt."""
+    """PNG iTXt. The keyword is Latin-1. The translated keyword and text are UTF-8.
+
+    Flag 1 means the text is zlib, the same rule as zTXt.
+    """
     if b"\x00" not in chunk:
-        return chunk.decode("latin-1", "replace")
+        return chunk.decode("utf-8", "replace")
     keyword, _, rest = chunk.partition(b"\x00")
     pieces = [keyword.decode("latin-1", "replace")]
     if len(rest) < 2:
@@ -1058,13 +1122,13 @@ def _itxt_text(chunk: bytes) -> str:
     language, _, tail = tail.partition(b"\x00")
     translated, _, text = tail.partition(b"\x00")
     pieces.append(language.decode("latin-1", "replace"))
-    pieces.append(translated.decode("latin-1", "replace"))
+    pieces.append(translated.decode("utf-8", "replace"))
     if flag == 1:
         try:
             text = zlib.decompress(text)
         except zlib.error:
             pass
-    pieces.append(text.decode("latin-1", "replace"))
+    pieces.append(text.decode("utf-8", "replace"))
     return "\n".join(pieces)
 
 
@@ -1172,7 +1236,7 @@ def _is_price_literal(literal: str) -> bool:
         return False
     try:
         value = abs(float(literal))
-    except ValueError:
+    except (ValueError, OverflowError):
         return False
     return math.isfinite(value) and value >= 1.0
 
@@ -1265,9 +1329,15 @@ def _preamble_allowed(text: str, symbols: tuple[str, ...]) -> bool:
 
 
 def _free_text_allowed(text: str, symbols: tuple[str, ...], scale: float | None) -> bool:
+    """Free text on the screen's export check. A price is rejected, as in ``scan_publication``.
+
+    Allow-listed numeric cells never reach this function. A clock is not a price.
+    """
     if not _preamble_allowed(text, symbols):
         return False
     if _contains_scale(text, scale):
+        return False
+    if _free_text_has_price(text):
         return False
     _pieces, allowed = _surface_pieces(text, scale=scale)
     return allowed

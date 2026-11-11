@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...designer_allow import canonical_png
 from ..audience import (
     PNG_READ_LIMIT,
     apply_designer,
@@ -34,6 +35,7 @@ from ..audience import (
     export_text,
     peek_scale,
     peek_symbols,
+    png_caption,
     refuse_oversized,
 )
 from ..backend import RunReport, chart_overlay, drawdown_line, exposure_line, load_run
@@ -801,46 +803,71 @@ class ResultsPage(QWidget):
         else:
             self.postmortem.setPlainText("No liquidation post-mortem in this report.")
 
-    def _figure_blocked(self, book: RunReport) -> bool:
+    def _designer_png(self, path: Path) -> tuple[str, bytes | None]:
+        """Canonical bytes for a designer view or export.
+
+        ``ok`` is a PNG with text chunks and trailing bytes removed. ``unread``
+        is a missing, oversized, or malformed file. ``withheld`` is a canonical
+        caption that still fails the shared check.
+        """
         report = self._report
-        if report is None or report.audience != "designer" or book.figure is None:
-            return False
-        opened = report.opened or book.directory
+        opened = (report.opened if report is not None else None) or path.parent
         try:
-            text = export_text(book.figure)
+            refuse_oversized(path, PNG_READ_LIMIT)
+            clean = canonical_png(path.read_bytes())
+            text = png_caption(clean)
         except (OSError, ValueError, MemoryError):
-            return True
-        return not export_allowed(text, symbols=peek_symbols(opened), scale=peek_scale(opened))
+            return "unread", None
+        if not export_allowed(text, symbols=peek_symbols(opened), scale=peek_scale(opened)):
+            return "withheld", None
+        return "ok", clean
+
+    def _clear_figure(self, note: str) -> None:
+        self.figure_label.setPixmap(QPixmap())
+        self.figure_label.setText("")
+        self.figure_note.setText(note)
+
+    def _show_figure(self, pixmap: QPixmap, name: str) -> None:
+        self.figure_note.setText(f"Saved figure: {name}. The interactive chart is separate and uses the CSV.")
+        self.figure_label.setText("")
+        self.figure_label.setPixmap(pixmap.scaledToWidth(960, Qt.TransformationMode.SmoothTransformation))
 
     def _fill_figure(self, book: RunReport) -> None:
         if book.figure is None or not book.figure.is_file():
-            self.figure_label.setPixmap(QPixmap())
-            self.figure_label.setText("")
-            self.figure_note.setText("equity.png is not in this run directory. The interactive chart is drawn from the equity CSV.")
+            self._clear_figure("equity.png is not in this run directory. The interactive chart is drawn from the equity CSV.")
+            return
+        designer = self._report is not None and self._report.audience == "designer"
+        if designer:
+            status, clean = self._designer_png(book.figure)
+            if status == "withheld":
+                self._clear_figure("Saved figure withheld. It did not pass the designer check.")
+                return
+            if status != "ok" or clean is None:
+                self._clear_figure("figure could not be read")
+                return
+            pixmap = QPixmap()
+            try:
+                pixmap.loadFromData(clean, "PNG")
+            except MemoryError:
+                pixmap = QPixmap()
+            if pixmap.isNull():
+                self._clear_figure("figure could not be read")
+                return
+            self._show_figure(pixmap, book.figure.name)
             return
         try:
             refuse_oversized(book.figure, PNG_READ_LIMIT)
         except (OSError, ValueError):
-            self.figure_label.setPixmap(QPixmap())
-            self.figure_label.setText("")
-            self.figure_note.setText("figure could not be read")
-            return
-        if self._figure_blocked(book):
-            self.figure_label.setPixmap(QPixmap())
-            self.figure_label.setText("")
-            self.figure_note.setText("Saved figure withheld. It did not pass the designer check.")
+            self._clear_figure("figure could not be read")
             return
         try:
             pixmap = QPixmap(str(book.figure))
         except MemoryError:
             pixmap = QPixmap()
         if pixmap.isNull():
-            self.figure_label.setPixmap(QPixmap())
-            self.figure_label.setText("")
-            self.figure_note.setText("figure could not be read")
+            self._clear_figure("figure could not be read")
             return
-        self.figure_note.setText(f"Saved figure: {book.figure.name}. The interactive chart is separate and uses the CSV.")
-        self.figure_label.setPixmap(pixmap.scaledToWidth(960, Qt.TransformationMode.SmoothTransformation))
+        self._show_figure(pixmap, book.figure.name)
 
     def _wipe_book_surface(self) -> None:
         """Drop the previous book's picture, tables, and invoice line contents."""
@@ -1029,12 +1056,9 @@ class ResultsPage(QWidget):
                 written.append(path.name)
         figure = book.directory / FIGURE_FILE
         if figure.is_file():
-            try:
-                text = export_text(figure)
-            except OSError:
-                text = None
-            if text is not None and export_allowed(text, symbols=symbols, scale=scale):
-                shutil.copy2(figure, target / FIGURE_FILE)
+            status, clean = self._designer_png(figure)
+            if status == "ok" and clean is not None:
+                (target / FIGURE_FILE).write_bytes(clean)
                 written.append(FIGURE_FILE)
 
     def _keep_export(self, path: Path, *, symbols, scale, designer: bool = True) -> bool:

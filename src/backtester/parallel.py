@@ -32,6 +32,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .accounting import normalize_price_basis, normalize_series_kind, require_annual_rate, require_withholding_rate, resolve_accounting
+from .designer_allow import designer_source_id
 from .profiles import get_profile
 from . import report as report_mod
 from .report import (
@@ -1171,7 +1172,8 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             folders[strategy_id] = _designer_component(strategy_id, unique_symbols, used_folders)
         folder = folders[strategy_id]
         source_used = used_sources.setdefault(folder, set())
-        source_name = _designer_component(row["source_id"], unique_symbols, source_used)
+        opaque_source = designer_source_id(str(row["source_id"]))
+        source_name = _designer_component(opaque_source, unique_symbols, source_used)
         placed[(strategy_id, row["source_id"])] = (folder, source_name, symbol)
         source = Path(item.out_dir) / "designer"
         if not source.is_dir():
@@ -1187,7 +1189,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                 unique_symbols,
                 strategy_id=strategy_id,
                 folder=folder,
-                source_id=row["source_id"],
+                source_id=opaque_source,
                 source_name=source_name,
             )
             _audit_job_tree(dest, unique_symbols)
@@ -1291,7 +1293,9 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             key = (row["strategy_id"], row["source_id"])
             _previous, old_source, symbol = placed[key]
             if _name_dirty(old_source, unique_symbols) or old_source.casefold() in source_used:
-                new_source = _designer_component(row["source_id"], unique_symbols, source_used)
+                new_source = _designer_component(
+                    designer_source_id(str(row["source_id"])), unique_symbols, source_used
+                )
                 src = designer / new_folder / old_source
                 dst = designer / new_folder / new_source
                 if src.exists() and src != dst:
@@ -1334,7 +1338,9 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                 source_name = old_source
                 source_used.add(source_name.casefold())
             else:
-                source_name = _designer_component(row["source_id"], unique_symbols, source_used)
+                source_name = _designer_component(
+                    designer_source_id(str(row["source_id"])), unique_symbols, source_used
+                )
             placed[key] = (new_folder, source_name, _symbol)
             _fail_published_row(results, row, message)
             _write_clean_designer_error(

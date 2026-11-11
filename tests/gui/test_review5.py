@@ -70,9 +70,10 @@ def _table_text(table) -> str:
 
 
 def test_signed_numbers_and_hyphen_words_stay_one_token():
+    prices = {"-340.25", "-$340.25", "-12.5%", "1.23e+4"}
     for sample in _WHOLE_NUMBERS:
         assert designer_surface_text(sample, ()) == sample
-        assert export_allowed(sample, symbols=(), scale=None)
+        assert export_allowed(sample, symbols=(), scale=None) is (sample not in prices)
 
 
 def test_glued_year_and_scale_tokens_fail_on_screen_and_in_export():
@@ -87,9 +88,9 @@ def test_glued_year_and_scale_tokens_fail_on_screen_and_in_export():
         assert "7.777" not in shown
         assert not export_allowed(glued, symbols=(), scale=7.777)
     assert designer_surface_text("price 2024.50 day 2024", ()) == "price 2024.50 day 2024"
-    assert export_allowed("price 2024.50 day 2024", symbols=(), scale=None)
+    assert not export_allowed("price 2024.50 day 2024", symbols=(), scale=None)
     assert designer_surface_text("long_2x and 2.5", (), scale=2) == "long_2x and 2.5"
-    assert export_allowed("long_2x and 2.5", symbols=(), scale=2)
+    assert not export_allowed("long_2x and 2.5", symbols=(), scale=2)
     assert "2" not in designer_surface_text("scale 2", (), scale=2).split()
 
 

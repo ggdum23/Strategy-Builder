@@ -153,8 +153,13 @@ def test_desk_clocks_export_and_a_designer_folder_shows_no_plant(qtbot, tmp_path
     assert not export_allowed(export_text(png), symbols=("QQQ",), scale=7.777)
     page.load_path(str(out), audience="designer")
     QApplication.processEvents()
-    assert "withheld" in page.figure_note.text().casefold()
+    assert "withheld" not in page.figure_note.text().casefold()
+    assert page.figure_note.text().startswith("Saved figure")
+    pixmap = page.figure_label.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
     exported = tmp_path / "poisoned"
     written = page.export_to(exported)
-    assert "equity.png" not in written
-    assert not (exported / "equity.png").exists()
+    assert "equity.png" in written
+    cleaned = (exported / "equity.png").read_bytes()
+    assert b"7.777" not in cleaned
+    assert b"QQQ" not in cleaned
