@@ -45,7 +45,17 @@ has no default cut. Importing the runner does not insert its directory on
 JSON, with non-finite floats as null. The pack runner keeps the reference
 `json.dump`, which can emit non-standard tokens.
 
-Arena financing stays 0 in this phase. A non-zero `--financing-rate`, a
-`--fee-mult` other than 1, or a dividend file on an Arena run is an error.
-Those switches belong to Desk. Adding Arena financing is later work and would
-change the reference loop.
+Arena financing stays 0 unless the caller passes a cash rate, a financing
+rate, or a dividend map. That default call does not construct the
+session-boundary carry, so the reference loop's cash updates are unchanged.
+`--fee-mult` other than 1 is still an error. A dividend file on a raw Arena
+run is still an error. `--price-basis total_return` is the opt-in that
+credits dividends, and a non-zero `--financing-rate` or `--cash-rate` is the
+opt-in that accrues `rate / 252` once per session boundary. See the price-basis
+section of `README.md`.
+
+The carry snap is the last processed bar of the session, after that bar's
+fill. Post-session fills are included when the strategy asks for extended
+hours. Borrow stays on the last regular bar. A warm-up `reset_day` zeros the
+carry totals and clears the snap before `due`, so the first live session is
+not charged.

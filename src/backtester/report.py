@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from .accounting import EXACT_RESERVED, LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
+
 _ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
 _BANNED_DESIGNER_KEYS = frozenset(
     {
@@ -85,6 +87,7 @@ _BOOL_KEYS = frozenset(
         "anonymized",
         "cancelled",
         "open_position_at_end",
+        "dividends_applied",
     }
 )
 _STATUS_TOKENS = frozenset({"ok", "error", "timeout", "cancelled", "memory", "crash"})
@@ -99,6 +102,7 @@ OPERATOR_LEADERBOARD_COLUMNS = (
     "source_id",
     "symbol",
     "profile",
+    *LEADERBOARD_KEYS,
     "status",
     "total_return",
     "excess_total_return",
@@ -426,6 +430,8 @@ def _exempt_designer_value(key: str, text: str) -> bool:
         return True
     if key in _BOOL_KEYS and folded in _BOOL_TOKENS:
         return True
+    if key in LEADERBOARD_KEYS and folded in VOCABULARY:
+        return True
     if key not in _FREE_TEXT_KEYS and key != "status" and _float_token(text):
         return True
     return False
@@ -514,12 +520,17 @@ RESERVED_VOCABULARY = _reserved_vocabulary()
 def reserved_symbol_conflict(symbol: str) -> str | None:
     """The reserved token ``symbol`` matches, or None.
 
-    The match is :func:`ticker_token_spans`: casefolded, bounded by a
+    Report-name tokens use :func:`ticker_token_spans`: casefolded, bounded by a
     non-alphanumeric character. ``SS`` does not match ``random``. ``2`` does
-    not match ``2x`` or ``001``.
+    not match ``2x`` or ``001``. Accounting values and keys match the whole
+    symbol only. ``session_boundary_1_252`` does not reserve ``1``, ``SESSION``,
+    or ``252``.
     """
     if not isinstance(symbol, str) or symbol == "":
         return None
+    folded = symbol.casefold()
+    if folded in EXACT_RESERVED:
+        return folded
     for token in RESERVED_VOCABULARY:
         if ticker_token_spans(token, symbol):
             return token
@@ -978,7 +989,12 @@ def _csv_cell(value) -> str:
 
 
 def write_leaderboard(path, rows, *, audience: str = "operator") -> None:
-    """Write ``leaderboard.csv``. ``rows`` are already in rank order."""
+    """Write ``leaderboard.csv``. ``rows`` are already in rank order.
+
+    Rows that record a price basis must share one accounting setting.
+    Rows with no price basis are left alone so an older board still writes.
+    """
+    refuse_mixed_rows(rows)
     if audience == "operator":
         columns = OPERATOR_LEADERBOARD_COLUMNS
     elif audience == "designer":
