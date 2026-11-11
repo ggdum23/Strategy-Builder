@@ -10,6 +10,7 @@ the environment, argv, and cwd. It is not an OS jail. See docs/ISOLATION.md.
 
 from __future__ import annotations
 
+import errno
 import gc
 import hashlib
 import hmac
@@ -338,7 +339,6 @@ _ENV_KEEP = frozenset(
         "TEMP",
         "TMP",
         "TMPDIR",
-        "PYTHONPATH",
         "PYTHONHOME",
         "PYTHONNOUSERSITE",
         "PYTHONHASHSEED",
@@ -503,6 +503,34 @@ def _child_environ(source) -> dict:
     return kept
 
 
+def _pythonpath_to_drop(source) -> list[str]:
+    """PYTHONPATH entries the child must not keep on ``sys.path``.
+
+    The variable itself is not inherited. An entry that is the installed
+    package root stays, because an editable or ``PYTHONPATH=src`` layout
+    imports ``backtester`` from there. Every other entry is removed, including
+    one under the operator's directory that holds another job's report.
+    """
+    raw = source.get("PYTHONPATH", "")
+    if not raw:
+        return []
+    package_root = os.path.normcase(str(Path(__file__).resolve().parent.parent))
+    dropped = []
+    for part in raw.split(os.pathsep):
+        if not part:
+            continue
+        try:
+            resolved = os.path.normcase(os.path.abspath(part))
+        except OSError:
+            continue
+        if resolved == package_root and os.path.isfile(
+            os.path.join(resolved, "backtester", "__init__.py")
+        ):
+            continue
+        dropped.append(resolved)
+    return dropped
+
+
 def _enter_child(job):
     """Scrub the book process before any strategy code runs.
 
@@ -515,6 +543,9 @@ def _enter_child(job):
     when this interpreter first imported multiprocessing, and spawn puts that
     directory on ``sys.path``. After the working directory is the empty temp
     dir, both point there instead. Install paths stay on ``sys.path``.
+    ``PYTHONPATH`` is not in the child environment. Entries from the parent's
+    ``PYTHONPATH`` that are not the installed package are removed here too,
+    because spawn already copied them onto ``sys.path``.
     """
     inherited_argv = list(sys.argv)
     inherited_cwd = os.getcwd()
@@ -530,6 +561,8 @@ def _enter_child(job):
         os.getcwd()
     ):
         sys.path[:] = _drop_directory(sys.path, operator_dir)
+    for banned in job.get("drop_sys_path") or []:
+        sys.path[:] = _drop_directory(sys.path, banned)
     return inherited_argv, inherited_cwd
 
 
@@ -544,6 +577,7 @@ def _launch_book(ctx, queue, job):
     proc = ctx.Process(target=_books_worker, args=(queue, job), name="walk-forward-book")
     with _LAUNCH_LOCK:
         job["cwd"] = cwd
+        job["drop_sys_path"] = _pythonpath_to_drop(os.environ)
         job["env"] = _child_environ(os.environ)
         old_argv = list(sys.argv)
         old_cwd = os.getcwd()
@@ -643,57 +677,55 @@ def _note_child(books, inherited_argv, inherited_cwd) -> None:
     observer.inherited_cwd = inherited_cwd
 
 
-def _signal_group(pid: int, sig: int) -> None:
-    """Signal a worker's process group once ``setsid`` has made it the leader.
+def _kill_group(pgid: int, sig: int) -> None:
+    """Signal a saved process group. The leader may already have been reaped.
 
-    Before that, the worker still shares this process's group. ``killpg``
-    would hit the parent, so only that pid is signaled.
+    ``os.getpgid`` fails with ``ESRCH`` once the leader is gone, so the caller
+    passes the id it recorded when the worker became the session leader. A
+    missing group is the process already being dead, not an error.
     """
     try:
-        pgid = os.getpgid(pid)
+        os.killpg(int(pgid), sig)
     except ProcessLookupError:
         return
-    if pgid != pid:
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
             return
-        return
-    try:
-        os.killpg(pgid, sig)
-    except ProcessLookupError:
-        return
+        raise
 
 
-def _stop_process(proc, job=None) -> None:
+def _stop_process(proc, job=None, pgid=None) -> None:
     """End a worker and the processes it started.
 
-    Linux sends SIGTERM to the worker's process group, then SIGKILL. Windows
-    terminates the job object, which contains the worker and its children.
-    Both waits are bounded. A no-op here leaves the worker running; the caller
-    still returns, and the test that watches the grandchild reaps it.
+    ``pgid`` is the worker pid recorded after ``setsid``. Linux signals that
+    group with SIGTERM and then SIGKILL even when the leader has already
+    exited, so a grandchild is not left with ``ppid`` 1. SIGKILL is not
+    conditional on the leader still being alive: a child that ignores SIGTERM
+    would otherwise survive. Windows terminates the job object on this path,
+    including a normal return. Both waits are bounded.
     """
     if job is not None:
         try:
             job.terminate()
         except OSError:
             pass
-    if proc is None:
-        return
-    pid = getattr(proc, "pid", None)
-    if pid and os.name != "nt":
-        _signal_group(pid, signal.SIGTERM)
-    elif proc.is_alive():
-        proc.terminate()
-    proc.join(timeout=2)
-    if proc.is_alive():
-        if pid and os.name != "nt":
-            _signal_group(pid, signal.SIGKILL)
-        else:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+    if pgid and os.name != "nt":
+        _kill_group(int(pgid), signal.SIGTERM)
+    elif proc is not None and proc.is_alive():
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    if proc is not None:
+        proc.join(timeout=2)
+    if pgid and os.name != "nt":
+        _kill_group(int(pgid), signal.SIGKILL)
+    elif proc is not None and proc.is_alive():
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    if proc is not None:
         proc.join(timeout=5)
 
 
@@ -706,13 +738,13 @@ def _cancelled(stop) -> bool:
     return bool(fn())
 
 
-def _wait_until_started(proc, event, queue, timeout: float, stop=None, job=None) -> None:
+def _wait_until_started(proc, event, queue, timeout: float, stop=None, job=None, pgid=None) -> None:
     import queue as queue_mod
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _cancelled(stop):
-            _stop_process(proc, job)
+            _stop_process(proc, job, pgid)
             raise RuntimeError("walk-forward worker cancelled")
         if event.wait(0.05):
             return
@@ -728,7 +760,7 @@ def _wait_until_started(proc, event, queue, timeout: float, stop=None, job=None)
     raise RuntimeError("walk-forward worker did not start")
 
 
-def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None):
+def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None, pgid=None):
     """Read the result, or raise as soon as the child exits without one.
 
     A dead child used to block on ``queue.get`` until the 600s timeout.
@@ -757,18 +789,18 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
                     f"walk-forward worker exited {proc.exitcode} without a result"
                 ) from None
         if _cancelled(stop):
-            _stop_process(proc, job)
+            _stop_process(proc, job, pgid)
             raise RuntimeError("walk-forward worker cancelled")
         if memory_bytes is not None:
             rss = process_tree_rss_bytes(proc.pid)
             if rss is not None and rss > int(memory_bytes):
-                _stop_process(proc, job)
+                _stop_process(proc, job, pgid)
                 raise RuntimeError(
                     f"walk-forward worker exceeded memory limit ({rss} > {int(memory_bytes)})"
                 )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _stop_process(proc, job)
+            _stop_process(proc, job, pgid)
             raise RuntimeError(f"walk-forward worker timed out (exit {proc.exitcode})")
         wait([reader, proc.sentinel], timeout=min(0.2, remaining))
 
@@ -893,7 +925,10 @@ def _isolated_books(
     import error belongs to that strategy.
 
     The gate is always used. On Windows the job object is armed before the
-    gate opens, so a process the strategy starts is in that job. Statistics
+    gate opens, so a process the strategy starts is in that job. If that
+    assignment fails, the run fails instead of falling back to signaling only
+    the worker pid. On Linux the worker pid is the process-group id once the
+    child has entered, and every exit path signals that group. Statistics
     and benchmarks are recomputed in this process from the child's result.
     """
     import multiprocessing
@@ -919,17 +954,30 @@ def _isolated_books(
     proc = None
     cwd = None
     guard = None
+    pgid = None
     try:
         proc, cwd = _launch_book(ctx, result_queue, job)
         guard = arm_worker_job(proc.pid, None if memory_bytes is None else int(memory_bytes))
+        if os.name == "nt" and guard is None:
+            raise RuntimeError("the worker could not be placed in a job object")
         _wait_until_started(proc, gate["started"], result_queue, 60, stop, guard)
+        # setsid has run: the started event is set after it. The group id is
+        # the worker pid. Keep it after the leader is reaped; getpgid cannot.
+        if os.name != "nt" and proc.pid:
+            pgid = int(proc.pid)
         try:
             if during is not None:
                 during()
         finally:
             gate["release"].set()
         message = _take_result(
-            proc, result_queue, timeout, memory_bytes=memory_bytes, stop=stop, job=guard
+            proc,
+            result_queue,
+            timeout,
+            memory_bytes=memory_bytes,
+            stop=stop,
+            job=guard,
+            pgid=pgid,
         )
         proc.join(timeout=60)
         if message[0] != "ok":
@@ -944,8 +992,9 @@ def _isolated_books(
             raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n")
         return _accept_child_books(profile, _standalone_frame(frame), message[1], kwargs)
     finally:
-        if proc is not None and proc.is_alive():
-            _stop_process(proc, guard)
+        # Success, a strategy exception, and a parent-side failure all come
+        # through here. The group is signaled even when the worker has exited.
+        _stop_process(proc, guard, pgid)
         if guard is not None:
             guard.close()
         result_queue.close()

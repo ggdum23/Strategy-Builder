@@ -149,7 +149,7 @@ python -m backtester test
 `parallel` runs one process per job. The worker count does not change a result.
 A strategy that crashes, hangs, or exceeds `--memory-mb` is one failed row, and
 the rest of the batch still finishes. A process that strategy starts is stopped
-with it. `--timeout` starts after that process is up. One `--dividends` file
+with it, including when the strategy returns or raises. `--timeout` starts after that process is up. One `--dividends` file
 applies to the whole batch. Arena rejects it. On an anonymized Desk pack the
 parent remaps each date and scales the amount before the child starts. The
 parent recomputes the statistics and runs the benchmarks; a child that rewrites

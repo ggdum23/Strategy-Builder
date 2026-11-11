@@ -287,12 +287,22 @@ def _plot_equity(path: Path, profile: str, result: dict) -> None:
         plt.close(fig)
 
 
+def _ticker_pattern(symbol: str) -> str:
+    """A ticker as its own token, including inside ``my_zzzx_v2``.
+
+    Underscore is a separator. ``\\b`` would treat it as a word character and
+    miss that embedding. Callers pass ``re.IGNORECASE`` so ``zzzx`` matches
+    a symbol stored as ``ZZZX``.
+    """
+    return rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])"
+
+
 def _scrub_text(value: str, symbol: str) -> str:
     text = _ISO_DATE.sub("", value)
     if symbol and text.casefold() == symbol.casefold():
         return "ASSET"
     if symbol and len(symbol) >= 2:
-        text = re.sub(rf"\b{re.escape(symbol)}\b", "ASSET", text, flags=re.IGNORECASE)
+        text = re.sub(_ticker_pattern(symbol), "ASSET", text, flags=re.IGNORECASE)
     return text
 
 
@@ -372,7 +382,7 @@ def assert_designer_clean(directory, *, symbol: str) -> None:
         if _ISO_DATE.search(text):
             raise RuntimeError(f"{path.name} contains a calendar date")
         if symbol and len(symbol) >= 2 and re.search(
-            rf"\b{re.escape(symbol)}\b", text, flags=re.IGNORECASE
+            _ticker_pattern(symbol), text, flags=re.IGNORECASE
         ):
             raise RuntimeError(f"{path.name} contains the ticker")
         if symbol and path.name.casefold() == f"{symbol.casefold()}{path.suffix.casefold()}":

@@ -76,7 +76,8 @@ def arm_worker_job(pid: int, memory_bytes: int | None = None):
     ceiling as before, added on top of that flag.
 
     Linux returns None. The runner kills the process group there. A failure to
-    arm the job returns None and does not raise.
+    arm the job returns None and does not raise. On Windows the runner treats
+    that None as a failed book: it does not continue with pid-only signaling.
     """
     if sys.platform != "win32":
         return None

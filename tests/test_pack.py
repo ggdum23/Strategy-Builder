@@ -248,6 +248,14 @@ def _recompress(payload: bytes, *, mtime: int = 0, filename: str = "") -> bytes:
     return buffer.getvalue()
 
 
+def _with_extra(blob: bytes, extra: bytes) -> bytes:
+    if blob[3] & 0x1C:
+        raise AssertionError("test gzip header already has optional fields")
+    flagged = blob[:3] + bytes([blob[3] | 0x04]) + blob[4:10]
+    length = len(extra).to_bytes(2, "little")
+    return flagged + length + extra + blob[10:]
+
+
 def _with_comment(blob: bytes, comment: bytes) -> bytes:
     if blob[3] & 0x1C:
         raise AssertionError("test gzip header already has optional fields")
@@ -307,6 +315,24 @@ def test_gzip_audit_checks_every_member(tmp_path):
         assert_anonymized_pack_clean(pack, symbol="NIK")
     target.write_bytes(original)
     assert_anonymized_pack_clean(pack, symbol="NIK")
+
+
+def test_load_pack_rejects_an_anonymized_gzip_extra_field(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    target.write_bytes(_with_extra(original, b"ZZZX"))
+    with pytest.raises(ValueError, match="FEXTRA"):
+        load_pack(pack)
+    with pytest.raises(ValueError, match="FEXTRA"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    target.write_bytes(original)
+    load_pack(pack)
 
 
 def test_load_pack_rejects_duplicate_manifest_keys(tmp_path):

@@ -101,16 +101,27 @@ environment. The lock is not a sandbox. The worker scrubs argv and the
 environment again after it starts, so a spawn that copied the operator
 process does not keep them. It also points
 `multiprocessing.process.ORIGINAL_DIR` at the empty temp directory and drops
-the operator directory from `sys.path`. Install paths stay.
+the operator directory from `sys.path`. Install paths stay. `PYTHONPATH` is
+not copied into the child. If the parent had that variable, any entry that is
+not the installed `backtester` package is also removed from the child's
+`sys.path`. A directory that only holds another job's `metrics.json` is one
+of those entries.
 
 The worker calls `setsid` on Linux before it waits for the parent, so it is
-its own process-group leader. A timeout, a cancel, or a resident-set kill
-signals that group: SIGTERM, then SIGKILL. A process the strategy started
-dies with it. On Windows every worker is placed in a job object before the
-parent releases it. The job sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The
-same stop calls `TerminateJobObject`, so those processes die together. A
-memory cap, when one was requested, is an additional commit-charge ceiling.
-The resident-set poll is separate from a `MemoryError` the strategy raises.
+its own process-group leader and the group id is the worker pid. The parent
+records that id when the child reports it has entered. A normal return, a
+strategy exception, a timeout, a cancel, a resident-set kill, and the final
+cleanup all signal that saved group: SIGTERM, then SIGKILL. The signal does
+not ask `getpgid` again, so it still works after the leader has been reaped.
+A grandchild that ignores SIGTERM dies on the SIGKILL. A grandchild that
+calls `setsid` itself leaves the group; that is the Phase 4 jail. On Windows
+every worker is placed in a job object before the parent releases it. The job
+sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Every exit path, including a
+normal return, calls `TerminateJobObject` and then closes the handle. If the
+job cannot be assigned, the book fails. It does not fall back to signaling
+only the worker pid. A memory cap, when one was requested, is an additional
+commit-charge ceiling. The resident-set poll is separate from a `MemoryError`
+the strategy raises.
 
 The worker redirects file descriptors 1 and 2 to a file in its temp directory,
 capped at 256 KiB. Further output is discarded without blocking the writer.

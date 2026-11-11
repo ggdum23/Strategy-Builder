@@ -231,8 +231,8 @@ def _token_present(symbol: str, text: str) -> bool:
     return re.search(rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])", text) is not None
 
 
-def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, int]:
-    """mtime, file name, whether an FCOMMENT is present, and the deflate offset.
+def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, bool, int]:
+    """mtime, file name, FCOMMENT, FEXTRA, and the deflate offset.
 
     RFC 1952 order after the 10-byte header is FEXTRA, FNAME, FCOMMENT, FHCRC.
     ``blob`` is one member, or a member followed by further members. Only the
@@ -243,6 +243,7 @@ def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, int]:
         raise ValueError("gzip member is not gzip")
     flags = blob[3]
     mtime = int.from_bytes(blob[4:8], "little")
+    has_extra = bool(flags & 0x04)
     pos = 10
     if flags & 0x04:
         if pos + 2 > len(blob):
@@ -268,7 +269,7 @@ def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, int]:
         pos += 2
     if pos > len(blob):
         raise ValueError("gzip member is truncated")
-    return mtime, fname, has_comment, pos
+    return mtime, fname, has_comment, has_extra, pos
 
 
 def _gzip_members(blob: bytes):
@@ -284,7 +285,7 @@ def _gzip_members(blob: bytes):
         rest = rest.lstrip(b"\x00")
         if not rest:
             return
-        mtime, fname, has_comment, start = _gzip_member(rest)
+        mtime, fname, has_comment, has_extra, start = _gzip_member(rest)
         inflator = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
         payload = inflator.decompress(rest[start:])
         unused = inflator.unused_data
@@ -293,7 +294,7 @@ def _gzip_members(blob: bytes):
         crc, length = struct.unpack("<II", unused[:8])
         if crc != zlib.crc32(payload) or length != (len(payload) & 0xFFFFFFFF):
             raise ValueError("gzip member failed its checksum")
-        yield (mtime, fname, has_comment), payload
+        yield (mtime, fname, has_comment, has_extra), payload
         rest = unused[8:]
 
 
@@ -312,7 +313,7 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
         raw = path.read_bytes()
         if path.suffix == ".gz":
             parts = []
-            for (mtime, fname, has_comment), payload in _gzip_members(raw):
+            for (mtime, fname, has_comment, has_extra), payload in _gzip_members(raw):
                 if mtime != 0:
                     raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
                 if fname:
@@ -320,6 +321,8 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
                     raise ValueError(f"{name} gzip file name is {shown!r}")
                 if has_comment:
                     raise ValueError(f"{name} gzip member has an FCOMMENT")
+                if has_extra:
+                    raise ValueError(f"{name} gzip member has an FEXTRA")
                 parts.append(payload.decode("utf-8"))
             if not parts:
                 raise ValueError(f"{name} gzip member is not gzip")
@@ -642,6 +645,29 @@ def _validate_manifest(document: dict) -> None:
         previous = chunk["last_day"]
 
 
+def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
+    """The same gzip header rules as the designer-pack audit.
+
+    Every member is checked. A file name, a comment, a non-zero mtime, or an
+    FEXTRA field is rejected. The builder does not emit those. ``load_pack``
+    repeats the check so a pack that bypassed the builder still fails closed.
+    """
+    saw = False
+    for (mtime, fname, has_comment, has_extra), _payload in _gzip_members(blob):
+        saw = True
+        if mtime != 0:
+            raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
+        if fname:
+            shown = fname.decode("utf-8", "replace")
+            raise ValueError(f"{name} gzip file name is {shown!r}")
+        if has_comment:
+            raise ValueError(f"{name} gzip member has an FCOMMENT")
+        if has_extra:
+            raise ValueError(f"{name} gzip member has an FEXTRA")
+    if not saw:
+        raise ValueError(f"{name} gzip member is not gzip")
+
+
 def load_pack(pack_dir) -> LoadedPack:
     """Read a pack. This does not open a sidecar."""
     root = Path(pack_dir)
@@ -660,6 +686,8 @@ def load_pack(pack_dir) -> LoadedPack:
         blob = path.read_bytes()
         if len(blob) >= MAX_FILE_BYTES:
             raise ValueError(f"{chunk['file']} is not under {MAX_FILE_BYTES} bytes")
+        if manifest["anonymized"]:
+            _reject_anonymized_gzip(chunk["file"], blob)
         hashed.append((chunk["file"], blob))
         frame = _read_csv_gz(path)
         days = sorted(int(day) for day in frame["day"].unique())
@@ -668,6 +696,8 @@ def load_pack(pack_dir) -> LoadedPack:
         frames.append(frame)
     daily_path = root / manifest["daily_file"]
     daily_blob = daily_path.read_bytes()
+    if manifest["anonymized"]:
+        _reject_anonymized_gzip(manifest["daily_file"], daily_blob)
     hashed.append((manifest["daily_file"], daily_blob))
     pack_id = _pack_id(hashed)
     if pack_id != manifest["pack_id"]:

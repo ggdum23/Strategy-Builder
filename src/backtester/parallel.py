@@ -868,10 +868,12 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         item = by_job[(row["strategy_id"], row["source_id"])]
         market = assignment[1]
         symbol = market.symbol if isinstance(market, _Prepared) else ""
+        # The directory suffix and the leaderboard id are the same string.
+        # Scrubbing alone turns both ZzZx and zzzx into ASSET.
+        folder = _designer_component(row["strategy_id"], symbol, used_names)
+        source_name = _designer_component(row["source_id"], symbol, set())
         source = Path(item.out_dir) / "designer"
         if source.is_dir():
-            folder = _designer_component(row["strategy_id"], symbol, used_names)
-            source_name = _designer_component(row["source_id"], symbol, set())
             dest = designer / folder / source_name
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.exists():
@@ -885,6 +887,8 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                 copied[key] = _scrub_text(value, symbol)
             else:
                 copied[key] = value
+        copied["strategy_id"] = folder
+        copied["source_id"] = source_name
         copied["error"] = _scrub_text(_designer_error_text(item), symbol)
         cleaned.append(copied)
     for index, row in enumerate(cleaned, start=1):

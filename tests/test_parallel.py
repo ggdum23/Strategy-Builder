@@ -678,13 +678,24 @@ def _sleeper_strategy(marker: Path, *, allocate: int = 0) -> str:
     )
 
 
+def _wait_dead(pid: int | None) -> bool:
+    if pid is None:
+        return True
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _alive(pid)
+
+
 def _assert_grandchild_gone(marker: Path, label: str) -> None:
     worker, child = _pids(marker)
     try:
         assert child is not None, f"{label}: strategy never started its child"
-        assert not _alive(child), f"{label}: grandchild {child} is still running"
+        assert _wait_dead(child), f"{label}: grandchild {child} is still running"
         if worker is not None:
-            assert not _alive(worker), f"{label}: worker {worker} is still running"
+            assert _wait_dead(worker), f"{label}: worker {worker} is still running"
     finally:
         _reap(child)
         _reap(worker)
@@ -980,7 +991,7 @@ def test_designer_error_hides_the_operator_traceback(tmp_path):
 def test_ticker_scrub_ignores_case(tmp_path):
     pack, sidecar, _built = _anon_pack(tmp_path, "ZZZX")
     result = run_parallel(
-        [_strategy(tmp_path / "strategies", "zzzx", FLAT)],
+        [_strategy(tmp_path / "strategies", "my_zzzx_v2", FLAT)],
         [PackMarket(str(pack), str(sidecar))],
         tmp_path / "out",
         profile="arena",
@@ -991,6 +1002,7 @@ def test_ticker_scrub_ignores_case(tmp_path):
     assert result.failures == 0, [(item.status, item.error) for item in result.results]
     designer = tmp_path / "out" / "designer"
     board = (designer / "leaderboard.csv").read_text(encoding="utf-8")
+    assert "my_ASSET_v2" in board
     assert "zzzx" not in board.casefold()
     names = [path.name for path in designer.rglob("*")]
     assert all("zzzx" not in name.casefold() for name in names)
@@ -1144,3 +1156,228 @@ def test_rss_poll_kills_without_a_memory_error(tmp_path):
     assert "exceeded memory limit" in (by_id["hog"].error or "")
     assert "MemoryError" not in (by_id["hog"].error or "")
     assert by_id["good"].status == "ok", detail
+
+
+def _orphan_strategy(marker: Path, ready: Path, *, ignore_term: bool, action: str) -> str:
+    if ignore_term:
+        grandchild = (
+            "import signal, time\n"
+            "from pathlib import Path\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"Path({str(ready)!r}).write_text('ready')\n"
+            "time.sleep(300)\n"
+        )
+        spawn = (
+            f"        child = subprocess.Popen([sys.executable, '-c', {grandchild!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL"
+            + (", creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)" if os.name == "nt" else "")
+            + ")\n"
+            "        deadline = time.time() + 15\n"
+            f"        while not Path({str(ready)!r}).is_file():\n"
+            "            if time.time() > deadline:\n"
+            "                break\n"
+            "            time.sleep(0.02)\n"
+        )
+    elif os.name == "nt":
+        spawn = (
+            "        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)\n"
+            "        child = subprocess.Popen(['ping', '-n', '300', '127.0.0.1'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)\n"
+        )
+    else:
+        spawn = (
+            "        child = subprocess.Popen(['sleep', '300'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        )
+    if action == "raise":
+        finish = "        raise RuntimeError('grandchild-left-behind')\n"
+    elif action == "sleep":
+        finish = "        time.sleep(300)\n        return None\n"
+    else:
+        finish = "        return None\n"
+    return (
+        "import json, os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        f"{spawn}"
+        f"        Path({str(marker)!r}).write_text(json.dumps({{'worker': os.getpid(), 'child': child.pid}}))\n"
+        f"{finish}"
+    )
+
+
+def _run_orphan(tmp_path: Path, name: str, *, ignore_term: bool, action: str, timeout_s: float, cancel: bool):
+    marker = tmp_path / f"{name}.json"
+    ready = tmp_path / f"{name}.ready"
+    _strategy(tmp_path / name, "orphan", _orphan_strategy(marker, ready, ignore_term=ignore_term, action=action))
+    token = CancelToken()
+    watcher = None
+    if cancel:
+        def _after_gate():
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if marker.is_file():
+                    time.sleep(0.3)
+                    token.cancel()
+                    return
+                time.sleep(0.05)
+
+        watcher = threading.Thread(target=_after_gate, daemon=True)
+        watcher.start()
+    started = time.monotonic()
+    try:
+        result = run_parallel(
+            discover_strategies(tmp_path / name),
+            [FrameMarket("book", "TEST", frame=_frame())],
+            tmp_path / f"{name}-out",
+            profile="arena",
+            workers=1,
+            timeout_s=timeout_s,
+            with_benchmarks=False,
+            cancel=token if cancel else None,
+        )
+        return result, time.monotonic() - started
+    finally:
+        if watcher is not None:
+            watcher.join(timeout=2)
+        _assert_grandchild_gone(marker, name)
+
+
+def test_grandchildren_are_reaped_after_return_error_timeout_and_cancel(tmp_path):
+    """A process the strategy starts dies on every exit, including a clean return.
+
+    The SIGTERM-ignoring grandchild stays alive if the group is not SIGKILLed
+    after the leader has exited. Plain ``sleep`` dies on SIGTERM, so it only
+    proves the success and error paths signal the group at all.
+    """
+    returned, elapsed = _run_orphan(
+        tmp_path, "sleep-ok", ignore_term=False, action="return", timeout_s=30, cancel=False
+    )
+    assert elapsed < 20
+    assert returned.results[0].status == "ok", (returned.results[0].status, returned.results[0].error)
+
+    raised, elapsed = _run_orphan(
+        tmp_path, "sleep-err", ignore_term=False, action="raise", timeout_s=30, cancel=False
+    )
+    assert elapsed < 20
+    assert raised.results[0].status == "error"
+    assert "grandchild-left-behind" in (raised.results[0].error or "")
+
+    ignored, elapsed = _run_orphan(
+        tmp_path, "ign-ok", ignore_term=True, action="return", timeout_s=30, cancel=False
+    )
+    assert elapsed < 20
+    assert ignored.results[0].status == "ok", (ignored.results[0].status, ignored.results[0].error)
+
+    timed, elapsed = _run_orphan(
+        tmp_path, "ign-timeout", ignore_term=True, action="sleep", timeout_s=6, cancel=False
+    )
+    assert elapsed < 20
+    assert timed.results[0].status == "timeout"
+
+    cancelled, elapsed = _run_orphan(
+        tmp_path, "ign-cancel", ignore_term=True, action="sleep", timeout_s=25, cancel=True
+    )
+    assert elapsed < 12, [(item.status, item.error) for item in cancelled.results]
+    assert cancelled.results[0].status == "cancelled"
+
+
+def test_designer_leaderboard_keeps_distinct_ids_for_ticker_case_variants(tmp_path):
+    from backtester.report import read_leaderboard
+
+    pack, sidecar, _built = _anon_pack(tmp_path, "ZZZX")
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "one", "ZzZx", FLAT),
+            _strategy(tmp_path / "two", "zzzx", FLAT),
+        ],
+        [PackMarket(str(pack), str(sidecar))],
+        tmp_path / "out",
+        profile="arena",
+        workers=2,
+        timeout_s=30,
+        with_benchmarks=False,
+    )
+    assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
+    designer = tmp_path / "out" / "designer"
+    rows = read_leaderboard(designer / "leaderboard.csv")
+    ids = [row["strategy_id"] for row in rows]
+    folders = sorted(path.name for path in designer.iterdir() if path.is_dir())
+    assert len(ids) == 2
+    assert len(set(ids)) == 2
+    assert sorted(ids) == folders
+    assert all("zzzx" not in item.casefold() for item in ids)
+    operator = read_leaderboard(tmp_path / "out" / "leaderboard.csv")
+    assert {row["strategy_id"] for row in operator} == {"ZzZx", "zzzx"}
+    assert_designer_clean(designer, symbol="ZZZX")
+
+
+def test_child_cannot_read_a_report_through_pythonpath(tmp_path):
+    secret = tmp_path / "via-pythonpath"
+    secret.mkdir()
+    (secret / "metrics.json").write_text(
+        json.dumps({"symbol": "QQQ", "share_scale": 9.001}), encoding="utf-8"
+    )
+    side = tmp_path / "seen.json"
+    source = (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "hits = []\n"
+        "pythonpath = os.environ.get('PYTHONPATH', '')\n"
+        "roots = [part for part in pythonpath.split(os.pathsep) if part]\n"
+        "roots.extend(sys.path)\n"
+        "for root in roots:\n"
+        "    candidate = Path(root) / 'metrics.json'\n"
+        "    try:\n"
+        "        if candidate.is_file():\n"
+        "            hits.append(candidate.read_text(encoding='utf-8'))\n"
+        "    except OSError:\n"
+        "        pass\n"
+        f"Path({str(side)!r}).write_text(json.dumps({{'hits': hits, 'pythonpath': pythonpath, 'path': sys.path}}))\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        return None\n"
+    )
+    old = os.environ.get("PYTHONPATH")
+    old_path = list(sys.path)
+    os.environ["PYTHONPATH"] = str(secret.resolve())
+    sys.path.insert(0, str(secret.resolve()))
+    try:
+        result = run_parallel(
+            [_strategy(tmp_path / "s", "reader", source)],
+            [FrameMarket("book", "TEST", frame=_frame())],
+            tmp_path / "out",
+            profile="arena",
+            workers=1,
+            timeout_s=30,
+            with_benchmarks=False,
+        )
+    finally:
+        if old is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = old
+        sys.path[:] = old_path
+    assert result.failures == 0, [(item.status, item.error) for item in result.results]
+    seen = json.loads(side.read_text(encoding="utf-8"))
+    dumped = json.dumps(seen)
+    assert seen["hits"] == []
+    assert "9.001" not in dumped
+    assert "QQQ" not in dumped
+    assert str(secret.resolve()) not in seen["pythonpath"]
+    assert all(os.path.normcase(os.path.abspath(entry)) != os.path.normcase(str(secret.resolve())) for entry in seen["path"] if entry)
+
+
+def test_a_missing_windows_job_fails_the_run(tmp_path, monkeypatch):
+    monkeypatch.setattr("backtester.limits.arm_worker_job", lambda *_args, **_kwargs: None)
+    result = run_parallel(
+        [_strategy(tmp_path / "s", "flat", FLAT)],
+        [FrameMarket("book", "TEST", frame=_frame())],
+        tmp_path / "out",
+        profile="arena",
+        workers=1,
+        timeout_s=30,
+        with_benchmarks=False,
+    )
+    if os.name == "nt":
+        assert result.results[0].status == "error"
+        assert "job object" in (result.results[0].error or "")
+    else:
+        assert result.results[0].status == "ok", (result.results[0].status, result.results[0].error)
