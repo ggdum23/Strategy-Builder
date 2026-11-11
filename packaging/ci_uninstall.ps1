@@ -50,7 +50,21 @@ if ($code -ne 0) {
     throw "uninstaller exited $code"
 }
 if ($DeleteUserData) {
+    # unins000.exe exits when its first phase is signalled, which is before
+    # CurUninstallStepChanged(usPostUninstall) runs DelTree in the second phase.
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Test-Path -LiteralPath $userRoot) -and ((Get-Date) -lt $deadline)) {
+        if (Test-Path -LiteralPath $log) {
+            $text = Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue
+            if ($text -match 'Strategy Builder keeping ') {
+                Get-Content -LiteralPath $log
+                throw "DELETEUSERDATA was ignored; uninstall kept $userRoot"
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
     if (Test-Path -LiteralPath $userRoot) {
+        if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
         throw "DELETEUSERDATA left $userRoot"
     }
     Write-Output "uninstalled $Destination"

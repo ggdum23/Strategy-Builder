@@ -101,6 +101,8 @@ def test_installer_script_defaults_and_keeps_user_data():
     assert "DeleteUserData" in uninstall
     assert "/DELETEUSERDATA" in uninstall
     assert "DELETEUSERDATA left" in uninstall
+    assert "DELETEUSERDATA was ignored" in uninstall
+    assert "AddSeconds(20)" in uninstall
     assert "ci-preserve.txt" in uninstall
     upgrade = (PACKAGING / "ci_upgrade.ps1").read_text(encoding="utf-8")
     assert "upgrade-keep" in upgrade
