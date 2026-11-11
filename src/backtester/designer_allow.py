@@ -133,6 +133,55 @@ _YEAR_KEY = re.compile(r"Y([1-9][0-9]{0,1})\Z")
 _MONTH_LIMIT = 600
 _YEAR_LIMIT = 60
 
+# One clock token. Hours may be one or two digits. Minutes and seconds are two.
+# The screen, the export, and ``publish_designer`` all use this spelling.
+CLOCK_BODY = r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?"
+CLOCK_TEXT = re.compile(CLOCK_BODY + r"\Z")
+_SESSION_TEXT = re.compile(r"(?:[SB]\d+|pre|rth|post|eth)\Z")
+_SAFE_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
+_ENUM_VALUES = {
+    "phase": frozenset({"pre", "rth", "post"}),
+    "profile": frozenset({"desk", "arena"}),
+    "audience": frozenset({"designer", "operator"}),
+    "status": frozenset({"ok", "error", "timeout", "cancelled", "memory", "crash"}),
+    "kind": frozenset({"strategy", "margin", "liquidation"}),
+    "price_basis": frozenset({"raw", "total_return"}),
+    "series_kind": frozenset({"raw", "total_return"}),
+    "total_return_method": frozenset(
+        {"none", "profile_dividends", "cash_dividends", "registry_series"}
+    ),
+    "accrual": frozenset({"session_boundary_1_252"}),
+    "leg": frozenset({"design", "locked"}),
+    "state": frozenset({"ok", "error", "running", "done"}),
+}
+_ID_KEYS = frozenset({"strategy_id", "source_id", "name"})
+_TIME_KEYS = frozenset({"time"})
+_SESSION_KEYS = frozenset({"session", "first_session", "last_session", "session_id"})
+_FREE_TEXT_KEYS = frozenset({"message", "error"})
+_BOOL_KEYS = frozenset(
+    {
+        "disqualified",
+        "busted",
+        "anonymized",
+        "cancelled",
+        "open_position_at_end",
+        "dividends_applied",
+    }
+)
+_BOOL_TEXT = frozenset({"true", "false"})
+# Sentences the report itself writes. Anything else on those keys is free text.
+_FIXED_TEXT = frozenset(
+    {
+        "withheld",
+        "the strategy failed",
+        "not published",
+        "stopped",
+        "no daily marks",
+    }
+)
+_NON_FINITE_TEXT = frozenset({"inf", "-inf", "nan"})
+_DROP = object()
+
 
 def period_key_allowed(name: str) -> bool:
     """True for an engine block label or a month/year stand-in in the schema."""
@@ -211,20 +260,117 @@ def project_designer(value):
     """Allow-listed copy of a metrics, fill, trade, liquidation, or benchmark tree.
 
     Fee dollars become ``cost_drag_bps``. Share counts, prices, notionals,
-    per-component fees, and accounting dollars are absent.
+    per-component fees, and accounting dollars are absent. A string is kept
+    only when the key's schema allows it. Free text such as ``message`` is
+    dropped, so a price or a scale cannot ride along in a caption.
     """
     return _keep(with_cost_drag(value))
 
 
-def _keep(value):
+def designer_csv_cell(key: str, cell: str) -> str:
+    """The cell ``publish_designer`` may write, or empty when it is free text.
+
+    A numeric cell keeps its original spelling. A clock, a session label, an
+    enum, and a safe id stay. Anything else is blank.
+    """
+    if cell == "":
+        return ""
+    if _numeric_text(cell):
+        if period_key_allowed(key) or key not in _STRING_SCHEMA_KEYS:
+            return cell
+        return ""
+    accepted = accept_string(key, cell)
+    if not isinstance(accepted, str):
+        return ""
+    return accepted
+
+
+def accept_string(key: str, text: str):
+    """A schema string, a number parsed from text, or None when the text is free.
+
+    None means the key is dropped. Numbers stay numbers. Period-key values
+    have to be numeric. ``message`` and ``error`` keep a fixed code only.
+    """
+    if text == "":
+        return ""
+    if key in _BOOL_KEYS and text in _BOOL_TEXT:
+        return text
+    if key in _FREE_TEXT_KEYS:
+        return text if text in _FIXED_TEXT else None
+    if key in _ENUM_VALUES:
+        return text if text in _ENUM_VALUES[key] else None
+    if key in _ID_KEYS:
+        return text if _SAFE_ID.fullmatch(text) else None
+    if key in _TIME_KEYS:
+        return text if CLOCK_TEXT.fullmatch(text) else None
+    if key in _SESSION_KEYS:
+        return text if _SESSION_TEXT.fullmatch(text) else None
+    if period_key_allowed(key):
+        return _finite_number(text)
+    number = _finite_number(text)
+    if number is not None:
+        return number
+    if text in _NON_FINITE_TEXT:
+        return text
+    return None
+
+
+_STRING_SCHEMA_KEYS = _FREE_TEXT_KEYS | frozenset(_ENUM_VALUES) | _ID_KEYS | _TIME_KEYS | _SESSION_KEYS
+
+
+def _numeric_text(text: str) -> bool:
+    number = _finite_number(text.strip())
+    return number is not None
+
+
+def _finite_number(text: str):
+    token = text.strip()
+    if not token:
+        return None
+    try:
+        if any(mark in token.lower() for mark in (".", "e")):
+            number = float(token)
+        else:
+            number = int(token)
+    except ValueError:
+        return None
+    if isinstance(number, float) and not math.isfinite(number):
+        return None
+    return number
+
+
+def _keep(value, key=None):
     if isinstance(value, list):
-        return [_keep(item) for item in value]
+        kept = []
+        for item in value:
+            child = _keep(item, key)
+            if child is _DROP:
+                continue
+            kept.append(child)
+        return kept
     if isinstance(value, dict):
         kept = {}
-        for key, item in value.items():
-            name = str(key)
+        for child_key, item in value.items():
+            name = str(child_key)
             if not redacted_key_allowed(name):
                 continue
-            kept[name] = _keep(item)
+            child = _keep(item, name)
+            if child is _DROP:
+                continue
+            kept[name] = child
         return kept
+    if key is None:
+        return value
+    return _typed_leaf(key, value)
+
+
+def _typed_leaf(key: str, value):
+    if isinstance(value, str):
+        accepted = accept_string(key, value)
+        return _DROP if accepted is None else accepted
+    if period_key_allowed(key):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return _DROP
+        if isinstance(value, float) and not math.isfinite(value):
+            return _DROP
     return value

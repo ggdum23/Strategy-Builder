@@ -21,7 +21,7 @@ import zlib
 from decimal import Decimal
 from pathlib import Path
 
-from ..designer_allow import redacted_key_allowed, with_cost_drag
+from ..designer_allow import CLOCK_BODY, CLOCK_TEXT, redacted_key_allowed, with_cost_drag
 
 _MONTH = (
     r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
@@ -129,8 +129,12 @@ _WORD_WITH_EXP = (
     r"(?:(?![eE][+-])[A-Za-z0-9_.])+[eE][+-](?:\d+(?:\.\d*)?|\.\d+)"
     r"|[A-Za-z0-9_.]+"
 )
+# A clock is one token. The colon stays, so ``09:25`` is not the two numbers
+# ``09`` and ``25``. Hours may be one or two digits. Seconds are optional.
+_CLOCK_TOKEN = re.compile(rf"(?<![A-Za-z0-9_])(?:{CLOCK_BODY})(?!\d)")
 _SURFACE_TOKEN = re.compile(
-    rf"(?<![A-Za-z0-9_])[+-]?\$?{_NUMBER_CORE}{_NUMBER_EXP}%?(?![A-Za-z0-9_])"
+    rf"(?<![A-Za-z0-9_])(?:{CLOCK_BODY})(?!\d)"
+    rf"|(?<![A-Za-z0-9_])[+-]?\$?{_NUMBER_CORE}{_NUMBER_EXP}%?(?![A-Za-z0-9_])"
     rf"|{_HYPHEN_WORD.pattern}"
     rf"|{_WORD_WITH_EXP}"
 )
@@ -655,26 +659,30 @@ def _power_of_ten_multiple(value: float, base: float) -> bool:
 def _literal_is_scale(literal: str, scale: float) -> bool:
     """True when this literal is the scale, its reciprocal, or the scale times 10^k.
 
-    The significand digit string is compared with the scale's digit string.
-    The parsed value is compared with the scale, with the reciprocal, and
-    with the scale scaled by powers of ten. The exponent is the same kind of literal.
+    The exponent is the same kind of literal. The parsed value is compared
+    with the scale, with the reciprocal, and with the scale scaled by powers
+    of ten. Those three match at any length. A match that is only the
+    significand digits, with no agreement in magnitude, needs at least three
+    significant digits. ``25`` is still the scale ``0.25`` because it is that
+    scale times one hundred. ``25e0.5`` is not, and a one- or two-digit
+    significand is also an ordinary number.
     """
-    if _significand_digits(literal) == _scale_digits(scale):
-        return True
     exponent = _exponent_text(literal)
     if exponent is not None and exponent != literal and _literal_is_scale(exponent, scale):
         return True
     try:
         value = abs(float(literal))
     except ValueError:
-        return False
-    if not math.isfinite(value):
-        return False
-    if scale != 0 and math.isclose(value, abs(1.0 / scale), rel_tol=1e-9, abs_tol=1e-12):
-        return True
-    return _power_of_ten_multiple(value, abs(scale)) or math.isclose(
-        value, abs(scale), rel_tol=1e-9, abs_tol=1e-12
-    )
+        value = None
+    if value is not None and math.isfinite(value):
+        if scale != 0 and math.isclose(value, abs(1.0 / scale), rel_tol=1e-9, abs_tol=1e-12):
+            return True
+        if _power_of_ten_multiple(value, abs(scale)) or math.isclose(
+            value, abs(scale), rel_tol=1e-9, abs_tol=1e-12
+        ):
+            return True
+    digits = _significand_digits(literal)
+    return len(digits) >= 3 and digits != "0" and digits == _scale_digits(scale)
 
 
 def _scale_in_token(token: str, scale: float | None) -> bool:
@@ -688,6 +696,8 @@ def _scale_in_token(token: str, scale: float | None) -> bool:
     """
     number = _scale_number(scale)
     if number is None or not token:
+        return False
+    if CLOCK_TEXT.fullmatch(token):
         return False
     probed = token.replace("$", "").replace("%", "").replace(",", "")
     for match in _NUMBER_LITERAL.finditer(probed):
@@ -708,6 +718,8 @@ def _keep_surface_token(token: str, *, previous: str, scale: float | None) -> bo
     plus a year, a year glued to letters, and the invoice scale do not.
     ``2024.50`` and the pair ``day 2024`` stay.
     """
+    if CLOCK_TEXT.fullmatch(token):
+        return True
     if _GLUED_YEAR.search(token):
         return False
     if _MONTH_IN_TOKEN.search(token) and _YEAR_IN_TOKEN.search(token):
@@ -983,8 +995,9 @@ def resolve_view(folder: Path, audience: str) -> tuple[str, Path, bool]:
 def export_text(path: Path) -> str:
     """Text used to decide whether a designer may receive ``path``.
 
-    Bytes are decoded as latin-1, so a binary file cannot skip the check by
-    failing a UTF-8 decode. PNG text chunks are included even when compressed.
+    A PNG is its text chunks only (``tEXt``, ``zTXt``, ``iTXt``), including a
+    compressed chunk. Pixel bytes are not text. Any other file is decoded as
+    latin-1, so a binary file cannot skip the check by failing a UTF-8 decode.
     A file over the read cap is refused before it is read whole.
     """
     suffix = path.suffix.lower()
@@ -996,6 +1009,8 @@ def export_text(path: Path) -> str:
         limit = JSON_READ_LIMIT
     refuse_oversized(path, limit)
     data = path.read_bytes()
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return _png_text(data)
     return data.decode("latin-1") + "\n" + _png_text(data)
 
 
@@ -1051,6 +1066,163 @@ def _itxt_text(chunk: bytes) -> str:
             pass
     pieces.append(text.decode("latin-1", "replace"))
     return "\n".join(pieces)
+
+
+def scan_publication(text: str, *, symbols: tuple[str, ...] = (), scale: float | None = None) -> str | None:
+    """None when ``text`` may be published. Otherwise ``the scale`` or ``a price``.
+
+    The scale decision is the same token check as the screen. A price is a
+    decimal literal in free text whose absolute value is at least 1.
+    Allow-listed numeric cells are neither. A clock is neither. An exponent
+    inside a hex id is not a price. Tickers and dates are the other audit.
+    """
+    del symbols
+    normalized = normalize_surface(text)
+    if _publication_has_scale(normalized, scale):
+        return "the scale"
+    if _publication_has_price(normalized):
+        return "a price"
+    return None
+
+
+def _free_has_scale(text: str, scale: float | None) -> bool:
+    """True only when a token is the invoice scale. A year glued into an id is not."""
+    if _scale_number(scale) is None:
+        return False
+    return _contains_scale(text, scale)
+
+
+def _publication_has_scale(text: str, scale: float | None) -> bool:
+    if _scale_number(scale) is None:
+        return False
+    structured = _structured_document(text)
+    if structured is None:
+        return _free_has_scale(text, scale)
+    kind, payload = structured
+    if kind == "json":
+        return _json_has_scale(payload, scale)
+    return _csv_has_scale(payload, scale)
+
+
+def _json_has_scale(value, scale: float | None, key: str | None = None) -> bool:
+    if isinstance(value, dict):
+        for child_key, item in value.items():
+            name = str(child_key)
+            if _free_has_scale(name, scale) or _json_has_scale(item, scale, name):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_json_has_scale(item, scale, key) for item in value)
+    if isinstance(value, str):
+        return _free_has_scale(value, scale)
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        if key is not None and redacted_key_allowed(key):
+            return False
+        return _contains_scale(str(value), scale)
+    return _free_has_scale(str(value), scale)
+
+
+def _csv_has_scale(rows: list[list[str]], scale: float | None) -> bool:
+    header = [cell.strip() for cell in rows[0]]
+    for name in header:
+        if _free_has_scale(name, scale):
+            return True
+    if header == ["key", "raw", "display"]:
+        for row in rows[1:]:
+            if not row:
+                continue
+            if _free_has_scale(row[0], scale):
+                return True
+            listed = redacted_key_allowed(row[0])
+            for cell in row[1:]:
+                if listed and (_numeric_cell(cell) or _formatted_number(cell)):
+                    continue
+                if _free_has_scale(cell, scale):
+                    return True
+        return False
+    listed = [redacted_key_allowed(name) for name in header]
+    for row in rows[1:]:
+        for index, cell in enumerate(row):
+            if index < len(listed) and listed[index] and _numeric_cell(cell):
+                continue
+            if _free_has_scale(cell, scale):
+                return True
+    return False
+
+
+def _publication_has_price(text: str) -> bool:
+    structured = _structured_document(text)
+    if structured is None:
+        return _free_text_has_price(text)
+    kind, payload = structured
+    if kind == "json":
+        return _json_has_price(payload)
+    return _csv_has_price(payload)
+
+
+def _is_price_literal(literal: str) -> bool:
+    """A decimal number at least 1. An exponent with no decimal point is not one.
+
+    ``450.12`` and ``7.777`` are prices. ``42e0`` inside a hex id is not,
+    and neither is an integer share count or a session minute.
+    """
+    if "." not in literal:
+        return False
+    try:
+        value = abs(float(literal))
+    except ValueError:
+        return False
+    return math.isfinite(value) and value >= 1.0
+
+
+def _free_text_has_price(text: str) -> bool:
+    masked = _CLOCK_TOKEN.sub(" ", normalize_surface(text))
+    return any(_is_price_literal(match.group(0)) for match in _NUMBER_LITERAL.finditer(masked))
+
+
+def _json_has_price(value, key: str | None = None) -> bool:
+    del key
+    if isinstance(value, dict):
+        for child_key, item in value.items():
+            if _free_text_has_price(str(child_key)) or _json_has_price(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_json_has_price(item) for item in value)
+    if isinstance(value, str):
+        return _free_text_has_price(value)
+    return False
+
+
+def _csv_has_price(rows: list[list[str]]) -> bool:
+    header = [cell.strip() for cell in rows[0]]
+    for name in header:
+        if _free_text_has_price(name):
+            return True
+    if header == ["key", "raw", "display"]:
+        for row in rows[1:]:
+            if not row:
+                continue
+            listed = redacted_key_allowed(row[0])
+            for cell in row[1:]:
+                if listed and (_numeric_cell(cell) or _formatted_number(cell)):
+                    continue
+                if _free_text_has_price(cell):
+                    return True
+        return False
+    listed = [redacted_key_allowed(name) for name in header]
+    for row in rows[1:]:
+        for index, cell in enumerate(row):
+            safe = index < len(listed) and listed[index] and (
+                _numeric_cell(cell) or _formatted_number(cell)
+            )
+            if safe:
+                continue
+            if _free_text_has_price(cell):
+                return True
+    return False
 
 
 def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) -> bool:

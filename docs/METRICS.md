@@ -203,7 +203,14 @@ rewritten into that tree.
 
 The equity chart is session index against equity. The title is `equity`.
 It has no ticker and no date axis. PNG bytes are not part of the determinism
-contract. An encoder may stamp the file.
+contract. An encoder may stamp the file. The designer check reads the PNG
+text chunks only, not the pixel bytes.
+
+A string on an allow-listed key has to match that key: a phase, a session
+label, a clock time, an accounting enum, or a safe id (`strategy_id`,
+`source_id`, `name`). Free text is omitted. `publish_designer` scans the
+tree with the operator scale and does not leave the directory behind when
+that scan fails.
 
 The designer tree is an allow-list. Share counts, prices, notionals,
 per-component fees, the dollar `fees_total`, and accounting dollars are not
