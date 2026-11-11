@@ -457,12 +457,22 @@ def entry_from_inspection(
     return entry
 
 
+def _json_pairs(pairs):
+    """Object hook that refuses a repeated key. ``json.loads`` would keep the last one."""
+    document = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        document[key] = value
+    return document
+
+
 def load_registry(path) -> dict:
     file = Path(path)
     if not file.is_file():
         raise FileNotFoundError(f"registry does not exist: {file}")
     try:
-        document = json.loads(file.read_text(encoding="utf-8"))
+        document = json.loads(file.read_text(encoding="utf-8"), object_pairs_hook=_json_pairs)
     except json.JSONDecodeError as exc:
         raise ValueError(f"registry {file} is not JSON: {exc}") from exc
     validate_registry(document)

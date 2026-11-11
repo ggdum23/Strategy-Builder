@@ -75,9 +75,10 @@ These are the readings that were not fixed by a single sentence in the spec.
     not scale borrow, financing, dividends, or the share count that advances the
     tier. Financing dollars can still change because cash changes.
 
-12. **`share_factor`.** Default 1.0 on this loader. 0.9 is the anonymized kit's
-    factor and is not the default. The CLI warns when a raw file is run with
-    anything other than 1.0. It scales per-share fees only.
+12. **`share_factor`.** Raw runs are 1.0. 0.9 is not a kit constant. Passing
+    any other factor on a raw run is an error. An anonymized pack keeps its
+    scale in the operator sidecar, and the runner passes that scale into the
+    engine so per-share fees use real share counts.
 
 13. **Tier month.** `live_session_ordinal // 21`. Warm-up does not advance it:
     going live clears the volume bucket, and the ordinal is counted from the
@@ -105,8 +106,13 @@ These are the readings that were not fixed by a single sentence in the spec.
 16. **Dividends.** `shares_held_into_the_ex_session * amount`, using the shares
     from the previous session's snap, credited or debited on cash before that
     session's fill. A positive amount credits longs and debits shorts. A missing
-    session is zero. No file means no dividends. Keys are the session ids the
-    engine is given (`YYYY-MM-DD` for named files).
+    session is zero. No file means no dividends. Keys in the operator file are
+    calendar dates (`YYYY-MM-DD` for named files, which are also the session
+    ids the named engine is given). An anonymized pack run takes those same
+    real dollars per real share. The parent multiplies each amount by
+    `share_scale` and remaps the date through the sidecar date map to the pack
+    session id (`S#####`). The child receives only that dict. A date that is
+    not in the pack is an error.
 
 17. **Bar order.** If this is the first live bar, reset the book flat to the
     starting equity. Then, if not disqualified: boundary charges, then an RTH

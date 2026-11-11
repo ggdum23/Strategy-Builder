@@ -9,7 +9,7 @@ The file is JSON, `schema_version` 1. JSON is the registry format because the re
 | Field | Meaning |
 | --- | --- |
 | `symbol`, `source_root`, `source_glob` | Where the monthly filled files live. `source_root` is whatever path was ingested. It is not a path baked into the program. |
-| `columns` | The filled-file columns that were present. |
+| `columns` | The required filled-file columns only. Any other column is an error. The loader reads those columns by name, so their order in the file does not matter. |
 | `timezone` | Offsets actually observed on `timestamp_et`. A daylight-time pair is the two US Eastern offsets one hour apart. Any other offset contradicts the column name and the ingest fails. |
 | `session_segments` | Clock window inferred for each label: modal first minute, last minute, and bar count, plus variants, gaps, and the engine phase. `hours_assumed` is always false. |
 | `price_adjustment` | `raw` or `total_return`. Total-return is recorded and is not runnable in this phase. Prices are not rewritten. |

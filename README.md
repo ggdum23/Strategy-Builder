@@ -91,9 +91,9 @@ again. Adding a ticker is a registry entry plus an ingest. It is not a code chan
 
 That does not copy the files. A new symbol needs its own filled files, its own
 dividend file if Desk should pay them, and an explicit split decision. An empty
-split list means the prints are raw. `--share-factor 0.9` on these raw files
-warns, because per-share fees would be wrong. An anonymized pack stores its own
-factor in the operator sidecar, and the runner passes that factor so per-share
+split list means the prints are raw. A raw run uses share factor 1.0. Passing
+another factor is an error. 0.9 is not a kit constant. An anonymized pack stores
+its scale in the operator sidecar, and the runner passes that scale so per-share
 fees still use real share counts.
 
 ## Walk-forward
@@ -141,9 +141,11 @@ python -m backtester test
 `--borrow-rate` overrides that profile's borrow. `--financing-rate` and
 `--fee-mult` are Desk switches. Arena rejects a financing rate, a fee multiplier
 other than 1, and a dividend file, so the reference loop stays the reference loop.
-`--dividends` is a CSV with columns `session,amount`. An anonymized pack refuses
-a dividend file: pack share counts are rescaled, and a raw per-share dividend
-would be applied to the wrong count.
+`--dividends` is a CSV with columns `session,amount`: real dollars per real
+share, keyed by calendar date. On an anonymized pack the runner multiplies the
+amount by `share_scale` and remaps the date to the pack session id. The child
+does not receive the calendar key or the unscaled amount. A date that is not in
+the pack is an error.
 
 A pack run prints the cost basis (`share_scale`, schedule, and that per-share
 fees used real share counts). `metrics.json` carries the same record.

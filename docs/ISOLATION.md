@@ -48,13 +48,29 @@ path when the class was loaded from a file) and the run kwargs. It does not
 receive the data directory, the CLI argv, or the locked frame.
 
 An anonymized pack run uses the same channels. `run_pack` reads the sidecar in
-the operator process, then drops that document before the spawn. The child
-receives the anonymized frame and the numeric `share_factor` (the price factor
-k, which the engine needs in order to bill real share counts). It does not
-receive the sidecar document, the date map, the ticker, the volume factor, the
-operator note, or the sidecar path. Heap, environment, argv, and cwd are the
-in-scope checks. A hardcoded absolute path can still open a file; that is the
-Phase 4 jail, not this one.
+the operator process, then drops that document before the spawn. The sidecar
+file is where the scale factors, the date map, and the ticker are stored. The
+child still receives `share_scale` (the price factor k) because the engine
+bills per-share fees on real share counts. It does not receive the sidecar
+document, the date map, the ticker, the volume factor, the operator note, or
+the sidecar path. The runner frames that are only forwarding the number do not
+keep a local named `share_scale` or `share_factor` while `on_bar` runs. The
+engine frame does: Arena's `run` parameter and Desk's `DeskConfig.share_factor`
+are how the invoice is computed, and a strategy can see them.
+
+Post-fee cash determines k from the public fee schedule even if those names
+were hidden. That residual follows from the owner's choice to charge real
+per-share fees. Moving billing into the parent is a Phase 4 option. It would
+take the scale off the child engine frame. It would not remove the inference
+from post-fee cash.
+
+The same pack leaks that `docs/PACK.md` lists apply here: weekday plus
+early-close shape, a crash-shaped path, native tick times `price_factor`, the
+billing scale above, and bar `count`, which is not volume-scaled and is an
+identity cue. `count` stays the source trade count.
+
+Heap, environment, argv, and cwd are the in-scope checks. A hardcoded absolute
+path can still open a file. That is the Phase 4 jail.
 
 `walk_forward` deletes the frame it was given. The command line passes that
 frame as the argument and does not keep another name for it. A caller that

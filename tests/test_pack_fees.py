@@ -178,6 +178,8 @@ def test_anonymized_pack_matches_raw_per_share_fees(tmp_path, anonymized_qqq, pr
     assert file_metrics["cost_basis"]["cost_schedule"] == profile
     assert file_metrics["cost_basis"]["profile"] == profile
     assert "share_scale" in file_metrics["cost_basis"]["note"]
+    assert "volume_factor" not in (pack_dir / "metrics.json").read_text(encoding="utf-8")
+    assert "date_map" not in (pack_dir / "metrics.json").read_text(encoding="utf-8")
     assert raw["cost_basis"]["share_scale"] == 1.0
     assert raw["cost_basis"]["anonymized"] is False
     assert raw["cost_basis"]["cost_schedule"] == profile
@@ -218,18 +220,201 @@ def test_anonymized_pack_matches_raw_per_share_fees(tmp_path, anonymized_qqq, pr
     assert "2026-" not in curve
 
 
-def test_anonymized_pack_rejects_a_raw_dividend_file(tmp_path, anonymized_qqq):
-    pack, sidecar = anonymized_qqq
-    with pytest.raises(ValueError, match="dividend"):
+class TargetOnce:
+    """One target on the first regular bar. Later bars leave the position alone."""
+
+    WANTS_EXTENDED_HOURS = False
+    TARGET = 1.0
+
+    def __init__(self):
+        self.sent = False
+
+    def on_bar(self, bar, _state):
+        phase = bar["phase"] if "phase" in bar else bar["session"]
+        if phase != "rth" or self.sent:
+            return None
+        self.sent = True
+        return self.TARGET
+
+
+class TargetShort(TargetOnce):
+    TARGET = -1.0
+
+
+class ScaleFrame:
+    """Records runner-frame locals while on_bar is on the stack."""
+
+    WANTS_EXTENDED_HOURS = False
+    SCALE = 1.7
+
+    def __init__(self):
+        self.scale = self.SCALE
+        self.runner = []
+        self.engine_scale = None
+        self.desk_scale = None
+
+    def on_bar(self, _bar, _state):
+        if self.runner:
+            return 0.0
+        import sys
+
+        frame = sys._getframe()
+        while frame is not None:
+            code = frame.f_code
+            locs = frame.f_locals
+            if code.co_name in {"execute", "run_books", "_books_worker"} and code.co_filename.endswith("runner.py"):
+                bad = {}
+                for key, value in locs.items():
+                    if key in {"share_scale", "share_factor"} or _holds_scale(value, self.scale):
+                        bad[key] = True
+                self.runner.append((code.co_name, bad))
+            if code.co_name == "run" and code.co_filename.endswith("engine_arena.py"):
+                self.engine_scale = locs.get("share_scale")
+            if code.co_name == "run" and code.co_filename.endswith("engine_desk.py"):
+                cfg = locs.get("cfg")
+                self.desk_scale = None if cfg is None else getattr(cfg, "share_factor", None)
+            frame = frame.f_back
+        return 0.0
+
+
+def _holds_scale(value, scale):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return value == scale
+    if isinstance(value, dict):
+        if "share_scale" in value or "share_factor" in value:
+            return True
+        return any(_holds_scale(item, scale) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_holds_scale(item, scale) for item in value)
+    share = getattr(value, "share_factor", None)
+    return isinstance(share, (int, float)) and not isinstance(share, bool) and share == scale
+
+
+def _ohlc(day: datetime, minute: int) -> dict:
+    stamp = day.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=minute)
+    stamp = stamp.replace(tzinfo=ET)
+    return {
+        "timestamp_et": stamp.isoformat(),
+        "epoch_utc": int(stamp.timestamp()),
+        "open": 100.0,
+        "high": 100.5,
+        "low": 99.5,
+        "close": 100.0,
+        "volume": 1000,
+        "wap": 100.0,
+        "count": 4,
+        "filled": 0,
+        "session": "rth",
+    }
+
+
+def _dividend_series(tmp_path):
+    day1 = datetime(2024, 3, 4)
+    day2 = datetime(2024, 3, 5)
+    rows = [
+        _ohlc(day1, 9 * 60 + 30),
+        _ohlc(day1, 9 * 60 + 31),
+        _ohlc(day2, 9 * 60 + 30),
+    ]
+    path = tmp_path / "src" / "NIK_1min_filled_2024-03.csv.gz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = [
+        "timestamp_et", "epoch_utc", "open", "high", "low", "close", "volume", "wap", "count", "filled", "session",
+    ]
+    lines = [",".join(header)]
+    for row in rows:
+        lines.append(",".join(str(row[name]) for name in header))
+    with gzip.open(path, "wt", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(lines) + "\n")
+    loaded = load_named(path.parent, "NIK")
+    entry = entry_from_inspection(loaded.inspection, source_root=str(path.parent), profile="desk")
+    registry = tmp_path / "registry.json"
+    save_registry(registry, upsert_series({"schema_version": 1, "series": []}, entry))
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        path.parent, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="desk",
+        price_factor=2.5, volume_factor=0.4,
+    )
+    return path.parent, pack, sidecar
+
+
+@pytest.mark.parametrize("strategy_cls,cash", [(TargetOnce, 12500.0), (TargetShort, -12500.0)])
+def test_anonymized_desk_dividends_match_raw_cash(tmp_path, strategy_cls, cash, monkeypatch):
+    src, pack, sidecar = _dividend_series(tmp_path)
+    dividends = {"2024-03-05": 1.25}
+    seen = {}
+    import backtester.runner as runner_mod
+
+    real = runner_mod._isolated_books
+
+    def wrapped(strategy_cls, frame, profile, *, during=None, **kwargs):
+        seen["dividends"] = kwargs.get("dividends")
+        return real(strategy_cls, frame, profile, during=during, **kwargs)
+
+    monkeypatch.setattr(runner_mod, "_isolated_books", wrapped)
+    raw = run_named(
+        strategy_cls, src, "NIK", "desk", tmp_path / "raw",
+        dividends=dividends, with_benchmarks=False,
+    )
+    packed = run_pack(
+        strategy_cls, pack, sidecar, "desk", tmp_path / "packed",
+        dividends=dividends, with_benchmarks=False,
+    )
+    assert raw["dividends_net"] == cash
+    assert packed["dividends_net"] == cash
+    assert seen["dividends"] == {"S00002": 1.25 * 2.5}
+    assert "2024-03-05" not in seen["dividends"]
+    assert 1.25 not in seen["dividends"].values()
+
+
+def test_an_unknown_dividend_date_is_an_error(tmp_path):
+    _src, pack, sidecar = _dividend_series(tmp_path)
+    with pytest.raises(ValueError, match="1999-01-01"):
         run_pack(
-            RoundTrip,
-            pack,
-            sidecar,
-            "desk",
-            tmp_path / "div",
-            dividends={"S00008": 0.5},
-            with_benchmarks=False,
+            TargetOnce, pack, sidecar, "desk", tmp_path / "out",
+            dividends={"1999-01-01": 1.25}, with_benchmarks=False,
         )
+
+
+def test_child_runner_frames_do_not_keep_the_scale(tmp_path):
+    src, registry = _tiny_series(tmp_path)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="desk",
+        price_factor=ScaleFrame.SCALE, volume_factor=0.4,
+    )
+    for profile, attr in (("arena", "engine_scale"), ("desk", "desk_scale")):
+        payload = run_pack(
+            ScaleFrame, pack, sidecar, profile, tmp_path / profile, with_benchmarks=False,
+        )
+        observer = payload["strategy_observer"]
+        names = [name for name, _bad in observer.runner]
+        assert {"execute", "run_books", "_books_worker"} <= set(names)
+        assert all(not bad for _name, bad in observer.runner)
+        assert getattr(observer, attr) == ScaleFrame.SCALE
+
+
+def test_the_report_must_not_live_inside_the_pack(tmp_path):
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    message = "the report must not live inside the pack directory"
+    with pytest.raises(ValueError, match=message):
+        run_pack(RoundTrip, pack, tmp_path / "side.json", "arena", pack / "out")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(pack, target_is_directory=True)
+    except OSError as exc:
+        pytest.fail(f"symlink coverage did not run: {exc}")
+    with pytest.raises(ValueError, match=message):
+        run_pack(RoundTrip, pack, tmp_path / "side.json", "arena", link / "nested")
+    with pytest.raises(ValueError, match=message):
+        run_pack(RoundTrip, link, tmp_path / "side.json", "arena", pack)
 
 
 def _tiny_series(tmp_path):

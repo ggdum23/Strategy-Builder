@@ -5,9 +5,9 @@ session ordinals. The ticker, the date map, and the scale factors are written
 only to the sidecar. Designer-facing file names carry neither a ticker nor a
 year. A chunk is about 250 trading sessions and each file stays under 25 MB.
 
-Prices multiplied by k are paired with share_scale = k. The runner reads that
-number from the sidecar and passes it to the engine. The pack itself does not
-contain it.
+Prices multiplied by k are paired with share_scale = k. The sidecar file is
+where that number is stored. The runner reads it and passes it to the child
+engine so per-share fees use real share counts. The pack files do not contain it.
 """
 
 from __future__ import annotations
@@ -229,6 +229,31 @@ def _token_present(symbol: str, text: str) -> bool:
     return re.search(rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])", text) is not None
 
 
+def _gzip_member(blob: bytes) -> tuple[int, bytes, bool]:
+    """mtime, file name, and whether an FCOMMENT is present.
+
+    RFC 1952 order after the 10-byte header is FEXTRA, FNAME, FCOMMENT, FHCRC.
+    """
+    if len(blob) < 10 or blob[:2] != b"\x1f\x8b":
+        raise ValueError("gzip member is not gzip")
+    flags = blob[3]
+    mtime = int.from_bytes(blob[4:8], "little")
+    pos = 10
+    if flags & 0x04:
+        if pos + 2 > len(blob):
+            raise ValueError("gzip extra field is truncated")
+        extra = int.from_bytes(blob[pos : pos + 2], "little")
+        pos += 2 + extra
+    fname = b""
+    if flags & 0x08:
+        end = blob.find(b"\x00", pos)
+        if end < 0:
+            raise ValueError("gzip file name is truncated")
+        fname = blob[pos:end]
+    has_comment = bool(flags & 0x10)
+    return mtime, fname, has_comment
+
+
 def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
     """Refuse a designer tree that still carries identity or a scale factor."""
     root = Path(pack_dir)
@@ -243,6 +268,14 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
             raise ValueError(f"{name} leaks identity in the file name")
         raw = path.read_bytes()
         if path.suffix == ".gz":
+            mtime, fname, has_comment = _gzip_member(raw)
+            if mtime != 0:
+                raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
+            if fname:
+                shown = fname.decode("utf-8", "replace")
+                raise ValueError(f"{name} gzip file name is {shown!r}")
+            if has_comment:
+                raise ValueError(f"{name} gzip member has an FCOMMENT")
             text = gzip.decompress(raw).decode("utf-8")
         else:
             try:
@@ -512,10 +545,20 @@ def build_pack(
     )
 
 
+def _json_pairs(pairs):
+    """Object hook that refuses a repeated key. ``json.loads`` would keep the last one."""
+    document = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        document[key] = value
+    return document
+
+
 def load_sidecar(path) -> dict:
     file = Path(path)
     try:
-        document = json.loads(file.read_text(encoding="utf-8"))
+        document = json.loads(file.read_text(encoding="utf-8"), object_pairs_hook=_json_pairs)
     except json.JSONDecodeError as exc:
         raise ValueError(f"sidecar {file} is not JSON: {exc}") from exc
     validate_sidecar(document)

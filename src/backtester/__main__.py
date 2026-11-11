@@ -374,7 +374,7 @@ def _cmd_pack(args) -> int:
         f"bar_minutes={result.bar_minutes}"
     )
     if result.anonymized:
-        print("scale factors and the date map are only in the sidecar")
+        print("scale factors and the date map are in the sidecar")
     else:
         print("named pack is unscaled (share_scale 1)")
     print(f"pack: {result.pack_dir}")

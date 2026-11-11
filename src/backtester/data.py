@@ -284,6 +284,10 @@ def _read_month(path: Path) -> pd.DataFrame:
     missing = [name for name in REQUIRED_COLUMNS if name not in frame.columns]
     if missing:
         raise ValueError(f"{path.name} is missing columns: {', '.join(missing)}")
+    extra = [str(name) for name in frame.columns if str(name) not in REQUIRED_COLUMNS]
+    if extra:
+        raise ValueError(f"{path.name} has extra columns: {', '.join(extra)}")
+    # Names, not positions. A reordered file still lines up.
     return frame.loc[:, list(REQUIRED_COLUMNS)].copy()
 
 

@@ -106,6 +106,7 @@ def test_chunk_defaults_and_anonymized_scrub(tmp_path):
     loaded = load_pack(pack)
     assert list(loaded.frame["date"].unique()) == ["S00001", "S00002", "S00003"]
     assert float(loaded.frame.iloc[0]["open"]) == pytest.approx(10.0 * 1.7)
+    assert int(loaded.frame.iloc[0]["count"]) == 3
     assert "NIK" not in loaded.frame.to_csv(index=False)
     text = gzip.decompress((pack / "bars_part_001.csv.gz").read_bytes()).decode("utf-8")
     assert "2024-" not in text
@@ -214,3 +215,65 @@ def test_default_chunk_splits_after_250_sessions(tmp_path):
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
     assert [item["sessions"] for item in manifest["chunks"]] == [250, 1]
     assert all(path.stat().st_size < MAX_FILE_BYTES for path in pack.iterdir())
+
+
+def test_registry_and_sidecar_reject_duplicate_json_keys(tmp_path):
+    registry = tmp_path / "reg.json"
+    registry.write_text('{"schema_version": 1, "series": [], "schema_version": 1}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate JSON key 'schema_version'"):
+        from backtester.registry import load_registry
+
+        load_registry(registry)
+    nested = tmp_path / "nested.json"
+    nested.write_text(
+        '{"schema_version": 1, "series": [{"symbol": "NIK", "symbol": "QQQ"}]}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate JSON key 'symbol'"):
+        from backtester.registry import load_registry
+
+        load_registry(nested)
+    sidecar = tmp_path / "side.json"
+    sidecar.write_text('{"pack_id": "abc", "pack_id": "def"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate JSON key 'pack_id'"):
+        load_sidecar(sidecar)
+
+
+def _recompress(payload: bytes, *, mtime: int = 0, filename: str = "") -> bytes:
+    import io
+
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=mtime, filename=filename) as handle:
+        handle.write(payload)
+    return buffer.getvalue()
+
+
+def _with_comment(blob: bytes, comment: bytes) -> bytes:
+    if blob[3] & 0x1C:
+        raise AssertionError("test gzip header already has optional fields")
+    flagged = blob[:3] + bytes([blob[3] | 0x10]) + blob[4:10]
+    return flagged + comment + b"\x00" + blob[10:]
+
+
+def test_gzip_members_carry_no_name_comment_or_mtime(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    payload = gzip.decompress(original)
+    cases = [
+        _recompress(payload, filename="QQQ.csv"),
+        _recompress(payload, mtime=1),
+        _with_comment(original, b"note"),
+    ]
+    for blob in cases:
+        target.write_bytes(blob)
+        with pytest.raises(ValueError, match="gzip"):
+            assert_anonymized_pack_clean(pack, symbol="NIK")
+        target.write_bytes(original)
+    assert_anonymized_pack_clean(pack, symbol="NIK")

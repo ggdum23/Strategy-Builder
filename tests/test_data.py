@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from backtester.data import (
+    REQUIRED_COLUMNS,
     assert_no_silent_splits,
     discover_filled_files,
     frame_to_desk_bars,
@@ -464,3 +465,56 @@ def test_ambiguous_series_fail_loudly(tmp_path):
     write_month(path, one_price)
     with pytest.raises(ValueError, match="tick"):
         load_named(path, "NIK")
+
+
+def _write_columns(path: Path, rows: list[dict], columns: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [",".join(columns)]
+    for row in rows:
+        lines.append(",".join(str(row[name]) for name in columns))
+    with gzip.open(path, "wt", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def test_extra_columns_are_named_and_rejected(tmp_path):
+    row = minute_row(datetime(2024, 6, 3), 9 * 60 + 30, "rth", 10.0)
+    row["vendor"] = "tape"
+    path = tmp_path / "NIK_1min_filled_2024-06.csv.gz"
+    _write_columns(path, [row], list(REQUIRED_COLUMNS) + ["vendor"])
+    with pytest.raises(ValueError, match="extra columns: vendor"):
+        load_named(path.parent, "NIK")
+
+
+def test_columns_are_read_by_name_when_the_file_order_changes(tmp_path):
+    """A position-based read would put the close into another field."""
+    row = minute_row(datetime(2024, 6, 3), 9 * 60 + 30, "rth", 10.0)
+    row["open"] = 10
+    row["high"] = 12
+    row["low"] = 9
+    row["close"] = 11
+    order = [
+        "close", "session", "filled", "count", "wap", "volume",
+        "low", "high", "open", "epoch_utc", "timestamp_et",
+    ]
+    assert set(order) == set(REQUIRED_COLUMNS)
+    assert order != list(REQUIRED_COLUMNS)
+    path = tmp_path / "NIK_1min_filled_2024-06.csv.gz"
+    _write_columns(path, [row], order)
+    loaded = load_named(path.parent, "NIK")
+    first = loaded.frame.iloc[0]
+    assert first["open"] == 10
+    assert first["close"] == 11
+    assert first["high"] == 12
+    assert first["low"] == 9
+    assert first["session"] == "rth"
+
+
+def test_duplicate_and_out_of_order_timestamps_are_rejected(tmp_path):
+    day = datetime(2024, 6, 3)
+    path = tmp_path / "NIK_1min_filled_2024-06.csv.gz"
+    write_month(path, [minute_row(day, 570, "rth", 10.0), minute_row(day, 570, "rth", 11.0)])
+    with pytest.raises(ValueError, match="strictly increasing"):
+        load_named(path.parent, "NIK")
+    write_month(path, [minute_row(day, 571, "rth", 10.0), minute_row(day, 570, "rth", 11.0)])
+    with pytest.raises(ValueError, match="strictly increasing"):
+        load_named(path.parent, "NIK")
