@@ -1416,8 +1416,95 @@ def _icacls_run(args: list[str]) -> None:
         raise SandboxError(f"icacls failed ({proc.returncode}): {detail[-500:]}")
 
 
+def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
+    """Add a non-inherited traverse ACE without walking the directory.
+
+    ``icacls`` on ``C:\\hostedtoolcache\\windows`` does not return. The
+    AppContainer only needs to cross that directory to reach Python.
+    """
+    if not path.exists():
+        return
+    advapi = lease.advapi
+    kernel = lease.kernel
+
+    class Trustee(ctypes.Structure):
+        _fields_ = (
+            ("pMultipleTrustee", ctypes.c_void_p),
+            ("MultipleTrusteeOperation", ctypes.c_uint32),
+            ("TrusteeForm", ctypes.c_uint32),
+            ("TrusteeType", ctypes.c_uint32),
+            ("ptstrName", ctypes.c_void_p),
+        )
+
+    class ExplicitAccess(ctypes.Structure):
+        _fields_ = (
+            ("grfAccessPermissions", ctypes.c_uint32),
+            ("grfAccessMode", ctypes.c_uint32),
+            ("grfInheritance", ctypes.c_uint32),
+            ("Trustee", Trustee),
+        )
+
+    advapi.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi.SetEntriesInAclW.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(ExplicitAccess),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.SetEntriesInAclW.restype = ctypes.c_uint32
+    advapi.SetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi.SetNamedSecurityInfoW.restype = ctypes.c_uint32
+    dacl = ctypes.c_void_p()
+    security = ctypes.c_void_p()
+    # SE_FILE_OBJECT = 1, DACL_SECURITY_INFORMATION = 4
+    status = advapi.GetNamedSecurityInfoW(str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security))
+    if status != 0:
+        raise SandboxError(f"could not read the ACL on {path} (winerror {status})")
+    entry = ExplicitAccess()
+    # FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    entry.grfAccessPermissions = 0x20 | 0x80 | 0x100000
+    entry.grfAccessMode = 1  # GRANT_ACCESS
+    entry.grfInheritance = 0
+    entry.Trustee.TrusteeForm = 0  # TRUSTEE_IS_SID
+    entry.Trustee.ptstrName = lease.sid
+    updated = ctypes.c_void_p()
+    try:
+        status = advapi.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(updated))
+        if status != 0:
+            raise SandboxError(f"could not add a traverse ACE on {path} (winerror {status})")
+        status = advapi.SetNamedSecurityInfoW(str(path), 1, 4, None, None, updated, None)
+        if status != 0:
+            raise SandboxError(f"could not write the ACL on {path} (winerror {status})")
+    finally:
+        if security.value:
+            kernel.LocalFree(security)
+        if updated.value:
+            kernel.LocalFree(updated)
+
+
 def _win_grant(lease: _WinLease, path: Path, rights: str, *, recurse: bool) -> None:
     if not path.exists():
+        return
+    if not recurse and rights == "(X)":
+        _win_grant_traverse(lease, path)
         return
     command = [_icacls(), str(path), "/grant", f"*{lease.sid_text}:{rights}", "/C", "/Q"]
     if recurse:
