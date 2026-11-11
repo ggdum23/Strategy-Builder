@@ -76,11 +76,13 @@ py -3 -m pip install -r packaging\requirements-build.txt
 powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 ```
 
-The script compiles with Inno Setup 6.7.4 only. An `ISCC.exe` whose version
-is anything else, including a copy already on the machine, is not used.
-When 6.7.4 is missing, the script downloads `innosetup-6.7.4.exe`, checks
-its SHA256 (`a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c`),
-and only then runs it. Output:
+The script compiles with Inno Setup 6.7.4 only. An `ISCC.exe` whose compiler
+banner is anything else, including a copy already on the machine, is not
+used. The shipped compiler's version resource is `0.0.0.0`; the script reads
+the `Compiler engine version: Inno Setup 6.7.4` line instead. When 6.7.4 is
+missing, the script downloads `innosetup-6.7.4.exe`, checks its SHA256
+(`a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c`), and
+only then runs it. Output:
 
 ```text
 packaging\dist\StrategyBuilder\          the one-folder bundle

@@ -119,10 +119,13 @@ def test_workflow_builds_installs_smokes_and_publishes():
     assert "pyinstaller==6.22.3" in (PACKAGING / "requirements-build.txt").read_text(encoding="utf-8")
     build = (PACKAGING / "build_windows.ps1").read_text(encoding="utf-8")
     assert '$InnoVersion = "6.7.4"' in build
+    assert "$innoVersion" not in build
+    assert "$AppVersion" in build
     assert "innosetup-$InnoVersion.exe" in build
     assert "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c" in build
     assert build.index("Inno Setup download hash") < build.index("Wait-GuiProcess")
     assert "Test-ExactInnoVersion" in build
+    assert "Compiler engine version" in build
     for phrase in (
         "Build installer",
         "Record SHA256",

@@ -28,10 +28,18 @@ function Get-LeadingVersion {
 
 function Get-IsccVersionText {
     param([Parameter(Mandatory = $true)][string]$Path)
-    $info = (Get-Item -LiteralPath $Path).VersionInfo
-    $product = Get-LeadingVersion ([string]$info.ProductVersion)
-    if ($product) { return $product }
-    return Get-LeadingVersion ([string]$info.FileVersion)
+    # ISCC.exe and ISCmplr.dll ship with a 0.0.0.0 version resource. The
+    # compiler prints the real number, from SetupVersion, before it compiles:
+    # "Compiler engine version: Inno Setup 6.7.4".
+    $probe = Join-Path $env:TEMP "strategy-builder-iscc-probe.iss"
+    Set-Content -LiteralPath $probe -Value "; version probe`r`n" -Encoding ascii
+    $ErrorActionPreference = "Continue"
+    $PSNativeCommandUseErrorActionPreference = $false
+    $output = & $Path $probe 2>&1 | Out-String
+    if ($output -match 'Compiler engine version:\s+Inno Setup\s+(\d+\.\d+\.\d+(?:\.\d+)?)') {
+        return $Matches[1]
+    }
+    return ""
 }
 
 function Test-ExactInnoVersion {
@@ -107,7 +115,9 @@ function Resolve-Iscc {
 if ($LASTEXITCODE -ne 0) { throw "version check failed" }
 
 $project = (& $Python (Join-Path $Root "packaging\versions.py") --print project).Trim()
-$innoVersion = (& $Python (Join-Path $Root "packaging\versions.py") --print inno).Trim()
+# PowerShell variable names are not case-sensitive. Keep this distinct from
+# $InnoVersion, which is the required compiler pin above.
+$AppVersion = (& $Python (Join-Path $Root "packaging\versions.py") --print inno).Trim()
 $versionInfo = (& $Python (Join-Path $Root "packaging\versions.py") --print version-info).Trim()
 $pyi = (& $Python -c "import PyInstaller; print(PyInstaller.__version__)").Trim()
 if ($pyi -ne $PyInstallerPin) {
@@ -158,7 +168,7 @@ if (-not (Test-ExactInnoVersion $isccVersion)) {
 Write-Output "ISCC $iscc version $isccVersion"
 
 & $iscc `
-    "/DAppVersion=$innoVersion" `
+    "/DAppVersion=$AppVersion" `
     "/DVersionInfoVersion=$versionInfo" `
     "/DSetupName=$project" `
     "/DPayloadDir=$bundle" `
