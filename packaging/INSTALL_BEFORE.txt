@@ -1,0 +1,15 @@
+Strategy Builder reads 1-minute files that are already on this computer.
+
+The next page asks for that folder. The suggested path is:
+
+  C:\Users\Jeu\Desktop\Backtester
+
+Setup stores the path in your settings. It does not create the folder, and it
+does not copy, move, or unzip market data.
+
+Backtests and the series registry are kept in:
+
+  %LOCALAPPDATA%\StrategyBuilder
+
+Uninstall leaves that folder in place unless you ask the uninstaller to
+delete saved results. The program files themselves are removed.
