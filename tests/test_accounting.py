@@ -120,6 +120,14 @@ def test_default_arena_book_matches_the_engine_and_explicit_zeros():
     assert metrics["dividends_applied"] is False
     assert metrics["accounting"]["price_basis"] == "raw"
     assert metrics["cash_interest"] == 0.0
+    assert metrics["financing_cost"] == 0.0
+    assert metrics["dividends_net"] == 0.0
+    from backtester.runner import _summary
+
+    headline = _summary("arena", metrics)
+    assert headline["cash_interest"] == 0.0
+    assert headline["financing_cost"] == 0.0
+    assert headline["dividends_net"] == 0.0
     assert metrics["share_factor"] == 1.0
     assert metrics["cost_basis"]["per_share_fees"] == "real_share_counts"
 
@@ -150,6 +158,12 @@ def test_default_desk_book_matches_explicit_profile_defaults():
     assert metrics["total_return_method"] == "none"
     assert metrics["price_basis"] == "raw"
     assert metrics["dividends_applied"] is False
+    from backtester.runner import _summary
+
+    headline = _summary("desk", metrics)
+    assert headline["cash_interest"] == 0.0
+    assert headline["financing_cost"] == metrics["financing_cost"]
+    assert headline["dividends_net"] == metrics["dividends_net"]
     bars = _desk_bars()
     plain = engine_desk.run(Always(2.0), bars)
     explicit = engine_desk.run(
@@ -605,3 +619,200 @@ def test_desk_snap_includes_an_rth_flatten_and_not_a_post_target():
     assert closed
     assert closed[0]["session"] == "S2"
     assert closed[0]["phase"] == "rth"
+
+
+class _DividendSpy:
+    """Records dividend maps visible on the call stack. Holds one times equity."""
+
+    def __init__(self):
+        self.seen = []
+
+    def on_bar(self, _bar, _state):
+        import inspect
+
+        frame = inspect.currentframe()
+        while frame is not None:
+            local = frame.f_locals
+            for name, value in local.items():
+                if "dividend" not in name or not isinstance(value, dict):
+                    continue
+                self.seen.append({str(key): value[key] for key in value})
+            frame = frame.f_back
+        return 1.0
+
+
+def _dated_frame(dates):
+    rows = []
+    for day, date in enumerate(dates):
+        for minute in (570, 571, 959):
+            rows.append(
+                {
+                    "date": date,
+                    "day": day,
+                    "weekday": day,
+                    "minute": minute,
+                    "time": f"{minute // 60:02d}:{minute % 60:02d}",
+                    "session": "rth",
+                    "open": 100.0,
+                    "high": 100.5,
+                    "low": 99.5,
+                    "close": 100.25,
+                    "volume": 1000.0,
+                    "wap": 100.0,
+                    "count": 10,
+                    "filled": 0,
+                    "short_session": 0,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _shares_at_first_mark(profile, result):
+    if profile == "arena":
+        return result["daily"][0][3]
+    return result["daily"][0]["shares"]
+
+
+@pytest.mark.parametrize("profile", ["arena", "desk"])
+def test_walk_forward_hides_a_locked_ex_date(tmp_path, profile):
+    from backtester.runner import execute, walk_forward
+
+    dates = ["2024-06-03", "2024-06-04", "2024-06-05", "2024-06-06"]
+    frame = _dated_frame(dates)
+    design_amount = 1.25
+    locked_amount = 19.19
+    locked_date = "2024-06-06"
+    dividends = {"2024-06-04": design_amount, locked_date: locked_amount}
+    basis = "total_return" if profile == "arena" else "raw"
+    summary, slices, design_books, locked_books = walk_forward(
+        _DividendSpy,
+        frame,
+        profile,
+        tmp_path / profile,
+        symbol="NIK",
+        bar_minutes=1,
+        design_end_day=1,
+        warmup_days=1,
+        dividends=dividends,
+        price_basis=basis,
+        with_benchmarks=False,
+    )
+    assert summary["design_sessions"] == 2
+    assert slices.warmup_sessions == 1
+    design_result, design_metrics = design_books["strategy"]
+    locked_result, _locked_metrics = locked_books["strategy"]
+    design_shares = _shares_at_first_mark(profile, design_result)
+    locked_shares = _shares_at_first_mark(profile, locked_result)
+    assert design_shares > 0
+    assert locked_shares > 0
+    assert design_result["dividends"] == design_shares * design_amount
+    assert locked_result["dividends"] == locked_shares * locked_amount
+    assert design_metrics["dividends_net"] == design_shares * design_amount
+    seen = design_result["observer"].seen
+    assert seen
+    for mapping in seen:
+        assert locked_date not in mapping
+        assert locked_amount not in mapping.values()
+        assert all(locked_date not in str(key) for key in mapping)
+    locked_seen = locked_result["observer"].seen
+    assert any(locked_amount in mapping.values() for mapping in locked_seen)
+    assert any(locked_date in mapping for mapping in locked_seen)
+    with pytest.raises(ValueError, match="dividend date 1999-01-01 is not in this sample"):
+        execute(
+            Flat(),
+            frame,
+            "arena",
+            price_basis="total_return",
+            dividends={locked_date: locked_amount, "1999-01-01": 1.0},
+        )
+
+
+def test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo(tmp_path, capsys):
+    from backtester.__main__ import main
+
+    days = [datetime(2024, 6, 3), datetime(2024, 6, 4), datetime(2024, 6, 5)]
+    rows = []
+    for day in days:
+        for minute in (9 * 60 + 30, 9 * 60 + 31, 15 * 60 + 59):
+            rows.append(_filled_row(day, minute, 50.0))
+    src = tmp_path / "src"
+    _write_filled(src / "NIK_1min_filled_2024-06.csv.gz", rows)
+    dividends = tmp_path / "dividends.csv"
+    dividends.write_text(
+        "session,amount\n2024-06-03,1.0\n2024-06-04,1.25\n2024-06-05,19.19\n",
+        encoding="utf-8",
+    )
+    strategy = tmp_path / "strategy.py"
+    strategy.write_text(
+        "class Strategy:\n    def on_bar(self, bar, state):\n        return 1.0\n",
+        encoding="utf-8",
+    )
+    arena = main(
+        [
+            "walkforward",
+            "--profile",
+            "arena",
+            "--ticker",
+            "NIK",
+            "--strategy",
+            str(strategy),
+            "--src",
+            str(src),
+            "--out",
+            str(tmp_path / "arena"),
+            "--price-basis",
+            "total_return",
+            "--dividends",
+            str(dividends),
+            "--design-end-day",
+            "1",
+            "--warmup-days",
+            "1",
+        ]
+    )
+    assert arena == 0
+    desk = main(
+        [
+            "walkforward",
+            "--profile",
+            "desk",
+            "--ticker",
+            "NIK",
+            "--strategy",
+            str(strategy),
+            "--src",
+            str(src),
+            "--out",
+            str(tmp_path / "desk"),
+            "--dividends",
+            str(dividends),
+            "--design-end-day",
+            "1",
+            "--warmup-days",
+            "1",
+        ]
+    )
+    assert desk == 0
+    typo = tmp_path / "typo.csv"
+    typo.write_text("session,amount\n1999-01-01,1.0\n2024-06-04,1.25\n", encoding="utf-8")
+    rejected = main(
+        [
+            "run",
+            "--profile",
+            "arena",
+            "--ticker",
+            "NIK",
+            "--strategy",
+            str(strategy),
+            "--src",
+            str(src),
+            "--out",
+            str(tmp_path / "run"),
+            "--price-basis",
+            "total_return",
+            "--dividends",
+            str(typo),
+        ]
+    )
+    assert rejected == 2
+    assert "dividend date 1999-01-01 is not in this sample" in capsys.readouterr().err

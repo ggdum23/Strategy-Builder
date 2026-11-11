@@ -222,6 +222,8 @@ The snap is the book after the session's last bar, after that bar's fill. Arena 
 
 A long dividend with withholding `w` credits `shares * amount * (1 - w)` when the amount is positive. Withholding 0 uses `shares * amount` for longs and shorts. A short always pays the gross `shares * amount`.
 
+Walk-forward cuts the dividend file in the parent before each child starts. The design child receives only ex-dates inside the design frame. The locked child receives only ex-dates inside its frame, warm-up included. A date that is not in the whole sample still fails an Arena `run`.
+
 A series ingested as `total_return` stays `runnable: false` in the registry, and a pack of that series is still refused. `run --price-basis total_return --registry registry.json` executes it when the entry has no declared splits. Prices are not rewritten. A dividend file on that run is an error, because the series already includes distributions. Without `--registry`, `--price-basis total_return` means cash dividends and requires the CSV.
 
 Every run writes `price_basis`, `total_return_method`, `series_kind`, `cash_rate_annual`, `financing_rate_annual`, `withholding_rate`, `accrual` (`session_boundary_1_252`), `sessions_per_year` (252), and `dividends_applied` on `metrics.json` and `run.json`, both flat and under `accounting`. The leaderboard has the same columns and refuses a file whose rows disagree. A pack manifest and its sidecar record `price_basis` as the series kind (`raw` or `total_return`).

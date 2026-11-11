@@ -49,6 +49,9 @@ _ARENA_KEYS = (
     "n_fills",
     "fees_total",
     "borrow_cost",
+    "cash_interest",
+    "financing_cost",
+    "dividends_net",
     "percent_up_days",
     "cost_basis",
     "price_basis",
@@ -63,8 +66,6 @@ _ARENA_KEYS = (
 )
 
 _DESK_KEYS = _ARENA_KEYS + (
-    "financing_cost",
-    "dividends_net",
     "margin_calls_queued",
     "margin_calls_filled",
     "max_gross_leverage",
@@ -153,6 +154,36 @@ def _pack_dividends(dividends, *, anonymized: bool, share_scale: float, date_map
 def _summary(profile: str, metrics: dict) -> dict:
     keys = _DESK_KEYS if profile == "desk" else _ARENA_KEYS
     return {key: metrics.get(key) for key in keys}
+
+
+def _dividends_for_frame(frame, dividends):
+    """Dividends whose session is in ``frame``.
+
+    Walk-forward calls this in the parent, once per child, before that child
+    is spawned. A key that names a session outside the frame is left out.
+    ``None`` and an empty map stay as they are. ``run`` does not use this:
+    a dividend date missing from a complete sample still fails there.
+    """
+    if not dividends:
+        return dividends
+    sessions = set()
+    if "date" in frame.columns:
+        sessions.update(str(value) for value in frame["date"].tolist())
+    if "day" in frame.columns:
+        sessions.update(str(int(value)) for value in frame["day"].tolist())
+    kept = {}
+    for key, amount in dividends.items():
+        text = str(key)
+        if text in sessions:
+            kept[key] = amount
+            continue
+        try:
+            day = int(text)
+        except (TypeError, ValueError):
+            continue
+        if str(day) in sessions:
+            kept[key] = amount
+    return kept or None
 
 
 def _arena_dividend_days(frame, dividends) -> dict:
@@ -1418,6 +1449,10 @@ def walk_forward(
     Desk warm-up is flat (``live`` false) and goes live flat at the starting equity.
     Those are different engines. This function does not merge them.
 
+    Each child receives only the dividends whose session is in that child's
+    frame. The design process does not see a locked ex-date or its amount.
+    A date missing from the whole sample still fails an Arena ``run``.
+
     The books written here are operator books. They keep the original ticker.
     There is no designer tree, so a symbol that is reserved for anonymized
     reports is allowed.
@@ -1434,6 +1469,10 @@ def walk_forward(
         design_fraction=design_fraction,
         warmup_days=warmup_days,
     )
+    if get_profile(profile).name == "arena" and dividends:
+        # Same rejection ``run`` uses. A locked ex-date is in this frame, so
+        # it passes here and is removed from the design child below.
+        _arena_dividend_days(frame, dividends)
     design = _standalone_frame(slices.design)
     meta = _SliceMeta(
         design_end_day=slices.design_end_day,
@@ -1455,7 +1494,6 @@ def walk_forward(
         borrow_rate_annual=borrow_rate_annual,
         financing_rate_annual=financing_rate_annual,
         fee_mult=fee_mult,
-        dividends=dividends,
         initial_equity=initial_equity,
         with_benchmarks=with_benchmarks,
         price_basis=price_basis,
@@ -1474,6 +1512,7 @@ def walk_forward(
                 max_day=meta.design_end_day,
                 warmup_sessions=0,
                 during=during_design,
+                dividends=_dividends_for_frame(design, dividends),
                 **common,
             )
         finally:
@@ -1493,6 +1532,7 @@ def walk_forward(
             locked=locked,
             locked_with_warmup=locked_with,
         )
+        locked_dividends = _dividends_for_frame(rebuilt.locked_with_warmup, dividends)
         if profile == "arena":
             locked_books = _isolated_books(
                 strategy_cls,
@@ -1501,6 +1541,7 @@ def walk_forward(
                 reset_day=meta.locked_start_day if meta.warmup_sessions else None,
                 max_day=meta.locked_day_max,
                 warmup_sessions=0,
+                dividends=locked_dividends,
                 **common,
             )
         elif profile == "desk":
@@ -1510,6 +1551,7 @@ def walk_forward(
                 profile,
                 warmup_sessions=meta.warmup_sessions,
                 max_day=meta.locked_day_max,
+                dividends=locked_dividends,
                 **common,
             )
         else:
