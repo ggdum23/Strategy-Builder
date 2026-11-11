@@ -102,8 +102,11 @@ class _SessionCarry:
     """Session-boundary financing, cash interest, and dividends.
 
     Built only when a caller opts in. The default ``run`` leaves this object
-    as None and does not touch cash here. The snap is the previous session's
-    close, after that session's borrow charge and before this session's fill.
+    as None and does not touch cash here. The snap is the book after the
+    previous session's last bar, including a post-session fill, and before
+    this session's fill. Borrow stays on the last regular bar and is not
+    moved here. A warm-up reset clears the snap and the totals before
+    ``due``, so the first live session is not charged.
     """
 
     def __init__(self, cash_rate, financing_rate, withholding, dividends):
@@ -124,10 +127,6 @@ class _SessionCarry:
         self.financing = 0.0
         self.cash_interest = 0.0
         self.dividends_total = 0.0
-
-    def retarget(self, shares, cash, price):
-        price = float(price)
-        self.snap = (shares, price, cash + shares * price)
 
     def snap_close(self, shares, cash, price):
         price = float(price)
@@ -177,9 +176,11 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
     borrow_rate_annual: None uses costs.daily_borrow (0.30%/252). Any other value is an
       explicit override and is not the reference default.
     cash_rate_annual / financing_rate_annual: 0 leaves the reference loop unchanged.
-      Any other rate accrues once per session boundary on the previous close.
+      Any other rate accrues once per session boundary on the previous session's
+      last bar, after that bar's fill. A post-session fill is in the snap when
+      the strategy receives extended hours. Borrow stays on the last regular bar.
     dividends: None leaves the reference loop unchanged. A map of day -> amount
-      is credited at that day's boundary, before the fill.
+      is credited at that day's boundary, before the fill, on the shares in that snap.
     """
     month_of_day = month_of_day or _local_month
     taf_active_of_day = taf_active_of_day or (lambda d: True)
@@ -215,6 +216,13 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
     for j in range(n - 1, -1, -1):
         if dlv[j] and days[j] not in seen:
             seen.add(days[j]); last_dlv[j] = True
+    # Last processed bar of each session, post included when those bars are processed.
+    last_of_session = [False] * n
+    seen_session = set()
+    for j in range(n - 1, -1, -1):
+        if days[j] not in seen_session:
+            seen_session.add(days[j])
+            last_of_session[j] = True
 
     cash = float(initial_equity); shares = 0; target = 0.0; pending = None
     month_vol = {}
@@ -270,9 +278,15 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 started = True
                 did_reset = True
             if carry is not None:
-                # Reset rescales first. The accrual then uses that book, not the warm-up book.
+                # The reset already rescaled the book and dropped the warm-up
+                # marks. Drop the warm-up snap and totals too, before due, so
+                # the first live session is not charged. N live sessions then
+                # pay N-1 charges, and the first live mark is the reset equity.
                 if did_reset:
-                    carry.retarget(shares, cash, last_px)
+                    carry.financing = 0.0
+                    carry.cash_interest = 0.0
+                    carry.dividends_total = 0.0
+                    carry.snap = None
                 fin, interest, div = carry.due(day)
                 if fin != 0.0:
                     cash -= fin
@@ -353,11 +367,15 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 cash -= b; borrow_tot += b
                 if ep is not None: ep["cf"] -= b
             eq = cash + shares * c
-            if carry is not None:
-                carry.snap_close(shares, cash, c)
             if eq <= 0 and not busted:
                 busted = True
             daily.append((day, eq, (shares * c / eq) if eq > 0 else 0.0, shares, c))
+        # After this bar's fill. Borrow, when this is the last regular bar, is
+        # already in cash. The snap is this session's last processed bar, so a
+        # post-session fill is included and a regular-only session still snaps
+        # at the regular close.
+        if carry is not None and last_of_session[j]:
+            carry.snap_close(shares, cash, c)
         # ---- strategy decision
         if dlv[j]:
             bar = {k: cols[k][j] for k in keys}

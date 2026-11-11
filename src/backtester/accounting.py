@@ -26,6 +26,9 @@ PRICE_BASES = frozenset({"raw", "total_return"})
 METHODS = frozenset({"none", "profile_dividends", "cash_dividends", "registry_series"})
 
 # Closed tokens a designer report may print. They are not tickers.
+# A symbol that casefolds to one of these whole values is reserved. The
+# strings are not split on "_", so ``session_boundary_1_252`` does not
+# reserve the symbol ``1``.
 VOCABULARY = frozenset(
     {
         "raw",
@@ -66,6 +69,15 @@ IDENTITY_KEYS = (
 )
 
 RECORD_KEYS = IDENTITY_KEYS
+
+# Whole symbols reserved before an anonymized pack or designer tree is written.
+# Values and keys this phase writes into designer-visible files. Match the
+# full casefolded symbol. Do not split these on "_".
+EXACT_RESERVED = frozenset(
+    set(VOCABULARY)
+    | set(LEADERBOARD_KEYS)
+    | {"accounting", "cash_interest", "financing_cost", "dividends_net"}
+)
 
 _BOOL_NAMES = frozenset({"bool", "bool_", "bool8"})
 

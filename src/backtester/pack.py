@@ -247,6 +247,8 @@ def _json_values_have_ticker(value, symbol: str) -> bool:
     if isinstance(value, list):
         return any(_json_values_have_ticker(item, symbol) for item in value)
     if isinstance(value, str):
+        # ``raw`` and ``total_return`` are series-kind labels. A symbol that
+        # casefolds to either word is rejected before this pack is written.
         if value in PACK_COLUMNS or value in {"raw", "total_return"}:
             return False
         return _token_present(symbol, value)

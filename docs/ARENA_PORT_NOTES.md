@@ -53,3 +53,9 @@ run is still an error. `--price-basis total_return` is the opt-in that
 credits dividends, and a non-zero `--financing-rate` or `--cash-rate` is the
 opt-in that accrues `rate / 252` once per session boundary. See the price-basis
 section of `README.md`.
+
+The carry snap is the last processed bar of the session, after that bar's
+fill. Post-session fills are included when the strategy asks for extended
+hours. Borrow stays on the last regular bar. A warm-up `reset_day` zeros the
+carry totals and clears the snap before `due`, so the first live session is
+not charged.

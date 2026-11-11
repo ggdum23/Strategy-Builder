@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .accounting import LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
+from .accounting import EXACT_RESERVED, LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
 
 _ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
 _BANNED_DESIGNER_KEYS = frozenset(
@@ -519,12 +519,17 @@ RESERVED_VOCABULARY = _reserved_vocabulary()
 def reserved_symbol_conflict(symbol: str) -> str | None:
     """The reserved token ``symbol`` matches, or None.
 
-    The match is :func:`ticker_token_spans`: casefolded, bounded by a
+    Report-name tokens use :func:`ticker_token_spans`: casefolded, bounded by a
     non-alphanumeric character. ``SS`` does not match ``random``. ``2`` does
-    not match ``2x`` or ``001``.
+    not match ``2x`` or ``001``. Accounting values and keys match the whole
+    symbol only. ``session_boundary_1_252`` does not reserve ``1``, ``SESSION``,
+    or ``252``.
     """
     if not isinstance(symbol, str) or symbol == "":
         return None
+    folded = symbol.casefold()
+    if folded in EXACT_RESERVED:
+        return folded
     for token in RESERVED_VOCABULARY:
         if ticker_token_spans(token, symbol):
             return token

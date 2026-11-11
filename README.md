@@ -152,6 +152,15 @@ Reserved tokens: `001`, `1x`, `2x`, `and`, `arena`, `bars`, `benchmarks`,
 `post`, `pre`, `published`, `random`, `rth`, `software`, `stopped`,
 `strategy`, `tbl`, `the`, `title`, `trades`, `withheld`.
 
+These accounting values and keys are reserved as the whole symbol, and are
+not split on `_` (`session_boundary_1_252` does not reserve `1`):
+`accounting`, `accrual`, `cash_dividends`, `cash_interest`,
+`cash_rate_annual`, `dividends_applied`, `dividends_net`, `financing_cost`,
+`financing_rate_annual`, `none`, `price_basis`, `profile_dividends`, `raw`,
+`registry_series`, `series_kind`, `session_boundary_1_252`,
+`sessions_per_year`, `total_return`, `total_return_method`,
+`withholding_rate`.
+
 ## Commands
 
 ```text
@@ -208,6 +217,8 @@ These switches are opt-in. Leaving them off reproduces the previous books.
 | `--withholding` | 0 | Fraction kept back from a positive long dividend. Shorts pay the gross amount |
 
 Idle cash is `max(0, equity - |shares * price|)`. Borrowed money is `max(0, |shares * price| - equity)`. Both use the previous session's snap, before the charge. They are not both positive. The charge is applied at the next session boundary, before that session's first fill. There is no calendar-day count. A rate below 0 or above 1.0 is an error. `0.07` means 7 percent per year.
+
+The snap is the book after the session's last bar, after that bar's fill. Arena borrow stays on the last regular bar. When the strategy receives post-session bars, a fill there is in the snap. A warm-up reset clears the snap and the accrued totals before the first live session, so N live sessions pay N-1 charges and the first live mark is the reset equity. Desk already clears its snap in `enter_live`. A Desk target on a post bar fills at the next regular open, after the boundary charge.
 
 A long dividend with withholding `w` credits `shares * amount * (1 - w)` when the amount is positive. Withholding 0 uses `shares * amount` for longs and shorts. A short always pays the gross `shares * amount`.
 

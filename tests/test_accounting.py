@@ -227,17 +227,17 @@ def test_bases_are_mutually_exclusive_and_the_accrual_is_one_252nd():
 
 
 def test_flat_cash_interest_is_one_252nd_per_boundary():
-    rate = 0.10
     equity = 1_000_000.0
-    first = session_accrual(rate, equity)
-    second = session_accrual(rate, equity + first)
-    arena = engine_arena.run(Flat(), _frame(days=3), cash_rate_annual=rate)
+    # Literal session charges. This does not call session_accrual.
+    first = 0.10 / 252.0 * equity
+    second = 0.10 / 252.0 * (equity + first)
+    arena = engine_arena.run(Flat(), _frame(days=3), cash_rate_annual=0.10)
     assert arena["daily"][0][1] == equity
     assert arena["daily"][1][1] == equity + first
     assert arena["daily"][2][1] == equity + first + second
     assert arena["cash_interest"] == first + second
     assert arena["financing"] == 0.0
-    desk = engine_desk.run(Flat(), _desk_bars(), DeskConfig(cash_rate_annual=rate))
+    desk = engine_desk.run(Flat(), _desk_bars(), DeskConfig(cash_rate_annual=0.10))
     assert desk["cash_interest"] == first
     assert desk["cash"] == equity + first
     assert desk["financing"] == 0.0
@@ -309,7 +309,31 @@ def test_leaderboard_refuses_mixed_accounting_and_accepts_a_legacy_board(tmp_pat
     refuse_mixed_rows(legacy)
 
 
-def test_accounting_vocabulary_is_not_treated_as_a_ticker(tmp_path):
+def test_accounting_vocabulary_is_reserved_as_a_whole_symbol(tmp_path):
+    from backtester.accounting import EXACT_RESERVED
+    from backtester.report import require_anonymizable_symbol, reserved_symbol_conflict
+
+    blocked = (
+        "RAW",
+        "NONE",
+        "TOTAL_RETURN",
+        "CASH_DIVIDENDS",
+        "PROFILE_DIVIDENDS",
+        "REGISTRY_SERIES",
+        "SESSION_BOUNDARY_1_252",
+        "PRICE_BASIS",
+        "CASH_INTEREST",
+        "ACCOUNTING",
+    )
+    for symbol in blocked:
+        assert symbol.casefold() in EXACT_RESERVED
+        assert reserved_symbol_conflict(symbol) == symbol.casefold()
+        with pytest.raises(ValueError, match="reserved report name"):
+            require_anonymizable_symbol(symbol)
+    assert reserved_symbol_conflict("1") is None
+    assert reserved_symbol_conflict("SESSION") is None
+    assert reserved_symbol_conflict("RETURN") is None
+    assert reserved_symbol_conflict("252") is None
     root = tmp_path / "designer"
     root.mkdir()
     write_json(
@@ -327,9 +351,7 @@ def test_accounting_vocabulary_is_not_treated_as_a_ticker(tmp_path):
             "withholding_rate": 0.0,
         },
     )
-    assert_designer_clean(root, symbol="RAW")
-    assert_designer_clean(root, symbol="NONE")
-    assert_designer_clean(root, symbol="RETURN")
+    assert_designer_clean(root, symbol="ZZZX")
 
 
 def _write_filled(path: Path, rows: list[dict]) -> None:
@@ -473,3 +495,113 @@ def test_parallel_refuses_a_mixed_series_batch(tmp_path, monkeypatch):
             workers=1,
             price_basis="raw",
         )
+
+
+def test_arena_warmup_charges_only_live_sessions(tmp_path):
+    from backtester.runner import walk_forward
+
+    frame = _frame(days=6)
+    _summary, slices, _design, locked = walk_forward(
+        Flat,
+        frame,
+        "arena",
+        tmp_path / "out",
+        symbol="TEST",
+        bar_minutes=1,
+        design_end_day=3,
+        warmup_days=2,
+        cash_rate_annual=0.10,
+        with_benchmarks=False,
+    )
+    assert slices.warmup_sessions >= 2
+    result, metrics = locked["strategy"]
+    assert len(result["daily"]) == 2
+    one = 0.10 / 252.0 * 1_000_000.0
+    assert result["daily"][0][1] == 1_000_000.0
+    assert result["cash_interest"] == one
+    assert result["daily"][1][1] == 1_000_000.0 + one
+    # Flat book: the only cash change is the live charge, added onto the reset equity.
+    assert metrics["final_equity"] == metrics["initial_equity"] + metrics["cash_interest"]
+    assert metrics["cash_interest"] == one
+
+
+class _HoldThroughPost:
+    WANTS_EXTENDED_HOURS = True
+
+    def on_bar(self, bar, _state):
+        if bar["day"] == 0 and bar["minute"] == 570 and bar["session"] == "rth":
+            return 2.0
+        return None
+
+
+class _FlattenInPost(_HoldThroughPost):
+    def on_bar(self, bar, state):
+        if bar["day"] == 0 and bar["minute"] == 1000 and bar["session"] == "post":
+            return 0.0
+        return super().on_bar(bar, state)
+
+
+def test_arena_post_flatten_is_in_the_overnight_snap():
+    from test_engine import make_bars
+
+    bars = make_bars(days=2, rth_minutes=(570, 571), post=(1000, 1001), price=lambda _i: 100.0)
+    held = engine_arena.run(_HoldThroughPost(), bars, financing_rate_annual=0.08, dividends={1: 2.0})
+    flat = engine_arena.run(_FlattenInPost(), bars, financing_rate_annual=0.08, dividends={1: 2.0})
+    assert held["financing"] != 0.0
+    assert held["dividends"] != 0.0
+    assert any(fill[2] == "post" and fill[7] == 0 for fill in flat["fills"])
+    assert flat["financing"] == 0.0
+    assert flat["dividends"] == 0.0
+    # Borrow stays on the last regular bar. A long pays none.
+    assert flat["borrow"] == 0.0
+    assert held["borrow"] == 0.0
+
+
+class _DeskHold:
+    def on_bar(self, bar, _account):
+        if bar["session"] == "S1" and bar["time"] == "09:30" and bar["phase"] == "rth":
+            return 1.0
+        return None
+
+
+class _DeskFlattenRth(_DeskHold):
+    def on_bar(self, bar, account):
+        if bar["session"] == "S1" and bar["time"] == "09:31" and bar["phase"] == "rth":
+            return 0.0
+        return super().on_bar(bar, account)
+
+
+class _DeskFlattenPost(_DeskHold):
+    def on_bar(self, bar, account):
+        if bar["session"] == "S1" and bar["phase"] == "post":
+            return 0.0
+        return super().on_bar(bar, account)
+
+
+def test_desk_snap_includes_an_rth_flatten_and_not_a_post_target():
+    from test_desk import bar
+
+    bars = [
+        bar("S1", "09:30", "rth", 100),
+        bar("S1", "09:31", "rth", 100),
+        bar("S1", "09:32", "rth", 100),
+        bar("S1", "15:59", "rth", 100),
+        bar("S1", "16:00", "post", 100),
+        bar("S1", "16:01", "post", 100),
+        bar("S2", "09:30", "rth", 100),
+        bar("S2", "15:59", "rth", 100),
+    ]
+    config = DeskConfig(financing_rate_annual=0.08, dividends={"S2": 2.0})
+    held = engine_desk.run(_DeskHold(), bars, config)
+    flattened = engine_desk.run(_DeskFlattenRth(), bars, config)
+    posted = engine_desk.run(_DeskFlattenPost(), bars, config)
+    assert held["financing"] > 0.0
+    assert held["dividends"] != 0.0
+    assert flattened["financing"] == 0.0
+    assert flattened["dividends"] == 0.0
+    assert posted["financing"] > 0.0
+    assert posted["dividends"] != 0.0
+    closed = [fill for fill in posted["fills"] if fill["shares_after"] == 0]
+    assert closed
+    assert closed[0]["session"] == "S2"
+    assert closed[0]["phase"] == "rth"

@@ -119,7 +119,10 @@ These are the readings that were not fixed by a single sentence in the spec.
     fill of any pending order, then mark and high-water update, then the
     liquidation test, then the strategy, then the margin check. Worst equity/HWM
     is sampled at the end of the bar. The daily mark is written on the last RTH
-    bar. The financing snap is written on the last bar of the session.
+    bar. The financing snap is written on the last bar of the session, after
+    any fill on that bar. A post bar does not fill. A target set there waits
+    for the next RTH open, which is after the boundary charge, so the snap
+    still has the shares held through the close.
 
 18. **Margin call.** On every RTH bar close, after the strategy has spoken, if
     there is no pending order, the position is not flat, equity is positive, and

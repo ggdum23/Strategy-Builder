@@ -229,4 +229,6 @@ Every book records the price basis and the rates that produced it. The keys are 
 
 The same keys are on `run.json`, the leaderboard, and (for `price_basis` only, as the series kind) the pack manifest and sidecar. `write_leaderboard` raises when stamped rows disagree. A row with no `price_basis` is an older board and is not part of that check.
 
-Designer files may contain the closed tokens `raw`, `total_return`, `none`, `profile_dividends`, `cash_dividends`, `registry_series`, and `session_boundary_1_252`. Those cells are vocabulary, not a ticker. The stand-in for a real ticker is still `RANDOM`.
+Designer files may contain the closed tokens `raw`, `total_return`, `none`, `profile_dividends`, `cash_dividends`, `registry_series`, and `session_boundary_1_252`. Those cells are vocabulary, not a ticker. A symbol that casefolds to one of those whole values, or to one of the accounting keys, is rejected before an anonymized pack or designer tree is written. The match is the whole symbol: `session_boundary_1_252` does not reserve `1`. The stand-in for a real ticker is still `RANDOM`.
+
+The carry snap is the previous session's last bar, after that bar's fill. Arena borrow remains on the last regular bar. A warm-up reset drops the snap and the accrued totals, so the first live mark is the reset equity and N live sessions pay N-1 charges.
