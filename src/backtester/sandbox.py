@@ -1129,47 +1129,39 @@ def _win_block_network(sid_text: str) -> None:
     An AppContainer with no capabilities still reaches loopback far enough
     for a connect to time out instead of failing with access denied. A
     firewall block on the package SID fails that connect with 10013.
+    ``netsh`` on current Windows rejects ``package=``, so this uses the
+    firewall cmdlet.
     """
+    if not sid_text.startswith("S-1-") or any(ch in sid_text for ch in "\"'$`;\r\n"):
+        raise SandboxError("the AppContainer SID is not a form the firewall rule can use")
     system = os.environ.get("SystemRoot", "")
-    netsh = Path(system) / "System32" / "netsh.exe" if system else None
-    if netsh is None or not netsh.is_file():
-        raise SandboxError("netsh is not available; refusing to run without a network block")
-    for name, direction in (
-        ("strategybuilderjail-block-out", "out"),
-        ("strategybuilderjail-block-in", "in"),
-    ):
-        subprocess.run(
-            [str(netsh), "advfirewall", "firewall", "delete", "rule", f"name={name}"],
+    powershell = Path(system) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe" if system else None
+    if powershell is None or not powershell.is_file():
+        raise SandboxError("powershell is not available; refusing to run without a network block")
+    command = (
+        "$names = @('strategybuilderjail-block-out','strategybuilderjail-block-in')\n"
+        "foreach ($name in $names) {\n"
+        "  Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue |"
+        " Remove-NetFirewallRule -ErrorAction SilentlyContinue\n"
+        "}\n"
+        f"New-NetFirewallRule -DisplayName 'strategybuilderjail-block-out' -Direction Outbound"
+        f" -Action Block -Package '{sid_text}' -Profile Any -ErrorAction Stop | Out-Null\n"
+        f"New-NetFirewallRule -DisplayName 'strategybuilderjail-block-in' -Direction Inbound"
+        f" -Action Block -Package '{sid_text}' -Profile Any -ErrorAction Stop | Out-Null\n"
+    )
+    try:
+        proc = subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", command],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
             check=False,
         )
-        try:
-            proc = subprocess.run(
-                [
-                    str(netsh),
-                    "advfirewall",
-                    "firewall",
-                    "add",
-                    "rule",
-                    f"name={name}",
-                    f"dir={direction}",
-                    "action=block",
-                    f"package={sid_text}",
-                    "profile=any",
-                    "enable=yes",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SandboxError(f"the AppContainer firewall block was not added: {exc}") from exc
-        if proc.returncode != 0:
-            detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
-            raise SandboxError(f"the AppContainer firewall block was not added: {detail[-500:]}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SandboxError(f"the AppContainer firewall block was not added: {exc}") from exc
+    if proc.returncode != 0:
+        detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        raise SandboxError(f"the AppContainer firewall block was not added: {detail[-500:]}")
 
 
 def _clear_loopback(name: str, sid_text: str) -> None:
