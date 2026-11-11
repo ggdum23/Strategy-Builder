@@ -171,6 +171,56 @@ class TestCosts(unittest.TestCase):
         for k in ("commission", "exchange", "clearing", "cat", "total"):
             self.assertAlmostEqual(a[k], b[k])
 
+    def test_rescaled_prices_use_share_scale_k(self):
+        """Prices times k are paired with share_scale k, through run().
+
+        Pack shares are about 1/k of the real count. share_scale multiplies
+        them back for per-share fees. The round trip includes a sell so TAF
+        is charged. Dropping the forwarded share_scale fails this test.
+        """
+        k = 2.0
+        bars = make_bars(days=2, rth_minutes=(570, 571), price=lambda _i: 100.0)
+        plan = {(0, 570): 0.5, (1, 570): 0.0}
+        base = B.run(Scripted(dict(plan)), bars, share_scale=1.0)
+        scaled_bars = bars.copy()
+        for col in ("open", "high", "low", "close", "wap"):
+            scaled_bars[col] = scaled_bars[col] * k
+        scaled = B.run(Scripted(dict(plan)), scaled_bars, share_scale=k)
+        self.assertEqual(len(base["fills"]), 2)
+        self.assertTrue(any(fill[3] < 0 for fill in base["fills"]))
+        self.assertGreater(base["fees"]["taf"], 0.0)
+        self.assertGreater(scaled["fees"]["taf"], 0.0)
+        residual = 0.0
+        sale_base = 0.0
+        sale_scaled = 0.0
+        for left, right in zip(base["fills"], scaled["fills"]):
+            residual += abs(abs(left[3]) - abs(right[3]) * k)
+            if left[3] < 0:
+                sale_base += abs(left[3]) * left[5]
+            if right[3] < 0:
+                sale_scaled += abs(right[3]) * right[5]
+        per_share = {
+            "exchange": C.EXCHANGE_PER_SHARE,
+            "clearing": C.CLEARING_PER_SHARE,
+            "cat": C.CAT_PER_SHARE,
+            "taf": C.TAF_PER_SHARE,
+            "commission": C.COMMISSION_TIERS[0][1],
+        }
+        for key, rate in per_share.items():
+            self.assertAlmostEqual(
+                base["fees"][key], scaled["fees"][key], delta=residual * rate + 1e-9
+            )
+        self.assertAlmostEqual(
+            base["fees"]["pass_through"],
+            scaled["fees"]["pass_through"],
+            delta=residual * C.COMMISSION_TIERS[0][1] * (C.PASS_THROUGH_NYSE + C.PASS_THROUGH_FINRA) + 1e-9,
+        )
+        sale_gap = abs(sale_base - sale_scaled)
+        self.assertAlmostEqual(
+            base["fees"]["sec"], scaled["fees"]["sec"], delta=sale_gap * C.SEC_FEE_RATE + 1e-9
+        )
+        self.assertAlmostEqual(base["daily"][-1][1], scaled["daily"][-1][1], delta=5.0)
+
     def test_monthly_tier_in_engine(self):
         # 3 fills in the same 21-session 'month': the later fills get cheaper marginal rates
         bars = make_bars(days=3, price=lambda i: 10.0)

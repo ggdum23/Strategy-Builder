@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .data import load_dividends, load_named
+from .profiles import ARENA, DESK
 from .report import write_json
 from .strategy_loader import load_strategy_class
 
@@ -29,7 +30,15 @@ def _add_data_args(parser: argparse.ArgumentParser, *, require_out: bool) -> Non
     parser.add_argument("--bar-minutes", type=int, default=1)
     parser.add_argument("--out", required=require_out)
     parser.add_argument("--share-factor", type=float, default=None, help="Default 1.0 on raw files")
-    parser.add_argument("--borrow-rate", type=float, default=None, help="Annual borrow. Default is the profile rate.")
+    parser.add_argument(
+        "--borrow-rate",
+        type=float,
+        default=None,
+        help=(
+            "Annual borrow. Default "
+            f"{ARENA.borrow_rate_annual:.4f} on Arena and {DESK.borrow_rate_annual:.4f} on Desk."
+        ),
+    )
     parser.add_argument("--financing-rate", type=float, default=None, help="Desk only. Default 0.07. Arena stays at 0.")
     parser.add_argument("--fee-mult", type=float, default=1.0, help="Desk only. Doubles fees and slippage when set to 2.")
     parser.add_argument("--dividends", default=None, help="CSV with columns session,amount. Desk only.")

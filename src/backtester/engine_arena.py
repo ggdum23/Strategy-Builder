@@ -98,6 +98,11 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
       warm-up replay that trades normally).
     month_of_day / taf_active_of_day / period_label_of_day: callables day -> value (defaults: 21-session
       fee months, TAF always charged, 252-session periods).
+    share_scale: multiply pack share counts to get the shares per-share fees count.
+      When every pack price is the real price times k, the engine's share count is
+      about 1/k of the real count, so pass share_scale=k. SEC and the value caps
+      stay on pack shares times pack price, which is the real trade value. 1.0 is
+      the raw-file default.
     borrow_rate_annual: None uses costs.daily_borrow (0.30%/252). Any other value is an
       explicit override and is not the reference default.
     """

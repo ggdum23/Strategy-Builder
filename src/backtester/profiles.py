@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from . import costs as arena_costs
+from . import costs_desk
+
 
 @dataclass(frozen=True)
 class Profile:
@@ -17,6 +20,7 @@ class Profile:
     name: str
     max_abs_target: float
     fill_venue: str
+    # The runner reads this field. It is the engine constant, not a second copy.
     borrow_rate_annual: float
     financing_rate_annual: float
     dividends: bool
@@ -32,7 +36,7 @@ ARENA = Profile(
     name="arena",
     max_abs_target=2.0,
     fill_venue="next_delivered_bar",
-    borrow_rate_annual=0.0030,
+    borrow_rate_annual=arena_costs.BORROW_RATE_ANNUAL,
     financing_rate_annual=0.0,
     dividends=False,
     liquidation_hwm_fraction=None,
@@ -49,7 +53,7 @@ DESK = Profile(
     name="desk",
     max_abs_target=3.0,
     fill_venue="next_rth_open",
-    borrow_rate_annual=0.0025,
+    borrow_rate_annual=costs_desk.BORROW_RATE_ANNUAL,
     financing_rate_annual=0.07,
     dividends=True,
     liquidation_hwm_fraction=0.30,

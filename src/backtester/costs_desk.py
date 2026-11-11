@@ -61,7 +61,14 @@ def tiered_commission(shares, month_shares_before):
 
 
 def fill_costs(shares_signed, price, month_shares_before, share_factor=1.0, fee_mult=1.0):
-    """Dollar fees for one Desk fill. fee_mult scales the invoice after the schedule."""
+    """Dollar fees for one Desk fill.
+
+    ``share_factor`` is k when every pack price is the real price times k.
+    Counted shares are abs(pack shares) * k, which is the real share count.
+    ``fee_mult`` scales each dollar component after the minimum and the cap.
+    It does not scale the counted share count, and ``tier_shares`` stays that
+    unscaled count (zero when the order was capped). Borrow is not a fill fee.
+    """
     if share_factor <= 0.0:
         raise ValueError("share_factor must be positive")
     if fee_mult <= 0.0:
@@ -113,6 +120,7 @@ def fill_costs(shares_signed, price, month_shares_before, share_factor=1.0, fee_
         total += parts[key]
     parts["total"] = total
     parts["counted_shares"] = q
+    # Unscaled. fee_mult was applied to the dollar parts and must not change the tier.
     parts["tier_shares"] = 0.0 if capped else q
     return parts
 

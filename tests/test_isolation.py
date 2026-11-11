@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 import os
 import subprocess
@@ -39,6 +40,10 @@ def test_profiles_do_not_share_a_venue_or_a_fee_table():
     assert arena.max_abs_target != desk.max_abs_target
     assert arena.financing_rate_annual == 0.0
     assert desk.financing_rate_annual == 0.07
+    assert arena.borrow_rate_annual == 0.0030
+    assert desk.borrow_rate_annual == 0.0025
+    assert arena.borrow_rate_annual == arena_costs.BORROW_RATE_ANNUAL
+    assert desk.borrow_rate_annual == costs_desk.BORROW_RATE_ANNUAL
     assert arena.borrow_rate_annual != desk.borrow_rate_annual
     assert arena.dividends is False and desk.dividends is True
     assert arena.liquidation_hwm_fraction is None
@@ -48,6 +53,65 @@ def test_profiles_do_not_share_a_venue_or_a_fee_table():
     assert engine_arena.C is arena_costs
     assert engine_desk.D is costs_desk
     assert engine_arena.C.SEC_FEE_RATE != engine_desk.D.SEC_FEE_RATE
+
+
+def test_borrow_rate_help_names_both_profile_rates():
+    from backtester.__main__ import _build_parser
+
+    parser = _build_parser()
+    sub = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+    text = sub.choices["run"].format_help()
+    assert "0.0030" in text
+    assert "0.0025" in text
+
+
+def test_runner_charges_the_profile_borrow_rate():
+    import pandas as pd
+
+    from backtester.runner import execute
+
+    rows = []
+    for day, date in ((0, "2026-03-02"), (1, "2026-03-03")):
+        for minute in (570, 571):
+            rows.append(
+                {
+                    "date": date,
+                    "day": day,
+                    "weekday": 0,
+                    "minute": minute,
+                    "time": f"{minute // 60:02d}:{minute % 60:02d}",
+                    "session": "rth",
+                    "open": 100.0,
+                    "high": 100.0,
+                    "low": 100.0,
+                    "close": 100.0,
+                    "volume": 1000.0,
+                    "wap": 100.0,
+                    "count": 1,
+                    "filled": 0,
+                    "short_session": 0,
+                }
+            )
+    frame = pd.DataFrame(rows)
+
+    class Short:
+        WANTS_EXTENDED_HOURS = False
+
+        def on_bar(self, bar, _state):
+            first = bar.get("day") == 0 or bar.get("session") == "2026-03-02"
+            if first and (bar.get("minute") == 570 or bar.get("time") == "09:30"):
+                return -1.0
+            return None
+
+    arena_result, arena_metrics = execute(Short(), frame, "arena")
+    desk_result, desk_metrics = execute(Short(), frame, "desk")
+    notional = 1_000_000.0
+    assert arena_metrics["borrow_rate_annual"] == profiles.ARENA.borrow_rate_annual == 0.0030
+    assert desk_metrics["borrow_rate_annual"] == profiles.DESK.borrow_rate_annual == 0.0025
+    # Held across both session closes. Arena charges at each regular close.
+    assert arena_result["borrow"] == 2 * (notional * 0.0030 / 252)
+    # Desk charges once, at the next session boundary, on the previous close.
+    assert desk_result["borrow"] == notional * 0.0025 / 252
 
 
 def test_engines_do_not_import_each_other():

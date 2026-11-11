@@ -11,6 +11,8 @@ the environment, argv, and cwd. It is not an OS jail. See docs/ISOLATION.md.
 from __future__ import annotations
 
 import gc
+import hashlib
+import hmac
 import os
 import pickle
 import shutil
@@ -108,24 +110,22 @@ def execute(
             if warmup_sessions >= len(days):
                 raise ValueError("arena warmup covers the whole sample")
             effective_reset = days[warmup_sessions]
+        borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
         kwargs = {
             "initial_equity": initial_equity,
             "share_scale": share_factor,
             "reset_day": effective_reset,
+            "borrow_rate_annual": borrow,
         }
-        if borrow_rate_annual is not None:
-            kwargs["borrow_rate_annual"] = borrow_rate_annual
         result = engine_arena.run(strategy, frame, **kwargs)
         metrics = enrich_arena_metrics(result, engine_arena.metrics(result))
         metrics["share_factor"] = share_factor
-        metrics["borrow_rate_annual"] = (
-            engine_arena.C.BORROW_RATE_ANNUAL if borrow_rate_annual is None else borrow_rate_annual
-        )
+        metrics["borrow_rate_annual"] = borrow
         metrics["financing_rate_annual"] = 0.0
         return result, metrics
     if name == "desk":
         rate = engine_desk.D.FINANCING_RATE_ANNUAL if financing_rate_annual is None else financing_rate_annual
-        borrow = engine_desk.D.BORROW_RATE_ANNUAL if borrow_rate_annual is None else borrow_rate_annual
+        borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
         config = DeskConfig(
             initial_equity=initial_equity,
             share_factor=share_factor,
@@ -588,18 +588,61 @@ class _SliceMeta:
     locked_day_max: int
 
 
-def _spill_frame(frame) -> str:
-    """Write ``frame`` to a temp file and return the path. The copy is not kept."""
+def _keystream(key: bytes, nonce: bytes, nbytes: int) -> bytes:
+    """HMAC-SHA256 keystream. ``key`` is the only secret; ``nonce`` is stored in the file."""
+    chunks = []
+    produced = 0
+    counter = 0
+    while produced < nbytes:
+        block = hmac.new(key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest()
+        chunks.append(block)
+        produced += len(block)
+        counter += 1
+    return b"".join(chunks)[:nbytes]
+
+
+def _xor(data: bytes, stream: bytes) -> bytes:
+    import numpy as np
+
+    left = np.frombuffer(data, dtype=np.uint8)
+    right = np.frombuffer(stream, dtype=np.uint8)
+    return np.bitwise_xor(left, right).tobytes()
+
+
+def _seal(payload: bytes, key: bytes) -> bytes:
+    """Encrypt ``payload``. The file holds a nonce and a MAC, not the key."""
+    nonce = os.urandom(16)
+    cipher = _xor(payload, _keystream(key, nonce, len(payload)))
+    mac = hmac.new(key, b"BTLK" + nonce + cipher, hashlib.sha256).digest()
+    return b"BTLK" + nonce + mac + cipher
+
+
+def _open_sealed(blob: bytes, key: bytes) -> bytes:
+    if len(blob) < 4 + 16 + 32 or blob[:4] != b"BTLK":
+        raise ValueError("locked spill is not a sealed frame")
+    nonce = blob[4:20]
+    mac = blob[20:52]
+    cipher = blob[52:]
+    expected = hmac.new(key, b"BTLK" + nonce + cipher, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        raise ValueError("locked spill failed authentication")
+    return _xor(cipher, _keystream(key, nonce, len(cipher)))
+
+
+def _spill_frame(frame, key: bytes) -> str:
+    """Write a sealed frame. The file is not a readable pickle, and ``key`` is not written."""
+    payload = pickle.dumps(_standalone_frame(frame), protocol=pickle.HIGHEST_PROTOCOL)
+    sealed = _seal(payload, key)
+    del payload
     fd, path = tempfile.mkstemp(prefix="bt-locked-", suffix=".pkl")
     os.close(fd)
-    _standalone_frame(frame).to_pickle(path)
+    with open(path, "wb") as handle:
+        handle.write(sealed)
     return path
 
 
-def _read_spilled(path: str):
-    import pandas as pd
-
-    return pd.read_pickle(path)
+def _read_spilled(path: str, key: bytes):
+    return pickle.loads(_open_sealed(Path(path).read_bytes(), key))
 
 
 def walk_forward(
@@ -626,10 +669,11 @@ def walk_forward(
 ):
     """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
 
-    The parent keeps the design slice, spills the locked window to disk, and
-    drops the caller's frame before the design child starts. The locked window
-    is loaded again only after that child has exited. Each book is a new
-    spawned interpreter. See docs/ISOLATION.md.
+    The parent keeps the design slice and writes the locked window as a sealed
+    blob. The key stays in this function: it is not put in the child job, the
+    environment, argv, or any file. The caller's frame is dropped before the
+    design child starts, and the locked window is opened only after that child
+    has exited. Each book is a new spawned interpreter. See docs/ISOLATION.md.
 
     Arena warm-up trades, then rescales to the starting equity and keeps exposure.
     Desk warm-up is flat (``live`` false) and goes live flat at the starting equity.
@@ -652,7 +696,8 @@ def walk_forward(
         warmup_sessions=slices.warmup_sessions,
         locked_day_max=int(slices.locked["day"].max()),
     )
-    spilled = _spill_frame(slices.locked_with_warmup)
+    spill_key = os.urandom(32)
+    spilled = _spill_frame(slices.locked_with_warmup, spill_key)
     del slices
     del frame
     gc.collect()
@@ -681,7 +726,7 @@ def walk_forward(
             )
         finally:
             _restore_dumpable(previous_dumpable)
-        locked_with = _standalone_frame(_read_spilled(spilled))
+        locked_with = _standalone_frame(_read_spilled(spilled, spill_key))
         locked = _standalone_frame(
             locked_with.loc[locked_with["day"] >= meta.locked_start_day].reset_index(drop=True)
         )

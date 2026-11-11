@@ -5,10 +5,13 @@ from __future__ import annotations
 import gc
 import inspect
 import os
+import pickle
 import random
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -98,6 +101,76 @@ class DeskRec:
             (bar["session"], float(bar["close"]), bar["time"], account["live"], account["equity"], account["position_shares"])
         )
         return 1.0 if bar["time"] == "09:30" and bar["phase"] == "rth" else None
+
+
+def _holds_close(obj, needle, depth=0):
+    if depth > 8:
+        return False
+    try:
+        if isinstance(obj, float):
+            return obj == needle
+        if isinstance(obj, pd.DataFrame):
+            if "close" in obj.columns and obj["close"].size and (obj["close"].to_numpy() == needle).any():
+                return True
+            return False
+        if isinstance(obj, pd.Series):
+            return bool(obj.size and (obj.to_numpy() == needle).any())
+        if isinstance(obj, np.ndarray) and obj.dtype.kind in "fiu" and obj.size:
+            return bool((obj == needle).any())
+        if isinstance(obj, dict):
+            return any(_holds_close(value, needle, depth + 1) for value in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(_holds_close(value, needle, depth + 1) for value in obj)
+    except Exception:
+        return False
+    return False
+
+
+def _read_temp_pickles(needle):
+    """Unpickle every readable temp candidate. Returns whether the close was found, and how many files were read."""
+    root = Path(tempfile.gettempdir())
+    paths = set(root.glob("bt-locked-*")) | set(root.glob("*.pkl"))
+    saw = False
+    files = 0
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_size > 32 * 1024 * 1024:
+                continue
+            blob = path.read_bytes()
+        except OSError:
+            continue
+        files += 1
+        try:
+            obj = pickle.loads(blob)
+        except Exception:
+            continue
+        if _holds_close(obj, needle):
+            saw = True
+    return saw, files
+
+
+class SpillHunter:
+    """Globs the temp directory for the locked spill and tries to unpickle it.
+
+    The needle is a class constant so the child does not need a parent-set
+    attribute. It exists only on the locked slice.
+    """
+
+    needle = 91_827_364.0
+    WANTS_EXTENDED_HOURS = False
+
+    def __init__(self):
+        self.checked = False
+        self.saw = False
+        self.files = 0
+
+    def on_bar(self, _bar, _state):
+        if not self.checked:
+            self.checked = True
+            self.saw, self.files = _read_temp_pickles(self.needle)
+        return 0.0
 
 
 class MemoryScanner:
@@ -250,6 +323,24 @@ def test_profile_warmup_and_no_future_bars(tmp_path):
     assert "3795" not in inspect.getsource(runner)
     assert desk_summary["warmup_rule"] == "flat_until_live"
     assert arena_summary["warmup_rule"] == "rescale_keep_exposure"
+
+
+@pytest.mark.parametrize("profile", ["arena", "desk"])
+def test_design_child_cannot_unpickle_the_locked_spill(tmp_path, profile):
+    needle = SpillHunter.needle
+    frame = make_frame(6, sentinel_day=5, sentinel=needle)
+    assert needle not in set(frame.loc[frame["day"] <= 3, "close"].tolist())
+    assert needle in set(frame.loc[frame["day"] > 3, "close"].tolist())
+    _summary, slices, design, _locked = walk_forward(
+        SpillHunter, frame, profile, tmp_path / profile, symbol="TEST", bar_minutes=1,
+        design_end_day=3, with_benchmarks=False,
+    )
+    assert needle not in set(slices.design["close"].tolist())
+    assert needle in set(slices.locked["close"].tolist())
+    observer = design["strategy"][0]["observer"]
+    assert observer.checked is True
+    assert observer.files >= 1
+    assert observer.saw is False
 
 
 @pytest.mark.parametrize("profile", ["arena", "desk"])

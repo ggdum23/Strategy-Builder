@@ -8,12 +8,19 @@ Phase 1 does not build that jail.
 ## What Phase 1 isolates
 
 - **Heap.** Spawn does not copy the parent address space. Before the design
-  child starts, the parent spills the locked window to a temporary file,
-  deletes the full frame and the locked slice, and collects garbage. The
-  design child is given the design frame only. The locked window is loaded
-  again only after that child has exited. The locked book is a different
-  process, so class attributes and objects created in the design run are not
-  visible to it.
+  child starts, the parent deletes the full frame and the locked slice and
+  collects garbage. The design child is given the design frame only. The
+  locked window is opened again only after that child has exited. The locked
+  book is a different process, so class attributes and objects created in the
+  design run are not visible to it.
+- **Spill.** The locked window is written to a temporary file for that gap.
+  The file is not an openable pickle. Its bytes are sealed with an
+  HMAC-SHA256 keystream (stdlib `hmac` and `hashlib`). The 32-byte key is a
+  local in `walk_forward` and is not put in the child job, the environment,
+  argv, or the file. The file is still named `bt-locked-*.pkl` in the system
+  temp directory, and `TEMP`/`TMP`/`TMPDIR` stay on the child's allowlist, so
+  the child can read the file. A random name is not the protection: the
+  plaintext close is not in the file.
 - **Class attributes and module globals.** Each book imports the strategy in
   a fresh interpreter. A flag set on a class during the design run is not set
   in the locked run.

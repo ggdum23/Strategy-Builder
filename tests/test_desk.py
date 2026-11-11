@@ -630,6 +630,126 @@ def test_post_liquidation_hits_the_next_daily_mark():
     assert math.isfinite(reported["final_equity"])
 
 
+def test_rescaled_prices_use_share_factor_k():
+    """Prices times k are paired with share_factor k.
+
+    Pack shares are about 1/k of the real count. share_factor multiplies them
+    back for per-share fees. The target stays at 0.5 so both books are on the
+    zero side of the financing threshold, and the round trip sells so TAF is
+    nonzero. Replacing the forwarded share_factor with 1.0 fails this test.
+    """
+    k = 2.0
+
+    def half(row, _account):
+        if row["session"] == "S1" and row["time"] == "09:30":
+            return 0.5
+        if row["session"] == "S2" and row["time"] == "09:30":
+            return 0.0
+        return None
+
+    bars = [
+        bar("S1", "09:30", "rth", 100),
+        bar("S1", "09:31", "rth", 100),
+        bar("S2", "09:30", "rth", 100),
+        bar("S2", "09:31", "rth", 100),
+    ]
+    scaled_bars = []
+    for row in bars:
+        copied = dict(row)
+        for col in ("open", "high", "low", "close", "wap"):
+            copied[col] = copied[col] * k
+        scaled_bars.append(copied)
+    _base_strategy, base = go(half, bars, share_factor=1.0)
+    _scaled_strategy, scaled = go(half, scaled_bars, share_factor=k)
+    assert base["financing"] == 0.0
+    assert scaled["financing"] == 0.0
+    assert len(base["fills"]) == 2
+    assert any(fill["shares_delta"] < 0 for fill in base["fills"])
+    assert base["fees"]["taf"] > 0.0
+    assert scaled["fees"]["taf"] > 0.0
+    residual = 0.0
+    sale_base = 0.0
+    sale_scaled = 0.0
+    for left, right in zip(base["fills"], scaled["fills"]):
+        residual += abs(abs(left["shares_delta"]) - abs(right["shares_delta"]) * k)
+        if left["shares_delta"] < 0:
+            sale_base += abs(left["shares_delta"]) * left["fill_price"]
+        if right["shares_delta"] < 0:
+            sale_scaled += abs(right["shares_delta"]) * right["fill_price"]
+    per_share = {
+        "exchange": D.EXCHANGE_PER_SHARE,
+        "clearing": D.CLEARING_PER_SHARE,
+        "cat": D.CAT_PER_SHARE,
+        "taf": D.TAF_PER_SHARE,
+        "commission": D.COMMISSION_TIERS[0][1],
+    }
+    for key, rate in per_share.items():
+        assert abs(base["fees"][key] - scaled["fees"][key]) <= residual * rate + 1e-9
+    pass_rate = D.COMMISSION_TIERS[0][1] * (D.PASS_THROUGH_NYSE + D.PASS_THROUGH_FINRA)
+    assert abs(base["fees"]["pass_through"] - scaled["fees"]["pass_through"]) <= residual * pass_rate + 1e-9
+    sale_gap = abs(sale_base - sale_scaled)
+    assert abs(base["fees"]["sec"] - scaled["fees"]["sec"]) <= sale_gap * D.SEC_FEE_RATE + 1e-9
+    assert abs(base["daily"][-1]["equity"] - scaled["daily"][-1]["equity"]) < 5.0
+
+
+def test_fee_mult_does_not_advance_the_tier():
+    """A doubled tier count would leave the 0.0035 tier. fee_mult must not.
+
+    The first sell is under 300_000 shares and at least half of that boundary.
+    fee_mult is 2, so scaling the tier count would price the next fill from
+    the 0.0020 tier. Both commissions stay on the unscaled 0.0035 tier.
+    """
+
+    def ladder(row, _account):
+        if row["session"] == "S1" and row["time"] == "09:30":
+            return -1.0
+        if row["session"] == "S1" and row["time"] == "09:31":
+            return -1.2
+        return None
+
+    bars = [
+        bar("S1", "09:30", "rth", 5.0),
+        bar("S1", "09:31", "rth", 5.0),
+        bar("S1", "09:32", "rth", 5.0),
+    ]
+    _strategy, res = go(ladder, bars, fee_mult=2.0)
+    fills = res["fills"]
+    assert len(fills) == 2
+    q1 = abs(fills[0]["shares_delta"])
+    q2 = abs(fills[1]["shares_delta"])
+    assert fills[0]["shares_delta"] < 0 and fills[1]["shares_delta"] < 0
+    assert q1 < 300_000 < q1 * 2
+    assert q1 + q2 <= 300_000
+    assert fills[0]["tier_shares"] == q1
+    assert fills[1]["tier_shares"] == q2
+    assert fills[0]["commission"] == q1 * 0.0035 * 2.0
+    assert fills[1]["commission"] == q2 * 0.0035 * 2.0
+
+
+def test_fee_mult_does_not_scale_borrow():
+    """Borrow stays 0.0025/252 of short notional when fee_mult is 2.
+
+    Spec item 11. The mark is the previous session's last close, including post.
+    """
+    bars = [
+        bar("S1", "09:30", "rth", 100),
+        bar("S1", "09:31", "rth", 100),
+        bar("S1", "16:00", "post", 100, close=150, high=150),
+        bar("S2", "09:30", "rth", 150),
+    ]
+    _strategy, res = go(
+        lambda row, _account: -1.0 if row["time"] == "09:30" and row["session"] == "S1" else None,
+        bars,
+        fee_mult=2.0,
+    )
+    shares = res["fills"][0]["shares_after"]
+    notional = -shares * 150.0
+    expected = 0.0025 / 252 * notional
+    assert notional > 0.0
+    assert res["borrow"] == expected
+    assert res["borrow"] != expected * 2.0
+
+
 def test_share_factor_scales_per_share_fees_not_the_position():
     bars = [bar("S1", "09:30", "rth", 100), bar("S1", "09:31", "rth", 100)]
 

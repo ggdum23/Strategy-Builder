@@ -20,6 +20,9 @@ class DeskConfig:
     """Run configuration. Official schedule defaults; ticker facts are not baked in."""
 
     initial_equity: float = 1_000_000.0
+    # Counted shares are abs(pack shares) * share_factor. When every pack price
+    # is the real price times k, pass k: pack shares are about 1/k of the real
+    # count, and per-share fees then use real shares. 1.0 is the raw-file default.
     share_factor: float = 1.0
     borrow_rate_annual: float = D.BORROW_RATE_ANNUAL
     financing_rate_annual: float = D.FINANCING_RATE_ANNUAL
@@ -295,6 +298,7 @@ class _Book:
             rate=self.cfg.financing_rate_annual,
             sessions_per_year=self.cfg.sessions_per_year,
         )
+        # fee_mult does not scale borrow. Spec item 11.
         bor = D.borrow_due(
             snap["shares"],
             snap["price"],
