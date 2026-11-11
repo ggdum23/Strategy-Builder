@@ -7,14 +7,17 @@ designer may be shown. The files beside it are the operator copy.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import math
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import threading
+import zlib
 from pathlib import Path
 
 import pandas as pd
@@ -48,6 +51,45 @@ _BANNED_DESIGNER_TEXT = (
     "source_glob",
     "sidecar",
 )
+# Free-text values and names use the underscore-aware ticker pattern.
+# Schema keys and CSV headers do not. Status, bool, and numeric columns keep
+# the tokens this report itself writes there.
+_FREE_TEXT_KEYS = frozenset(
+    {
+        "strategy_id",
+        "source_id",
+        "error",
+        "message",
+        "note",
+        "title",
+        "caption",
+        "software",
+        "comment",
+        "description",
+        "label",
+        "session",
+        "time",
+        "phase",
+        "kind",
+        "profile",
+        "audience",
+        "first_session",
+        "last_session",
+        "session_id",
+    }
+)
+_BOOL_KEYS = frozenset(
+    {
+        "disqualified",
+        "busted",
+        "anonymized",
+        "cancelled",
+        "open_position_at_end",
+    }
+)
+_STATUS_TOKENS = frozenset({"ok", "error", "timeout", "cancelled", "memory", "crash"})
+_BOOL_TOKENS = frozenset({"true", "false"})
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 # Rank is assigned after sorting. The sort is excess total return, then id.
 # Desk and Arena both use that excess. Sharpe is not the rank.
@@ -297,7 +339,32 @@ def _ticker_pattern(symbol: str) -> str:
     return rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])"
 
 
-def _scrub_text(value: str, symbol: str) -> str:
+def _float_token(text: str) -> bool:
+    token = text.strip()
+    if not token:
+        return False
+    try:
+        float(token)
+    except ValueError:
+        return False
+    return True
+
+
+def _exempt_designer_value(key: str, text: str) -> bool:
+    """Tokens this report writes, and only in the columns that emit them."""
+    folded = text.strip().casefold()
+    if key == "status" and folded in _STATUS_TOKENS:
+        return True
+    if key in _BOOL_KEYS and folded in _BOOL_TOKENS:
+        return True
+    if key not in _FREE_TEXT_KEYS and key != "status" and _float_token(text):
+        return True
+    return False
+
+
+def _scrub_text(value: str, symbol: str, *, key: str = "") -> str:
+    if key and _exempt_designer_value(key, value):
+        return value
     text = _ISO_DATE.sub("", value)
     if symbol and text.casefold() == symbol.casefold():
         return "ASSET"
@@ -309,18 +376,18 @@ def _scrub_text(value: str, symbol: str) -> str:
 def redact_metrics(payload, *, symbol: str = ""):
     """Drop the ticker, calendar dates, and scale factors from a report object."""
 
-    def walk(value):
+    def walk(value, key=""):
         if isinstance(value, dict):
             out = {}
-            for key, item in value.items():
-                if str(key) in _BANNED_DESIGNER_KEYS:
+            for child_key, item in value.items():
+                if str(child_key) in _BANNED_DESIGNER_KEYS:
                     continue
-                out[str(key)] = walk(item)
+                out[str(child_key)] = walk(item, str(child_key))
             return out
         if isinstance(value, (list, tuple)):
-            return [walk(item) for item in value]
+            return [walk(item, key) for item in value]
         if isinstance(value, str):
-            return _scrub_text(value, symbol)
+            return _scrub_text(value, symbol, key=key)
         return value
 
     redacted = walk(payload)
@@ -369,24 +436,192 @@ def _scrub_result(result: dict, symbol: str) -> dict:
     return out
 
 
-def assert_designer_clean(directory, *, symbol: str) -> None:
-    """Raise if a designer tree still carries a ticker, a date, or a factor."""
-    root = Path(directory)
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() == ".png":
-            continue
+def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
+    """Why this value cannot be shown, or None when it is safe.
+
+    ``symbol`` is compared with free text (ids, errors, captions, names) as
+    its own token, so ``my_zzzx_v2`` still matches. Other values fail only
+    when the whole value is the ticker. Keys and CSV headers are not passed
+    here. Status, bool, and numeric cells keep the tokens those columns emit.
+    """
+    if not isinstance(text, str) or text == "":
+        return None
+    for token in _BANNED_DESIGNER_TEXT:
+        if token in text:
+            return token
+    if _ISO_DATE.search(text):
+        return "a calendar date"
+    if not symbol or len(symbol) < 2:
+        return None
+    if _exempt_designer_value(key, text):
+        return None
+    if text.strip().casefold() == symbol.casefold():
+        return "the ticker"
+    if key in _FREE_TEXT_KEYS and re.search(_ticker_pattern(symbol), text, flags=re.IGNORECASE):
+        return "the ticker"
+    return None
+
+
+def _raise_designer_value(filename: str, key: str, text: str, symbol: str) -> None:
+    reason = _designer_value_error(key, text, symbol)
+    if reason:
+        raise RuntimeError(f"{filename} contains {reason}")
+
+
+def _raise_designer_name(name: str, symbol: str) -> None:
+    """File and directory names are free text. A ticker token in the name fails."""
+    reason = _designer_value_error("caption", name, symbol)
+    if reason == "the ticker":
+        raise RuntimeError(f"{name} is named with the ticker")
+    if reason:
+        raise RuntimeError(f"{name} contains {reason}")
+
+
+def _raise_schema_label(filename: str, label: str) -> None:
+    """A JSON key or a CSV header. The ticker pattern does not apply."""
+    for token in _BANNED_DESIGNER_TEXT:
+        if token in label:
+            raise RuntimeError(f"{filename} contains {token}")
+    if _ISO_DATE.search(label):
+        raise RuntimeError(f"{filename} contains a calendar date")
+
+
+def _walk_designer_json(filename: str, key: str, value, symbol: str) -> None:
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            name = str(child_key)
+            _raise_schema_label(filename, name)
+            _walk_designer_json(filename, name, child, symbol)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _walk_designer_json(filename, key, item, symbol)
+        return
+    if isinstance(value, str):
+        _raise_designer_value(filename, key, value, symbol)
+
+
+def _audit_json_file(path: Path, symbol: str) -> None:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{path.name} is not JSON") from exc
+    _walk_designer_json(path.name, "", document, symbol)
+
+
+def _audit_csv_file(path: Path, symbol: str) -> None:
+    try:
         text = path.read_text(encoding="utf-8")
-        for token in _BANNED_DESIGNER_TEXT:
-            if token in text:
-                raise RuntimeError(f"{path.name} contains {token}")
-        if _ISO_DATE.search(text):
-            raise RuntimeError(f"{path.name} contains a calendar date")
-        if symbol and len(symbol) >= 2 and re.search(
-            _ticker_pattern(symbol), text, flags=re.IGNORECASE
-        ):
-            raise RuntimeError(f"{path.name} contains the ticker")
-        if symbol and path.name.casefold() == f"{symbol.casefold()}{path.suffix.casefold()}":
-            raise RuntimeError(f"{path.name} is named with the ticker")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{path.name} is not text") from exc
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return
+    header = rows[0]
+    for label in header:
+        _raise_schema_label(path.name, label)
+    for row in rows[1:]:
+        for index, cell in enumerate(row):
+            key = header[index] if index < len(header) else ""
+            _raise_designer_value(path.name, key, cell, symbol)
+
+
+def _itxt_strings(data: bytes) -> list[str]:
+    keyword, _, rest = data.partition(b"\x00")
+    if len(rest) < 2:
+        raise ValueError("truncated iTXt")
+    flag = rest[0]
+    method = rest[1]
+    language, _, rest = rest[2:].partition(b"\x00")
+    translated, _, text = rest.partition(b"\x00")
+    found = [keyword.decode("latin-1", "replace")]
+    if language:
+        found.append(language.decode("latin-1", "replace"))
+    if translated:
+        found.append(translated.decode("utf-8", "replace"))
+    if flag == 0:
+        found.append(text.decode("utf-8", "replace"))
+    elif flag == 1 and method == 0:
+        found.append(zlib.decompress(text).decode("utf-8", "replace"))
+    else:
+        raise ValueError("unknown iTXt compression")
+    return found
+
+
+def _png_metadata_texts(blob: bytes) -> list[str]:
+    """Uncompressed and zlib text chunks. Pixel data is not a caption."""
+    if not blob.startswith(_PNG_SIGNATURE):
+        raise ValueError("not a png")
+    pos = 8
+    texts: list[str] = []
+    while pos + 12 <= len(blob):
+        length = struct.unpack(">I", blob[pos : pos + 4])[0]
+        kind = blob[pos + 4 : pos + 8]
+        start = pos + 8
+        end = start + length
+        if length < 0 or end + 4 > len(blob):
+            raise ValueError("truncated png")
+        data = blob[start:end]
+        if kind == b"tEXt":
+            keyword, _, text = data.partition(b"\x00")
+            texts.append(keyword.decode("latin-1", "replace"))
+            texts.append(text.decode("latin-1", "replace"))
+        elif kind == b"zTXt":
+            keyword, _, rest = data.partition(b"\x00")
+            texts.append(keyword.decode("latin-1", "replace"))
+            if not rest or rest[0] != 0:
+                raise ValueError("truncated zTXt")
+            texts.append(zlib.decompress(rest[1:]).decode("latin-1", "replace"))
+        elif kind == b"iTXt":
+            texts.extend(_itxt_strings(data))
+        elif kind == b"IEND":
+            return texts
+        pos = end + 4
+    raise ValueError("png ended without IEND")
+
+
+def _audit_png_file(path: Path, symbol: str) -> None:
+    try:
+        texts = _png_metadata_texts(path.read_bytes())
+    except Exception as exc:
+        raise RuntimeError(f"{path.name} png metadata could not be read") from exc
+    for text in texts:
+        _raise_designer_value(path.name, "caption", text, symbol)
+
+
+def assert_designer_clean(directory, *, symbol: str) -> None:
+    """Raise if a designer tree still carries a ticker, a date, or a factor.
+
+    JSON and CSV are parsed. The ticker pattern is not applied to schema keys
+    or CSV headers, so a column such as ``borrow_cost`` is not the ticker
+    ``COST``. Free-text values and file or directory names still match an
+    embedded ticker, including ``my_zzzx_v2``. A value that is exactly the
+    ticker fails, including PNG text and metadata, unless that column is
+    where the report writes the token (``ok``, ``inf``, ``true``, a float).
+    """
+    root = Path(directory)
+    paths = [root, *list(root.rglob("*"))]
+    for path in paths:
+        _raise_designer_name(path.name, symbol)
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix == ".png":
+            _audit_png_file(path, symbol)
+            continue
+        if path.stat().st_size == 0:
+            continue
+        if suffix == ".json":
+            _audit_json_file(path, symbol)
+            continue
+        if suffix == ".csv":
+            _audit_csv_file(path, symbol)
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"{path.name} is not text") from exc
+        _raise_designer_value(path.name, "caption", text, symbol)
 
 
 def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str) -> Path:

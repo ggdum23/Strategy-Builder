@@ -14,6 +14,7 @@ from backtester.data import load_named
 from backtester.pack import (
     CHUNK_SESSIONS,
     MAX_FILE_BYTES,
+    _pack_id,
     assert_anonymized_pack_clean,
     build_pack,
     load_pack,
@@ -333,6 +334,40 @@ def test_load_pack_rejects_an_anonymized_gzip_extra_field(tmp_path):
         assert_anonymized_pack_clean(pack, symbol="NIK")
     target.write_bytes(original)
     load_pack(pack)
+
+
+def _rewrite_pack_id(pack: Path) -> None:
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    hashed = [(chunk["file"], (pack / chunk["file"]).read_bytes()) for chunk in manifest["chunks"]]
+    hashed.append((manifest["daily_file"], (pack / manifest["daily_file"]).read_bytes()))
+    manifest["pack_id"] = _pack_id(hashed)
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def test_load_pack_rejects_a_second_clean_gzip_member(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    payload = gzip.decompress(original)
+    second = _recompress(payload, mtime=0, filename="")
+    target.write_bytes(original + second)
+    _rewrite_pack_id(pack)
+    with pytest.raises(ValueError, match="members") as caught:
+        load_pack(pack)
+    assert "pack_id" not in str(caught.value)
+    with pytest.raises(ValueError, match="members") as caught:
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    assert "pack_id" not in str(caught.value)
+    target.write_bytes(original)
+    _rewrite_pack_id(pack)
+    loaded = load_pack(pack)
+    assert len(loaded.frame) == len(gzip.decompress(original).splitlines()) - 1
 
 
 def test_load_pack_rejects_duplicate_manifest_keys(tmp_path):

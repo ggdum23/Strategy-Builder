@@ -150,6 +150,86 @@ def test_redaction_drops_the_ticker_the_date_and_the_factor(tmp_path):
         assert_designer_clean(root, symbol="BRK.B")
 
 
+def _png_with_text(keyword: str, text: str) -> bytes:
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    body = keyword.encode("latin-1") + b"\x00" + text.encode("latin-1")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"tEXt", body) + chunk(b"IEND", b"")
+
+
+def test_designer_audit_ignores_schema_tokens_and_rejects_a_planted_value(tmp_path):
+    root = tmp_path / "designer"
+    root.mkdir()
+    payload = {
+        "borrow_cost": 1.25,
+        "financing_cost": 0.0,
+        "max_dd_duration_sessions": 3,
+        "dividends_net": 0.0,
+        "max_drawdown": -0.1,
+        "percent_up_days": 0.5,
+        "frac_sessions_long_at_close": 0.0,
+        "turnover_per_year": 0.0,
+        "avg_holding_sessions": 0.0,
+        "best_day": 0.0,
+        "status": "ok",
+        "calmar": "inf",
+        "disqualified": "true",
+        "strategy_id": "flat",
+        "audience": "designer",
+    }
+    (root / "metrics.json").write_text(json.dumps(payload), encoding="utf-8")
+    header = [
+        "status",
+        "calmar",
+        "disqualified",
+        "borrow_cost",
+        "max_dd_duration_sessions",
+        "dividends_net",
+        "max_drawdown",
+        "strategy_id",
+        "percent_up_days",
+        "error",
+    ]
+    row = ["ok", "inf", "false", "0", "1", "0", "-0.1", "flat", "0.5", ""]
+    (root / "leaderboard.csv").write_text(",".join(header) + "\n" + ",".join(row) + "\n", encoding="utf-8")
+    (root / "equity.png").write_bytes(_png_with_text("Title", "equity"))
+    for symbol in ("COST", "DD", "NET", "MAX", "OK", "INF", "ID", "TRUE", "UP", "AT", "PER", "AVG", "DAY"):
+        assert_designer_clean(root, symbol=symbol)
+
+    leaked = dict(payload)
+    leaked["note"] = "COST"
+    (root / "metrics.json").write_text(json.dumps(leaked), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ticker"):
+        assert_designer_clean(root, symbol="COST")
+    leaked["note"] = "my_cost_v2"
+    (root / "metrics.json").write_text(json.dumps(leaked), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ticker"):
+        assert_designer_clean(root, symbol="COST")
+    leaked["note"] = "kept"
+    leaked["borrow_cost"] = "COST"
+    (root / "metrics.json").write_text(json.dumps(leaked), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ticker"):
+        assert_designer_clean(root, symbol="COST")
+    leaked["borrow_cost"] = 1.25
+    leaked["note"] = "2024-01-02"
+    (root / "metrics.json").write_text(json.dumps(leaked), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="calendar date"):
+        assert_designer_clean(root, symbol="COST")
+    (root / "metrics.json").write_text(json.dumps(payload), encoding="utf-8")
+    (root / "equity.png").write_bytes(_png_with_text("Title", "COST"))
+    with pytest.raises(RuntimeError, match="ticker"):
+        assert_designer_clean(root, symbol="COST")
+    (root / "my_cost_v2").mkdir()
+    (root / "equity.png").write_bytes(_png_with_text("Title", "equity"))
+    with pytest.raises(RuntimeError, match="named with the ticker"):
+        assert_designer_clean(root, symbol="COST")
+
+
 def test_leaderboard_uses_lf_and_writes_inf():
     import tempfile
 

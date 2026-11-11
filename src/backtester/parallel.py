@@ -28,12 +28,13 @@ import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 from concurrent.futures import FIRST_COMPLETED
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .profiles import get_profile
 from .report import (
     OPERATOR_LEADERBOARD_COLUMNS,
+    _designer_value_error,
     _scrub_text,
     assert_designer_clean,
     redact_metrics,
@@ -843,8 +844,71 @@ def _designer_component(value: str, symbol: str, used: set) -> str:
     return _safe_component(candidate)
 
 
+def _result_for(results, row) -> JobResult:
+    for item in results:
+        if item.strategy_id == row["strategy_id"] and item.source_id == row["source_id"]:
+            return item
+    raise KeyError((row["strategy_id"], row["source_id"]))
+
+
+def _fail_published_row(results, row, message: str) -> None:
+    """One job's designer tree failed. The batch still finishes."""
+    row["status"] = "error"
+    row["error"] = message
+    for index, item in enumerate(results):
+        if item.strategy_id == row["strategy_id"] and item.source_id == row["source_id"]:
+            results[index] = replace(item, status="error", error=message)
+            return
+
+
+def _audit_job_tree(dest, symbols) -> None:
+    probes = list(dict.fromkeys([*symbols, ""]))
+    for probe in probes:
+        assert_designer_clean(dest, symbol=probe or "")
+
+
+def _cell_violation(copied: dict, symbols) -> str | None:
+    probes = list(dict.fromkeys([*symbols, ""]))
+    for key, value in copied.items():
+        if not isinstance(value, str):
+            continue
+        for probe in probes:
+            reason = _designer_value_error(key, value, probe)
+            if reason:
+                return f"{key} contains {reason}"
+    return None
+
+
+def _write_clean_designer_error(dest, folder: str, source_name: str, profile: str, symbol: str) -> None:
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "strategy_id": folder,
+        "source_id": source_name,
+        "profile": profile,
+        "status": "error",
+        "error": "the strategy failed",
+    }
+    write_json(dest / "error.json", redact_metrics(payload, symbol=symbol or ""))
+    try:
+        _audit_job_tree(dest, [symbol] if symbol else [])
+    except Exception:
+        shutil.rmtree(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        write_json(
+            dest / "error.json",
+            {"status": "error", "error": "the strategy failed", "audience": "designer"},
+        )
+
+
 def _bundle_designer(out, ranked_rows, assignments, results) -> None:
-    """One directory a designer can be handed. Named jobs stay out of it."""
+    """One directory a designer can be handed. Named jobs stay out of it.
+
+    A scrub or audit failure marks that job ``error`` and stays inside this
+    function. The other jobs are still published, and the caller still writes
+    ``run.json``.
+    """
     selected = []
     symbols = []
     for row, assignment in _rows_with_markets(ranked_rows, assignments):
@@ -852,51 +916,133 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         anonymized = not isinstance(market, _Prepared) or market.anonymized
         if not anonymized:
             continue
-        selected.append(row)
+        selected.append((row, assignment))
         if isinstance(market, _Prepared) and market.symbol:
             symbols.append(market.symbol)
     if not selected:
         return
+    unique_symbols = list(dict.fromkeys(symbols))
     designer = out / "designer"
     if designer.exists():
         shutil.rmtree(designer)
     designer.mkdir(parents=True)
-    by_job = {(item.strategy_id, item.source_id): item for item in results}
-    cleaned = []
+    mutated = False
+    placed = {}
     used_names = set()
-    for row, assignment in _rows_with_markets(selected, assignments):
-        item = by_job[(row["strategy_id"], row["source_id"])]
+    for row, assignment in selected:
+        item = _result_for(results, row)
         market = assignment[1]
         symbol = market.symbol if isinstance(market, _Prepared) else ""
         # The directory suffix and the leaderboard id are the same string.
         # Scrubbing alone turns both ZzZx and zzzx into ASSET.
         folder = _designer_component(row["strategy_id"], symbol, used_names)
         source_name = _designer_component(row["source_id"], symbol, set())
+        placed[(row["strategy_id"], row["source_id"])] = (folder, source_name, symbol)
         source = Path(item.out_dir) / "designer"
-        if source.is_dir():
-            dest = designer / folder / source_name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                shutil.rmtree(dest)
+        if not source.is_dir():
+            continue
+        dest = designer / folder / source_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            shutil.rmtree(dest)
+        try:
             shutil.copytree(source, dest)
-        copied = {}
-        for key, value in row.items():
-            if key == "symbol":
+            _audit_job_tree(dest, unique_symbols)
+        except Exception as exc:
+            mutated = True
+            _fail_published_row(results, row, _clip(f"designer audit failed: {exc}"))
+            _write_clean_designer_error(dest, folder, source_name, row.get("profile") or "", symbol)
+
+    def designer_rows():
+        nonlocal mutated
+        cleaned = []
+        for row in ranked_rows:
+            key = (row["strategy_id"], row["source_id"])
+            if key not in placed:
                 continue
-            if isinstance(value, str):
-                copied[key] = _scrub_text(value, symbol)
-            else:
-                copied[key] = value
-        copied["strategy_id"] = folder
-        copied["source_id"] = source_name
-        copied["error"] = _scrub_text(_designer_error_text(item), symbol)
-        cleaned.append(copied)
-    for index, row in enumerate(cleaned, start=1):
-        row["rank"] = index
-    write_leaderboard(designer / "leaderboard.csv", cleaned, audience="designer")
-    assert_designer_clean(designer, symbol="")
-    for symbol in symbols:
-        assert_designer_clean(designer, symbol=symbol)
+            folder, source_name, symbol = placed[key]
+            item = _result_for(results, row)
+            copied = {}
+            for column, value in row.items():
+                if column == "symbol":
+                    continue
+                if isinstance(value, str):
+                    copied[column] = _scrub_text(value, symbol, key=column)
+                else:
+                    copied[column] = value
+            copied["strategy_id"] = folder
+            copied["source_id"] = source_name
+            if row["status"] != "ok":
+                copied["status"] = "error"
+                copied["error"] = _scrub_text(_designer_error_text(item), symbol, key="error")
+            violation = _cell_violation(copied, unique_symbols)
+            if violation:
+                mutated = True
+                _fail_published_row(results, row, _clip(f"designer audit failed: {violation}"))
+                copied["status"] = "error"
+                copied["error"] = "the strategy failed"
+                for column, value in list(copied.items()):
+                    if isinstance(value, str) and _cell_violation({column: value}, unique_symbols):
+                        replacement = "ASSET" if column in {"strategy_id", "source_id"} else "the strategy failed"
+                        copied[column] = replacement
+            cleaned.append(copied)
+        for index, copied in enumerate(cleaned, start=1):
+            copied["rank"] = index
+        return cleaned
+
+    def republish_operator() -> None:
+        if not mutated:
+            return
+        ranked_rows.sort(key=_rank_key)
+        for index, row in enumerate(ranked_rows, start=1):
+            row["rank"] = index
+        write_leaderboard(out / "leaderboard.csv", ranked_rows, audience="operator")
+
+    def assert_tree() -> None:
+        assert_designer_clean(designer, symbol="")
+        for symbol in unique_symbols:
+            assert_designer_clean(designer, symbol=symbol)
+
+    designer_rows()
+    republish_operator()
+    write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
+    try:
+        assert_tree()
+    except Exception:
+        mutated = True
+        for row in ranked_rows:
+            key = (row["strategy_id"], row["source_id"])
+            if key not in placed:
+                continue
+            folder, source_name, symbol = placed[key]
+            dest = designer / folder / source_name
+            if not dest.is_dir():
+                continue
+            try:
+                _audit_job_tree(dest, unique_symbols)
+            except Exception as exc:
+                _fail_published_row(results, row, _clip(f"designer audit failed: {exc}"))
+                _write_clean_designer_error(
+                    dest, folder, source_name, row.get("profile") or "", symbol
+                )
+        republish_operator()
+        write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
+        try:
+            assert_tree()
+        except Exception as exc:
+            message = _clip(f"designer audit failed: {exc}")
+            for row in ranked_rows:
+                key = (row["strategy_id"], row["source_id"])
+                if key in placed and row["status"] == "ok":
+                    _fail_published_row(results, row, message)
+            if designer.exists():
+                shutil.rmtree(designer)
+            designer.mkdir(parents=True, exist_ok=True)
+            write_json(
+                designer / "error.json",
+                {"status": "error", "error": "the strategy failed", "audience": "designer"},
+            )
+            republish_operator()
 
 
 def _order_results(results, ranked_rows) -> list[JobResult]:

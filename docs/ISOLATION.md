@@ -25,8 +25,11 @@ Phase 1 does not build that jail.
   a fresh interpreter. A flag set on a class during the design run is not set
   in the locked run.
 - **Environment.** The child receives an allowlist (`PATH`, the Windows
-  system-directory variables, `TEMP`/`TMP`/`TMPDIR`, `PYTHON*`, `VIRTUAL_ENV`,
-  the dynamic-linker path variables, `LANG`/`LC_*`, and `TZ`). Every other
+  system-directory variables, `TEMP`/`TMP`/`TMPDIR`, `PYTHONHOME`,
+  `PYTHONNOUSERSITE`, `PYTHONHASHSEED`, `PYTHONUTF8`, `PYTHONIOENCODING`,
+  `PYTHONUNBUFFERED`, `PYTHONSAFEPATH`, `PYTHONLEGACYWINDOWSSTDIO`,
+  `PYTHONMALLOC`, `VIRTUAL_ENV`, the dynamic-linker path variables,
+  `LANG`/`LC_*`, and `TZ`). `PYTHONPATH` is not on that list. Every other
   variable is dropped, including a data-root variable. `PATH` is kept because
   the interpreter and native libraries may need it. A data directory that
   someone has placed on `PATH` is not removed.

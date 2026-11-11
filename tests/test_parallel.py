@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -923,18 +924,19 @@ def test_enter_child_scrubs_a_dirty_argv_and_environment(tmp_path):
         sys.path[:] = old_path
 
 
-def _anon_pack(tmp_path: Path, symbol: str):
+def _anon_pack(tmp_path: Path, symbol: str, name: str = "", price_factor: float = 1.1):
     from backtester.data import load_named
     from backtester.pack import build_pack
     from backtester.registry import entry_from_inspection, save_registry, upsert_series
 
-    src = _named_series(tmp_path / "src", symbol)
+    root = tmp_path / name if name else tmp_path
+    src = _named_series(root / "src", symbol)
     loaded = load_named(src, symbol)
-    registry = tmp_path / "registry.json"
+    registry = root / "registry.json"
     entry = entry_from_inspection(loaded.inspection, source_root=str(src), profile="arena")
     save_registry(registry, upsert_series({"schema_version": 1, "series": []}, entry))
-    pack = tmp_path / "pack"
-    sidecar = tmp_path / "operator" / "secret.json"
+    pack = root / "pack"
+    sidecar = root / "operator" / "secret.json"
     built = build_pack(
         src,
         symbol,
@@ -943,7 +945,7 @@ def _anon_pack(tmp_path: Path, symbol: str):
         anonymize=True,
         profile="arena",
         registry_path=registry,
-        price_factor=1.1,
+        price_factor=price_factor,
         volume_factor=0.5,
     )
     return pack, sidecar, built
@@ -1381,3 +1383,169 @@ def test_a_missing_windows_job_fails_the_run(tmp_path, monkeypatch):
         assert "job object" in (result.results[0].error or "")
     else:
         assert result.results[0].status == "ok", (result.results[0].status, result.results[0].error)
+
+
+_SCHEMA_TICKERS = ("COST", "DD", "NET", "MAX", "OK", "INF", "ID", "TRUE")
+
+
+def _registered(index: Path, run_id: str, out: Path) -> None:
+    assert (out / "run.json").is_file()
+    document = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert document["id"] == run_id
+    index_doc = json.loads(index.read_text(encoding="utf-8"))
+    assert run_id in index_doc["runs"]
+    assert Path(index_doc["runs"][run_id]["path"]) == out.resolve()
+
+
+def test_schema_token_tickers_publish_and_register(tmp_path):
+    """Headers such as borrow_cost are not the ticker COST."""
+    from backtester.report import read_leaderboard
+
+    for symbol in _SCHEMA_TICKERS:
+        pack, sidecar, _built = _anon_pack(tmp_path, symbol, name=symbol)
+        index = tmp_path / symbol / "runs.json"
+        out = tmp_path / symbol / "out"
+        result = run_parallel(
+            [_strategy(tmp_path / symbol / "strategies", "flat", FLAT)],
+            [PackMarket(str(pack), str(sidecar))],
+            out,
+            profile="arena",
+            workers=1,
+            timeout_s=60,
+            index_path=index,
+        )
+        assert result.failures == 0, (symbol, [(item.status, item.error) for item in result.results])
+        _registered(index, result.run_id, out)
+        board = read_leaderboard(out / "designer" / "leaderboard.csv")
+        assert board[0]["status"] == "ok"
+        if symbol == "INF":
+            assert board[0]["calmar"] == "inf"
+        if symbol == "OK":
+            assert "ASSET" not in board[0]["status"]
+        assert_designer_clean(out / "designer", symbol=symbol)
+        info = json.loads((out / "run.json").read_text(encoding="utf-8"))
+        assert info["jobs"][0]["status"] == "ok"
+        assert info["jobs"][0]["symbol"] == symbol
+
+
+def test_mixed_zzzx_and_cost_batch_registers_both(tmp_path):
+    from backtester.report import read_leaderboard
+
+    zzzx_pack, zzzx_side, _built = _anon_pack(tmp_path, "ZZZX", name="zzzx", price_factor=1.1)
+    cost_pack, cost_side, _built = _anon_pack(tmp_path, "COST", name="cost", price_factor=1.3)
+    index = tmp_path / "runs.json"
+    out = tmp_path / "out"
+    result = run_parallel(
+        [_strategy(tmp_path / "strategies", "flat", FLAT)],
+        [
+            PackMarket(str(zzzx_pack), str(zzzx_side)),
+            PackMarket(str(cost_pack), str(cost_side)),
+        ],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        index_path=index,
+    )
+    assert result.failures == 0, [(item.source_id, item.status, item.error) for item in result.results]
+    _registered(index, result.run_id, out)
+    info = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert {job["symbol"] for job in info["jobs"]} == {"ZZZX", "COST"}
+    assert {job["status"] for job in info["jobs"]} == {"ok"}
+    board = read_leaderboard(out / "designer" / "leaderboard.csv")
+    assert len(board) == 2
+    assert {row["status"] for row in board} == {"ok"}
+    assert_designer_clean(out / "designer", symbol="ZZZX")
+    assert_designer_clean(out / "designer", symbol="COST")
+
+
+_REAL_COPYTREE = shutil.copytree
+
+
+def _plant_cost_note(src, dst, *args, **kwargs):
+    _REAL_COPYTREE(src, dst, *args, **kwargs)
+    metrics = Path(dst) / "metrics.json"
+    if not metrics.is_file():
+        return
+    document = json.loads(metrics.read_text(encoding="utf-8"))
+    strategy = (document.get("run") or {}).get("strategy_id") or document.get("strategy_id")
+    if strategy != "leaky":
+        return
+    document["note"] = "COST"
+    metrics.write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_a_ticker_in_a_value_fails_only_that_row(tmp_path, monkeypatch):
+    monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_cost_note)
+    pack, sidecar, _built = _anon_pack(tmp_path, "COST", name="cost")
+    index = tmp_path / "runs.json"
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "flat", FLAT),
+            _strategy(tmp_path / "strategies", "leaky", FLAT),
+        ],
+        [PackMarket(str(pack), str(sidecar))],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+        index_path=index,
+    )
+    by_id = {item.strategy_id: item for item in result.results}
+    assert by_id["flat"].status == "ok", by_id["flat"].error
+    assert by_id["leaky"].status == "error"
+    assert "ticker" in (by_id["leaky"].error or "")
+    assert result.failures == 1
+    _registered(index, result.run_id, out)
+    info = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    statuses = {job["strategy_id"]: job["status"] for job in info["jobs"]}
+    assert statuses == {"flat": "ok", "leaky": "error"}
+    blob = []
+    for path in (out / "designer").rglob("*"):
+        if path.is_file() and path.suffix.lower() != ".png":
+            blob.append(path.read_text(encoding="utf-8"))
+    assert "COST" not in "\n".join(blob)
+    assert_designer_clean(out / "designer", symbol="COST")
+
+
+def test_parallel_cli_exits_without_a_traceback_when_one_row_fails(tmp_path, monkeypatch, capsys):
+    from backtester.__main__ import main
+
+    monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_cost_note)
+    monkeypatch.chdir(tmp_path)
+    pack, sidecar, _built = _anon_pack(tmp_path, "COST", name="cost")
+    strategies = tmp_path / "strategies"
+    _strategy(strategies, "flat", FLAT)
+    _strategy(strategies, "leaky", FLAT)
+    out = tmp_path / "out"
+    code = main(
+        [
+            "parallel",
+            "--strategies",
+            str(strategies),
+            "--workers",
+            "2",
+            "--profile",
+            "arena",
+            "--pack",
+            str(pack),
+            "--sidecar",
+            str(sidecar),
+            "--out",
+            str(out),
+            "--timeout",
+            "60",
+            "--no-benchmarks",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert (out / "run.json").is_file()
+    info = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert {job["status"] for job in info["jobs"]} == {"ok", "error"}
+    index = json.loads((tmp_path / ".backtester-runs.json").read_text(encoding="utf-8"))
+    assert info["id"] in index["runs"]

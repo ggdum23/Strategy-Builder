@@ -298,6 +298,33 @@ def _gzip_members(blob: bytes):
         rest = unused[8:]
 
 
+def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
+    """One clean gzip member, inflated.
+
+    A second member is rejected even when its header is clean. ``GzipFile``
+    concatenates members, and duplicate rows still pass the unique-day check,
+    so the loaded book would be longer than the pack that was built. The
+    builder writes a single member.
+    """
+    payloads = []
+    for (mtime, fname, has_comment, has_extra), payload in _gzip_members(blob):
+        if mtime != 0:
+            raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
+        if fname:
+            shown = fname.decode("utf-8", "replace")
+            raise ValueError(f"{name} gzip file name is {shown!r}")
+        if has_comment:
+            raise ValueError(f"{name} gzip member has an FCOMMENT")
+        if has_extra:
+            raise ValueError(f"{name} gzip member has an FEXTRA")
+        payloads.append(payload)
+    if not payloads:
+        raise ValueError(f"{name} gzip member is not gzip")
+    if len(payloads) != 1:
+        raise ValueError(f"{name} gzip has {len(payloads)} members; expected 1")
+    return payloads
+
+
 def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
     """Refuse a designer tree that still carries identity or a scale factor."""
     root = Path(pack_dir)
@@ -312,20 +339,10 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
             raise ValueError(f"{name} leaks identity in the file name")
         raw = path.read_bytes()
         if path.suffix == ".gz":
-            parts = []
-            for (mtime, fname, has_comment, has_extra), payload in _gzip_members(raw):
-                if mtime != 0:
-                    raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
-                if fname:
-                    shown = fname.decode("utf-8", "replace")
-                    raise ValueError(f"{name} gzip file name is {shown!r}")
-                if has_comment:
-                    raise ValueError(f"{name} gzip member has an FCOMMENT")
-                if has_extra:
-                    raise ValueError(f"{name} gzip member has an FEXTRA")
-                parts.append(payload.decode("utf-8"))
-            if not parts:
-                raise ValueError(f"{name} gzip member is not gzip")
+            try:
+                parts = [payload.decode("utf-8") for payload in _anonymized_gzip_payloads(name, raw)]
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{name} is not text; refusing to ship it") from exc
             text = "".join(parts)
         else:
             try:
@@ -646,26 +663,14 @@ def _validate_manifest(document: dict) -> None:
 
 
 def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
-    """The same gzip header rules as the designer-pack audit.
+    """The same gzip rules as the designer-pack audit.
 
-    Every member is checked. A file name, a comment, a non-zero mtime, or an
-    FEXTRA field is rejected. The builder does not emit those. ``load_pack``
-    repeats the check so a pack that bypassed the builder still fails closed.
+    One member, mtime 0, no file name, no comment, and no FEXTRA. A second
+    member is rejected here as well, including one whose header is clean.
+    ``load_pack`` repeats the check so a pack that bypassed the builder still
+    fails closed.
     """
-    saw = False
-    for (mtime, fname, has_comment, has_extra), _payload in _gzip_members(blob):
-        saw = True
-        if mtime != 0:
-            raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
-        if fname:
-            shown = fname.decode("utf-8", "replace")
-            raise ValueError(f"{name} gzip file name is {shown!r}")
-        if has_comment:
-            raise ValueError(f"{name} gzip member has an FCOMMENT")
-        if has_extra:
-            raise ValueError(f"{name} gzip member has an FEXTRA")
-    if not saw:
-        raise ValueError(f"{name} gzip member is not gzip")
+    _anonymized_gzip_payloads(name, blob)
 
 
 def load_pack(pack_dir) -> LoadedPack:
