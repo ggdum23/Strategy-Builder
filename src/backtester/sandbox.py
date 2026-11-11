@@ -692,18 +692,37 @@ def _stage_packages(work: Path) -> list[Path]:
     """Build ``pydeps/NN`` slots in parent import order and write ``deps.json``.
 
     The slot holds one package. Its parent is what goes on ``sys.path``, so a
-    scan of that path cannot see a sibling ``dist-info`` or ``.pth``.
+    scan of that path cannot see a sibling ``dist-info`` or ``.pth``. A
+    ``*.libs`` directory is placed in that same slot: on Windows the numpy
+    loader looks beside the package, not on ``sys.path``.
     """
     packages = _runtime_package_dirs()
     stage = work / "pydeps"
     stage.mkdir()
     entries = []
-    for index, path in enumerate(packages):
+    dlls = []
+    slots: dict[Path, Path] = {}
+    index = 0
+    for path in packages:
+        if path.name.endswith(".libs"):
+            owner = path.parent / path.name[: -len(".libs")]
+            slot = slots.get(owner)
+            if slot is not None:
+                _link_into(path, slot / path.name)
+                dlls.append(str(path))
+                continue
         slot = stage / f"{index:02d}"
         slot.mkdir()
         _link_into(path, slot / path.name)
+        slots[path] = slot
         entries.append(f"pydeps/{index:02d}")
-    (work / "deps.json").write_text(json.dumps({"path": entries}), encoding="utf-8")
+        index += 1
+        if path.name.endswith(".libs"):
+            dlls.append(str(path))
+    (work / "deps.json").write_text(
+        json.dumps({"path": entries, "dlls": dlls}),
+        encoding="utf-8",
+    )
     return packages
 
 

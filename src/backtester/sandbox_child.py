@@ -165,9 +165,25 @@ def _extend_path() -> None:
     spec = json.loads(path.read_text(encoding="utf-8"))
     path.unlink()
     entries = spec.get("path") if isinstance(spec, dict) else spec
-    for entry in reversed([item for item in (entries or []) if item]):
+    entries = [item for item in (entries or []) if item]
+    for entry in reversed(entries):
         if entry not in sys.path:
             sys.path.insert(0, entry)
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        # The absolute directory is the one the parent imported. A junction
+        # beside the package is not always where LoadLibrary looks.
+        dlls = spec.get("dlls") if isinstance(spec, dict) else None
+        for raw in dlls or []:
+            folder = Path(raw)
+            if folder.is_dir():
+                os.add_dll_directory(str(folder))
+        for entry in entries:
+            root = Path(entry)
+            if not root.is_dir():
+                continue
+            for child in root.iterdir():
+                if child.is_dir() and child.name.endswith(".libs"):
+                    os.add_dll_directory(str(child))
 
 
 def _windows_token_facts() -> dict:
