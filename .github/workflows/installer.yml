@@ -19,8 +19,8 @@ jobs:
     permissions:
       contents: read
     env:
-      SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
-      SB_SMOKE_DIR: ${{ runner.temp }}\smoke results
+      # runner.temp is not available in a job-level env block. The install and
+      # smoke steps set the paths, and both paths contain a space on purpose.
       STRATEGY_BUILDER_HEADLESS: "1"
     steps:
       - uses: actions/checkout@v4
@@ -57,15 +57,22 @@ jobs:
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
       - name: Silent install
         shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
         run: |
           $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
           ./packaging/ci_install.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
       - name: Smoke tests
         shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
+          SB_SMOKE_DIR: ${{ runner.temp }}\smoke results
         run: python packaging/smoke_frozen.py --exe "$env:SB_INSTALL_DIR\backtester.exe" --repo . --work $env:SB_SMOKE_DIR
       - name: Silent uninstall
         if: always()
         shell: pwsh
+        env:
+          SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
         run: |
           $unins = Join-Path $env:SB_INSTALL_DIR "unins000.exe"
           if (-not (Test-Path -LiteralPath $unins)) {
