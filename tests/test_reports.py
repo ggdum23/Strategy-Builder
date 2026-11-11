@@ -352,6 +352,10 @@ def test_token_match_is_casefolded_and_bounded_for_one_character(tmp_path):
     assert ticker_token_spans("ASSET", "ASS") == []
     assert scrub_symbols("my_GOOGL_v2", ["GOOG", "GOOGL"]) == "my_ASSET_v2"
     assert scrub_symbols("my_GOOG_v2", ["GOOGL", "GOOG"]) == "my_ASSET_v2"
+    assert ticker_token_spans("ASSET-2", "2") == [(6, 7)]
+    assert ticker_token_spans(scrub_symbols("asset", ["asset"]), "asset") == []
+    assert ticker_token_spans(scrub_symbols("my_asset_v2", ["asset"]), "asset") == []
+    assert scrub_symbols("COST", ["COST"]) == "ASSET"
     root = tmp_path / "designer"
     root.mkdir()
     (root / "equity.csv").write_text("equity\navg\n", encoding="utf-8")

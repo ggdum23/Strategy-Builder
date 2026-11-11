@@ -951,6 +951,44 @@ def _anon_pack(tmp_path: Path, symbol: str, name: str = "", price_factor: float 
     return pack, sidecar, built
 
 
+def _pack_for_ticker_two(tmp_path: Path, name: str, price_factor: float):
+    """One Monday session and two prices, with no anonymized cell equal to ``2``.
+
+    A second anonymized day is numbered 2, and Wednesday's weekday is 2. Either
+    cell is the ticker, so this pack stays on Monday and scales away from ``.2``.
+    """
+    from backtester.data import load_named
+    from backtester.pack import build_pack
+    from backtester.registry import entry_from_inspection, save_registry, upsert_series
+
+    root = tmp_path / name
+    src = root / "src"
+    day = datetime(2024, 1, 8)
+    rows = [
+        _row(day, 9 * 60 + 30, 50.0),
+        _row(day, 9 * 60 + 31, 51.0),
+    ]
+    _write_rows(src / "2_1min_filled_2024-01.csv.gz", rows)
+    loaded = load_named(src, "2")
+    registry = root / "registry.json"
+    entry = entry_from_inspection(loaded.inspection, source_root=str(src), profile="arena")
+    save_registry(registry, upsert_series({"schema_version": 1, "series": []}, entry))
+    pack = root / "pack"
+    sidecar = root / "operator" / "secret.json"
+    built = build_pack(
+        src,
+        "2",
+        pack,
+        sidecar,
+        anonymize=True,
+        profile="arena",
+        registry_path=registry,
+        price_factor=price_factor,
+        volume_factor=0.5,
+    )
+    return pack, sidecar, built
+
+
 def test_designer_error_hides_the_operator_traceback(tmp_path):
     pack, sidecar, _built = _anon_pack(tmp_path, "NIK")
     source = (
@@ -1836,3 +1874,171 @@ def test_a_file_named_v_json_fails_only_that_job(tmp_path, monkeypatch):
     assert not (designer / "error.json").is_file()
     assert all(path.name != "V.json" for path in designer.rglob("*"))
     assert_designer_clean(designer, symbol="V")
+
+
+def _assert_ids_match_directories(designer):
+    from backtester.report import read_leaderboard
+
+    folders = [path for path in designer.iterdir() if path.is_dir()]
+    names = [path.name for path in folders]
+    assert len(names) == len({name.casefold() for name in names})
+    board = read_leaderboard(designer / "leaderboard.csv")
+    assert {row["strategy_id"] for row in board} == set(names)
+    for row in board:
+        source = designer / row["strategy_id"] / row["source_id"]
+        assert source.is_dir(), (row["strategy_id"], row["source_id"])
+    for folder in folders:
+        sources = [path.name for path in folder.iterdir() if path.is_dir()]
+        assert len(sources) == len({name.casefold() for name in sources})
+    return board
+
+
+def test_designer_components_are_casefold_unique_and_screened():
+    from backtester.parallel import _designer_component
+    from backtester.report import ticker_token_spans
+
+    used: set[str] = set()
+    first = _designer_component("My_COST_v2", ["COST"], used)
+    second = _designer_component("my_cost_v2", ["COST"], used)
+    assert first.casefold() != second.casefold()
+    assert ticker_token_spans(first, "COST") == []
+    assert ticker_token_spans(second, "COST") == []
+
+    sources: set[str] = set()
+    pack = _designer_component("Pack", ["2", "QQQ"], sources)
+    pack_folded = _designer_component("pack", ["2", "QQQ"], sources)
+    assert pack.casefold() != pack_folded.casefold()
+    assert ticker_token_spans(pack, "2") == []
+    assert ticker_token_spans(pack_folded, "2") == []
+    assert ticker_token_spans(pack_folded, "QQQ") == []
+
+    tickers: set[str] = set()
+    two = _designer_component("2", ["2", "QQQ"], tickers)
+    qqq = _designer_component("QQQ", ["2", "QQQ"], tickers)
+    assert two.casefold() != qqq.casefold()
+    for name in (two, qqq):
+        assert ticker_token_spans(name, "2") == []
+        assert ticker_token_spans(name, "QQQ") == []
+    assert "ASSET-2" not in {two, qqq}
+
+    tens: set[str] = set()
+    names = [_designer_component("10", ["10"], tens) for _ in range(12)]
+    assert len(names) == len({name.casefold() for name in names})
+    assert "ASSET-10" not in names
+    assert all(ticker_token_spans(name, "10") == [] for name in names)
+
+    stand_in: set[str] = set()
+    renamed = _designer_component("asset", ["asset"], stand_in)
+    assert renamed.casefold() != "asset"
+    assert ticker_token_spans(renamed, "asset") == []
+
+
+def test_case_variant_designer_dirs_stay_distinct(tmp_path):
+    from backtester.report import ticker_token_spans
+
+    pack, sidecar, _built = _anon_pack(tmp_path, "COST", name="cost", price_factor=1.2)
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "My_COST_v2", FLAT),
+            _strategy(tmp_path / "strategies", "my_cost_v2", FLAT),
+        ],
+        [PackMarket(str(pack), str(sidecar))],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+    )
+    assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
+    designer = out / "designer"
+    board = _assert_ids_match_directories(designer)
+    assert {row["status"] for row in board} == {"ok"}
+    folders = [path for path in designer.iterdir() if path.is_dir()]
+    assert len(folders) == 2
+    for folder in folders:
+        assert any(folder.rglob("metrics.json"))
+        assert ticker_token_spans(folder.name, "COST") == []
+    assert_designer_clean(designer, symbol="COST")
+
+
+def test_numeric_ticker_suffix_is_not_published(tmp_path):
+    from backtester.report import ticker_token_spans
+
+    two_pack, two_side, _built = _pack_for_ticker_two(tmp_path, "two", 1.5)
+    qqq_pack, qqq_side, _built = _anon_pack(tmp_path, "QQQ", name="qqq", price_factor=1.35)
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "2", FLAT),
+            _strategy(tmp_path / "strategies", "QQQ", FLAT),
+        ],
+        [
+            PackMarket(str(two_pack), str(two_side), source_id="book"),
+            PackMarket(str(qqq_pack), str(qqq_side), source_id="book"),
+        ],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+    )
+    assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
+    designer = out / "designer"
+    assert not (designer / "ASSET-2").exists()
+    board = _assert_ids_match_directories(designer)
+    assert len(board) == 4
+    assert {row["status"] for row in board} == {"ok"}
+    for path in designer.rglob("*"):
+        assert ticker_token_spans(path.name, "2") == []
+        assert ticker_token_spans(path.name, "QQQ") == []
+    for folder in [path for path in designer.iterdir() if path.is_dir()]:
+        assert any(folder.rglob("metrics.json"))
+    assert_designer_clean(designer, symbol="2")
+    assert_designer_clean(designer, symbol="QQQ")
+
+
+def test_a_forced_ticker_suffix_is_renamed_off_disk(tmp_path, monkeypatch):
+    """A directory named with a ticker must not survive the audit."""
+    from backtester.parallel import _designer_component as real_component
+
+    state = {"poisoned": False}
+
+    def poison(value, symbols, used):
+        if not state["poisoned"] and value == "QQQ":
+            state["poisoned"] = True
+            used.add("asset-2")
+            return "ASSET-2"
+        return real_component(value, symbols, used)
+
+    monkeypatch.setattr("backtester.parallel._designer_component", poison)
+    two_pack, two_side, _built = _pack_for_ticker_two(tmp_path, "two", 1.5)
+    qqq_pack, qqq_side, _built = _anon_pack(tmp_path, "QQQ", name="qqq", price_factor=1.45)
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "2", FLAT),
+            _strategy(tmp_path / "strategies", "QQQ", FLAT),
+        ],
+        [
+            PackMarket(str(two_pack), str(two_side)),
+            PackMarket(str(qqq_pack), str(qqq_side)),
+        ],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=60,
+        with_benchmarks=False,
+    )
+    assert state["poisoned"]
+    by_id = {item.strategy_id: item for item in result.results}
+    assert by_id["2"].status == "ok", by_id["2"].error
+    assert by_id["QQQ"].status == "ok", by_id["QQQ"].error
+    designer = out / "designer"
+    assert not (designer / "ASSET-2").exists()
+    board = _assert_ids_match_directories(designer)
+    assert {row["status"] for row in board} == {"ok"}
+    for folder in [path for path in designer.iterdir() if path.is_dir()]:
+        assert any(folder.rglob("metrics.json"))
+    assert_designer_clean(designer, symbol="2")
+    assert_designer_clean(designer, symbol="QQQ")

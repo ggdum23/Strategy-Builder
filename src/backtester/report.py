@@ -431,24 +431,51 @@ def _exempt_designer_value(key: str, text: str) -> bool:
     return False
 
 
-def _scrub_text(value: str, symbol: str, *, key: str = "") -> str:
+def _safe_stand_in(symbols) -> str:
+    """The replacement token. ``ASSET`` unless that token is itself a batch ticker."""
+    ordered = _symbol_order(symbols)
+    folded = {symbol.casefold() for symbol in ordered}
+    for candidate in ("ASSET", "BOOK", "RUN", "NAME", "SLOT", "ITEM"):
+        if candidate.casefold() in folded:
+            continue
+        if any(ticker_token_spans(candidate, symbol) for symbol in ordered):
+            continue
+        return candidate
+    for length in range(2, 48):
+        candidate = "q" * length
+        if candidate.casefold() in folded:
+            continue
+        if any(ticker_token_spans(candidate, symbol) for symbol in ordered):
+            continue
+        return candidate
+    return "q"
+
+
+def _scrub_text(value: str, symbol: str, *, key: str = "", replacement: str = "ASSET") -> str:
     if key and _exempt_designer_value(key, value):
         return value
     text = _ISO_DATE.sub("", value)
     if not symbol:
         return text
     if text.strip().casefold() == symbol.casefold():
-        return "ASSET"
-    return _replace_token(text, symbol, "ASSET")
+        return replacement
+    return _replace_token(text, symbol, replacement)
 
 
 def scrub_symbols(value: str, symbols, *, key: str = "") -> str:
-    """Scrub every symbol in ``symbols``. A string is one symbol, not a list of characters."""
+    """Scrub every symbol in ``symbols``. A string is one symbol, not a list of characters.
+
+    The stand-in is ``ASSET`` when that word is not one of the symbols. A symbol
+    whose casefold is ``asset`` is replaced with the next clean stand-in, so the
+    replacement is not itself a ticker.
+    """
+    replacement = _safe_stand_in(symbols)
     text = value
-    for symbol in _symbol_order(symbols):
-        text = _scrub_text(text, symbol, key=key)
-    if not _symbol_order(symbols):
-        text = _scrub_text(text, "", key=key)
+    ordered = _symbol_order(symbols)
+    for symbol in ordered:
+        text = _scrub_text(text, symbol, key=key, replacement=replacement)
+    if not ordered:
+        text = _scrub_text(text, "", key=key, replacement=replacement)
     return text
 
 

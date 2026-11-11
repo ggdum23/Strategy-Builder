@@ -871,23 +871,77 @@ def _designer_error_text(item: JobResult) -> str:
     return "the strategy failed"
 
 
+def _name_dirty(candidate: str, symbols) -> bool:
+    """True when this path component would fail the designer audit."""
+    if not isinstance(candidate, str) or candidate == "":
+        return True
+    try:
+        _safe_component(candidate)
+    except ValueError:
+        return True
+    seen: set[str] = set()
+    for probe in [*(symbols or ()), ""]:
+        if probe in seen:
+            continue
+        seen.add(probe)
+        if _designer_value_error("caption", candidate, probe):
+            return True
+    return False
+
+
+def _screened_sentence(symbols) -> str:
+    """An error sentence that is not a ticker for any symbol in the batch."""
+    for phrase in ("the strategy failed", "withheld", "not published", "stopped"):
+        if not _name_dirty(phrase, symbols):
+            return phrase
+    for length in range(2, 40):
+        phrase = "q" * length
+        if not _name_dirty(phrase, symbols):
+            return phrase
+    return "q"
+
+
 def _designer_component(value: str, symbols, used: set) -> str:
     """A designer path component scrubbed against every symbol in the batch.
 
-    Two ids that scrub to the same text stay distinct: the second is
-    ``ASSET-2``, then ``ASSET-3``. The same strategy id always gets the same
-    component, so the caller passes one shared ``used`` set per directory.
+    ``used`` stores casefolded names, the same reservation as job directories.
+    ``My_ASSET_v2`` and ``my_ASSET_v2`` would be one folder on a
+    case-insensitive disk, so the second becomes ``my_ASSET_v2-2``. A candidate
+    whose base or suffix is a ticker for any batch symbol is skipped, including
+    ``ASSET-2`` when the symbol is ``2`` and ``ASSET`` when the symbol casefolds
+    to ``asset``. The same strategy id always gets the same component, so the
+    caller passes one shared ``used`` set per directory.
     """
-    text = scrub_symbols(str(value), symbols) if symbols else str(value)
-    if not text or text in {".", ".."}:
-        text = "ASSET"
-    candidate = text
-    suffix = 2
-    while candidate in used:
-        candidate = f"{text}-{suffix}"
-        suffix += 1
-    used.add(candidate)
-    return _safe_component(candidate)
+    symbol_list = tuple(dict.fromkeys(symbol for symbol in (symbols or ()) if symbol))
+    scrubbed = scrub_symbols(str(value), symbol_list) if symbol_list else str(value)
+    stems: list[str] = []
+    if scrubbed and not _name_dirty(scrubbed, symbol_list):
+        stems.append(scrubbed)
+    for stand_in in ("ASSET", "BOOK", "RUN", "NAME", "SLOT", "ITEM"):
+        if stand_in not in stems and not _name_dirty(stand_in, symbol_list):
+            stems.append(stand_in)
+    length = 2
+    while len(stems) < 6 and length <= 48:
+        generated = "q" * length
+        length += 1
+        if generated not in stems and not _name_dirty(generated, symbol_list):
+            stems.append(generated)
+    for stem in stems:
+        bare = True
+        suffix = 2
+        for _attempt in range(20000):
+            candidate = stem if bare else f"{stem}-{suffix}"
+            if bare:
+                bare = False
+            else:
+                suffix += 1
+            if _name_dirty(candidate, symbol_list):
+                continue
+            if candidate.casefold() in used:
+                continue
+            used.add(candidate.casefold())
+            return candidate
+    raise RuntimeError(f"no screened designer name for {value!r}")
 
 
 def _result_for(results, row) -> JobResult:
@@ -925,27 +979,35 @@ def _cell_violation(copied: dict, symbols) -> str | None:
     return None
 
 
-def _write_clean_designer_error(dest, folder: str, source_name: str, profile: str, symbol: str) -> None:
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True, exist_ok=True)
+def _write_clean_designer_error(dest, folder: str, source_name: str, profile: str, symbols) -> None:
+    """Replace ``dest`` with an error file that passes the audit for every symbol.
+
+    The directory is removed again when the audit fails, so a ticker suffix is
+    never left on disk. ``folder`` and ``source_name`` must already be screened.
+    """
+    if _name_dirty(folder, symbols) or _name_dirty(source_name, symbols):
+        raise RuntimeError(f"unscreened designer name {folder}/{source_name}")
+    phrase = _screened_sentence(symbols)
     payload = {
         "strategy_id": folder,
         "source_id": source_name,
-        "profile": profile,
         "status": "error",
-        "error": "the strategy failed",
+        "error": phrase,
     }
-    write_json(dest / "error.json", redact_metrics(payload, symbol=symbol or ""))
-    try:
-        _audit_job_tree(dest, [symbol] if symbol else [])
-    except Exception:
+    if profile and not _name_dirty(str(profile), symbols):
+        payload["profile"] = str(profile)
+    if not _name_dirty("designer", symbols):
+        payload["audience"] = "designer"
+    dest = Path(dest)
+    if dest.exists():
         shutil.rmtree(dest)
-        dest.mkdir(parents=True, exist_ok=True)
-        write_json(
-            dest / "error.json",
-            {"status": "error", "error": "the strategy failed", "audience": "designer"},
-        )
+    dest.mkdir(parents=True, exist_ok=True)
+    write_json(dest / "error.json", payload)
+    try:
+        _audit_job_tree(dest, symbols)
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
 
 
 def _bundle_designer(out, ranked_rows, assignments, results) -> None:
@@ -1010,8 +1072,20 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             _audit_job_tree(dest, unique_symbols)
         except Exception as exc:
             mutated = True
+            names_dirty = _name_dirty(folder, unique_symbols) or _name_dirty(source_name, unique_symbols)
+            if names_dirty:
+                # Keep the book. A later pass renames the directory when the
+                # files themselves are clean, so a bad suffix does not fail
+                # the row that ran.
+                continue
             _fail_published_row(results, row, _clip(f"designer audit failed: {exc}"))
-            _write_clean_designer_error(dest, folder, source_name, row.get("profile") or "", symbol)
+            try:
+                _write_clean_designer_error(
+                    dest, folder, source_name, row.get("profile") or "", unique_symbols
+                )
+            except Exception:
+                if dest.exists():
+                    shutil.rmtree(dest, ignore_errors=True)
 
     def designer_rows():
         nonlocal mutated
@@ -1030,6 +1104,8 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                     copied[column] = scrub_symbols(value, unique_symbols, key=column)
                 else:
                     copied[column] = value
+            # The leaderboard id is the directory name. Do not substitute a
+            # different token; a repair pass renames the directory to match.
             copied["strategy_id"] = folder
             copied["source_id"] = source_name
             if row["status"] != "ok":
@@ -1037,16 +1113,21 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                 copied["error"] = scrub_symbols(
                     _designer_error_text(item), unique_symbols, key="error"
                 )
-            violation = _cell_violation(copied, unique_symbols)
-            if violation:
+            other = {
+                column: value
+                for column, value in copied.items()
+                if column not in {"strategy_id", "source_id"} and isinstance(value, str)
+            }
+            if _cell_violation(other, unique_symbols):
                 mutated = True
-                _fail_published_row(results, row, _clip(f"designer audit failed: {violation}"))
+                _fail_published_row(results, row, _clip("designer audit failed: leaderboard cell"))
                 copied["status"] = "error"
-                copied["error"] = "the strategy failed"
+                copied["error"] = _screened_sentence(unique_symbols)
                 for column, value in list(copied.items()):
+                    if column in {"strategy_id", "source_id", "status"}:
+                        continue
                     if isinstance(value, str) and _cell_violation({column: value}, unique_symbols):
-                        replacement = "ASSET" if column in {"strategy_id", "source_id"} else "the strategy failed"
-                        copied[column] = replacement
+                        copied[column] = _screened_sentence(unique_symbols)
             cleaned.append(copied)
         for index, copied in enumerate(cleaned, start=1):
             copied["rank"] = index
@@ -1065,11 +1146,98 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         for symbol in unique_symbols:
             assert_designer_clean(designer, symbol=symbol)
 
+    def _rows_for(folder: str) -> list:
+        found = []
+        for row in ranked_rows:
+            key = (row["strategy_id"], row["source_id"])
+            if key in placed and placed[key][0] == folder:
+                found.append(row)
+        return found
+
+    def _rename_clean(folder: str) -> str:
+        """Give a dirty directory a screened name and keep the books."""
+        rows_here = _rows_for(folder)
+        representative = rows_here[0]["strategy_id"] if rows_here else folder
+        new_folder = folder
+        if _name_dirty(folder, unique_symbols):
+            new_folder = _designer_component(representative, unique_symbols, used_folders)
+            old_path = designer / folder
+            new_path = designer / new_folder
+            if old_path.exists():
+                old_path.rename(new_path)
+        source_used = used_sources.setdefault(new_folder, set())
+        for row in rows_here:
+            key = (row["strategy_id"], row["source_id"])
+            _previous, old_source, symbol = placed[key]
+            if _name_dirty(old_source, unique_symbols) or old_source.casefold() in source_used:
+                new_source = _designer_component(row["source_id"], unique_symbols, source_used)
+                src = designer / new_folder / old_source
+                dst = designer / new_folder / new_source
+                if src.exists() and src != dst:
+                    src.rename(dst)
+            else:
+                new_source = old_source
+                source_used.add(new_source.casefold())
+            placed[key] = (new_folder, new_source, symbol)
+            dest = designer / new_folder / new_source
+            if dest.is_dir():
+                scrub_designer_tree(
+                    dest,
+                    unique_symbols,
+                    strategy_id=folder,
+                    folder=new_folder,
+                    source_id=old_source,
+                    source_name=new_source,
+                )
+        return new_folder
+
+    def _fail_folder(folder: str, message: str) -> None:
+        """Replace one strategy folder with screened error trees, then re-audit."""
+        rows_here = _rows_for(folder)
+        old_path = designer / folder
+        if old_path.exists():
+            shutil.rmtree(old_path)
+        if not rows_here:
+            return
+        if not _name_dirty(folder, unique_symbols):
+            new_folder = folder
+            source_used: set[str] = set()
+            used_sources[new_folder] = source_used
+        else:
+            new_folder = _designer_component(rows_here[0]["strategy_id"], unique_symbols, used_folders)
+            source_used = used_sources.setdefault(new_folder, set())
+        for row in rows_here:
+            key = (row["strategy_id"], row["source_id"])
+            _previous, old_source, _symbol = placed[key]
+            if not _name_dirty(old_source, unique_symbols) and old_source.casefold() not in source_used:
+                source_name = old_source
+                source_used.add(source_name.casefold())
+            else:
+                source_name = _designer_component(row["source_id"], unique_symbols, source_used)
+            placed[key] = (new_folder, source_name, _symbol)
+            _fail_published_row(results, row, message)
+            _write_clean_designer_error(
+                designer / new_folder / source_name,
+                new_folder,
+                source_name,
+                row.get("profile") or "",
+                unique_symbols,
+            )
+        try:
+            _audit_job_tree(designer / new_folder, unique_symbols)
+        except Exception:
+            if (designer / new_folder).exists():
+                shutil.rmtree(designer / new_folder, ignore_errors=True)
+            raise
+
     def isolate_dirty_folders() -> None:
         """A failure outside one job directory fails that strategy's rows only.
 
         The published tree is not replaced by a single error file, and a clean
-        strategy keeps its directory.
+        strategy keeps its directory. A directory whose name is a ticker is
+        renamed to a screened name. When the files are clean the row stays
+        ok. A failed audit is removed before a screened tree is written, so
+        the dirty name does not remain on disk.
         """
         nonlocal mutated
         dirty: list[tuple[str, Exception]] = []
@@ -1090,41 +1258,64 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         mutated = True
         for folder, exc in dirty:
             message = _clip(f"designer audit failed: {exc}")
-            folder_path = designer / folder
-            if folder_path.exists():
-                shutil.rmtree(folder_path)
-            for row in ranked_rows:
-                key = (row["strategy_id"], row["source_id"])
-                if key not in placed or placed[key][0] != folder:
+            names_dirty = _name_dirty(folder, unique_symbols) or any(
+                _name_dirty(placed[(row["strategy_id"], row["source_id"])][1], unique_symbols)
+                for row in _rows_for(folder)
+            )
+            if names_dirty:
+                new_folder = _rename_clean(folder)
+                try:
+                    _audit_job_tree(designer / new_folder, unique_symbols)
                     continue
-                _source_folder, source_name, symbol = placed[key]
-                _fail_published_row(results, row, message)
-                _write_clean_designer_error(
-                    designer / folder / source_name,
-                    folder,
-                    source_name,
-                    row.get("profile") or "",
-                    symbol,
-                )
+                except Exception as exc2:
+                    message = _clip(f"designer audit failed: {exc2}")
+                    folder = new_folder
+            _fail_folder(folder, message)
+
+    def publish_designer_board() -> None:
+        republish_operator()
+        write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
+
+    def drop_remaining_dirty() -> None:
+        """A directory that still fails the audit is deleted, not published."""
+        nonlocal mutated
+        mutated = True
+        seen: list[str] = []
+        for folder, _source_name, _symbol in list(placed.values()):
+            if folder not in seen:
+                seen.append(folder)
+        for folder in seen:
+            folder_path = designer / folder
+            if not folder_path.exists():
+                continue
+            try:
+                _audit_job_tree(folder_path, unique_symbols)
+            except Exception:
+                shutil.rmtree(folder_path, ignore_errors=True)
+                for row in ranked_rows:
+                    key = (row["strategy_id"], row["source_id"])
+                    if key in placed and placed[key][0] == folder:
+                        _fail_published_row(results, row, "designer audit failed")
+                        placed.pop(key, None)
 
     designer_rows()
-    republish_operator()
-    write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
+    publish_designer_board()
     try:
         assert_tree()
     except Exception:
         mutated = True
         isolate_dirty_folders()
-        republish_operator()
-        write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
+        publish_designer_board()
         try:
             assert_tree()
         except Exception:
-            # Still do not fail the rows whose directories are clean, and do
-            # not replace the whole designer tree.
             isolate_dirty_folders()
-            republish_operator()
-            write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
+            publish_designer_board()
+            try:
+                assert_tree()
+            except Exception:
+                drop_remaining_dirty()
+                publish_designer_board()
 
 
 def _order_results(results, ranked_rows) -> list[JobResult]:
