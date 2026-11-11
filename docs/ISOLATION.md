@@ -68,13 +68,18 @@ per-share fees use real share counts. It does not receive the sidecar
 document, the date map, the ticker, the volume factor, the operator note, or
 the sidecar path.
 
-A strategy loaded from a file does not run in that worker. The worker launches
-the same jail as `backtester referee` and drives it one bar at a time. The
-pipe is not given the scale, the accounting record, or the dividend map. The
-strategy process has no engine frame, so it cannot see `share_scale` or
-`share_factor`. An in-memory class still runs beside the engine. That is how
-a test observes the window's ex-dates. Benchmarks are official code and stay
-in the worker.
+A strategy file does not run in that worker, and the operator process does
+not import it. `run`, `run --pack`, `walkforward`, `parallel`, and `referee`
+pass the path through. The worker launches the same jail as `backtester
+referee` and learns the class name, extended-hours flag, and day-end hook
+from the pipe. The pipe is not given the scale, the accounting record, or
+the dividend map. The strategy process has no engine frame, so it cannot see
+`share_scale` or `share_factor`. An in-memory class passed to the library
+still runs beside the engine. That is how a test observes the window's
+ex-dates. `--unsafe-in-process` is the only escape, it prints a warning, and
+it refuses a pack. Benchmarks are official code and stay in the worker. The
+designer per-call timeout defaults to 10 seconds, the same as the referee,
+and `--call-timeout` changes it.
 
 Post-fee cash is still in the account the engine sends. A designer who knows
 the public fee schedule can infer k from that cash. The name and the factor
@@ -209,9 +214,9 @@ strategy reads that file and trades only when the flag is present. The two
 runs do not share a process, so an in-memory flag does not carry over. They
 are not confined to a filesystem. A path outside the empty working directory
 still works, and the locked run can see a file the design run wrote.
-The referee jail does not mount those directories, and on Windows a deny ACE
-covers them. A file the jailed strategy creates does not survive the jail
-and is not a path the next run is given.
+The referee jail does not mount those directories, and on Windows the
+AppContainer token is not granted them. A file the jailed strategy creates
+does not survive the jail and is not a path the next run is given.
 
 ## Referee sandbox (Phase 4)
 
@@ -232,20 +237,23 @@ The backend name is `job+appcontainer`.
   `JOB_OBJECT_LIMIT_PROCESS_MEMORY`, and `JOB_OBJECT_LIMIT_JOB_MEMORY`.
 - The token is an AppContainer profile with zero capabilities, so it has no
   network capability. A socket call fails with access denied (10013).
--   `icacls` grants read/execute on the Python runtime and the Windows
-  directory, traverse-only on the directories between those and the volume
-  root, and full control on the private temp directory only. The volume root
-  itself is not edited: All Application Packages can already traverse it, and
-  `icacls` on that root does not finish. The AppContainer profile and those
-  runtime grants are kept for the life of the process. Each launch still
-  grants the private directory and removes that grant when the process exits.
-  Orphaned `sb*` profiles left by a dead process are deleted on the next
-  start. Data, market, and repository directories get an explicit deny ACE
-  for the AppContainer SID. `LOCALAPPDATA` is the host value. CreateProcess
-  returns 203 when it is missing, so a missing value refuses the launch.
-  The directory itself is denied without inheritance, because the profile and
-  the private temp live under it. The process environment is a sorted
-  Unicode block. CreateProcess rejects an unsorted block.
+-   One AppContainer profile (`strategybuilderjail`) is created per machine.
+  `icacls` grants read/execute on the Python runtime and the Windows
+  directory once, traverse-only on the directories between those and the
+  volume root. The volume root itself is not edited. Later launches see a
+  marker and do not walk that tree again. Each launch grants the private
+  temp directory only. There is no per-launch recursive deny: the container
+  token is not the user, so a directory that was not granted is not readable.
+  A child whose token is not an AppContainer, or whose token has a
+  capability, is not resumed. Loopback exemptions for this profile are
+  removed. A connect to a listening loopback server and to an external
+  address both fail with access denied (10013). `LOCALAPPDATA` is the host
+  value. CreateProcess returns 203 when it is missing, so a missing value
+  refuses the launch. That directory is denied without inheritance, once,
+  because the profile and the private temp live under it. The process
+  environment is a sorted Unicode block. CreateProcess rejects an unsorted
+  block. A frozen child is `StrategyBuilder.exe --sandbox-child` (or the
+  console `backtester.exe`), not a system Python running a `.py` file.
 - `OpenProcess` of the parent with `PROCESS_VM_READ` is denied by the
   AppContainer token.
 - If the profile, the job, the assignment, or an ACL edit fails, the launch
@@ -255,10 +263,13 @@ The backend name is `job+appcontainer`.
 
 This is the CI backend. The workflow installs `bubblewrap`. The launch is
 `bwrap --unshare-all --unshare-user --disable-userns --die-with-parent
---new-session --cap-drop ALL`, with read-only binds for the interpreter and
-a bind of the private temp directory only. Data and repository paths are not
-mounted. Installer metadata that contains a denied path (`*.pth`,
-`*.egg-link`, `*.dist-info/direct_url.json`) is covered with an empty file.
+--new-session --cap-drop ALL`. The child is `python -I -S -B`. `sys.path`
+starts with staged directories that contain only the packages this process
+imported (numpy and pandas, in the parent's order, plus the libraries they
+need), then the standard library. site-packages is covered inside the
+namespace and only those package directories are bound back, so `*.pth`,
+`*.egg-link`, and `direct_url.json` are not on the child's path. `/etc/ld.so.cache`
+is bound read-only. Data and repository paths are not mounted.
 
 A seccomp filter returns EPERM for `socket`, `connect`, `accept`, `accept4`,
 `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `shutdown`, `bind`, `listen`,
@@ -287,8 +298,10 @@ without running that cleanup.
 
 If `bwrap` cannot start a namespace, the launch uses landlock plus the same
 seccomp filter, the same rlimits, and `PR_SET_PDEATHSIG` set to `SIGKILL`.
-Landlock allows reading the interpreter and writing the private directory.
-Opening a data path returns EPERM. There is no pid namespace and no network
+Landlock allows reading the interpreter, the staged package directories, and
+the directory that holds `/etc/ld.so.cache`, and writing the private
+directory. The child is still `python -I -S`, so site-packages is not on
+`sys.path`. Opening a data path returns EPERM. There is no pid namespace and no network
 namespace, so the network block is the seccomp filter alone. `/proc` is not
 in the allow-list. A raw `clone3` task on this backend is not reaped by a
 pid namespace; bubblewrap is the stronger backend and is the one CI installs.

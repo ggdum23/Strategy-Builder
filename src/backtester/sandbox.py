@@ -27,6 +27,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 
@@ -274,8 +275,10 @@ def _bwrap_guarantees() -> dict:
         ),
         "filesystem": (
             "new mount namespace. The Python runtime and the private temp directory "
-            "are mounted. Data, market, and repository directories are not. Installer "
-            "metadata that names the repository is mounted over with an empty file."
+            "are mounted. Data, market, and repository directories are not. The child "
+            "is python -I -S with a staged sys.path of the packages this process "
+            "imports. site-packages metadata is not on that path. /etc/ld.so.cache "
+            "is the only file bound from /etc."
         ),
         "process": (
             "new pid namespace and die-with-parent. seccomp denies setsid, setpgid, "
@@ -299,10 +302,11 @@ def _landlock_guarantees() -> dict:
         "backend": "landlock+seccomp",
         "network": "seccomp returns EPERM for socket and connect. A network namespace is not created.",
         "filesystem": (
-            "landlock allow-list: read the Python runtime, write the private temp directory. "
-            "Opening a data or repository path returns EPERM. This is not a mount namespace. "
-            "An editable install's path string can still be read from site-packages metadata; "
-            "opening that path is denied."
+            "landlock allow-list: read the Python runtime and the staged packages, "
+            "write the private temp directory. Opening a data or repository path returns "
+            "EPERM. This is not a mount namespace. The child is python -I -S, so "
+            "site-packages is not on sys.path. Landlock rules are directories, so a "
+            "prefix that contains site-packages cannot have that one directory punched out."
         ),
         "process": (
             "seccomp denies setsid, setpgid, fork, vfork, and clone without CLONE_THREAD. "
@@ -321,15 +325,17 @@ def _windows_guarantees() -> dict:
     return {
         "os": "windows",
         "backend": "job+appcontainer",
-        "network": "AppContainer with no capabilities, so the process has no network capability",
+        "network": (
+            "AppContainer with no capabilities and no loopback exemption. A connect to a "
+            "listening loopback server and to an external address both fail with access denied."
+        ),
         "filesystem": (
-            "AppContainer SID is not granted on data, market, or repository files. "
-            "An explicit deny ACE is added on those directories and on the files under them "
-            "when the walk finishes, and removed when the referee exits. The private temp "
-            "directory is the writable grant. LOCALAPPDATA is the host value, because the "
-            "AppContainer profile lives there, and a non-inheriting deny stops the container "
-            "from opening that directory. The profile and the runtime grants are kept for "
-            "the life of this process so later launches do not walk the Python tree again."
+            "The process token is an AppContainer, so the user SID does not grant file "
+            "access. The profile is granted read/execute on the runtime once, not on every "
+            "launch, and full control of the private temp directory. Data, market, and "
+            "repository trees are not granted. LOCALAPPDATA is the host value the profile "
+            "needs, and a non-inheriting deny on that directory is applied once. A child "
+            "that is not an AppContainer is not resumed."
         ),
         "process": (
             "job object with KILL_ON_JOB_CLOSE, active process limit 1, a commit-charge cap, "
@@ -447,17 +453,22 @@ class Sandbox:
             shutil.rmtree(self.workdir, ignore_errors=True)
 
 
-def _interpreter_command(script: Path) -> list[str]:
-    """How to execute a copied jail script with this interpreter.
+def _interpreter_command(script: Path, *, child: bool = False) -> list[str]:
+    """How to execute a jail script with this interpreter.
 
-    A normal CPython is started with ``-I -B -s`` so it does not read the
-    user site or write bytecode. A frozen executable is not that interpreter.
-    ``--backtester-sandbox`` is the entry the frozen launcher recognizes, and
-    it runs the copied script inside the same jail.
+    A source child is ``python -I -S -B``. ``-S`` skips site.py, so the
+    editable install and dist-packages are not added to ``sys.path``. The
+    parent then inserts only the staged package directories. A frozen child
+    is this executable again, with ``--sandbox-child`` and the private
+    directory as its cwd. No strategy path is put on that command line.
     """
+    if child and getattr(sys, "frozen", False):
+        return [sys.executable, "--sandbox-child"]
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--backtester-sandbox", str(script)]
-    return [sys.executable, "-I", "-B", "-s", str(script)]
+        return [sys.executable, str(script)]
+    if child:
+        return [sys.executable, "-I", "-S", "-B", str(script)]
+    return [sys.executable, "-I", "-S", "-B", str(script)]
 
 
 def launch(
@@ -538,13 +549,19 @@ def _write_workspace(
 ) -> None:
     shim = Path(__file__).resolve().parent / "sandbox_child.py"
     (work / "strategy.py").write_bytes(strategy.read_bytes())
-    (work / "sandbox_child.py").write_bytes(shim.read_bytes())
+    # A frozen jail is the executable itself. There is no system python and
+    # no .py shim on disk. Source runs still copy the shim.
+    if not getattr(sys, "frozen", False):
+        if not shim.is_file():
+            raise SandboxError("sandbox_child.py is missing")
+        (work / "sandbox_child.py").write_bytes(shim.read_bytes())
     limits = {
         "memory_bytes": int(memory_bytes),
         "cpu_seconds": int(cpu_seconds),
         "capture_stdio": bool(capture_stdio),
     }
     (work / "limits.json").write_text(json.dumps(limits), encoding="utf-8")
+    _stage_packages(work)
 
 
 def _runtime_roots() -> list[Path]:
@@ -592,36 +609,98 @@ def _site_dirs() -> list[Path]:
     return found
 
 
-def _needles(denied: list[Path]) -> tuple[str, ...]:
-    values = []
-    for path in denied:
-        text = str(path)
-        if len(text) >= 2:
-            values.append(text)
-    return tuple(values)
+# Imported in the parent so the staged copy is the one this process uses,
+# in this order. A name that is not installed is skipped.
+_STAGED_IMPORTS = ("numpy", "pandas", "dateutil", "pytz", "tzdata", "six")
 
 
-def _leak_files(directory: Path, needles: tuple[str, ...]) -> list[Path]:
-    if not needles or not directory.is_dir():
-        return []
-    candidates = list(directory.glob("*.pth"))
-    candidates.extend(directory.glob("*.egg-link"))
-    candidates.extend(directory.glob("*.dist-info/direct_url.json"))
-    hits = []
-    seen = set()
-    for path in candidates:
-        if not path.is_file() or path in seen:
-            continue
-        seen.add(path)
+def _runtime_package_dirs() -> list[Path]:
+    """Directories and modules this process actually imported.
+
+    Each path is the package directory (or a single-file module), never the
+    site-packages directory that holds ``*.pth`` and ``direct_url.json``.
+    A sibling ``*.libs`` directory is included so a wheel's OpenBLAS loads.
+    Anything inside this repository is not staged.
+    """
+    import importlib
+
+    repo = Path(__file__).resolve().parents[2]
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
         try:
-            if path.stat().st_size > 1_000_000:
-                continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            resolved = path.resolve()
         except OSError:
+            return
+        if resolved in seen or not resolved.exists():
+            return
+        if resolved == repo or repo in resolved.parents:
+            return
+        seen.add(resolved)
+        found.append(resolved)
+
+    for name in _STAGED_IMPORTS:
+        try:
+            module = importlib.import_module(name)
+        except Exception:
             continue
-        if any(needle in text for needle in needles):
-            hits.append(path)
-    return hits
+        file = getattr(module, "__file__", None)
+        if not file:
+            continue
+        module_path = Path(file)
+        if module_path.name == "__init__.py":
+            package = module_path.parent
+            add(package)
+            sibling = package.parent / f"{package.name}.libs"
+            if sibling.is_dir():
+                add(sibling)
+        else:
+            add(module_path)
+    return found
+
+
+def _link_into(src: Path, dest: Path) -> None:
+    """Point ``dest`` at ``src`` without copying a package tree."""
+    if dest.exists() or dest.is_symlink():
+        return
+    if src.is_file() or os.name != "nt":
+        try:
+            os.symlink(src, dest, target_is_directory=src.is_dir())
+            return
+        except OSError:
+            if src.is_file():
+                shutil.copy2(src, dest)
+                return
+            raise
+    proc = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(dest), str(src)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise SandboxError(f"could not stage {src.name}: {detail}")
+
+
+def _stage_packages(work: Path) -> list[Path]:
+    """Build ``pydeps/NN`` slots in parent import order and write ``deps.json``.
+
+    The slot holds one package. Its parent is what goes on ``sys.path``, so a
+    scan of that path cannot see a sibling ``dist-info`` or ``.pth``.
+    """
+    packages = _runtime_package_dirs()
+    stage = work / "pydeps"
+    stage.mkdir()
+    entries = []
+    for index, path in enumerate(packages):
+        slot = stage / f"{index:02d}"
+        slot.mkdir()
+        _link_into(path, slot / path.name)
+        entries.append(f"pydeps/{index:02d}")
+    (work / "deps.json").write_text(json.dumps({"path": entries}), encoding="utf-8")
+    return packages
 
 
 def _child_env(work: Path) -> dict:
@@ -653,7 +732,6 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
                 raise SandboxError(
                     f"the Python runtime {root} is inside a denied directory; refusing to mount it"
                 )
-    needles = _needles(denied)
     cmd = [
         binary,
         "--unshare-all",
@@ -666,35 +744,25 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
     ]
     for root in roots:
         cmd.extend(["--ro-bind", str(root), str(root)])
-    cmd.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind", str(work), str(work)])
-    dep_names = []
-    pass_fds = []
-    sites = _site_dirs()
-    site_mounts = []
-    for index, directory in enumerate(sites):
+    packages = _runtime_package_dirs()
+    # A prefix mount includes site-packages. Cover that directory, then put
+    # back only the package directories the parent resolved. Metadata files
+    # that sit beside them are not mounted. A package outside the prefix is
+    # bound on its own path, so its parent in the jail contains only that bind.
+    hidden_sites = []
+    for directory in _site_dirs():
         covered = any(directory == root or root in directory.parents for root in roots)
-        sandbox_root = directory if covered else work / f"deps{index}"
-        if not covered:
-            cmd.extend(["--ro-bind", str(directory), str(sandbox_root)])
-            dep_names.append(sandbox_root.name)
-        site_mounts.append((directory, sandbox_root))
-    if dep_names:
-        (work / "runtime.json").write_text(json.dumps(dep_names), encoding="utf-8")
-    empty = os.memfd_create("sb-empty", 0)
+        if covered and directory not in hidden_sites:
+            hidden_sites.append(directory)
+            cmd.extend(["--tmpfs", str(directory)])
+    for path in packages:
+        cmd.extend(["--ro-bind", str(path), str(path)])
+    cache = Path("/etc/ld.so.cache")
+    if cache.is_file():
+        cmd.extend(["--dir", "/etc", "--ro-bind", str(cache), str(cache)])
+    cmd.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind", str(work), str(work)])
+    pass_fds = []
     try:
-        overlays = []
-        seen_dest = set()
-        for directory, sandbox_root in site_mounts:
-            for leak in _leak_files(directory, needles):
-                dest = str(Path(sandbox_root) / leak.relative_to(directory))
-                if dest in seen_dest:
-                    continue
-                seen_dest.add(dest)
-                overlays.append(dest)
-        for dest in overlays:
-            dup = os.dup(empty)
-            pass_fds.append(dup)
-            cmd.extend(["--ro-bind-data", str(dup), dest])
         filt = _filter_bytes(deny=_SANDBOX_DENY, allow_threads=True)
         seccomp_fd = os.memfd_create("sb-seccomp", 0)
         os.write(seccomp_fd, filt)
@@ -711,7 +779,7 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
         )
         for key, value in _child_env(work).items():
             cmd.extend(["--setenv", key, value])
-        cmd.extend(_interpreter_command(work / "sandbox_child.py"))
+        cmd.extend(_interpreter_command(work / "sandbox_child.py", child=True))
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -729,7 +797,6 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
     finally:
         for fd in pass_fds:
             os.close(fd)
-        os.close(empty)
 
     def _cleanup():
         return None
@@ -740,9 +807,17 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
 def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seconds: int) -> Sandbox:
     """Landlock, seccomp, rlimits, and a parent-death signal. No preexec fork."""
     read_dirs = [str(path) for path in _runtime_roots()]
-    for directory in _site_dirs():
-        if directory not in read_dirs and str(directory) not in read_dirs:
+    for package in _runtime_package_dirs():
+        directory = package if package.is_dir() else package.parent
+        if str(directory) not in read_dirs:
             read_dirs.append(str(directory))
+    cache = Path("/etc/ld.so.cache")
+    if cache.is_file():
+        # Landlock names directories. The cache file's directory is the
+        # smallest rule that lets the linker open that one file.
+        etc = str(cache.parent)
+        if etc not in read_dirs:
+            read_dirs.append(etc)
     for directory in read_dirs:
         path = Path(directory)
         for banned in denied:
@@ -755,15 +830,6 @@ def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_s
         if directory and os.path.isdir(directory):
             rules.append([directory, _LANDLOCK_READ])
     rules.append([str(work), _LANDLOCK_WRITE])
-    dep_names = []
-    for directory in _site_dirs():
-        covered = any(
-            Path(directory) == root or root in Path(directory).parents for root in _runtime_roots()
-        )
-        if not covered:
-            dep_names.append(str(directory))
-    if dep_names:
-        (work / "runtime.json").write_text(json.dumps(dep_names), encoding="utf-8")
     (work / "filter.bin").write_bytes(_filter_bytes(deny=_SANDBOX_DENY, allow_threads=True))
     (work / "jail.json").write_text(
         json.dumps(
@@ -779,7 +845,7 @@ def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_s
     (work / "enter.py").write_text(_LANDLOCK_ENTER, encoding="utf-8")
     try:
         proc = subprocess.Popen(
-            _interpreter_command(work / "enter.py"),
+            _interpreter_command(work / "enter.py", child=True),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -873,8 +939,8 @@ def main():
         except OSError:
             _fail("jail metadata was left in the work directory")
     if getattr(sys, "frozen", False):
-        os.execv(sys.executable, [sys.executable, "--backtester-sandbox", "sandbox_child.py"])
-    os.execv(sys.executable, [sys.executable, "-I", "-B", "-s", "sandbox_child.py"])
+        os.execv(sys.executable, [sys.executable, "--sandbox-child"])
+    os.execv(sys.executable, [sys.executable, "-I", "-S", "-B", "sandbox_child.py"])
 
 
 if __name__ == "__main__":
@@ -888,25 +954,18 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
         raise SandboxError("the Windows jail is only applied on Windows")
     lease = _win_lease_acquire()
     extra_grants: list[tuple[Path, bool]] = []
-    denies: list[Path] = []
-    shallow: list[Path] = []
     popen = None
     try:
         try:
             _win_reject_overlap(lease.grant_paths, denied)
+            # The AppContainer token is the file boundary. A per-launch
+            # recursive deny of the repository walks the tree inside the
+            # strategy timeout. The private directory is the only grant
+            # that changes per launch, and it is a handful of files.
             extra_grants = _win_grant_work(lease, work)
-            denies = _win_apply_denies(lease, denied)
-            local = _local_app_data()
-            # The private directory is under the user temp, which is inside
-            # LOCALAPPDATA. An inheriting deny would cover the work directory
-            # and the AppContainer profile. A deny on the directory object
-            # itself blocks opening it. Children keep their own ACEs.
-            if local is not None and local.exists() and not _is_volume_root(local):
-                _win_deny_shallow(lease, local)
-                shallow.append(local)
             popen = _win_spawn(work, lease, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
         except Exception:
-            _win_drop_launch_aces(lease, denies, shallow, extra_grants)
+            _win_drop_launch_aces(lease, [], [], extra_grants)
             raise
     finally:
         if popen is None:
@@ -925,7 +984,7 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
                 popen._process = None
         finally:
             try:
-                _win_drop_launch_aces(lease, denies, shallow, extra_grants)
+                _win_drop_launch_aces(lease, [], [], extra_grants)
             finally:
                 _win_lease_release()
 
@@ -946,6 +1005,7 @@ class _WinLease:
         self.name = ""
         self.refs = 0
         self.grant_paths: list[tuple[Path, bool]] = []
+        self.ancestor_grants: set[Path] = set()
         self.userenv = None
         self.advapi = None
         self.kernel = None
@@ -985,6 +1045,114 @@ def _win_fail(prefix: str) -> SandboxError:
     return SandboxError(f"{prefix} (winerror {code})")
 
 
+_PROFILE_NAME = "strategybuilderjail"
+_ALREADY_EXISTS = 0x800700B7
+
+
+def warm_windows_profile() -> None:
+    """Create the AppContainer and its runtime ACLs once per machine.
+
+    The first jail in a process pays for ``icacls`` on the interpreter.
+    Later launches, including workers spawned after this returns, reuse the
+    marker and only grant their private directory.
+    """
+    if sys.platform != "win32":
+        return
+    lease = _win_lease_acquire()
+    _win_lease_release()
+    return lease
+
+
+def _grant_marker_path() -> Path:
+    local = _local_app_data()
+    if local is None:
+        raise SandboxError("LOCALAPPDATA is not set; refusing to start the sandbox")
+    return local / "strategybuilderjail-grants.json"
+
+
+def _with_profile_lock(action):
+    local = _local_app_data()
+    if local is None:
+        raise SandboxError("LOCALAPPDATA is not set; refusing to start the sandbox")
+    lock = local / "strategybuilderjail.lock"
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 600:
+                    lock.unlink()
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                raise SandboxError("timed out waiting for the AppContainer grant")
+            time.sleep(0.25)
+    try:
+        return action()
+    finally:
+        os.close(fd)
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def _clear_loopback(name: str, sid_text: str) -> None:
+    """Drop a loopback exemption for this profile. Missing entries are fine."""
+    system = os.environ.get("SystemRoot", "")
+    if not system:
+        return
+    exe = Path(system) / "System32" / "CheckNetIsolation.exe"
+    if not exe.is_file():
+        return
+    for args in (["-d", "-n=" + name], ["-d", "-p=" + sid_text]):
+        try:
+            subprocess.run(
+                [str(exe), "LoopbackExempt", *args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
+def _recorded_grants(sid_text: str):
+    path = _grant_marker_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("sid") != sid_text:
+        return None
+    if payload.get("roots") != [str(path) for path in _windows_grant_roots()]:
+        return None
+    if not payload.get("local_denied"):
+        return None
+    grants = []
+    for item in payload.get("grants") or []:
+        if not isinstance(item, list) or len(item) != 2:
+            return None
+        grants.append((Path(item[0]), bool(item[1])))
+    return grants
+
+
+def _write_grant_marker(sid_text: str, grants, *, local_denied: bool, loopback_cleared: bool) -> None:
+    payload = {
+        "sid": sid_text,
+        "roots": [str(path) for path in _windows_grant_roots()],
+        "grants": [[str(path), bool(recurse)] for path, recurse in grants],
+        "local_denied": bool(local_denied),
+        "loopback_cleared": bool(loopback_cleared),
+    }
+    path = _grant_marker_path()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _win_lease_open(lease: _WinLease) -> None:
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     userenv = ctypes.WinDLL("userenv", use_last_error=True)
@@ -1006,15 +1174,28 @@ def _win_lease_open(lease: _WinLease) -> None:
     advapi.FreeSid.restype = ctypes.c_void_p
     kernel.LocalFree.argtypes = [ctypes.c_void_p]
     kernel.LocalFree.restype = ctypes.c_void_p
-    name = "sb" + os.urandom(8).hex()
+    userenv.DeriveAppContainerSidFromAppContainerName.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    userenv.DeriveAppContainerSidFromAppContainerName.restype = ctypes.c_long
+    name = _PROFILE_NAME
     sid = ctypes.c_void_p()
+    created = False
     hr = userenv.CreateAppContainerProfile(name, name, name, None, 0, ctypes.byref(sid))
-    if hr != 0 or not sid.value:
+    if (hr & 0xFFFFFFFF) == _ALREADY_EXISTS or (hr != 0 and not sid.value):
+        hr = userenv.DeriveAppContainerSidFromAppContainerName(name, ctypes.byref(sid))
+        if hr != 0 or not sid.value:
+            raise SandboxError(f"DeriveAppContainerSidFromAppContainerName failed (hresult {hr & 0xFFFFFFFF:08x})")
+    elif hr != 0 or not sid.value:
         raise SandboxError(f"CreateAppContainerProfile failed (hresult {hr & 0xFFFFFFFF:08x})")
+    else:
+        created = True
     text_ptr = ctypes.c_wchar_p()
     if not advapi.ConvertSidToStringSidW(sid, ctypes.byref(text_ptr)) or not text_ptr.value:
         advapi.FreeSid(sid)
-        userenv.DeleteAppContainerProfile(name)
+        if created:
+            userenv.DeleteAppContainerProfile(name)
         raise _win_fail("ConvertSidToStringSidW failed")
     sid_text = str(text_ptr.value)
     kernel.LocalFree(text_ptr)
@@ -1024,25 +1205,59 @@ def _win_lease_open(lease: _WinLease) -> None:
     lease.userenv = userenv
     lease.advapi = advapi
     lease.kernel = kernel
-    grants: list[tuple[Path, bool]] = []
-    try:
-        for root in _windows_grant_roots():
-            recurse = root != _system_root()
-            _win_grant(lease, root, "(OI)(CI)(RX)", recurse=recurse)
-            grants.append((root, recurse))
-            for parent in _ancestors(root):
-                if parent == root or any(parent == earlier for earlier, _flag in grants):
-                    continue
-                _win_grant(lease, parent, "(X)", recurse=False)
-                grants.append((parent, False))
-    except Exception:
+
+    def ensure_grants():
+        recorded = _recorded_grants(sid_text)
+        marker = {}
+        try:
+            marker = json.loads(_grant_marker_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            marker = {}
+        if recorded is not None and marker.get("loopback_cleared") and marker.get("sid") == sid_text:
+            lease.grant_paths = recorded
+            return
+        # Once per machine. CheckNetIsolation can take longer than a strategy
+        # timeout, so a later process must not run it again.
+        _clear_loopback(name, sid_text)
+        if recorded is not None:
+            lease.grant_paths = recorded
+            _write_grant_marker(
+                sid_text, recorded, local_denied=True, loopback_cleared=True
+            )
+            return
+        grants: list[tuple[Path, bool]] = []
+        try:
+            for root in _windows_grant_roots():
+                recurse = root != _system_root()
+                _win_grant(lease, root, "(OI)(CI)(RX)", recurse=recurse)
+                grants.append((root, recurse))
+                for parent in _ancestors(root):
+                    if parent == root or any(parent == earlier for earlier, _flag in grants):
+                        continue
+                    _win_grant(lease, parent, "(X)", recurse=False)
+                    grants.append((parent, False))
+            local = _local_app_data()
+            local_denied = False
+            if local is not None and local.exists() and not _is_volume_root(local):
+                _win_deny_shallow(lease, local)
+                local_denied = True
+        except Exception:
+            lease.grant_paths = grants
+            for path, recurse in grants:
+                _win_remove_aces(lease, [path], recurse=recurse)
+            raise
         lease.grant_paths = grants
-        for path, recurse in grants:
-            _win_remove_aces(lease, [path], recurse=recurse)
+        _write_grant_marker(
+            sid_text, grants, local_denied=local_denied, loopback_cleared=True
+        )
+
+    try:
+        _with_profile_lock(ensure_grants)
+    except Exception:
         advapi.FreeSid(sid)
-        userenv.DeleteAppContainerProfile(name)
+        if created:
+            userenv.DeleteAppContainerProfile(name)
         raise
-    lease.grant_paths = grants
 
 
 def _system_root() -> Path | None:
@@ -1194,36 +1409,10 @@ def _win_sweep_orphans() -> None:
         userenv.DeleteAppContainerProfile.restype = ctypes.c_long
     except OSError:
         return
-    roots = []
-    try:
-        roots = _windows_grant_roots()
-    except SandboxError:
-        roots = []
-    icacls = None
-    try:
-        icacls = _icacls()
-    except SandboxError:
-        icacls = None
-    for name, sid_text in orphans:
-        if icacls is not None and sid_text.startswith("S-"):
-            for root in roots:
-                if not root.exists():
-                    continue
-                command = [
-                    icacls,
-                    str(root),
-                    "/remove:g",
-                    f"*{sid_text}",
-                    "/remove:d",
-                    f"*{sid_text}",
-                    "/T",
-                    "/C",
-                    "/Q",
-                ]
-                try:
-                    _icacls_run(command)
-                except SandboxError:
-                    continue
+    # Removing ACEs with icacls /T walks the Python tree once per leftover
+    # profile. The SIDs are unused once the profile is deleted. Leave the
+    # ACEs; they do not grant a live process.
+    for name, _sid_text in orphans:
         try:
             userenv.DeleteAppContainerProfile(name)
         except OSError:
@@ -1274,11 +1463,13 @@ def _win_grant_work(lease: _WinLease, work: Path) -> list[tuple[Path, bool]]:
     _win_grant(lease, work, "(OI)(CI)(F)", recurse=True)
     applied.append((work, True))
     granted = {path for path, _recurse in lease.grant_paths}
+    granted.update(lease.ancestor_grants)
     for parent in _ancestors(work):
         if parent in granted:
             continue
         _win_grant(lease, parent, "(X)", recurse=False)
-        applied.append((parent, False))
+        lease.ancestor_grants.add(parent)
+        granted.add(parent)
     return applied
 
 
@@ -1497,7 +1688,7 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
         info.StartupInfo.hStdOutput = stdout_w
         info.StartupInfo.hStdError = stderr_w
         info.lpAttributeList = ctypes.cast(attributes, ctypes.c_void_p)
-        command = subprocess.list2cmdline(_interpreter_command(work / "sandbox_child.py"))
+        command = subprocess.list2cmdline(_interpreter_command(work / "sandbox_child.py", child=True))
         command_buf = ctypes.create_unicode_buffer(command)
         env_buf = _windows_env_block(_windows_env(work))
         created = _WinProcessInformation()
@@ -1519,6 +1710,7 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
             raise _win_fail("CreateProcessW failed")
         process = created.hProcess
         thread = created.hThread
+        _win_require_container(lease, process)
         job = _win_arm_job(kernel, process, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
         if kernel.ResumeThread(thread) == 0xFFFFFFFF:
             raise _win_fail("ResumeThread failed")
@@ -1555,9 +1747,49 @@ def _win_pipe(kernel):
     read = ctypes.c_void_p()
     write = ctypes.c_void_p()
     security = _WinSecurityAttributes(ctypes.sizeof(_WinSecurityAttributes), None, 1)
-    if not kernel.CreatePipe(ctypes.byref(read), ctypes.byref(write), ctypes.byref(security), 0):
+    # The default pipe is a few kilobytes. One bar is one write; a larger
+    # buffer keeps that write from blocking on the child's first read.
+    if not kernel.CreatePipe(ctypes.byref(read), ctypes.byref(write), ctypes.byref(security), 65536):
         raise _win_fail("CreatePipe failed")
     return read.value, write.value
+
+
+def _win_require_container(lease: _WinLease, process) -> None:
+    """Refuse to resume a process that is not an empty AppContainer."""
+    advapi = lease.advapi
+    kernel = lease.kernel
+    advapi.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.OpenProcessToken.restype = ctypes.c_int
+    advapi.GetTokenInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    advapi.GetTokenInformation.restype = ctypes.c_int
+    token = ctypes.c_void_p()
+    if not advapi.OpenProcessToken(process, 0x0008, ctypes.byref(token)):
+        raise _win_fail("OpenProcessToken failed")
+    try:
+        flag = ctypes.c_uint32()
+        needed = ctypes.c_uint32()
+        if not advapi.GetTokenInformation(token, 29, ctypes.byref(flag), 4, ctypes.byref(needed)):
+            raise _win_fail("TokenIsAppContainer failed")
+        if int(flag.value) != 1:
+            raise SandboxError(
+                f"the child is not an AppContainer (TokenIsAppContainer={int(flag.value)}); refusing to resume"
+            )
+        advapi.GetTokenInformation(token, 30, None, 0, ctypes.byref(needed))
+        size = int(needed.value or 4)
+        buf = ctypes.create_string_buffer(size)
+        if not advapi.GetTokenInformation(token, 30, buf, size, ctypes.byref(needed)):
+            raise _win_fail("TokenCapabilities failed")
+        count = int(ctypes.c_uint32.from_buffer_copy(buf).value)
+        if count != 0:
+            raise SandboxError(f"the AppContainer has {count} capabilities; refusing to resume")
+    finally:
+        kernel.CloseHandle(token)
 
 
 def _local_app_data() -> Path | None:

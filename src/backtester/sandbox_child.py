@@ -1,9 +1,10 @@
 """Strategy process for the one-bar referee.
 
-The parent launches this file with ``python -I`` inside the sandbox. stdin and
-stdout are the protocol. One request is read, ``on_bar`` runs, one decision is
-written. The next bar is not in the pipe until that decision is written, so a
-strategy that reads stdin here blocks until the per-call timeout.
+The parent launches this file with ``python -I -S`` inside the sandbox, or
+re-invokes a frozen executable with ``--sandbox-child``. stdin and stdout are
+the protocol. One request is read, ``on_bar`` runs, one decision is written.
+The next bar is not in the pipe until that decision is written, so a strategy
+that reads stdin here blocks until the per-call timeout.
 
 This file is copied into the private directory next to ``strategy.py``. It
 uses the standard library only. It does not embed a data path, a scale, or a
@@ -102,20 +103,28 @@ def _finish_stdio() -> None:
     _stdio_thread.join(timeout=2)
 
 
+_stdin_buf = b""
+
+
 def _recv() -> dict | None:
-    buf = bytearray()
-    while True:
-        chunk = os.read(0, 1)
+    """Read one JSON line. Bytes past the newline stay for the next request."""
+    global _stdin_buf
+    while b"\n" not in _stdin_buf:
+        chunk = os.read(0, 65536)
         if not chunk:
-            if not buf:
+            if not _stdin_buf:
                 return None
             break
-        buf.extend(chunk)
-        if chunk == b"\n":
-            break
-        if len(buf) > 1_000_000:
+        _stdin_buf += chunk
+        if len(_stdin_buf) > 1_000_000 and b"\n" not in _stdin_buf:
             raise ValueError("request is too large")
-    return json.loads(bytes(buf).decode("utf-8"))
+    if b"\n" not in _stdin_buf:
+        line, _stdin_buf = _stdin_buf, b""
+    else:
+        line, _stdin_buf = _stdin_buf.split(b"\n", 1)
+    if not line and not _stdin_buf:
+        return None
+    return json.loads(line.decode("utf-8"))
 
 
 def _apply_limits() -> bool:
@@ -144,14 +153,84 @@ def _apply_limits() -> bool:
 
 
 def _extend_path() -> None:
-    path = Path("runtime.json")
+    """Use only the staged package directories the parent resolved.
+
+    ``-S`` already skipped site-packages. These entries are inserted in the
+    parent's order, in front of the standard library, and the file is removed
+    before the strategy is loaded.
+    """
+    path = Path("deps.json")
     if not path.is_file():
         return
-    entries = json.loads(path.read_text(encoding="utf-8"))
+    spec = json.loads(path.read_text(encoding="utf-8"))
     path.unlink()
-    for entry in entries:
-        if entry and entry not in sys.path:
-            sys.path.append(entry)
+    entries = spec.get("path") if isinstance(spec, dict) else spec
+    for entry in reversed([item for item in (entries or []) if item]):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+
+
+def _windows_token_facts() -> dict:
+    """AppContainer facts for this process. Empty capabilities are required."""
+    import ctypes
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.OpenProcessToken.restype = ctypes.c_int
+    advapi.GetTokenInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    advapi.GetTokenInformation.restype = ctypes.c_int
+    kernel.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    facts = {"is_app_container": 0, "capability_count": -1, "error": ""}
+    token = ctypes.c_void_p()
+    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        facts["error"] = f"OpenProcessToken winerror {ctypes.get_last_error()}"
+        return facts
+    try:
+        flag = ctypes.c_uint32()
+        needed = ctypes.c_uint32()
+        if not advapi.GetTokenInformation(token, 29, ctypes.byref(flag), 4, ctypes.byref(needed)):
+            facts["error"] = f"TokenIsAppContainer winerror {ctypes.get_last_error()}"
+            return facts
+        facts["is_app_container"] = int(flag.value)
+        if not advapi.GetTokenInformation(token, 30, None, 0, ctypes.byref(needed)) and not needed.value:
+            facts["error"] = f"TokenCapabilities winerror {ctypes.get_last_error()}"
+            return facts
+        size = int(needed.value or 4)
+        buf = ctypes.create_string_buffer(size)
+        if not advapi.GetTokenInformation(token, 30, buf, size, ctypes.byref(needed)):
+            facts["error"] = f"TokenCapabilities winerror {ctypes.get_last_error()}"
+            return facts
+        facts["capability_count"] = int(ctypes.c_uint32.from_buffer_copy(buf).value)
+        return facts
+    finally:
+        kernel.CloseHandle(token)
+
+
+def _refuse_if_unconfined() -> str | None:
+    """A Windows child that is not an empty AppContainer does not run the strategy."""
+    if os.name != "nt":
+        return None
+    facts = _windows_token_facts()
+    try:
+        Path("token.json").write_text(json.dumps(facts), encoding="utf-8")
+    except OSError:
+        pass
+    sys.stderr.write("token " + json.dumps(facts) + "\n")
+    sys.stderr.flush()
+    if facts.get("is_app_container") != 1:
+        return "the child is not an AppContainer"
+    if facts.get("capability_count") not in (0,):
+        return "the AppContainer has capabilities"
+    return None
 
 
 def _load():
@@ -249,6 +328,11 @@ def main() -> int:
         _prepare_stdio(capture)
         _extend_path()
         sys.argv = ["strategy"]
+        confined = _refuse_if_unconfined()
+        if confined:
+            _recv()
+            _send({"op": "error", "error": confined})
+            return 1
         try:
             strategy, wants, has_day_end = _load()
         except Exception as exc:

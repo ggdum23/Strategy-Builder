@@ -226,6 +226,7 @@ def run_parallel(
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
     registry_path=None,
+    call_timeout: float | None = None,
 ) -> ParallelResult:
     """Cartesian product of strategies and markets. See the module docstring."""
     from . import runner as runner_mod
@@ -379,6 +380,7 @@ def run_parallel(
                 memory_bytes=memory_bytes,
                 stop=stop,
                 strategy_path=ref.path,
+                call_timeout=10.0 if call_timeout is None else float(call_timeout),
                 share_factor=market.share_factor,
                 borrow_rate_annual=market.borrow_rate_annual,
                 financing_rate_annual=financing_rate_annual,

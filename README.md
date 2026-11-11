@@ -129,8 +129,12 @@ operator `metrics.json` still records that cost basis and the original ticker.
 date, and no scale field. The designer-facing stand-in for a ticker is
 `RANDOM`. Strategy and source directory names use that spelling, with a
 `-2`, `-3`, ... suffix when two ids would be the same folder. Do not put
-operator paths in a strategy. `referee` runs that strategy one bar at a time
-in an OS jail; the child does not receive the sidecar, the calendar, or `share_scale`.
+operator paths in a strategy. A strategy file passed to `run`, `run --pack`,
+`walkforward`, `parallel`, or `referee` executes only in the OS jail. The
+operator process does not import it. The child does not receive the sidecar,
+the calendar, or `share_scale`. An in-memory class passed to the library stays
+in process. `--unsafe-in-process` is the debug escape: it prints a warning and
+refuses a pack.
 The twenty designer strategies under `examples/strategies/` are the Arena examples.
 Desk examples are under `examples/desk/`.
 

@@ -133,12 +133,14 @@ def assert_jailed_surface(payload: dict) -> None:
     entries = payload.get("cwd_entries")
     if not isinstance(entries, list):
         raise SystemExit(f"child cwd entries are not a list: {entries!r}")
-    allowed = {"strategy.py", "sandbox_child.py", "stdio.log"}
+    allowed = {"strategy.py", "sandbox_child.py", "stdio.log", "pydeps", "deps.json", "token.json"}
     unexpected = [name for name in entries if name not in allowed]
     if unexpected:
         raise SystemExit(f"jail cwd has unexpected entries: {entries}")
-    if "strategy.py" not in entries or "sandbox_child.py" not in entries:
+    if "strategy.py" not in entries:
         raise SystemExit(f"jail cwd is missing the strategy: {entries}")
+    if payload.get("frozen") is not True and "sandbox_child.py" not in entries:
+        raise SystemExit(f"source jail cwd is missing the shim: {entries}")
 
 
 def windows_file_version(path: Path) -> str:
@@ -359,7 +361,7 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
             command = str(payload.get("os_command_line") or "")
             if "--src" in command or src_text in command:
                 raise SystemExit(f"child command line still carries the data path: {command}")
-            if "sandbox_child.py" not in command and "--backtester-sandbox" not in command:
+            if "--sandbox-child" not in command:
                 raise SystemExit(f"child was not the sandbox: {command!r}")
             if not str(payload.get("cwd_name") or "").startswith("bt-referee-"):
                 raise SystemExit(f"child cwd was not the jail directory: {payload.get('cwd')}")
@@ -373,6 +375,150 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
                 raise SystemExit(f"child executable was {executable_name}")
     finally:
         _clean_probes(probe_dir)
+
+    flat = work / "flat"
+    flat.mkdir()
+    (flat / "strategy.py").write_text(
+        "class Strategy:\n    def on_bar(self, bar, state):\n        return None\n",
+        encoding="utf-8",
+    )
+    registry = work / "registry.json"
+    _run(
+        exe,
+        [
+            "ingest", "--ticker", "QQQ", "--src", str(src),
+            "--registry", str(registry), "--profile", "arena", "--price-kind", "raw",
+        ],
+        cwd=work,
+        env=env,
+        timeout=180,
+    )
+    pack_dir = work / "pack"
+    sidecar = work / "sidecar.json"
+    _run(
+        exe,
+        [
+            "pack", "--ticker", "QQQ", "--src", str(src),
+            "--out", str(pack_dir), "--sidecar", str(sidecar),
+            "--registry", str(registry), "--named", "--profile", "arena",
+        ],
+        cwd=work,
+        env=env,
+        timeout=300,
+    )
+    pack_out = work / "pack-run"
+    _run(
+        exe,
+        [
+            "run", "--profile", "arena", "--strategy", str(flat / "strategy.py"),
+            "--pack", str(pack_dir), "--sidecar", str(sidecar),
+            "--out", str(pack_out),
+        ],
+        cwd=work,
+        env=env,
+        timeout=900,
+    )
+    pack_metrics = json.loads((pack_out / "metrics.json").read_text(encoding="utf-8"))
+    if pack_metrics.get("profile") != "arena":
+        raise SystemExit(f"pack run profile was {pack_metrics.get('profile')}")
+    parallel_out = work / "parallel-run"
+    _run(
+        exe,
+        [
+            "parallel", "--strategies", str(flat), "--workers", "1",
+            "--profile", "arena", "--ticker", "QQQ", "--src", str(src),
+            "--out", str(parallel_out), "--no-benchmarks",
+        ],
+        cwd=work,
+        env=env,
+        timeout=900,
+    )
+    if not (parallel_out / "leaderboard.csv").is_file():
+        raise SystemExit("parallel did not write a leaderboard")
+    referee_out = work / "referee-run"
+    _run(
+        exe,
+        [
+            "referee", "--strategy", str(flat / "strategy.py"),
+            "--hidden", str(src), "--profile", "arena", "--ticker", "QQQ",
+            "--out", str(referee_out), "--no-benchmarks",
+        ],
+        cwd=work,
+        env=env,
+        timeout=900,
+    )
+    referee_doc = json.loads((referee_out / "referee.json").read_text(encoding="utf-8"))
+    if referee_doc.get("disqualified"):
+        raise SystemExit(f"referee disqualified a flat strategy: {referee_doc}")
+
+    import socket
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 44123))
+    listener.listen(1)
+    listener.settimeout(0.2)
+    note = work / "note.txt"
+    note.write_text("frozen-smoke-note", encoding="utf-8")
+    hostile = work / "hostile"
+    hostile.mkdir()
+    (hostile / "strategy.py").write_text(
+        "import os\n"
+        "import socket\n"
+        "from pathlib import Path\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        if getattr(self, 'done', False):\n"
+        "            return None\n"
+        "        self.done = True\n"
+        "        seen = os.environ.get('SB_SMOKE_FILE', '')\n"
+        "        text = ''\n"
+        "        if seen:\n"
+        "            try:\n"
+        "                text = Path(seen).read_text(encoding='utf-8')\n"
+        "            except OSError:\n"
+        "                text = ''\n"
+        "        network = 'open'\n"
+        "        try:\n"
+        "            sock = socket.socket()\n"
+        "            sock.settimeout(3)\n"
+        "            sock.connect(('127.0.0.1', 44123))\n"
+        "            sock.close()\n"
+        "        except OSError as exc:\n"
+        "            network = exc.errno\n"
+        "        self.surface = {'secret_seen': bool(seen), 'read': text, 'network': network}\n"
+        "        return None\n",
+        encoding="utf-8",
+    )
+    hostile_env = dict(env)
+    hostile_env["SB_SMOKE_FILE"] = str(note)
+    hostile_out = work / "hostile-run"
+    try:
+        _run(
+            exe,
+            [
+                "run", "--profile", "arena", "--ticker", "QQQ",
+                "--strategy", str(hostile / "strategy.py"),
+                "--src", str(src), "--out", str(hostile_out),
+            ],
+            cwd=work,
+            env=hostile_env,
+            timeout=900,
+        )
+    finally:
+        listener.close()
+    surface_path = hostile_out / "child_surface.json"
+    if not surface_path.is_file():
+        raise SystemExit("hostile strategy did not report a surface")
+    surface = json.loads(surface_path.read_text(encoding="utf-8"))
+    if surface.get("secret_seen") or surface.get("read"):
+        raise SystemExit(f"hostile strategy read the operator file: {surface}")
+    # EPERM, EACCES, or WinError 10013. A refused or timed-out connect
+    # means the socket was attempted, which is not a block.
+    if surface.get("network") not in (1, 13, 10013):
+        raise SystemExit(f"hostile strategy was not denied the network: {surface}")
+    if "frozen-smoke-note" in json.dumps(surface):
+        raise SystemExit(f"hostile strategy saw the note: {surface}")
     print("frozen smoke ok")
 
 

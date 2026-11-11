@@ -23,7 +23,6 @@ from .registry import (
     upsert_series,
 )
 from .report import write_json
-from .strategy_loader import load_strategy_class
 
 
 def _repo_root() -> Path:
@@ -105,6 +104,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_data_args(run, require_out=True, require_src=False)
     run.add_argument("--pack", default=None, help="Chunked pack directory")
     run.add_argument("--sidecar", default=None, help="Operator sidecar for that pack. Never ship this file.")
+    run.add_argument(
+        "--call-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds for one strategy call inside the jail.",
+    )
+    run.add_argument(
+        "--unsafe-in-process",
+        action="store_true",
+        help="Execute the strategy file in this process. Refuses a pack or an anonymized run.",
+    )
 
     walk = sub.add_parser("walkforward", help="Design window, then a locked tail")
     _add_data_args(walk, require_out=True)
@@ -116,6 +126,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Sessions of history before the locked tail. Profile decides what warm-up does.",
+    )
+    walk.add_argument(
+        "--call-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds for one strategy call inside the jail.",
+    )
+    walk.add_argument(
+        "--unsafe-in-process",
+        action="store_true",
+        help="Execute the strategy file in this process. Refuses a pack or an anonymized run.",
     )
 
     ingest = sub.add_parser("ingest", help="Inspect filled files and, with --registry, record the series")
@@ -167,6 +188,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parallel.add_argument("--sidecar", action="append", default=None)
     parallel.add_argument("--bar-minutes", type=int, default=1, help="Named files only. A pack keeps the bar size it was built with.")
     parallel.add_argument("--timeout", type=float, default=600.0, help="Seconds for one strategy after its process has started")
+    parallel.add_argument(
+        "--call-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds for one strategy call inside the jail.",
+    )
     parallel.add_argument("--memory-mb", type=int, default=None, help="Resident-set cap for one strategy process")
     parallel.add_argument("--borrow-rate", type=float, default=None)
     parallel.add_argument(
@@ -262,10 +289,20 @@ def _print_headline(profile: str, payload: dict) -> None:
         )
 
 
+_UNSAFE_IN_PROCESS = (
+    "WARNING: --unsafe-in-process runs the strategy file outside the OS jail. "
+    "It can read this machine's files, open the network, and see process memory. "
+    "It refuses a pack or an anonymized run."
+)
+
+
 def _cmd_run(args) -> int:
     from .runner import run_named, run_pack
 
-    strategy_cls = load_strategy_class(args.strategy)
+    if args.unsafe_in_process and (args.pack or args.sidecar):
+        raise ValueError("--unsafe-in-process cannot run a pack or an anonymized book")
+    if args.unsafe_in_process:
+        print(_UNSAFE_IN_PROCESS, file=sys.stderr)
     if args.pack or args.sidecar:
         if args.share_factor is not None:
             raise ValueError(
@@ -278,7 +315,7 @@ def _cmd_run(args) -> int:
         if args.bar_minutes != 1:
             raise ValueError("bar size is fixed when the pack is built. Build another pack to change it.")
         payload = run_pack(
-            strategy_cls,
+            args.strategy,
             args.pack,
             args.sidecar,
             args.profile,
@@ -292,6 +329,7 @@ def _cmd_run(args) -> int:
             price_basis=args.price_basis,
             cash_rate_annual=args.cash_rate,
             withholding_rate=args.withholding,
+            call_timeout=args.call_timeout,
         )
         _print_headline(args.profile, payload)
         print(f"wrote {args.out}")
@@ -307,7 +345,7 @@ def _cmd_run(args) -> int:
     if not args.src or not args.ticker:
         raise ValueError("a named run needs --src and --ticker")
     payload = run_named(
-        strategy_cls,
+        args.strategy,
         args.src,
         args.ticker,
         args.profile,
@@ -324,6 +362,8 @@ def _cmd_run(args) -> int:
         cash_rate_annual=args.cash_rate,
         withholding_rate=args.withholding,
         registry_path=args.registry,
+        in_process=bool(args.unsafe_in_process),
+        call_timeout=args.call_timeout,
     )
     _print_headline(args.profile, payload)
     _print_data_notes(((payload.get("run") or {}).get("inspection") or {}).get("notes"))
@@ -371,10 +411,11 @@ def _cmd_walk(args) -> int:
             "walkforward warm-up is --warmup-days, counted back from the locked tail. "
             "--warmup-sessions belongs to `run`."
         )
-    strategy_cls = load_strategy_class(args.strategy)
+    if args.unsafe_in_process:
+        print(_UNSAFE_IN_PROCESS, file=sys.stderr)
     pack = _walk_inputs(args)
     summary, _slices, _design, _locked = walk_forward(
-        strategy_cls,
+        args.strategy,
         pack.pop("frame"),
         args.profile,
         args.out,
@@ -395,6 +436,8 @@ def _cmd_walk(args) -> int:
         series_kind=pack["series_kind"],
         cash_rate_annual=args.cash_rate,
         withholding_rate=args.withholding,
+        in_process=bool(args.unsafe_in_process),
+        call_timeout=args.call_timeout,
     )
     print(
         f"[{args.profile}] design through {summary['design_end_date']} "
@@ -613,6 +656,7 @@ def _cmd_parallel(args) -> int:
             cash_rate_annual=args.cash_rate,
             withholding_rate=args.withholding,
             registry_path=args.registry,
+            call_timeout=args.call_timeout,
         )
     finally:
         signal.signal(signal.SIGINT, previous)
@@ -733,7 +777,9 @@ def _cmd_test() -> int:
     import pytest
 
     root = _repo_root()
-    return int(pytest.main(["-q", str(root / "tests")]))
+    # The October-sample jail comparison is its own CI job. Running it inside
+    # every matrix cell walks 20 strategies twice through the pipe.
+    return int(pytest.main(["-q", "-m", "not jailed_sample", str(root / "tests")]))
 
 
 def main(argv=None) -> int:
@@ -762,6 +808,18 @@ def main(argv=None) -> int:
         return 2
     except (ValueError, FileNotFoundError, NotImplementedError, AttributeError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        from .runner import WorkerFailure
+        from .sandbox import SandboxError
+
+        if not isinstance(exc, (WorkerFailure, SandboxError)):
+            raise
+        text = str(exc).strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("  ")]
+        lines = [line for line in lines if not line.startswith("Traceback")]
+        message = lines[-1] if lines else type(exc).__name__
+        print(f"error: {message}", file=sys.stderr)
         return 2
 
 

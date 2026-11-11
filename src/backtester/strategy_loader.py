@@ -1,8 +1,10 @@
 """Load a ``Strategy`` class from a file path.
 
 The strategy directory is put on ``sys.path`` so a parameter module that sits
-next to ``strategy.py`` can be imported. ``run`` executes that code in this
-process. It is not the referee sandbox.
+next to ``strategy.py`` can be imported. The CLI does not call this for a
+file strategy. ``run``, ``walkforward``, ``parallel``, and ``referee`` execute
+that file in the jail. This function is the in-memory path used by tests and
+by ``--unsafe-in-process``.
 """
 
 from __future__ import annotations

@@ -423,9 +423,22 @@ def test_selftest_probes_are_blocked(name, expect):
     _needs_jail()
     if name == "setsid.py" and sys.platform != "linux":
         pytest.skip("setsid is the Linux escape")
+    server = None
+    if name == "net.py":
+        # The probe connects to a live listener and to a public address.
+        # ECONNREFUSED from a closed port is not evidence of a block.
+        import socket
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 44123))
+        server.listen(1)
+        server.settimeout(0.2)
     try:
-        assert probe(SELFTEST / name, call_timeout=5, startup_timeout=20) == expect
+        assert probe(SELFTEST / name, call_timeout=8, startup_timeout=20) == expect
     finally:
+        if server is not None:
+            server.close()
         leftover = ROOT / ".referee-arm-test"
         if leftover.exists():
             leftover.unlink()

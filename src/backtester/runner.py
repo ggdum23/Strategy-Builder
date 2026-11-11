@@ -854,10 +854,17 @@ def _books_worker(queue, job):
         frame = job["frame"]
         profile = job["profile"]
         kwargs = job["kwargs"]
+        call_timeout = float(job.get("call_timeout", _JAIL_CALL_TIMEOUT_S))
         job.clear()
         if spec.get("kind") == "path":
             books = _run_jailed_books(
-                spec["path"], frame, profile, kwargs, inherited_argv, inherited_cwd
+                spec["path"],
+                frame,
+                profile,
+                kwargs,
+                inherited_argv,
+                inherited_cwd,
+                call_timeout,
             )
         else:
             from .sandbox import lock_worker_session
@@ -888,10 +895,33 @@ def _books_worker(queue, job):
 
 _JAIL_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
 _JAIL_CPU_SECONDS = 3600
-_JAIL_CALL_TIMEOUT_S = 3600.0
+# Same default as the referee. A longer bar has to opt in.
+_JAIL_CALL_TIMEOUT_S = 10.0
+
+def _bind_strategy(strategy, *, in_process: bool):
+    """Return ``(class_or_none, path_or_none)``.
+
+    A path is the jail. A class object is the in-memory library path, including
+    a class a test already loaded from a file. ``in_process`` loads a path in
+    this process and strips the file marker so the worker does not jail it.
+    """
+    if in_process:
+        if isinstance(strategy, (str, os.PathLike)):
+            from .strategy_loader import load_strategy_class
+
+            strategy = load_strategy_class(strategy)
+        if getattr(strategy, "__strategy_path__", None):
+            try:
+                delattr(strategy, "__strategy_path__")
+            except AttributeError:
+                strategy.__strategy_path__ = None
+        return strategy, None
+    if isinstance(strategy, (str, os.PathLike)):
+        return None, str(strategy)
+    return strategy, None
 
 
-def _run_jailed_books(strategy_path, frame, profile, kwargs, inherited_argv, inherited_cwd):
+def _run_jailed_books(strategy_path, frame, profile, kwargs, inherited_argv, inherited_cwd, call_timeout):
     """Engine in this process. The strategy file runs in the referee jail.
 
     ``kwargs`` already holds the accounting record and this window's dividend
@@ -908,7 +938,7 @@ def _run_jailed_books(strategy_path, frame, profile, kwargs, inherited_argv, inh
     cwd = Path.cwd()
     if cwd not in deny:
         deny.append(cwd)
-    share_factor = kwargs.pop("share_factor")
+    share_factor = kwargs.pop("share_factor", 1.0)
     crash_code = None
     with jailed_strategy(
         strategy_path,
@@ -916,7 +946,7 @@ def _run_jailed_books(strategy_path, frame, profile, kwargs, inherited_argv, inh
         deny_paths=deny,
         memory_bytes=_JAIL_MEMORY_BYTES,
         cpu_seconds=_JAIL_CPU_SECONDS,
-        call_timeout=_JAIL_CALL_TIMEOUT_S,
+        call_timeout=float(call_timeout),
     ) as remote:
         # The jail is already a new session. Later forks of this worker cannot
         # leave the group.
@@ -1226,6 +1256,15 @@ def _isolated_books(
 
     from .limits import arm_worker_job
 
+    if os.name == "nt":
+        # The runtime ACL is once per machine. Pay for it here, before the
+        # worker's timeout clock starts, so a book does not spend its budget
+        # walking the Python tree.
+        from .sandbox import warm_windows_profile
+
+        warm_windows_profile()
+    run_kwargs = dict(kwargs)
+    call_timeout = float(run_kwargs.pop("call_timeout", _JAIL_CALL_TIMEOUT_S))
     if strategy_path is not None:
         spec = {"kind": "path", "path": str(strategy_path)}
     elif strategy_cls is None:
@@ -1239,7 +1278,8 @@ def _isolated_books(
         "strategy": spec,
         "frame": _standalone_frame(frame),
         "profile": profile,
-        "kwargs": _plain_kwargs(kwargs),
+        "kwargs": _plain_kwargs(run_kwargs),
+        "call_timeout": call_timeout,
         "gate": gate,
     }
     proc = None
@@ -1281,7 +1321,7 @@ def _isolated_books(
             raise failure
         if proc.exitcode not in (0, None):
             raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n")
-        return _accept_child_books(profile, _standalone_frame(frame), message[1], kwargs)
+        return _accept_child_books(profile, _standalone_frame(frame), message[1], run_kwargs)
     finally:
         # Success, a strategy exception, and a parent-side failure all come
         # through here. The group is signaled even when the worker has exited.
@@ -1430,6 +1470,8 @@ def run_named(
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
     registry_path=None,
+    in_process: bool = False,
+    call_timeout: float | None = None,
 ):
     loaded, declared_kind = load_run_series(
         src,
@@ -1454,10 +1496,8 @@ def run_named(
             "0.9 is not a kit constant."
         )
     warnings = []
-    books = run_books(
-        strategy_cls,
-        loaded.frame,
-        profile,
+    bound_cls, bound_path = _bind_strategy(strategy_cls, in_process=in_process)
+    book_kwargs = dict(
         share_factor=factor,
         borrow_rate_annual=borrow_rate_annual,
         financing_rate_annual=financing_rate_annual,
@@ -1471,6 +1511,12 @@ def run_named(
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
     )
+    if bound_path is not None:
+        if call_timeout is not None:
+            book_kwargs["call_timeout"] = float(call_timeout)
+        books = _isolated_books(bound_cls, loaded.frame, profile, strategy_path=bound_path, **book_kwargs)
+    else:
+        books = run_books(bound_cls, loaded.frame, profile, **book_kwargs)
     payload = write_books(
         out_dir,
         profile,
@@ -1480,6 +1526,7 @@ def run_named(
         books,
         extra={"warnings": warnings, "inspection": loaded.inspection.as_dict()},
     )
+    _write_child_surface(out_dir, books)
     return payload
 
 
@@ -1576,6 +1623,8 @@ def walk_forward(
     series_kind: str = "raw",
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
+    in_process: bool = False,
+    call_timeout: float | None = None,
 ):
     """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
 
@@ -1602,6 +1651,7 @@ def walk_forward(
     There is no designer tree, so a symbol that is reserved for anonymized
     reports is allowed.
     """
+    strategy_cls, strategy_path = _bind_strategy(strategy_cls, in_process=in_process)
     if share_factor != 1.0:
         raise ValueError(
             f"share_factor {share_factor} is not 1.0. Raw runs use 1.0. "
@@ -1656,6 +1706,8 @@ def walk_forward(
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
     )
+    if call_timeout is not None:
+        common["call_timeout"] = float(call_timeout)
     notes = [str(note) for note in (inspection_notes or ())]
     previous_dumpable = _set_dumpable(False)
     try:
@@ -1664,6 +1716,7 @@ def walk_forward(
                 strategy_cls,
                 design,
                 profile,
+                strategy_path=strategy_path,
                 max_day=meta.design_end_day,
                 warmup_sessions=0,
                 during=during_design,
@@ -1694,6 +1747,7 @@ def walk_forward(
                 strategy_cls,
                 rebuilt.locked_with_warmup,
                 profile,
+                strategy_path=strategy_path,
                 reset_day=meta.locked_start_day if meta.warmup_sessions else None,
                 max_day=meta.locked_day_max,
                 warmup_sessions=0,
@@ -1706,6 +1760,7 @@ def walk_forward(
                 strategy_cls,
                 rebuilt.locked_with_warmup,
                 profile,
+                strategy_path=strategy_path,
                 warmup_sessions=meta.warmup_sessions,
                 max_day=meta.locked_day_max,
                 dividends=locked_dividends,
@@ -1772,6 +1827,8 @@ def run_pack(
     price_basis: str = "raw",
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
+    in_process: bool = False,
+    call_timeout: float | None = None,
 ):
     """Run a pack. The sidecar stays in this process.
 
@@ -1780,6 +1837,9 @@ def run_pack(
     receive the sidecar document, the date map, the ticker, the volume factor,
     or the operator note. Dividend amounts are scaled and re-keyed here first.
     """
+    if in_process:
+        raise ValueError("--unsafe-in-process cannot run a pack or an anonymized book")
+    strategy_cls, strategy_path = _bind_strategy(strategy_cls, in_process=False)
     from .pack import load_pack, load_sidecar
 
     if _report_inside_pack(pack_dir, out_dir):
@@ -1819,6 +1879,8 @@ def run_pack(
         strategy_cls,
         loaded.frame,
         profile,
+        strategy_path=strategy_path,
+        call_timeout=_JAIL_CALL_TIMEOUT_S if call_timeout is None else float(call_timeout),
         share_factor=share_scale,
         borrow_rate_annual=borrow_rate_annual,
         financing_rate_annual=financing_rate_annual,
