@@ -161,8 +161,9 @@ def _dividends_for_frame(frame, dividends):
 
     Walk-forward calls this in the parent, once per child, before that child
     is spawned. A key that names a session outside the frame is left out.
-    ``None`` and an empty map stay as they are. ``run`` does not use this:
-    a dividend date missing from a complete sample still fails there.
+    ``None`` stays ``None`` (no file). When the file had entries and none of
+    them fall in this frame, the result is an empty dict: the file was
+    present and this window has no ex-date. ``run`` does not use this.
     """
     if not dividends:
         return dividends
@@ -183,7 +184,7 @@ def _dividends_for_frame(frame, dividends):
             continue
         if str(day) in sessions:
             kept[key] = amount
-    return kept or None
+    return kept
 
 
 def _arena_dividend_days(frame, dividends) -> dict:
@@ -227,7 +228,46 @@ def _arena_dividend_days(frame, dividends) -> dict:
     return out
 
 
+def _bound_accounting(
+    profile: str,
+    *,
+    price_basis,
+    series_kind,
+    cash_rate_annual,
+    financing_rate_annual,
+    withholding_rate,
+    dividends,
+):
+    """Name the method from the dividend file this process was given.
+
+    Desk's omitted financing rate is ``costs_desk.FINANCING_RATE_ANNUAL``,
+    read here. Walk-forward calls this once in the parent, on the full file,
+    and hands that record to each child. A child does not call it on a slice.
+    """
+    name = get_profile(profile).name
+    if name == "desk" and financing_rate_annual is None:
+        financing_rate_annual = engine_desk.D.FINANCING_RATE_ANNUAL
+    return resolve_accounting(
+        name,
+        price_basis=price_basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        withholding_rate=withholding_rate,
+        dividends=dividends,
+    )
+
+
 def _accounting_for(profile: str, kwargs: dict):
+    """The record already resolved for this book, or a fresh one.
+
+    Walk-forward puts the full-file record on ``kwargs``. That record wins.
+    Resolving again from a window's dividend map would treat an empty slice
+    as "no file".
+    """
+    provided = kwargs.get("accounting")
+    if provided is not None:
+        return provided
     return resolve_accounting(
         profile,
         price_basis=kwargs.get("price_basis", "raw"),
@@ -297,11 +337,16 @@ def execute(
     series_kind: str = "raw",
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
+    accounting=None,
 ):
     """Run one strategy instance on ``frame``.
 
     ``max_day``, when set, refuses a frame whose last session is later than
     that day. Walk-forward uses it so a design run cannot be handed the tail.
+
+    ``accounting``, when given, is the record already resolved from the full
+    dividend file. This function does not look at whether ``dividends`` is
+    empty. An empty map credits no cash and still keeps that record.
     """
     # Drop the parameter name before on_bar. The engine call receives the value.
     billing = [share_factor]
@@ -311,21 +356,21 @@ def execute(
         raise RuntimeError(
             f"refusing to run: frame contains day {int(frame['day'].max())} after declared end {int(max_day)}"
         )
-    # Desk's omitted rate is the live constant, read in the process that runs
-    # the book. A strategy that patches it changes the child book, and the
-    # parent benchmark (unpatched) rejects the row. The profile value is the
-    # same 0.07 when the constant is untouched.
-    if name == "desk" and financing_rate_annual is None:
-        financing_rate_annual = engine_desk.D.FINANCING_RATE_ANNUAL
-    accounting = resolve_accounting(
-        name,
-        price_basis=price_basis,
-        series_kind=series_kind,
-        cash_rate_annual=cash_rate_annual,
-        financing_rate_annual=financing_rate_annual,
-        withholding_rate=withholding_rate,
-        dividends=dividends,
-    )
+    # No record yet: name the method here. Desk's omitted rate is the live
+    # constant, read in this process. A strategy that patches it changes the
+    # child book, and the parent benchmark (unpatched) rejects the row.
+    # Walk-forward passes the record it already resolved from the full file,
+    # so an empty slice is not read as "no file".
+    if accounting is None:
+        accounting = _bound_accounting(
+            name,
+            price_basis=price_basis,
+            series_kind=series_kind,
+            cash_rate_annual=cash_rate_annual,
+            financing_rate_annual=financing_rate_annual,
+            withholding_rate=withholding_rate,
+            dividends=dividends,
+        )
     if name == "arena":
         if fee_mult != 1.0:
             raise ValueError(
@@ -1042,6 +1087,7 @@ def _accept_child_books(profile: str, frame, child_books: dict, kwargs: dict) ->
         series_kind=kwargs.get("series_kind", "raw"),
         cash_rate_annual=kwargs.get("cash_rate_annual"),
         withholding_rate=kwargs.get("withholding_rate"),
+        accounting=kwargs.get("accounting"),
     )
     billing = [float(kwargs.get("share_factor", 1.0))]
     for label, cls in _benchmarks(get_profile(profile).name):
@@ -1190,6 +1236,7 @@ def run_books(
     series_kind: str = "raw",
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
+    accounting=None,
 ):
     """Fresh instance per book. Benchmarks reuse the strategy's cost configuration."""
     billing = [share_factor]
@@ -1208,6 +1255,7 @@ def run_books(
         series_kind=series_kind,
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
+        accounting=accounting,
     )
     strategy = strategy_cls()
     result, metrics = execute(strategy, frame, profile, share_factor=_release(billing), **common)
@@ -1449,9 +1497,14 @@ def walk_forward(
     Desk warm-up is flat (``live`` false) and goes live flat at the starting equity.
     Those are different engines. This function does not merge them.
 
-    Each child receives only the dividends whose session is in that child's
-    frame. The design process does not see a locked ex-date or its amount.
-    A date missing from the whole sample still fails an Arena ``run``.
+    The parent resolves one accounting record from the full dividend file,
+    then gives each child that record and only the ex-dates inside that
+    child's frame. An empty map means the file was present and this window
+    has no ex-date. The child does not decide the method from the map.
+    A dividend date that is not in the full sample fails here, for Arena and
+    for Desk, before either child starts. An Arena ``run`` still rejects a
+    date that is not in its sample. A Desk ``run`` still looks a session up
+    and credits nothing when the key is absent.
 
     The books written here are operator books. They keep the original ticker.
     There is no designer tree, so a symbol that is reserved for anonymized
@@ -1469,10 +1522,20 @@ def walk_forward(
         design_fraction=design_fraction,
         warmup_days=warmup_days,
     )
-    if get_profile(profile).name == "arena" and dividends:
-        # Same rejection ``run`` uses. A locked ex-date is in this frame, so
-        # it passes here and is removed from the design child below.
+    if dividends:
+        # Both profiles. A locked ex-date is in this frame, so it passes here
+        # and is left out of the design child below. A date that is in neither
+        # window is not in the sample.
         _arena_dividend_days(frame, dividends)
+    accounting = _bound_accounting(
+        profile,
+        price_basis=price_basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        withholding_rate=withholding_rate,
+        dividends=dividends,
+    )
     design = _standalone_frame(slices.design)
     meta = _SliceMeta(
         design_end_day=slices.design_end_day,
@@ -1513,6 +1576,7 @@ def walk_forward(
                 warmup_sessions=0,
                 during=during_design,
                 dividends=_dividends_for_frame(design, dividends),
+                accounting=accounting,
                 **common,
             )
         finally:
@@ -1542,6 +1606,7 @@ def walk_forward(
                 max_day=meta.locked_day_max,
                 warmup_sessions=0,
                 dividends=locked_dividends,
+                accounting=accounting,
                 **common,
             )
         elif profile == "desk":
@@ -1552,6 +1617,7 @@ def walk_forward(
                 warmup_sessions=meta.warmup_sessions,
                 max_day=meta.locked_day_max,
                 dividends=locked_dividends,
+                accounting=accounting,
                 **common,
             )
         else:
@@ -1585,7 +1651,7 @@ def walk_forward(
     design_record = design_payload.get("accounting")
     locked_record = locked_payload.get("accounting")
     if design_record != locked_record:
-        raise RuntimeError("design and locked books disagree on accounting settings")
+        raise ValueError("design and locked books disagree on accounting settings")
     if design_record:
         summary["accounting"] = design_record
         for key, value in design_record.items():

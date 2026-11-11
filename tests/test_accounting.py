@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -816,3 +817,167 @@ def test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo(tmp_path,
     )
     assert rejected == 2
     assert "dividend date 1999-01-01 is not in this sample" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "profile,basis,method",
+    [
+        ("arena", "total_return", "cash_dividends"),
+        ("desk", "total_return", "cash_dividends"),
+        ("desk", "raw", "profile_dividends"),
+    ],
+)
+def test_empty_design_window_keeps_the_full_file_record(tmp_path, profile, basis, method):
+    from backtester.runner import walk_forward
+
+    locked_date = "2024-06-05"
+    amount = 19.19
+    summary, _slices, design_books, locked_books = walk_forward(
+        _DividendSpy,
+        _dated_frame(["2024-06-03", "2024-06-04", locked_date]),
+        profile,
+        tmp_path / profile,
+        symbol="NIK",
+        bar_minutes=1,
+        design_end_day=1,
+        warmup_days=1,
+        dividends={locked_date: amount},
+        price_basis=basis,
+        with_benchmarks=False,
+    )
+    design_result, design_metrics = design_books["strategy"]
+    locked_result, locked_metrics = locked_books["strategy"]
+    record = design_metrics["accounting"]
+    assert record == locked_metrics["accounting"]
+    assert summary["accounting"] == record
+    assert record["total_return_method"] == method
+    assert record["dividends_applied"] is True
+    assert design_metrics["dividends_net"] == 0.0
+    assert design_result.get("dividends", 0.0) == 0.0
+    seen = design_result["observer"].seen
+    assert seen
+    for mapping in seen:
+        assert locked_date not in mapping
+        assert amount not in mapping.values()
+        assert all(locked_date not in str(key) for key in mapping)
+    locked_seen = locked_result["observer"].seen
+    assert any(locked_date in mapping for mapping in locked_seen)
+    assert any(amount in mapping.values() for mapping in locked_seen)
+
+
+def test_arena_raw_walk_forward_still_refuses_a_dividend_file(tmp_path):
+    from backtester.runner import walk_forward
+
+    with pytest.raises(ValueError, match="The arena profile does not credit dividends."):
+        walk_forward(
+            Flat,
+            _dated_frame(["2024-06-03", "2024-06-04", "2024-06-05"]),
+            "arena",
+            tmp_path / "arena",
+            symbol="NIK",
+            bar_minutes=1,
+            design_end_day=1,
+            warmup_days=1,
+            dividends={"2024-06-05": 1.0},
+            with_benchmarks=False,
+        )
+
+
+@pytest.mark.parametrize("profile", ["arena", "desk"])
+def test_walk_forward_rejects_a_date_outside_the_sample(tmp_path, profile):
+    from backtester.runner import walk_forward
+
+    with pytest.raises(ValueError, match="dividend date 1999-01-01 is not in this sample"):
+        walk_forward(
+            Flat,
+            _dated_frame(["2024-06-03", "2024-06-04", "2024-06-05"]),
+            profile,
+            tmp_path / profile,
+            symbol="NIK",
+            bar_minutes=1,
+            design_end_day=1,
+            warmup_days=1,
+            dividends={"1999-01-01": 1.0},
+            with_benchmarks=False,
+        )
+
+
+def _walk_cli(tmp_path, profile, dividends_text, *, price_basis=None):
+    from backtester.__main__ import main
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    days = [datetime(2024, 6, 3), datetime(2024, 6, 4), datetime(2024, 6, 5)]
+    rows = []
+    for day in days:
+        for minute in (9 * 60 + 30, 9 * 60 + 31, 15 * 60 + 59):
+            rows.append(_filled_row(day, minute, 50.0))
+    src = tmp_path / "src"
+    _write_filled(src / "NIK_1min_filled_2024-06.csv.gz", rows)
+    dividends = tmp_path / f"{profile}-dividends.csv"
+    dividends.write_text(dividends_text, encoding="utf-8")
+    strategy = tmp_path / "strategy.py"
+    strategy.write_text(
+        "class Strategy:\n    def on_bar(self, bar, state):\n        return 1.0\n",
+        encoding="utf-8",
+    )
+    argv = [
+        "walkforward",
+        "--profile",
+        profile,
+        "--ticker",
+        "NIK",
+        "--strategy",
+        str(strategy),
+        "--src",
+        str(src),
+        "--out",
+        str(tmp_path / profile),
+        "--dividends",
+        str(dividends),
+        "--design-end-day",
+        "1",
+        "--warmup-days",
+        "1",
+    ]
+    if price_basis is not None:
+        argv.extend(["--price-basis", price_basis])
+    return main(argv)
+
+
+def test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date(tmp_path, capsys):
+    locked = "session,amount\n2024-06-05,19.19\n"
+    for profile in ("arena", "desk"):
+        code = _walk_cli(tmp_path / profile, profile, locked, price_basis="total_return")
+        assert code == 0
+        payload = json.loads((tmp_path / profile / profile / "walkforward.json").read_text(encoding="utf-8"))
+        record = payload["accounting"]
+        assert record["total_return_method"] == "cash_dividends"
+        assert record["dividends_applied"] is True
+        assert payload["design"]["dividends_applied"] is True
+        assert payload["locked"]["dividends_applied"] is True
+        assert payload["design"]["dividends_net"] == 0.0
+        assert payload["design"]["total_return_method"] == payload["locked"]["total_return_method"]
+    desk = _walk_cli(tmp_path / "desk-raw", "desk", locked)
+    assert desk == 0
+    payload = json.loads((tmp_path / "desk-raw" / "desk" / "walkforward.json").read_text(encoding="utf-8"))
+    assert payload["accounting"]["total_return_method"] == "profile_dividends"
+    assert payload["accounting"]["dividends_applied"] is True
+    assert payload["design"]["dividends_net"] == 0.0
+    assert payload["design"]["dividends_applied"] == payload["locked"]["dividends_applied"]
+    arena = _walk_cli(tmp_path / "arena-raw", "arena", locked)
+    assert arena == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "Traceback" not in err
+    assert "The arena profile does not credit dividends." in err
+
+
+def test_walkforward_cli_rejects_an_out_of_sample_date_for_both_profiles(tmp_path, capsys):
+    typo = "session,amount\n1999-01-01,1.0\n"
+    for profile in ("arena", "desk"):
+        code = _walk_cli(tmp_path / profile, profile, typo)
+        assert code == 2
+        err = capsys.readouterr().err
+        assert err.startswith("error: ")
+        assert "Traceback" not in err
+        assert "dividend date 1999-01-01 is not in this sample" in err

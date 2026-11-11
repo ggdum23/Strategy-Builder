@@ -13,10 +13,14 @@ Phase 1 does not build that jail.
   locked window is opened again only after that child has exited. The locked
   book is a different process, so class attributes and objects created in the
   design run are not visible to it.
-- **Dividends.** The parent passes each child only the ex-dates whose session
-  is in that child's frame. A locked ex-date and its amount are not in the
-  design process. An Arena `run` of a complete sample still rejects a dividend
-  date that is not in that sample.
+- **Dividends.** The parent resolves one accounting record from the full
+  dividend file, then passes each child that record and only the ex-dates
+  whose session is in that child's frame. An empty map means the file was
+  present and this window has no ex-date. The child does not decide the
+  method from the map. A locked ex-date and its amount are not in the design
+  process. A dividend date that is not in the full sample fails the
+  walk-forward for Arena and for Desk before either child starts. An Arena
+  `run` of a complete sample still rejects a date that is not in that sample.
 - **Spill.** The locked window is written to a temporary file for that gap.
   The file is not an openable pickle. Its bytes are sealed with an
   HMAC-SHA256 keystream (stdlib `hmac` and `hashlib`). The 32-byte key is a
