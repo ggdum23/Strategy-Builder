@@ -6,6 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot "ci_process.ps1")
 
 $unins = Join-Path $Destination "unins000.exe"
 if (-not (Test-Path -LiteralPath $unins)) {
@@ -23,8 +24,9 @@ if (Test-Path -LiteralPath $log) {
     Remove-Item -LiteralPath $log -Force
 }
 
-& $unins /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/LOG=$log"
-$code = $LASTEXITCODE
+$arguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=""$log"""
+$code = Wait-GuiProcess -File $unins -Arguments $arguments
+Write-Output "uninstaller exit $code"
 
 $deadline = (Get-Date).AddSeconds(90)
 $cli = Join-Path $Destination "backtester.exe"

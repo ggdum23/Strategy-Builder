@@ -93,8 +93,12 @@ def test_installer_script_defaults_and_keeps_user_data():
     uninstall = (PACKAGING / "ci_uninstall.ps1").read_text(encoding="utf-8")
     assert "/VERYSILENT" in install and "/CURRENTUSER" in install
     assert 'must contain a space' in install
+    assert "Wait-GuiProcess" in install and "Wait-GuiProcess" in uninstall
     assert "/DELETEUSERDATA" not in uninstall
     assert "ci-preserve.txt" in uninstall
+    helper = (PACKAGING / "ci_process.ps1").read_text(encoding="utf-8")
+    assert "WaitForExit" in helper
+    assert "UseShellExecute = $false" in helper
 
 
 def test_workflow_builds_installs_smokes_and_publishes():

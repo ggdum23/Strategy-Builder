@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot "ci_process.ps1")
 
 if ($Destination -notmatch " ") {
     throw "install directory must contain a space: $Destination"
@@ -29,10 +30,12 @@ if (Test-Path -LiteralPath $log) {
 }
 
 Write-Output "Installing to $Destination"
-& $SetupExe /VERYSILENT /CURRENTUSER /SUPPRESSMSGBOXES /NORESTART "/DIR=$Destination" "/LOG=$log"
-if ($LASTEXITCODE -ne 0) {
+$arguments = "/VERYSILENT /CURRENTUSER /SUPPRESSMSGBOXES /NORESTART /DIR=""$Destination"" /LOG=""$log"""
+$code = Wait-GuiProcess -File $SetupExe -Arguments $arguments
+Write-Output "installer exit $code"
+if ($code -ne 0) {
     if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
-    throw "installer exited $LASTEXITCODE"
+    throw "installer exited $code"
 }
 
 $cli = Join-Path $Destination "backtester.exe"
