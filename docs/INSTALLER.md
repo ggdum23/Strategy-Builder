@@ -157,7 +157,8 @@ function so the resource tracker is diverted too.
 The runner's own scrub is unchanged and still applies in the child:
 
 - argv becomes `['backtester-design']` before the strategy is loaded
-- the working directory is an empty `bt-book-*` directory
+- the working directory is a fresh `bt-book-*` directory. The runner's
+  capped stdout/stderr file, `stdio.log`, is the only name in it
 - the environment keeps only the allowlist in `runner._ENV_KEEP`
 
 `PATH`, `SYSTEMROOT`, `TEMP` / `TMP`, and `LD_LIBRARY_PATH` stay, because

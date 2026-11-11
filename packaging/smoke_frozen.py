@@ -97,7 +97,12 @@ def _child_env(src: Path) -> dict:
 
 
 def assert_child_surface(payload: dict) -> None:
-    """The strategy saw only the runner allowlist, in an empty directory."""
+    """The strategy saw only the runner allowlist.
+
+    The working directory starts empty. The one file the runner itself
+    creates there is ``stdio.log``, the capped copy of the child's stdout
+    and stderr. Any other name is a file the strategy could see.
+    """
     from backtester.runner import _ENV_KEEP
 
     reported = payload.get("env_keys")
@@ -110,8 +115,10 @@ def assert_child_surface(payload: dict) -> None:
     extra = sorted({name for name in keys if name not in _ENV_KEEP and not name.startswith("LC_")})
     if extra:
         raise SystemExit(f"child environment is outside the allowlist: {extra}")
-    if payload.get("cwd_entries") != []:
-        raise SystemExit(f"child cwd was not empty: {payload.get('cwd_entries')}")
+    entries = payload.get("cwd_entries") or []
+    unexpected = [name for name in entries if name != "stdio.log"]
+    if unexpected:
+        raise SystemExit(f"child cwd was not empty: {entries}")
 
 
 def windows_file_version(path: Path) -> str:
