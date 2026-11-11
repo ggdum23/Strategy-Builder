@@ -451,7 +451,8 @@ def _present_designer(window, tmp_path: Path) -> None:
     assert not re.search(r"[a-z]:[\\/]", blob)
     assert "\\\\?\\" not in blob
     assert str(folder).casefold() not in blob
-    assert "random" in blob
+    assert window.results_page.path.text() == "<designer run>"
+    assert window.statusBar().currentMessage() == "Designer view."
     window.show_page(4)
 
 

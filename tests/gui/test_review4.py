@@ -297,15 +297,17 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
         n_fills=9,
         cost_basis={"share_scale": 2, "anonymized": True, "cost_schedule": "arena"},
     )
+    # 0.02 has significand "2", the same digits as this book's scale.
+    metrics["excess_total_return"] = 0.03
+    metrics["benchmarks"]["buy_and_hold_1x"]["total_return"] = 0.03
     folder = write_book(tmp_path / "fuzz", metrics, benchmark=False)
     window = _window(qtbot, tmp_path)
     page = window.results_page
     page.load_path(str(folder), audience="designer")
     QApplication.processEvents()
-    shown = str(page._report.metrics.get("comment") or "")
+    assert "comment" not in page._report.metrics
     blob = "\n".join(
         [
-            shown,
             page.identity.text(),
             page.cost_line.text(),
             page.chart.readout.text(),
@@ -319,9 +321,8 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
     assert "scale 2" not in blob
     for sample in dates[:12] + paths[:4]:
         assert sample not in blob, sample
-    assert "held" in shown and "RANDOM" in shown
     for piece in ("long_2x", "2.5", "2024.50", "0.2024", "day 2024"):
-        assert piece not in shown, piece
+        assert piece not in blob, piece
     exported = tmp_path / "copy"
     written = page.export_to(exported)
     assert "metrics.json" in written
@@ -330,5 +331,6 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
     for sample in dates[:12] + paths[:4]:
         assert sample not in sheet
     assert "QQQ" not in sheet
+    assert "comment" not in json.loads(sheet)
     for piece in ("long_2x", "2.5", "2024.50", "day 2024"):
         assert piece not in sheet

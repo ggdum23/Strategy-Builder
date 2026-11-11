@@ -40,6 +40,7 @@ from ..backend import RunReport, chart_overlay, drawdown_line, exposure_line, lo
 from ..charts import ChartPanel
 from ..format import MISSING, format_number, is_missing
 from ..schema import (
+    ACCOUNTING_KEYS,
     ACTIVITY_KEYS,
     BENCHMARK_TITLES,
     COPY_FILES,
@@ -146,6 +147,10 @@ class ResultsPage(QWidget):
         self.fees.setMinimumHeight(72)
         self.fees_footer = QLabel("")
         self.fees_footer.setObjectName("feesTotal")
+        self.accounting_title = Section("Accounting")
+        self.accounting = DictTable()
+        self.accounting.setObjectName("accountingTable")
+        self.accounting.setMinimumHeight(72)
         self.period_title = Section("Period returns")
         self.periods = PeriodHeat()
         self.jobs_title = Section("Jobs")
@@ -174,6 +179,8 @@ class ResultsPage(QWidget):
             self.fees_title,
             self.fees,
             self.fees_footer,
+            self.accounting_title,
+            self.accounting,
             self.period_title,
             self.periods,
             self.jobs_title,
@@ -263,8 +270,9 @@ class ResultsPage(QWidget):
     def _show_path(self, report: RunReport) -> None:
         shown = self._source_path
         if report.audience == "designer" and shown:
-            folder = Path(shown)
             shown = self._designer_line(report, shown)
+            if not shown.strip():
+                shown = "<designer run>"
         self.path.edit.blockSignals(True)
         self.path.set_text(shown)
         self.path.edit.blockSignals(False)
@@ -413,6 +421,7 @@ class ResultsPage(QWidget):
         self._fill_activity(book)
         self._fill_benchmarks(book)
         self._fill_fees(book)
+        self._fill_accounting(book)
         self._fill_periods(book)
         self._show_section(self.jobs_title, self.jobs, False)
         self._fill_other(book)
@@ -486,7 +495,7 @@ class ResultsPage(QWidget):
     def _show_chart(self, visible: bool) -> None:
         self.chart.setVisible(visible)
         if visible:
-            self.chart.setMinimumHeight(480)
+            self.chart.setMinimumHeight(520)
             self.chart.setMaximumHeight(16777215)
         else:
             self.chart.setMinimumHeight(0)
@@ -620,6 +629,44 @@ class ResultsPage(QWidget):
         if not rows:
             self.fees_footer.setVisible(False)
 
+    def _accounting_value(self, metrics: dict, key: str):
+        if key in metrics and not isinstance(metrics.get(key), (dict, list)):
+            return metrics.get(key)
+        nested = metrics.get("accounting")
+        if isinstance(nested, dict) and key in nested:
+            return nested.get(key)
+        return None
+
+    def _fill_accounting(self, book: RunReport) -> None:
+        """Settings and dollar amounts the report stored. Nothing is recomputed."""
+        metrics = book.metrics if isinstance(book.metrics, dict) else {}
+        nested = metrics.get("accounting") if isinstance(metrics.get("accounting"), dict) else {}
+        rows = []
+        for key in ACCOUNTING_KEYS:
+            if key not in metrics and key not in nested:
+                continue
+            spec = SPECS.get(key)
+            value = self._accounting_value(metrics, key)
+            kind = spec.kind if spec else leaderboard_kind(key)
+            if isinstance(value, bool):
+                value = "yes" if value else "no"
+                kind = "text"
+            rows.append(
+                {
+                    "setting": spec.label if spec else key,
+                    "value": value,
+                    "kind": kind,
+                }
+            )
+        self.accounting.set_records(
+            ("setting", "value"),
+            rows,
+            {"setting": "Setting", "value": "Value"},
+            row_kinds={"value": "kind"},
+        )
+        self._fit_table(self.accounting, len(rows) or 1)
+        self._show_section(self.accounting_title, self.accounting, bool(rows))
+
     def _fill_periods(self, book: RunReport) -> None:
         payload = book.period_returns if isinstance(book.period_returns, dict) else None
         self.periods.set_periods(payload, self.host.theme)
@@ -703,6 +750,8 @@ class ResultsPage(QWidget):
         index = 0
         for key in DESK_KEYS:
             if key not in metrics and metrics.get("profile") != "desk":
+                continue
+            if report_is_designer(book) and key not in metrics:
                 continue
             if report_is_designer(book) and key == "share_factor":
                 continue
@@ -792,6 +841,8 @@ class ResultsPage(QWidget):
         self.fees.set_records(("component",), [])
         self.fees_footer.setText("")
         self.fees_footer.setVisible(False)
+        self._show_section(self.accounting_title, self.accounting, False)
+        self.accounting.set_records(("setting",), [])
         self.period_title.setVisible(False)
         self.periods.clear()
         self.periods.setVisible(False)
@@ -849,7 +900,7 @@ class ResultsPage(QWidget):
             drawdown=drawdown,
             sessions=sessions,
             equity_note="Equity and the benchmark, from the report files.",
-            drawdown_note=dd_note or "Drawdown is equity divided by its running peak, minus one.",
+            drawdown_note=dd_note or "Drawdown is equity / running peak − 1.",
             exposure=exposure,
         )
         self.chart.caption.setToolTip(note)

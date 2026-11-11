@@ -184,7 +184,7 @@ def test_share_factor_is_withheld_like_share_scale(qtbot, tmp_path):
     metrics["symbol"] = "QQQ"
     folder = write_book(tmp_path / "book", metrics, benchmark=False)
     (folder / "fills.csv").write_text("note\nshare_factor 0.42\n", encoding="utf-8")
-    (folder / "trades.csv").write_text("note\nplain row\n", encoding="utf-8")
+    (folder / "trades.csv").write_text("side\nplain row\n", encoding="utf-8")
     (folder / "equity.png").write_bytes(_png_itxt(b"share_factor 0.42"))
     window = _window(qtbot, tmp_path)
     page = window.results_page

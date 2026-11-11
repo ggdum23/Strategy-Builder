@@ -99,6 +99,7 @@ def test_headers_and_keys_use_the_same_stripper(qtbot, tmp_path):
     metrics["symbol"] = "QQQ"
     metrics["QQQ"] = "see QQQ"
     metrics["comment"] = "see QQQ"
+    metrics["strategy_id"] = "QQQ"
     metrics[_PATH_KEY] = 1
     folder = write_book(tmp_path / "book", metrics, benchmark=False)
     (folder / "fills.csv").write_text(
@@ -111,12 +112,17 @@ def test_headers_and_keys_use_the_same_stripper(qtbot, tmp_path):
     page.load_path(str(folder), audience="designer")
     QApplication.processEvents()
     headers = _headers(page.fills)
-    assert "RANDOM" in headers
     assert "QQQ" not in headers
+    assert "RANDOM" not in headers
     assert "ASSET" not in headers
+    assert "date" not in headers
+    assert "open" not in headers
+    assert "day" in headers and "session" in headers
     other = _table_text(page.other)
     assert "RANDOM" in other
-    assert "field" in other
+    assert "strategy_id" in page._report.other_fields
+    assert "comment" not in page._report.metrics
+    assert "QQQ" not in page._report.metrics
     for needle in ("QQQ", "ASSET", "Users", "Builder", "data.csv", _PATH_KEY):
         assert needle not in other
     page.load_path(str(folder), audience="operator")

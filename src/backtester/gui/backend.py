@@ -198,7 +198,7 @@ def _floats(values) -> list[float]:
 def _drawdown(equity: list[float], initial) -> tuple[list[float], str]:
     """Picture of the equity column. Not the official max drawdown."""
     series = list(equity)
-    note = "Drawdown is equity divided by its running peak, minus one."
+    note = "Drawdown is equity / running peak − 1."
     if not is_missing(initial):
         try:
             series = [float(initial)] + series

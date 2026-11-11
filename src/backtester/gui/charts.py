@@ -240,7 +240,7 @@ class ChartPanel(QWidget):
         tools.addWidget(self.exposure_box)
         tools.addWidget(reset)
         self.canvas = pg.GraphicsLayoutWidget()
-        self.canvas.setMinimumHeight(420)
+        self.canvas.setMinimumHeight(360)
         self.equity_plot = self.canvas.addPlot(
             row=0,
             col=0,
@@ -271,14 +271,16 @@ class ChartPanel(QWidget):
         self.dd_caption = QLabel("")
         self.dd_caption.setObjectName("muted")
         self.dd_caption.setWordWrap(True)
+        self.dd_caption.setMinimumHeight(22)
         self.readout = QLabel("Drag to pan. Wheel to zoom. The readout is the session and each series.")
         self.readout.setObjectName("crosshair")
         self.readout.setWordWrap(True)
+        self.readout.setMinimumHeight(22)
         layout.addLayout(tools)
         layout.addWidget(self.canvas, 1)
         layout.addWidget(self.dd_caption)
         layout.addWidget(self.readout)
-        self.setMinimumHeight(480)
+        self.setMinimumHeight(520)
         self._vline_equity = pg.InfiniteLine(angle=90, movable=False)
         self._vline_drawdown = pg.InfiniteLine(angle=90, movable=False)
         self.canvas.scene().sigMouseMoved.connect(self._moved)

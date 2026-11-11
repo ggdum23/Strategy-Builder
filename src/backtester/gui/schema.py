@@ -97,6 +97,7 @@ PANEL_KEYS = frozenset(
         "symbol",
         "bar_minutes",
         "error",
+        "accounting",
     }
 )
 
@@ -185,6 +186,63 @@ METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("financing_rate_annual", "Financing rate", "fraction", "desk", "Annual financing rate stored on the run. Arena stays at 0."),
     MetricSpec("borrow_rate_annual", "Borrow rate", "fraction", "desk", "Annual borrow rate stored on the run."),
     MetricSpec("share_factor", "Share factor", "ratio", "desk", "Share factor stored on the Desk result. Named raw runs are 1."),
+    MetricSpec("price_basis", "Price basis", "text", "accounting", "raw or total_return, as stored on the run."),
+    MetricSpec(
+        "total_return_method",
+        "Total-return method",
+        "text",
+        "accounting",
+        "none, profile_dividends, cash_dividends, or registry_series.",
+    ),
+    MetricSpec("series_kind", "Series kind", "text", "accounting", "raw or total_return, the kind the file was declared as."),
+    MetricSpec(
+        "cash_rate_annual",
+        "Cash rate",
+        "fraction",
+        "accounting",
+        "Annual decimal earned by idle cash. 0.05 is 5 percent. Unit: fraction per year.",
+    ),
+    MetricSpec(
+        "withholding_rate",
+        "Withholding",
+        "fraction",
+        "accounting",
+        "Fraction of a positive long dividend withheld. 0.15 is 15 percent.",
+    ),
+    MetricSpec("accrual", "Accrual", "text", "accounting", "session_boundary_1_252. One step of rate / 252 at each session boundary."),
+    MetricSpec("sessions_per_year", "Sessions / year", "count", "accounting", "252. The accrual divisor stored on the run."),
+    MetricSpec(
+        "dividends_applied",
+        "Dividends applied",
+        "text",
+        "accounting",
+        "True when a dividend file was credited. This is the stored flag, not a guess.",
+    ),
+    MetricSpec(
+        "cash_interest",
+        "Cash interest",
+        "money",
+        "accounting",
+        "Dollars credited on idle cash. rate / 252 on max(0, equity − |position value|). Unit: dollars.",
+    ),
+)
+
+# Settings and dollar amounts from the accounting record. The results page
+# lists these in this order. Dollar amounts can be inverted into a notional
+# or a share count; the designer allow-list drops those and keeps the settings.
+ACCOUNTING_KEYS = (
+    "price_basis",
+    "total_return_method",
+    "series_kind",
+    "cash_rate_annual",
+    "financing_rate_annual",
+    "withholding_rate",
+    "accrual",
+    "sessions_per_year",
+    "dividends_applied",
+    "cash_interest",
+    "financing_cost",
+    "dividends_net",
 )
 
 SPECS = {spec.key: spec for spec in METRICS}
@@ -233,6 +291,15 @@ _LEADERBOARD_KIND = {
     "extended_hours_fill_notional_frac": "fraction",
     "financing_rate_annual": "fraction",
     "borrow_rate_annual": "fraction",
+    "cash_rate_annual": "fraction",
+    "withholding_rate": "fraction",
+    "price_basis": "text",
+    "total_return_method": "text",
+    "series_kind": "text",
+    "accrual": "text",
+    "sessions_per_year": "count",
+    "dividends_applied": "text",
+    "cash_interest": "money",
     "sharpe": "ratio2",
     "sortino": "ratio2",
     "calmar": "ratio2",
@@ -289,6 +356,15 @@ LEADERBOARD_LABELS = {
     "long_round_trips": "Long trips",
     "short_round_trips": "Short trips",
     "timeout_s": "Timeout s",
+    "price_basis": "Price basis",
+    "total_return_method": "Total-return method",
+    "series_kind": "Series kind",
+    "cash_rate_annual": "Cash rate",
+    "withholding_rate": "Withholding",
+    "accrual": "Accrual",
+    "sessions_per_year": "Sessions / year",
+    "dividends_applied": "Dividends applied",
+    "cash_interest": "Cash interest",
 }
 
 
@@ -332,6 +408,9 @@ ASSEMBLED_COLUMNS = (
     "financing_cost",
     "borrow_cost",
     "dividends_net",
+    "cash_interest",
+    "price_basis",
+    "cash_rate_annual",
     "margin_calls_filled",
     "max_gross_leverage",
     "worst_equity_over_hwm",

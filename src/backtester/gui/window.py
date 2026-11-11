@@ -188,6 +188,7 @@ class MainWindow(QMainWindow):
 
     def set_status(self, text: str) -> None:
         self._status_text = text
+        self._status_while_designer = self._results_are_designer()
         self._publish_status()
 
     def note_results_audience(self) -> None:
@@ -237,6 +238,9 @@ class MainWindow(QMainWindow):
         return designer_surface_text(text, self._chrome_symbols(), scale=self._chrome_scale())
 
     def _publish_status(self) -> None:
+        if self._results_are_designer() and not getattr(self, "_status_while_designer", False):
+            self._status.showMessage("Designer view.")
+            return
         self._status.showMessage(self._public_text(self._status_text))
 
     def remember(self, **values: str) -> None:

@@ -16,6 +16,7 @@ import json
 import math
 import re
 import zlib
+from decimal import Decimal
 from pathlib import Path
 
 _MONTH = (
@@ -64,21 +65,30 @@ _SECRET_WORDS = re.compile(
 )
 # A path may contain spaces and commas (``Strategy Builder, Inc\QQQ\data.csv``).
 # ``\\?\UNC\``, ``\\?\``, and the slash forms ``//?/UNC/`` and ``//?/`` are paths.
-# After that prefix the rest of the field belongs to the path, including commas,
-# and it stops at a quote or the end of the line. A slash date such as 2024/1/4
-# is not a path: a POSIX path needs a letter in it.
+# A drive-relative path (``C:Users\...``, ``C:secret\NOTES.md``) is a path too.
+# So is a relative backslash path that contains ``hidden``, ``secret``, ``graded``,
+# or ``NOTES.md``. After a path starts, the rest of the field belongs to it,
+# including commas, and it stops at a quote or the end of the line. The word
+# immediately before or after a ``\\?\`` / ``//?/`` path goes with it. A slash
+# date such as 2024/1/4 is not a path: a POSIX path needs a letter in it.
 _PATH_TAIL = r"[^'\"\r\n]*"
+_ADJACENT_WORD = r"[A-Za-z][A-Za-z0-9_.-]*"
+_BEFORE_DEVICE = rf"(?:(?<![A-Za-z0-9_]){_ADJACENT_WORD}[ \t]+)?"
+_AFTER_DEVICE = rf"(?:['\"]?[ \t]+{_ADJACENT_WORD})?"
+_REL_KEYWORD = r"(?i:hidden|secret|graded|NOTES\.md)"
 _ABS_PATH = re.compile(
     "|".join(
         (
-            r"\\\\\?\\UNC\\" + _PATH_TAIL,
-            r"//\?/UNC/" + _PATH_TAIL,
-            r"\\\\\?\\" + _PATH_TAIL,
-            r"//\?/" + _PATH_TAIL,
-            r"[A-Za-z]:[\\/]" + _PATH_TAIL,
+            _BEFORE_DEVICE + r"\\\\\?\\UNC\\" + _PATH_TAIL + _AFTER_DEVICE,
+            _BEFORE_DEVICE + r"//\?/UNC/" + _PATH_TAIL + _AFTER_DEVICE,
+            _BEFORE_DEVICE + r"\\\\\?\\" + _PATH_TAIL + _AFTER_DEVICE,
+            _BEFORE_DEVICE + r"//\?/" + _PATH_TAIL + _AFTER_DEVICE,
+            r"(?<![A-Za-z0-9_])[A-Za-z]:(?:[\\/]|[^'\"\r\n\\/]*\\)" + _PATH_TAIL,
             r"\\\\[^\\/'\"<>|*?\r\n]+[\\/]" + _PATH_TAIL,
             r"//[^/'\"<>|*?\r\n]+/" + _PATH_TAIL,
             r"/(?:[^/'\"<>|*?\r\n]+/)+[^/'\"<>|*?\r\n]*[A-Za-z]" + _PATH_TAIL,
+            rf"(?<![A-Za-z0-9_])(?:[^\\/'\"\r\n]+\\)+{_REL_KEYWORD}[^'\"\r\n]*",
+            rf"(?<![A-Za-z0-9_]){_REL_KEYWORD}\\[^'\"\r\n]*",
         )
     )
 )
@@ -86,10 +96,11 @@ _ABS_PATH = re.compile(
 _NUMBER_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?(?![A-Za-z0-9_])"
 )
-# A decimal or a scientific literal inside a larger token (``build2_7.777``, ``v2_1e7.777``).
-# A bare integer is not this shape, so ``long_2x`` stays.
-_EMBEDDED_SCALE = re.compile(
-    r"(?<![0-9.])([+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?|[+-]?\d+[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+# Every numeric literal: optional sign, digits, optional decimal, optional exponent.
+# It may be glued to letters or underscores. ``_scale_in_token`` is the one
+# comparison the screen and the export both use.
+_NUMBER_LITERAL = re.compile(
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?"
 )
 _MONTH_WORDS = frozenset(
     "jan january feb february mar march apr april may jun june jul july aug august "
@@ -107,10 +118,17 @@ _NUMBER_CORE = r"(?:\d{1,3}(?:,\d{3})+(?:\.\d*)?|\d+(?:\.\d*)?|\.\d+)"
 _NUMBER_EXP = r"(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?"
 _NUMBER_SURFACE = re.compile(rf"[+-]?\$?{_NUMBER_CORE}{_NUMBER_EXP}%?")
 _HYPHEN_WORD = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)+")
+# A signed exponent stays inside the word token (``build2_7777e-3``). The
+# letter class does not swallow the ``e`` of that exponent, or the following
+# ``-3`` would be a separate token and the scale check would miss it.
+_WORD_WITH_EXP = (
+    r"(?:(?![eE][+-])[A-Za-z0-9_.])+[eE][+-](?:\d+(?:\.\d*)?|\.\d+)"
+    r"|[A-Za-z0-9_.]+"
+)
 _SURFACE_TOKEN = re.compile(
     rf"(?<![A-Za-z0-9_])[+-]?\$?{_NUMBER_CORE}{_NUMBER_EXP}%?(?![A-Za-z0-9_])"
     rf"|{_HYPHEN_WORD.pattern}"
-    r"|[A-Za-z0-9_.]+"
+    rf"|{_WORD_WITH_EXP}"
 )
 _GLUED_YEAR = re.compile(r"(?i)(?:[A-Za-z](?:19|20)\d{2}|(?:19|20)\d{2}[A-Za-z])")
 _MONTH_IN_TOKEN = re.compile(rf"(?i)(?<![A-Za-z]){_MONTH}(?![A-Za-z])")
@@ -170,12 +188,135 @@ PRICE_COLUMNS = frozenset(
     }
 )
 # Share counts let equity and exposure be inverted back into a price.
-# A redacted view drops them with the price columns. A published designer/
-# tree keeps the scaled counts Phase 3 wrote.
+# A published designer/ tree keeps the scaled counts Phase 3 wrote.
+# A redacted view does not use this list: it keeps only REDACTED_KEYS.
 SHARE_COLUMNS = frozenset({"shares", "shares_delta", "shares_after", "position_shares"})
 
+# A redacted designer surface (screen and export) keeps these names and drops
+# every other key. A new field is hidden until it is added here. Safe by
+# construction: returns, ratios, exposure, drawdowns, counts, bar indices,
+# and a single fee total. No share counts, prices, notionals, or per-component
+# fees. ``open`` is a fill price, so it is not listed; ``open_position_at_end`` is.
+REDACTED_KEYS = frozenset(
+    {
+        "total_return",
+        "cagr",
+        "ann_vol",
+        "max_drawdown",
+        "worst_day",
+        "best_day",
+        "hit_rate",
+        "percent_up_days",
+        "excess_total_return",
+        "bh_total_return",
+        "long_2x_total_return",
+        "frac_bars_long",
+        "frac_bars_short",
+        "frac_sessions_long_at_close",
+        "frac_sessions_short_at_close",
+        "extended_hours_fill_notional_frac",
+        "borrow_rate_annual",
+        "financing_rate_annual",
+        "cash_rate_annual",
+        "withholding_rate",
+        "sharpe",
+        "sortino",
+        "calmar",
+        "turnover_per_year",
+        "avg_abs_exposure_close",
+        "avg_net_exposure_close",
+        "avg_abs_exposure_bars",
+        "worst_equity_over_hwm",
+        "max_gross_leverage",
+        "avg_gross_leverage",
+        "fee_mult",
+        "years",
+        "sessions_per_year",
+        "equity",
+        "exposure",
+        "position",
+        "initial_equity",
+        "final_equity",
+        "sessions",
+        "n_fills",
+        "round_trips",
+        "long_round_trips",
+        "short_round_trips",
+        "max_dd_duration_sessions",
+        "margin_calls_queued",
+        "margin_calls_filled",
+        "avg_holding_sessions",
+        "avg_holding_bars",
+        "rank",
+        "bar_minutes",
+        "timeout_s",
+        "disqualified",
+        "busted",
+        "open_position_at_end",
+        "anonymized",
+        "cancelled",
+        "dividends_applied",
+        "first_session",
+        "last_session",
+        "first_day",
+        "last_day",
+        "session",
+        "ordinal",
+        "day",
+        "minute",
+        "bars",
+        "start_ordinal",
+        "end_ordinal",
+        "start_day",
+        "end_day",
+        "fees_total",
+        "total",
+        "fees_breakdown",
+        "period_returns",
+        "monthly",
+        "yearly",
+        "liquidation",
+        "benchmarks",
+        "buy_and_hold_1x",
+        "long_2x",
+        "profile",
+        "audience",
+        "accounting",
+        "price_basis",
+        "total_return_method",
+        "series_kind",
+        "accrual",
+        "status",
+        "error",
+        "state",
+        "name",
+        "strategy_id",
+        "source_id",
+        "kind",
+        "phase",
+        "time",
+        "side",
+        "leg",
+        "message",
+    }
+)
+# Period stand-ins written by the engines and by the month/year relabel.
+_PERIOD_KEY = re.compile(r"[SBMY]\d+")
 
-def _hide_column(name: str, *, drop_prices: bool) -> bool:
+
+def redacted_key_allowed(name: str) -> bool:
+    """True when a redacted designer surface may keep this field name.
+
+    Screen and export both go through ``_hide_column(..., allow_list=True)``,
+    which calls this. A key that is not listed is dropped.
+    """
+    key = str(name)
+    return key in REDACTED_KEYS or _PERIOD_KEY.fullmatch(key) is not None
+
+
+def _hide_column(name: str, *, drop_prices: bool, allow_list: bool = False) -> bool:
+    if allow_list:
+        return not redacted_key_allowed(name)
     if name in DESIGNER_DROP_KEYS:
         return True
     return bool(drop_prices and (name in PRICE_COLUMNS or name in SHARE_COLUMNS))
@@ -341,21 +482,35 @@ def _month_near_year(text: str) -> bool:
     )
 
 
-def _scrub_obj(value, symbols: tuple[str, ...], *, drop_prices: bool, scale: float | None = None):
+def _scrub_obj(
+    value,
+    symbols: tuple[str, ...],
+    *,
+    drop_prices: bool,
+    scale: float | None = None,
+    allow_list: bool = False,
+):
     if isinstance(value, dict):
         if _is_period_map(value):
-            return _relabel_periods(value, symbols, drop_prices=drop_prices, scale=scale)
+            return _relabel_periods(
+                value, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list
+            )
         clean = {}
         used: set[str] = set()
         for key, item in value.items():
             name = str(key)
-            if _hide_column(name, drop_prices=drop_prices):
+            if _hide_column(name, drop_prices=drop_prices, allow_list=allow_list):
                 continue
             renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
-            clean[renamed] = _scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale)
+            clean[renamed] = _scrub_obj(
+                item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list
+            )
         return clean
     if isinstance(value, list):
-        return [_scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale) for item in value]
+        return [
+            _scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list)
+            for item in value
+        ]
     if isinstance(value, str):
         return _scrub_string(value, symbols, scale)
     return value
@@ -369,7 +524,14 @@ def _is_period_map(value: dict) -> bool:
     return any(str(key) in {"monthly", "yearly"} and isinstance(item, dict) for key, item in value.items())
 
 
-def _relabel_periods(value: dict, symbols: tuple[str, ...], *, drop_prices: bool, scale: float | None):
+def _relabel_periods(
+    value: dict,
+    symbols: tuple[str, ...],
+    *,
+    drop_prices: bool,
+    scale: float | None,
+    allow_list: bool = False,
+):
     """Monthly and yearly keys become ``M1``, ``M2`` and ``Y1``, ``Y2``. Every value stays."""
     clean = {}
     used: set[str] = set()
@@ -379,12 +541,18 @@ def _relabel_periods(value: dict, symbols: tuple[str, ...], *, drop_prices: bool
             prefix = "M" if name == "monthly" else "Y"
             nested = {}
             for index, child in enumerate(item.values(), start=1):
-                nested[f"{prefix}{index}"] = _scrub_obj(child, symbols, drop_prices=drop_prices, scale=scale)
+                nested[f"{prefix}{index}"] = _scrub_obj(
+                    child, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list
+                )
             clean[name] = nested
             used.add(name)
             continue
+        if _hide_column(name, drop_prices=drop_prices, allow_list=allow_list):
+            continue
         renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
-        clean[renamed] = _scrub_obj(item, symbols, drop_prices=drop_prices, scale=scale)
+        clean[renamed] = _scrub_obj(
+            item, symbols, drop_prices=drop_prices, scale=scale, allow_list=allow_list
+        )
     return clean
 
 
@@ -406,14 +574,21 @@ def _replace_table(table, columns, rows):
     return type(table)(columns=tuple(columns), rows=tuple(rows), source=table.source)
 
 
-def _scrub_table(table, symbols: tuple[str, ...], *, drop_prices: bool, scale: float | None = None):
+def _scrub_table(
+    table,
+    symbols: tuple[str, ...],
+    *,
+    drop_prices: bool,
+    scale: float | None = None,
+    allow_list: bool = False,
+):
     if table is None:
         return None
     pairs = []
     used: set[str] = set()
     for column in table.columns:
         name = str(column)
-        if _hide_column(name, drop_prices=drop_prices):
+        if _hide_column(name, drop_prices=drop_prices, allow_list=allow_list):
             continue
         # Headers use the same stripper as values. A ticker-only header becomes RANDOM.
         renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
@@ -433,20 +608,36 @@ def _scrub_table(table, symbols: tuple[str, ...], *, drop_prices: bool, scale: f
 def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: float | None = None) -> None:
     """Mutate ``report`` so a designer screen cannot render operator secrets."""
     report.audience = "designer"
-    report.metrics = _scrub_obj(report.metrics, symbols, drop_prices=redacted, scale=scale)
-    report.other_fields = _scrub_obj(report.other_fields, symbols, drop_prices=redacted, scale=scale)
-    report.benchmarks = _scrub_obj(report.benchmarks, symbols, drop_prices=redacted, scale=scale)
+    report.metrics = _scrub_obj(
+        report.metrics, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+    )
+    report.other_fields = _scrub_obj(
+        report.other_fields, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+    )
+    report.benchmarks = _scrub_obj(
+        report.benchmarks, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+    )
     report.cost_basis = None
     if report.liquidation is not None:
-        report.liquidation = _scrub_obj(report.liquidation, symbols, drop_prices=redacted, scale=scale)
+        report.liquidation = _scrub_obj(
+            report.liquidation, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        )
     if report.config is not None:
-        report.config = _scrub_obj(report.config, symbols, drop_prices=True, scale=scale)
+        report.config = _scrub_obj(
+            report.config, symbols, drop_prices=True, scale=scale, allow_list=redacted
+        )
     if report.walkforward is not None:
-        report.walkforward = _scrub_obj(report.walkforward, symbols, drop_prices=True, scale=scale)
+        report.walkforward = _scrub_obj(
+            report.walkforward, symbols, drop_prices=True, scale=scale, allow_list=redacted
+        )
     if report.fees_breakdown is not None:
-        report.fees_breakdown = _scrub_obj(report.fees_breakdown, symbols, drop_prices=False, scale=scale)
+        report.fees_breakdown = _scrub_obj(
+            report.fees_breakdown, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        )
     if report.period_returns is not None:
-        report.period_returns = _scrub_obj(report.period_returns, symbols, drop_prices=False, scale=scale)
+        report.period_returns = _scrub_obj(
+            report.period_returns, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        )
     report.warnings = [designer_surface_text(str(item), symbols, scale=scale) for item in report.warnings]
     report.missing = [designer_surface_text(str(item), symbols, scale=scale) for item in report.missing]
     for curve in list(report.curves) + list(report.benchmark_curves):
@@ -456,10 +647,16 @@ def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: f
         if curve.name not in _PROTECTED_CURVE_NAMES:
             curve.name = designer_surface_text(str(curve.name), symbols, scale=scale)
         curve.drawdown_note = designer_surface_text(str(curve.drawdown_note), symbols, scale=scale)
-    report.fills = _scrub_table(report.fills, symbols, drop_prices=redacted, scale=scale)
-    report.episodes = _scrub_table(report.episodes, symbols, drop_prices=redacted, scale=scale)
+    report.fills = _scrub_table(
+        report.fills, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+    )
+    report.episodes = _scrub_table(
+        report.episodes, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+    )
     if report.leaderboard is not None:
-        report.leaderboard = _scrub_table(report.leaderboard, symbols, drop_prices=redacted, scale=scale)
+        report.leaderboard = _scrub_table(
+            report.leaderboard, symbols, drop_prices=redacted, scale=scale, allow_list=redacted
+        )
     cleaned_children = []
     for child in report.children:
         if not isinstance(child, dict):
@@ -469,13 +666,13 @@ def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: f
         if nested is not None and hasattr(nested, "metrics"):
             apply_designer(nested, symbols, redacted=redacted, scale=scale)
             outer = {key: value for key, value in child.items() if key not in {"report", "path"}}
-            outer = _scrub_obj(outer, symbols, drop_prices=True, scale=scale)
+            outer = _scrub_obj(outer, symbols, drop_prices=True, scale=scale, allow_list=redacted)
             outer.pop("path", None)
             _strip_child_error(outer, symbols, scale)
             outer["report"] = nested
             cleaned_children.append(outer)
             continue
-        cleaned_children.append(_designer_child(child, symbols, scale=scale))
+        cleaned_children.append(_designer_child(child, symbols, scale=scale, allow_list=redacted))
     report.children = cleaned_children
 
 
@@ -520,26 +717,6 @@ def _numeric_text(token: str) -> str:
     return sign + text.replace(",", "")
 
 
-def _glued_scale_number(token: str) -> str | None:
-    """A number glued to letters, as in ``scale7.777`` or ``x7.777``.
-
-    ``long_2x`` is not this shape: the digit is not the whole remainder of the token.
-    """
-    prefixed = re.fullmatch(
-        r"(?i)[A-Za-z]+_?([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)%?",
-        token,
-    )
-    if prefixed:
-        return prefixed.group(1)
-    suffixed = re.fullmatch(
-        r"(?i)([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)%?_?[A-Za-z]+",
-        token,
-    )
-    if suffixed:
-        return suffixed.group(1)
-    return None
-
-
 def _exponent_text(token: str) -> str | None:
     match = re.search(r"[eE]([+-]?(?:\d+(?:\.\d*)?|\.\d+))$", token)
     if match is None:
@@ -547,29 +724,75 @@ def _exponent_text(token: str) -> str | None:
     return match.group(1)
 
 
-def _scale_in_token(token: str, scale: float | None) -> bool:
-    """True when this token's number, decimal, or exponent is the invoice scale.
+def _significand_digits(literal: str) -> str:
+    """Digits of the significand, with the decimal point and end zeros removed."""
+    mantissa = re.split(r"[eE]", literal.strip(), maxsplit=1)[0]
+    mantissa = mantissa.lstrip("+-").replace(".", "").replace(",", "")
+    digits = mantissa.strip("0")
+    return digits or "0"
 
-    A standalone ``2``, a glued ``scale7.777``, and ``build2_7.777`` all count
-    when that number equals the scale. ``long_2x``, ``2.5``, and ``12`` do not.
+
+def _scale_digits(number: float) -> str:
+    text = format(Decimal(str(abs(number))), "f").rstrip("0").rstrip(".")
+    return _significand_digits(text)
+
+
+def _power_of_ten_multiple(value: float, base: float) -> bool:
+    if value == 0 or base == 0 or not math.isfinite(value) or not math.isfinite(base):
+        return False
+    ratio = abs(value / base)
+    log = math.log10(ratio)
+    nearest = round(log)
+    if abs(nearest) > 24:
+        return False
+    return math.isclose(ratio, 10.0**nearest, rel_tol=1e-6, abs_tol=0.0)
+
+
+def _literal_is_scale(literal: str, scale: float) -> bool:
+    """True when this literal is the scale, its reciprocal, or the scale times 10^k.
+
+    The significand digit string is compared with the scale's digit string.
+    The parsed value is compared with the scale, with the reciprocal, and
+    with the scale scaled by powers of ten. The exponent is the same kind of literal.
+    """
+    if _significand_digits(literal) == _scale_digits(scale):
+        return True
+    exponent = _exponent_text(literal)
+    if exponent is not None and exponent != literal and _literal_is_scale(exponent, scale):
+        return True
+    try:
+        value = abs(float(literal))
+    except ValueError:
+        return False
+    if not math.isfinite(value):
+        return False
+    if scale != 0 and math.isclose(value, abs(1.0 / scale), rel_tol=1e-9, abs_tol=1e-12):
+        return True
+    return _power_of_ten_multiple(value, abs(scale)) or math.isclose(
+        value, abs(scale), rel_tol=1e-9, abs_tol=1e-12
+    )
+
+
+def _scale_in_token(token: str, scale: float | None) -> bool:
+    """True when any numeric literal in ``token`` is the invoice scale.
+
+    One regex pulls every literal (optional sign, digits, optional decimal,
+    optional exponent), glued to letters or not. A bare integer counts only
+    when it is the whole token, so ``long_2x`` stays and a standalone ``2``
+    does not. ``2.5`` is a different significand. The screen and the export
+    both call this.
     """
     number = _scale_number(scale)
-    if number is None:
+    if number is None or not token:
         return False
-    if _NUMBER_SURFACE.fullmatch(token):
-        if _same_number(_numeric_text(token), number):
-            return True
-        exponent = _exponent_text(_numeric_text(token))
-        return exponent is not None and _same_number(exponent, number)
-    glued = _glued_scale_number(token)
-    if glued is not None and _same_number(glued, number):
-        return True
-    for match in _EMBEDDED_SCALE.finditer(token):
-        piece = match.group(1)
-        if _same_number(piece, number):
-            return True
-        exponent = _exponent_text(piece)
-        if exponent is not None and _same_number(exponent, number):
+    probed = token.replace("$", "").replace("%", "").replace(",", "")
+    for match in _NUMBER_LITERAL.finditer(probed):
+        literal = match.group(0)
+        bare_integer = re.fullmatch(r"[+-]?\d+", literal) is not None
+        whole = match.start() == 0 and match.end() == len(probed)
+        if bare_integer and not whole:
+            continue
+        if _literal_is_scale(literal, number):
             return True
     return False
 
@@ -684,13 +907,20 @@ def _leaf_token(value, symbols: tuple[str, ...], *, scale: float | None = None) 
     return text.strip()
 
 
-def _designer_child(child: dict, symbols: tuple[str, ...], *, scale: float | None = None) -> dict:
+def _designer_child(
+    child: dict,
+    symbols: tuple[str, ...],
+    *,
+    scale: float | None = None,
+    allow_list: bool = False,
+) -> dict:
     """A job row a designer may see. No filesystem path and no ticker."""
     cleaned = _scrub_obj(
         {key: value for key, value in child.items() if key != "path"},
         symbols,
         drop_prices=True,
         scale=scale,
+        allow_list=allow_list,
     )
     cleaned.pop("path", None)
     _strip_child_error(cleaned, symbols, scale)
