@@ -284,7 +284,8 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
         open_ep = {"side": ep["side"], "start_day": ep["start_day"], "end_day": cur_day, "bars": ep_bar_count[0],
                    "pnl": ep["cf"] + shares * last_close, "entry_notional": ep["entry_notional"], "open": True}
     return {
-        "initial_equity": initial_equity, "daily": daily, "fills": fills, "episodes": episodes, "open_episode": open_ep,
+        "initial_equity": initial_equity, "share_scale": share_scale,
+        "daily": daily, "fills": fills, "episodes": episodes, "open_episode": open_ep,
         "fees": fees_tot, "slippage": slip_tot, "borrow": borrow_tot, "traded_notional": traded_notional,
         "eth_notional": eth_notional, "n_fills": n_fills, "busted": busted,
         "bar_exposure": {"avg_abs": sum_abs_exp / n_exp if n_exp else 0.0, "frac_long": n_long / n_exp if n_exp else 0.0,

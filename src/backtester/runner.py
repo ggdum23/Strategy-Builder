@@ -13,6 +13,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import hmac
+import math
 import os
 import pickle
 import shutil
@@ -44,6 +45,7 @@ _ARENA_KEYS = (
     "fees_total",
     "borrow_cost",
     "percent_up_days",
+    "cost_basis",
 )
 
 _DESK_KEYS = _ARENA_KEYS + (
@@ -60,6 +62,79 @@ _DESK_KEYS = _ARENA_KEYS + (
     "share_factor",
     "fee_mult",
 )
+
+
+def _cost_basis(profile: str, share_factor: float, *, anonymized: bool) -> dict:
+    """What the invoice used. The strategy does not receive this dict."""
+    schedule = get_profile(profile).fee_table
+    name = get_profile(profile).name
+    return {
+        "share_scale": share_factor,
+        "share_factor": share_factor,
+        "anonymized": bool(anonymized),
+        "per_share_fees": "real_share_counts",
+        "value_fees": "unscaled_trade_value",
+        "cost_schedule": schedule,
+        "profile": name,
+        "note": (
+            f"Per-share fees use real share counts (share_scale={share_factor}). "
+            f"Value-based fees use trade value. Cost schedule: {schedule}."
+        ),
+    }
+
+
+def _release(holder: list):
+    """Hand the billing value to the callee and leave this frame without it.
+
+    The engine still has the scale for the duration of ``on_bar``. The runner
+    frames above that call do not keep a local named ``share_scale`` or
+    ``share_factor``. Post-fee cash still determines k. See docs/ISOLATION.md.
+    """
+    if len(holder) != 1:
+        raise RuntimeError("billing handoff is empty")
+    return holder.pop()
+
+
+def _report_inside_pack(pack_dir, out_dir) -> bool:
+    """True when the resolved report path is the pack or a path inside it."""
+    pack = Path(pack_dir).resolve()
+    out = Path(out_dir).resolve()
+    try:
+        out.relative_to(pack)
+    except ValueError:
+        return False
+    return True
+
+
+def _pack_dividends(dividends, *, anonymized: bool, share_scale: float, date_map: dict):
+    """Real $/real-share amounts become the dict the child engine is given.
+
+    An anonymized pack's session id is ``S#####``. The calendar date and the
+    unscaled amount stay in this process.
+    """
+    if not dividends:
+        return None
+    if not anonymized:
+        return {str(key): float(value) for key, value in dividends.items()}
+    by_date = {}
+    for ordinal, date in date_map.items():
+        day = str(date)
+        if day in by_date:
+            raise ValueError(f"sidecar date map repeats {day}")
+        by_date[day] = str(ordinal)
+    scaled = {}
+    for key, amount in dividends.items():
+        day = str(key)
+        if day not in by_date:
+            raise ValueError(f"dividend date {day} is not in this pack")
+        session_id = f"S{int(by_date[day]):05d}"
+        value = float(amount) * float(share_scale)
+        if not math.isfinite(value):
+            raise ValueError(f"dividend for {day} is not finite")
+        if session_id in scaled:
+            raise ValueError(f"dividend date {day} maps to {session_id} twice")
+        scaled[session_id] = value
+    return scaled
 
 
 def _summary(profile: str, metrics: dict) -> dict:
@@ -81,12 +156,16 @@ def execute(
     initial_equity: float = 1_000_000.0,
     reset_day: int | None = None,
     max_day: int | None = None,
+    anonymized: bool = False,
 ):
     """Run one strategy instance on ``frame``.
 
     ``max_day``, when set, refuses a frame whose last session is later than
     that day. Walk-forward uses it so a design run cannot be handed the tail.
     """
+    # Drop the parameter name before on_bar. The engine call receives the value.
+    billing = [share_factor]
+    del share_factor
     name = get_profile(profile).name
     if max_day is not None and len(frame) and int(frame["day"].max()) > int(max_day):
         raise RuntimeError(
@@ -111,33 +190,40 @@ def execute(
                 raise ValueError("arena warmup covers the whole sample")
             effective_reset = days[warmup_sessions]
         borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
-        kwargs = {
-            "initial_equity": initial_equity,
-            "share_scale": share_factor,
-            "reset_day": effective_reset,
-            "borrow_rate_annual": borrow,
-        }
-        result = engine_arena.run(strategy, frame, **kwargs)
+        result = engine_arena.run(
+            strategy,
+            frame,
+            initial_equity=initial_equity,
+            share_scale=_release(billing),
+            reset_day=effective_reset,
+            borrow_rate_annual=borrow,
+        )
         metrics = enrich_arena_metrics(result, engine_arena.metrics(result))
-        metrics["share_factor"] = share_factor
+        scale = float(result["share_scale"])
+        metrics["share_factor"] = scale
         metrics["borrow_rate_annual"] = borrow
         metrics["financing_rate_annual"] = 0.0
+        metrics["cost_basis"] = _cost_basis(name, scale, anonymized=anonymized)
         return result, metrics
     if name == "desk":
         rate = engine_desk.D.FINANCING_RATE_ANNUAL if financing_rate_annual is None else financing_rate_annual
         borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
-        config = DeskConfig(
-            initial_equity=initial_equity,
-            share_factor=share_factor,
-            borrow_rate_annual=borrow,
-            financing_rate_annual=rate,
-            fee_mult=fee_mult,
-            live_start_ordinal=warmup_sessions,
-            dividends=dict(dividends or {}),
-        )
         rows = frame_to_desk_bars(frame)
-        result = engine_desk.run(strategy, rows, config)
+        result = engine_desk.run(
+            strategy,
+            rows,
+            DeskConfig(
+                initial_equity=initial_equity,
+                share_factor=_release(billing),
+                borrow_rate_annual=borrow,
+                financing_rate_annual=rate,
+                fee_mult=fee_mult,
+                live_start_ordinal=warmup_sessions,
+                dividends=dict(dividends or {}),
+            ),
+        )
         metrics = engine_desk.metrics(result)
+        metrics["cost_basis"] = _cost_basis(name, metrics["share_factor"], anonymized=anonymized)
         return result, metrics
     raise ValueError(f"unknown profile {profile}")
 
@@ -342,7 +428,17 @@ def _books_worker(queue, job):
             if not gate["release"].wait(timeout=180):
                 raise RuntimeError("design parent did not release the walk-forward child")
         strategy_cls = _load_strategy(job["strategy"])
-        books = run_books(strategy_cls, job["frame"], job["profile"], **job["kwargs"])
+        frame = job["frame"]
+        profile = job["profile"]
+        kwargs = job["kwargs"]
+        job.clear()
+        books = run_books(
+            strategy_cls,
+            frame,
+            profile,
+            share_factor=kwargs.pop("share_factor"),
+            **kwargs,
+        )
         _note_child(books, inherited_argv, inherited_cwd)
         queue.put(("ok", _picklable_books(books)))
     except BaseException:
@@ -479,10 +575,12 @@ def run_books(
     reset_day: int | None = None,
     max_day: int | None = None,
     with_benchmarks: bool = True,
+    anonymized: bool = False,
 ):
     """Fresh instance per book. Benchmarks reuse the strategy's cost configuration."""
+    billing = [share_factor]
+    del share_factor
     common = dict(
-        share_factor=share_factor,
         borrow_rate_annual=borrow_rate_annual,
         financing_rate_annual=financing_rate_annual,
         fee_mult=fee_mult,
@@ -491,14 +589,19 @@ def run_books(
         initial_equity=initial_equity,
         reset_day=reset_day,
         max_day=max_day,
+        anonymized=anonymized,
     )
     strategy = strategy_cls()
-    result, metrics = execute(strategy, frame, profile, **common)
+    result, metrics = execute(strategy, frame, profile, share_factor=_release(billing), **common)
+    billing.append(metrics["share_factor"])
     books = {"strategy": (_tag_observer(result, strategy), metrics)}
     if with_benchmarks:
         for label, cls in _benchmarks(profile):
             bench = cls()
-            bench_result, bench_metrics = execute(bench, frame, profile, **common)
+            bench_result, bench_metrics = execute(
+                bench, frame, profile, share_factor=_release(billing), **common
+            )
+            billing.append(bench_metrics["share_factor"])
             books[label] = (_tag_observer(bench_result, bench), bench_metrics)
     return books
 
@@ -545,13 +648,23 @@ def run_named(
     with_benchmarks: bool = True,
 ):
     loaded = load_named(src, symbol, bar_minutes=bar_minutes, splits=splits)
-    factor = loaded.inspection.share_factor if share_factor is None else share_factor
-    warnings = []
-    if factor != 1.0:
-        warnings.append(
-            f"share_factor is {factor} on raw {symbol} files. Raw prints use 1.0; "
-            "0.9 is only for an anonymized desk kit whose prices were rescaled."
+    if not loaded.inspection.runnable:
+        raise ValueError(
+            f"{symbol} is {loaded.inspection.price_adjustment} and is not runnable. "
+            "This phase executes raw prices only."
         )
+    if share_factor is not None and float(share_factor) != 1.0:
+        raise ValueError(
+            f"share_factor {share_factor} is not 1.0. Raw runs use 1.0. "
+            "0.9 is not a kit constant."
+        )
+    factor = loaded.inspection.share_factor if share_factor is None else float(share_factor)
+    if factor != 1.0:
+        raise ValueError(
+            f"share_factor {factor} is not 1.0. Raw runs use 1.0. "
+            "0.9 is not a kit constant."
+        )
+    warnings = []
     books = run_books(
         strategy_cls,
         loaded.frame,
@@ -679,6 +792,11 @@ def walk_forward(
     Desk warm-up is flat (``live`` false) and goes live flat at the starting equity.
     Those are different engines. This function does not merge them.
     """
+    if share_factor != 1.0:
+        raise ValueError(
+            f"share_factor {share_factor} is not 1.0. Raw runs use 1.0. "
+            "0.9 is not a kit constant."
+        )
     slices = slice_walkforward(
         frame,
         design_end_day=design_end_day,
@@ -790,6 +908,89 @@ def walk_forward(
     }
     write_json(out / "walkforward.json", summary)
     return summary, rebuilt, design_books, locked_books
+
+
+def run_pack(
+    strategy_cls,
+    pack_dir,
+    sidecar_path,
+    profile: str,
+    out_dir,
+    *,
+    borrow_rate_annual: float | None = None,
+    financing_rate_annual: float | None = None,
+    fee_mult: float = 1.0,
+    dividends: dict | None = None,
+    warmup_sessions: int = 0,
+    initial_equity: float = 1_000_000.0,
+    with_benchmarks: bool = True,
+    during=None,
+):
+    """Run a pack. The sidecar stays in this process.
+
+    An anonymized pack's share_scale is the price factor k. The child engine
+    receives that number so per-share fees use real share counts. It does not
+    receive the sidecar document, the date map, the ticker, the volume factor,
+    or the operator note. Dividend amounts are scaled and re-keyed here first.
+    """
+    from .pack import load_pack, load_sidecar
+
+    if _report_inside_pack(pack_dir, out_dir):
+        raise ValueError("the report must not live inside the pack directory")
+    loaded = load_pack(pack_dir)
+    secret = load_sidecar(sidecar_path)
+    if secret["pack_id"] != loaded.pack_id:
+        raise ValueError("sidecar does not match this pack")
+    if bool(secret["anonymized"]) != loaded.anonymized:
+        raise ValueError("sidecar anonymized flag does not match the pack")
+    anonymized = bool(secret["anonymized"])
+    share_scale = float(secret["share_scale"])
+    symbol = str(secret["symbol"])
+    child_dividends = _pack_dividends(
+        dividends,
+        anonymized=anonymized,
+        share_scale=share_scale,
+        date_map=secret["date_map"],
+    )
+    if borrow_rate_annual is None and secret["borrow_rate_source"] == "explicit":
+        borrow_rate_annual = float(secret["borrow_rate_annual"])
+    # The rest of the sidecar (date map, ticker, volume factor, note) is not
+    # copied into the child job. Drop the document before the spawn.
+    del secret
+    gc.collect()
+    books = _isolated_books(
+        strategy_cls,
+        loaded.frame,
+        profile,
+        share_factor=share_scale,
+        borrow_rate_annual=borrow_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        fee_mult=fee_mult,
+        dividends=child_dividends,
+        warmup_sessions=warmup_sessions,
+        initial_equity=initial_equity,
+        with_benchmarks=with_benchmarks,
+        anonymized=anonymized,
+        during=during,
+    )
+    payload = write_books(
+        out_dir,
+        get_profile(profile).name,
+        symbol,
+        loaded.bar_minutes,
+        loaded.frame,
+        books,
+        extra={
+            "warnings": [],
+            "pack_id": loaded.pack_id,
+            "anonymized": anonymized,
+        },
+    )
+    # Not written to metrics.json. A test reads what the child strategy observed.
+    observer = books["strategy"][0].get("observer")
+    if observer is not None:
+        payload["strategy_observer"] = observer
+    return payload
 
 
 def run_parallel(*_args, **_kwargs):

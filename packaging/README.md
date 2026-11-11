@@ -2,9 +2,10 @@
 
 Phase 1 does not build an installer. The layout is meant to take one later.
 
-- Library entry: import `backtester.runner`, `backtester.data`, `backtester.engine_arena`,
-  `backtester.engine_desk`. Importing them does not read the working directory,
-  does not print, and does not load market data.
+- Library entry: import `backtester.runner`, `backtester.data`, `backtester.registry`,
+  `backtester.pack`, `backtester.engine_arena`, `backtester.engine_desk`. Importing
+  them does not read the working directory, does not print, and does not load
+  market data. The GUI should call those modules. Printing stays in `backtester.__main__`.
 - CLI entry for PyInstaller: `backtester.__main__:main`.
 - Window entry, still empty: `backtester.desktop:main`.
 - A Windows build should bundle its own Python. The operator machine's system

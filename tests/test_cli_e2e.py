@@ -29,8 +29,14 @@ def _run(args, cwd: Path):
 
 
 def test_stubs_return_2_without_writing():
-    for command in ("pack", "parallel", "referee", "report"):
+    for command in ("parallel", "referee", "report"):
         assert main([command]) == 2
+
+
+def test_pack_without_arguments_exits():
+    with pytest.raises(SystemExit) as caught:
+        main(["pack"])
+    assert caught.value.code == 2
 
 
 def test_arena_sample_month(tmp_path):
@@ -135,18 +141,17 @@ def test_ingest_and_guards(tmp_path):
     assert info["n_sessions"] == 22
     assert info["share_factor"] == 1.0
     assert info["cost_schedule"] == "chosen at run time by --profile"
-    warned = _run(
+    refused_factor = _run(
         [
             "run", "--profile", "desk", "--ticker", "SPY", "--strategy", str(HOLD),
             "--src", str(SPY), "--out", str(tmp_path / "warn"), "--share-factor", "0.9", "--bar-minutes", "30",
         ],
         tmp_path,
     )
-    assert warned.returncode == 0, warned.stderr
-    payload = json.loads((tmp_path / "warn" / "metrics.json").read_text(encoding="utf-8"))
-    assert payload["share_factor"] == 0.9
-    assert payload["run"]["inspection"]["share_factor"] == 1.0
-    assert any("share_factor" in note for note in payload["run"]["warnings"])
+    assert refused_factor.returncode == 2
+    assert "share_factor" in refused_factor.stderr
+    assert "1.0" in refused_factor.stderr
+    assert "not a kit constant" in refused_factor.stderr
     refused = _run(
         [
             "run", "--profile", "arena", "--ticker", "QQQ", "--strategy", str(D02),

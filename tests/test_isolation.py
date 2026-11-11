@@ -195,13 +195,20 @@ def test_sample_fixtures_stay_under_a_megabyte():
     assert total > 0
 
 
+def test_a_ticker_is_not_a_code_fork():
+    for name in ("data.py", "registry.py", "pack.py", "runner.py", "__main__.py"):
+        text = (ROOT / "src" / "backtester" / name).read_text(encoding="utf-8")
+        for token in ('== "QQQ"', "== 'QQQ'", '== "SPY"', "== 'SPY'"):
+            assert token not in text, f"{name} branches on a ticker"
+
+
 def test_import_is_side_effect_free(tmp_path):
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     code = (
         "import backtester, backtester.engine_arena, backtester.engine_desk, "
-        "backtester.data, backtester.runner, backtester.costs, backtester.costs_desk, "
-        "backtester.arena_runner"
+        "backtester.data, backtester.registry, backtester.pack, backtester.runner, "
+        "backtester.costs, backtester.costs_desk, backtester.arena_runner"
     )
     subprocess.check_call([sys.executable, "-c", code], cwd=tmp_path, env=env)
     assert list(tmp_path.iterdir()) == []
