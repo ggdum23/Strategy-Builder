@@ -233,7 +233,8 @@ def test_version_and_placeholder_and_launcher_check(tmp_path, capsys):
         gui=True,
         environ=env,
     ) == 0
-    assert report.read_text(encoding="utf-8").strip() == "launcher-check: placeholder"
+    # The desktop package is on this branch, so the frozen window launches it.
+    assert report.read_text(encoding="utf-8").strip() == "launcher-check: gui"
     config = strategy_builder_config.ensure_user_config(env, defaults)
     assert frozen_entry.show_placeholder(config, interactive=False) == 0
     text = capsys.readouterr().out

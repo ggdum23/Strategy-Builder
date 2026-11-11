@@ -49,10 +49,13 @@ class Banner(QFrame):
         self.setObjectName(f"banner-{severity}")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
-        label = QLabel(text)
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(label)
+        self._label = QLabel(text)
+        self._label.setWordWrap(True)
+        self._label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self._label)
+
+    def text(self) -> str:
+        return self._label.text()
 
 
 class PathField(QWidget):

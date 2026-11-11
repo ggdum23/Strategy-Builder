@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -172,9 +173,10 @@ class RunPage(QWidget):
         layout.addWidget(self.dividends)
         layout.addWidget(use_data)
         layout.addWidget(use_pack)
-        layout.addStretch(1)
+        form.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         form_scroll = QScrollArea()
         form_scroll.setWidgetResizable(True)
+        form_scroll.setAlignment(Qt.AlignmentFlag.AlignTop)
         form_scroll.setFrameShape(QFrame.Shape.NoFrame)
         form_scroll.setWidget(form)
         side = QWidget()
@@ -196,17 +198,20 @@ class RunPage(QWidget):
         self._summary_layout.setContentsMargins(0, 0, 0, 0)
         self._summary_layout.setSpacing(4)
         self._summary_labels: list[tuple[str, QLabel]] = []
-        summary_scroll = QScrollArea()
-        summary_scroll.setWidgetResizable(True)
-        summary_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        summary_scroll.setWidget(self.summary)
-        side_layout.addWidget(summary_scroll, 1)
+        self.summary.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.summary_scroll = QScrollArea()
+        self.summary_scroll.setWidgetResizable(True)
+        self.summary_scroll.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.summary_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.summary_scroll.setWidget(self.summary)
+        self.summary_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        side_layout.addWidget(self.summary_scroll, 0)
         side_layout.addWidget(Section("Worker"))
         self.log = QPlainTextEdit()
         self.log.setObjectName("runLog")
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(140)
-        side_layout.addWidget(self.log)
+        self.log.setMinimumHeight(120)
+        side_layout.addWidget(self.log, 1)
         self.batch_table = DictTable()
         self.batch_table.setMinimumHeight(120)
         self.batch_table.setVisible(False)
@@ -349,6 +354,12 @@ class RunPage(QWidget):
         if name == "arena" and self.fee.text().strip() not in {"", "1", "1.0"}:
             self.fee.setText("1")
         walking = self.walk.isChecked()
+        if walking and self.pack.isChecked():
+            self.named.blockSignals(True)
+            self.pack.blockSignals(True)
+            self.named.setChecked(True)
+            self.named.blockSignals(False)
+            self.pack.blockSignals(False)
         batch = self.batch.isChecked()
         packed = self.pack.isChecked() and not walking
         self._show(self.src, not packed)
@@ -400,6 +411,11 @@ class RunPage(QWidget):
             cut = draft["design_end_date"] or draft["design_end_day"] or draft["design_fraction"]
             rows.append(("Walk-forward cut", "—" if cut in (None, "") else str(cut)))
         self._fill_summary(rows)
+        margins = self._summary_layout.contentsMargins()
+        height = self._summary_layout.sizeHint().height() + margins.top() + margins.bottom() + 4
+        height = max(height, 26 * len(self._summary_labels) + 8)
+        self.summary_scroll.setMinimumHeight(height)
+        self.summary_scroll.setMaximumHeight(height)
         issues = validate_config(draft)
         self.run_button.setEnabled(not issues and not self.host.run_in_progress())
         clear_layout(self.banners)

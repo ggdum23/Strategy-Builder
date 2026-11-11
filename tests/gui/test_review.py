@@ -24,7 +24,7 @@ pytest.importorskip("pytestqt")
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from backtester.gui.audience import scrub_text
 from backtester.gui.charts import ChartPanel
@@ -310,8 +310,11 @@ def test_results_banner_activity_fees_and_readout(qtbot, tmp_path):
     banners = []
     for index in range(window.results_page.banners.count()):
         widget = window.results_page.banners.itemAt(index).widget()
-        if widget is not None and hasattr(widget, "text"):
-            banners.append(widget.text())
+        if widget is None:
+            continue
+        labels = widget.findChildren(QLabel)
+        assert labels
+        banners.extend(label.text() for label in labels)
     assert not any("equity.png" in text for text in banners)
     window.results_page.tabs.setCurrentIndex(4)
     assert "equity.png" in window.results_page.figure_note.text()

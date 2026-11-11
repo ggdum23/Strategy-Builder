@@ -61,6 +61,8 @@ def format_number(kind: str, value: Any) -> str:
         return _fraction_text(number)
     if kind == "money":
         return "$" + _grouped(number, 2)
+    if kind == "money_full":
+        return "$" + _grouped(number, _money_digits(number))
     if kind == "count":
         if float(number).is_integer():
             return f"{int(number):,}"
@@ -80,12 +82,26 @@ def format_number(kind: str, value: Any) -> str:
     return str(value)
 
 
+def _money_digits(number: float) -> int:
+    """The value's own scale, at least two places, so fee rows can add up."""
+    try:
+        exponent = Decimal(str(number)).as_tuple().exponent
+    except Exception:
+        return 2
+    if isinstance(exponent, str):
+        return 2
+    return max(2, min(8, -int(exponent)))
+
+
 def _fraction_text(number: float) -> str:
     """Percent. A non-zero value that would round to 0.00% keeps more digits."""
     scaled = number * 100.0
     if scaled == 0.0:
         return "0.00%"
     if round(scaled, 2) == 0.0:
+        # Eight places still print 0.00000000% for a tiny fraction. Say so.
+        if abs(scaled) < 5e-9:
+            return f"{scaled:.2e}%"
         magnitude = math.floor(math.log10(abs(scaled)))
         decimals = min(8, max(4, -magnitude + 1))
         return _grouped(scaled, decimals) + "%"

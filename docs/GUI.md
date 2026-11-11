@@ -78,15 +78,17 @@ Any other scalar in `metrics.json` is listed under "Other reported fields" so a 
 
 If `benchmarks/<name>/metrics.json` and the parent `benchmarks` object disagree on a shared number, the page warns and shows the file.
 
-The drawdown line on the chart is equity / running peak − 1, stored as a fraction. The axis prints that fraction as a percent. The caption under each plot is one sentence. The official max drawdown is the card, which is `max_drawdown` from `metrics.json`. Log scale applies to the equity plot only, and only when every equity point is above zero. In log mode the view is the log10 of those points, with padding in log space, and the axis labels stay in dollars. The crosshair reads equity as money and drawdown as a percent.
+The drawdown line on the chart is equity / running peak − 1, stored as a fraction. The axis prints that fraction as a percent. The caption under each plot is one sentence. The official max drawdown is the card, which is `max_drawdown` from `metrics.json`. Log scale applies to the equity plot only, and only when every equity point is above zero. In log mode the view is the log10 of those points, with padding in log space, and the axis labels stay in dollars. A tight range still gets several dollar ticks, and a session date is labeled only on an integer session. The crosshair reads equity as money and drawdown as a percent.
 
 Benchmark curves are aligned on the session column. Rows that do not match are not drawn. The count is on the caption tooltip. There is no interpolation.
 
-The fee table lists components only. The stored total is a footer under the table, not a row that has to add up to the rounded lines.
+The fee table lists components only. Each component keeps enough decimal places that the rows add back to the stored total. The footer is that stored total at cents, and it is cleared when the report has no fee breakdown. Other dollar figures stay at two decimals.
 
-The Run page hides fields the selected mode and profile do not use. A blank rate is labeled "profile default". The longer contract text is on the tooltip.
+The Run page hides fields the selected mode and profile do not use. A blank rate is labeled "profile default". The longer contract text is on the tooltip. Walk-forward uses named files: choosing it clears Pack. The form stays as tall as its fields. The worker log takes the space underneath.
 
-A designer view scrubs calendar dates in several spellings, including `2024/01/04` and `04-Jan-2024`. A designer export skips any file, including a PNG, that still contains a ticker, a share scale, or a date.
+A designer view scrubs calendar dates in several spellings, including `2024/01/04`, `04-Jan-2024`, `04.Jan.2024`, and `January 2024`. A bare year goes too, but not a number that merely contains one (`2024.50`, `0.2024`, `day 2024`). Monthly and yearly period keys are shown as `M1`, `M2` and `Y1`, `Y2`, and every stored value stays. The scale words, the scale number, and a ticker with a digit glued on (`QQQ1`) are removed. One-letter tickers count. `MA` inside `max_drawdown` does not. Benchmark rows use the same names as the chart (`1× buy and hold`). A failure is the exception summary, with the filesystem path removed. The operator view still has the traceback.
+
+Load keeps the real directory. The field may show a scrubbed path. Switching audience reloads the real directory, and Load follows the field when it was edited. A designer export runs the same allow-list on `metrics.json`, `displayed_metrics.csv`, and `leaderboard_view.csv` after writing them, and withholds a file that fails. PNG text is checked after decompression, including a compressed `iTXt` chunk. A percent that would print as eight zeros is shown in scientific form.
 
 ## Screenshots
 
@@ -112,6 +114,8 @@ Rendered offscreen at 1680×1180. These are fixture reports and the real profile
 - `docs/screenshots/18-run-pack-light.png`
 - `docs/screenshots/19-fees-dark.png`
 - `docs/screenshots/20-fees-light.png`
+- `docs/screenshots/21-designer-dark.png` — scrubbed designer view, period labels `M1` / `Y1`
+- `docs/screenshots/22-designer-light.png`
 
 ## Tests
 

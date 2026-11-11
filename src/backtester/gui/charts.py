@@ -29,12 +29,39 @@ class _DateAxis(pg.AxisItem):
         self.labels: list[str] = []
         self.enableAutoSIPrefix(False)
 
+    def tickValues(self, minVal, maxVal, size):
+        """One level of integer session indexes. A tick at 1.5 is not a session."""
+        lo, hi = sorted((float(minVal), float(maxVal)))
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            return []
+        if hi <= lo:
+            return [(1, [float(int(round(lo)))])]
+        count = max(1, int(float(size) / 72) if size else 1)
+        step = max(1, int(math.ceil((hi - lo) / count)))
+        step = _nice_int_step(step)
+        start = math.ceil(lo - 1e-9)
+        end = math.floor(hi + 1e-9)
+        values = []
+        index = int(start)
+        while index <= end:
+            values.append(float(index))
+            index += step
+        return [(step, values)]
+
     def tickStrings(self, values, scale, spacing):
         out = []
         last = len(self.labels) - 1
         previous = None
         for value in values:
-            index = int(round(float(value)))
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                out.append("")
+                continue
+            if abs(number - round(number)) > 1e-6:
+                out.append("")
+                continue
+            index = int(round(number))
             label = self.labels[index] if 0 <= index <= last else ""
             if label and label == previous:
                 out.append("")
@@ -51,6 +78,20 @@ class _NumberAxis(pg.AxisItem):
         super().__init__(*args, **kwargs)
         self.percent = False
         self.enableAutoSIPrefix(False)
+
+    def tickValues(self, minVal, maxVal, size):
+        """Several dollar ticks when a log span sits inside one power of ten."""
+        if not self.logMode or self.percent:
+            return super().tickValues(minVal, maxVal, size)
+        lo, hi = sorted((float(minVal), float(maxVal)))
+        if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
+            return []
+        low = 10 ** lo
+        high = 10 ** hi
+        step, dollars = _dollar_ticks(low, high)
+        if not dollars:
+            return [(None, [(lo + hi) / 2])]
+        return [(step, [math.log10(value) for value in dollars])]
 
     def tickStrings(self, values, scale, spacing):
         numbers = []
@@ -91,6 +132,50 @@ class _NumberAxis(pg.AxisItem):
             else:
                 out.append(f"{number:,.0f}")
         return out
+
+
+def _nice_int_step(step: int) -> int:
+    if step <= 1:
+        return 1
+    magnitude = 10 ** int(math.floor(math.log10(step)))
+    for factor in (1, 2, 5, 10):
+        if factor * magnitude >= step:
+            return factor * magnitude
+    return step
+
+
+def _nice_dollar_step(span: float, count: int) -> float:
+    raw = span / max(count, 1)
+    if not math.isfinite(raw) or raw <= 0:
+        return 1.0
+    magnitude = 10 ** math.floor(math.log10(raw))
+    for factor in (1, 2, 5, 10):
+        if factor * magnitude >= raw - 1e-9:
+            return float(factor * magnitude)
+    return float(10 * magnitude)
+
+
+def _dollar_ticks(low: float, high: float) -> tuple[float, list[float]]:
+    """1-2-5 steps across a dollar span. Tight log ranges still get several."""
+    span = high - low
+    chosen_step = 1.0
+    chosen: list[float] = []
+    for count in (6, 8, 10, 14):
+        step = _nice_dollar_step(span, count)
+        start = math.floor(low / step) * step
+        ticks = []
+        cursor = start
+        for _ in range(48):
+            if cursor > high + step * 0.01:
+                break
+            if low <= cursor <= high and cursor > 0:
+                ticks.append(cursor)
+            cursor += step
+        chosen_step = step
+        chosen = ticks
+        if len(ticks) >= 4:
+            return step, ticks[:8]
+    return chosen_step, chosen
 
 
 def _finite_pairs(xs, ys) -> list[tuple[float, float]]:
@@ -286,6 +371,7 @@ class ChartPanel(QWidget):
             top_axis.labels = list(study["sessions"])
         self.caption.setText(study["equity_note"])
         self.dd_caption.setText(study["drawdown_note"])
+        self.readout.setText("Drag to pan. Wheel to zoom. The readout is the session and each series.")
         top, ylabel, percent = self._series_for_top()
         self._equity_axis.percent = percent
         self.equity_plot.setLabel("left", ylabel)

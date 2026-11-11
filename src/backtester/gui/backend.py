@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .audience import apply_designer, book_is_anonymized, peek_symbols, resolve_view
+from .audience import apply_designer, book_is_anonymized, peek_scale, peek_symbols, resolve_view
 from .format import is_missing
 from .schema import (
     ACTIVITY_KEYS,
@@ -721,7 +721,7 @@ def load_run(directory, *, audience: str = "auto") -> RunReport:
     report.redacted = redacted
     report.withheld = withheld
     if chosen == "designer":
-        apply_designer(report, peek_symbols(folder), redacted=redacted)
+        apply_designer(report, peek_symbols(folder), redacted=redacted, scale=peek_scale(folder))
     elif withheld:
         report.warnings.append(
             "Withheld operator fields that were present in a report file: " + ", ".join(withheld) + "."

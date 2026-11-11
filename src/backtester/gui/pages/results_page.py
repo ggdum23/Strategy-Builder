@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -28,7 +29,16 @@ from ..audience import export_allowed, export_text, peek_scale, peek_symbols, sc
 from ..backend import RunReport, chart_overlay, drawdown_line, exposure_line, load_run
 from ..charts import ChartPanel
 from ..format import MISSING, format_number, is_missing
-from ..schema import ACTIVITY_KEYS, DESK_KEYS, FIGURE_FILES, KPI_KEYS, LEADERBOARD_LABELS, SPECS, leaderboard_kind
+from ..schema import (
+    ACTIVITY_KEYS,
+    BENCHMARK_TITLES,
+    DESK_KEYS,
+    FIGURE_FILES,
+    KPI_KEYS,
+    LEADERBOARD_LABELS,
+    SPECS,
+    leaderboard_kind,
+)
 from ..widgets import Banner, DictTable, MetricCard, PageHeader, PathField, PeriodHeat, Section, clear_layout
 
 
@@ -40,6 +50,7 @@ class ResultsPage(QWidget):
         self._cards: dict[str, MetricCard] = {}
         self._loading = False
         self._source_path = ""
+        self._displayed_path = ""
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 16)
         root.setSpacing(10)
@@ -99,6 +110,7 @@ class ResultsPage(QWidget):
     def _build_overview(self) -> None:
         body = QWidget()
         body.setObjectName("page")
+        body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 8, 8, 8)
         layout.setSpacing(8)
@@ -160,9 +172,9 @@ class ResultsPage(QWidget):
             self.other,
         ):
             layout.addWidget(widget)
-        layout.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(body)
         self.overview_scroll = scroll
@@ -224,15 +236,22 @@ class ResultsPage(QWidget):
         self.show_report(report)
 
     def load_current(self) -> None:
-        self.load_path(self._source_path or self.path.text(), audience=self.audience.currentData())
+        typed = self.path.text()
+        if self._displayed_path and typed == self._displayed_path and self._source_path:
+            target = self._source_path
+        else:
+            target = typed or self._source_path
+        self.load_path(target, audience=self.audience.currentData())
 
     def _show_path(self, report: RunReport) -> None:
         shown = self._source_path
         if report.audience == "designer" and shown:
-            shown = scrub_text(shown, peek_symbols(Path(shown)))
+            folder = Path(shown)
+            shown = scrub_text(shown, peek_symbols(folder), scale=peek_scale(folder))
         self.path.edit.blockSignals(True)
         self.path.set_text(shown)
         self.path.edit.blockSignals(False)
+        self._displayed_path = self.path.text()
 
     def _set_audience_combo(self, audience: str) -> None:
         self._loading = True
@@ -242,9 +261,9 @@ class ResultsPage(QWidget):
         self._loading = False
 
     def _audience_changed(self) -> None:
-        if self._loading or not self.path.text():
+        if self._loading or not self._source_path:
             return
-        self.load_path(self.path.text(), audience=self.audience.currentData())
+        self.load_path(self._source_path, audience=self.audience.currentData())
 
     def show_report(self, report: RunReport) -> None:
         self._report = report
@@ -336,6 +355,8 @@ class ResultsPage(QWidget):
             self._show_section(self.activity_title, self.activity, False)
             self._show_section(self.benchmark_title, self.benchmarks, False)
             self._show_section(self.fees_title, self.fees, False)
+            self.fees_footer.setText("")
+            self.fees_footer.setVisible(False)
             self.period_title.setVisible(False)
             self.periods.setVisible(False)
             self._fill_jobs(report)
@@ -345,6 +366,8 @@ class ResultsPage(QWidget):
             return
         if book is None:
             self.identity.setText(report.kind)
+            self.fees_footer.setText("")
+            self.fees_footer.setVisible(False)
             self._set_cards({})
             return
         metrics = book.metrics
@@ -447,6 +470,7 @@ class ResultsPage(QWidget):
         height = min(height, 320)
         table.setMinimumHeight(height)
         table.setMaximumHeight(height)
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def _set_cards(self, values: dict) -> None:
         clear_layout(self.cards_grid)
@@ -518,7 +542,8 @@ class ResultsPage(QWidget):
         )
         rows = [_benchmark_row("strategy", book.metrics)]
         for label, metrics in book.benchmarks.items():
-            rows.append(_benchmark_row(label, metrics if isinstance(metrics, dict) else {}))
+            title = BENCHMARK_TITLES.get(str(label), str(label))
+            rows.append(_benchmark_row(title, metrics if isinstance(metrics, dict) else {}))
         titles = {key: SPECS[key].label for key in columns if key in SPECS}
         titles["book"] = "Book"
         titles["financing_cost"] = "Financing"
@@ -547,7 +572,7 @@ class ResultsPage(QWidget):
             ("component", "dollars"),
             rows,
             {"component": "Component", "dollars": "Dollars"},
-            {"dollars": "money"},
+            {"dollars": "money_full"},
         )
         self._fit_table(self.fees, len(rows) or 1)
         if stored is None or not rows:
@@ -783,15 +808,19 @@ class ResultsPage(QWidget):
             if designer:
                 sheet = target / "metrics.json"
                 sheet.write_text(json.dumps(book.metrics, indent=2, default=str) + "\n", encoding="utf-8")
-                if sheet.name not in written:
-                    written.append(sheet.name)
+                if self._keep_export(sheet, symbols=symbols, scale=scale):
+                    if sheet.name not in written:
+                        written.append(sheet.name)
+                elif sheet.name in written:
+                    written.remove(sheet.name)
             rows = ["key,raw,display"]
             for key, card in self._cards.items():
                 raw = book.metrics.get(key) if key in book.metrics else ""
                 rows.append(f"{key},{_csv(raw)},{_csv(card.value.text())}")
             display = target / "displayed_metrics.csv"
             display.write_text("\n".join(rows) + "\n", encoding="utf-8")
-            written.append(display.name)
+            if self._keep_export(display, symbols=symbols, scale=scale, designer=designer):
+                written.append(display.name)
         if report is not None and report.leaderboard is not None and self.leaderboard.isVisible():
             model = self.leaderboard.model()
             if model is not None and model.columnCount():
@@ -804,9 +833,24 @@ class ResultsPage(QWidget):
                     lines.append(",".join(cells))
                 board = target / "leaderboard_view.csv"
                 board.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                written.append(board.name)
+                if self._keep_export(board, symbols=symbols, scale=scale, designer=designer):
+                    written.append(board.name)
         self.host.set_status("Exported " + ", ".join(written) if written else "Nothing to export")
         return written
+
+    def _keep_export(self, path: Path, *, symbols, scale, designer: bool = True) -> bool:
+        """Run the allow-list on a file this export just wrote. A failure is deleted."""
+        if not designer:
+            return True
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            path.unlink(missing_ok=True)
+            return False
+        if export_allowed(text, symbols=symbols, scale=scale):
+            return True
+        path.unlink(missing_ok=True)
+        return False
 
 
 def report_is_designer(report: RunReport) -> bool:

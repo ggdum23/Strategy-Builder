@@ -330,6 +330,9 @@ def test_screenshots(qtbot, tmp_path):
     assert window.results_page.fees_footer.text().endswith("$134.08")
     _grab(window, "19-fees-dark.png", tmp_path)
 
+    _present_designer(window, tmp_path)
+    _grab(window, "21-designer-dark.png", tmp_path)
+
     window.results_page.show_report(load_run(desk))
     window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\desk")
     window.results_page.tabs.setCurrentIndex(2)
@@ -404,6 +407,8 @@ def test_screenshots(qtbot, tmp_path):
     window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.fees_footer)
     QApplication.processEvents()
     _grab(window, "20-fees-light.png", tmp_path)
+    _present_designer(window, tmp_path)
+    _grab(window, "22-designer-light.png", tmp_path)
     window.results_page.show_report(load_run(desk))
     window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\desk")
     window.results_page.tabs.setCurrentIndex(2)
@@ -415,6 +420,36 @@ def test_screenshots(qtbot, tmp_path):
     window.results_page.overview_scroll.ensureWidgetVisible(window.results_page.leaderboard)
     QApplication.processEvents()
     _grab(window, "12-leaderboard-light.png", tmp_path)
+
+
+def _present_designer(window, tmp_path: Path) -> None:
+    """An anonymized book. The shot must not show the ticker, the scale, or a date."""
+    metrics = dict(ARENA_METRICS)
+    metrics["symbol"] = "ZZZX"
+    metrics["ticker"] = "QQQ"
+    metrics["anonymized"] = True
+    metrics["comment"] = "applied share_scale 7.777 for QQQ1 on 2024/01/04"
+    metrics["note"] = "04.Jan.2024 and January 2024"
+    metrics["cost_basis"] = {"share_scale": 7.777, "anonymized": True, "cost_schedule": "arena"}
+    metrics["period_returns"] = {
+        "S01": 0.04,
+        "monthly": {"2024-01": 0.01, "2024-02": 0.22},
+        "yearly": {"2024": 0.4, "2025": 0.6},
+    }
+    folder = write_book(tmp_path / "ZZZX" / "shot-designer", metrics, equity=_shot_equity())
+    window.results_page.load_path(str(folder))
+    window.results_page.path.edit.blockSignals(True)
+    window.results_page.path.set_text(r"C:\Users\Jeu\Desktop\Strategy Builder\out\ASSET\book")
+    window.results_page.path.edit.blockSignals(False)
+    window.results_page.tabs.setCurrentIndex(0)
+    window.results_page.overview_scroll.verticalScrollBar().setValue(0)
+    QApplication.processEvents()
+    assert window.results_page._report.audience == "designer"
+    assert _heat_has(window, "M1") and _heat_has(window, "Y2")
+    blob = _visible_blob(window.results_page).casefold()
+    for needle in ("share_scale", "7.777", "qqq", "zzzx", "january", "2024"):
+        assert needle not in blob, needle
+    window.show_page(4)
 
 
 def _paint_paths(window, pairs) -> None:
@@ -529,7 +564,18 @@ def _heat_has(window, needle: str) -> bool:
 
 
 def _visible_blob(window) -> str:
-    chunks = [window.windowTitle() or "", window.statusBar().currentMessage() or ""]
+    chunks = []
+    title = getattr(window, "windowTitle", None)
+    if callable(title):
+        chunks.append(title() or "")
+    status = getattr(window, "statusBar", None)
+    if callable(status):
+        try:
+            bar = status()
+        except Exception:
+            bar = None
+        if bar is not None:
+            chunks.append(bar.currentMessage() or "")
     for widget in window.findChildren(QWidget):
         for method in ("text", "toolTip", "statusTip", "whatsThis", "placeholderText", "windowTitle"):
             fn = getattr(widget, method, None)
