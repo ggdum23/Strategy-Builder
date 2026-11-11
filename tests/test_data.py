@@ -167,6 +167,8 @@ def test_resample_anchor_partial_tail_and_session_walls():
     out = resample(frame, 5)
     rth = out.loc[out["session"] == "rth"]
     assert list(rth["minute"]) == [571, 576]
+    assert list(rth["partial"].astype(int)) == [0, 1]
+    assert list(out.loc[out["session"] == "post", "partial"].astype(int)) == [1]
     assert 570 not in set(rth["minute"])
     assert float(rth.iloc[0]["open"]) == 10.0
     assert float(rth.iloc[0]["close"]) == 10.5 + 4
@@ -178,6 +180,7 @@ def test_resample_anchor_partial_tail_and_session_walls():
     copied = resample(frame, 1)
     assert len(copied) == len(frame)
     assert list(copied["open"]) == list(frame["open"])
+    assert set(copied["partial"].astype(int)) == {0}
 
 
 def test_resample_restarts_when_the_minute_goes_backwards():
@@ -308,3 +311,156 @@ def test_filename_rejects_a_path_separator():
     assert monthly_filled_filename("BRK.B", 2024, 1) == "BRK.B_1min_filled_2024-01.csv.gz"
     with pytest.raises(ValueError):
         monthly_filled_filename("QQQ/filled", 2024, 1)
+
+
+def test_partial_bucket_is_not_padded_and_does_not_take_the_next_session(tmp_path):
+    """A short session keeps its tail. The next day's price stays in the next day."""
+    day = datetime(2026, 6, 1)
+    nxt = datetime(2026, 6, 2)
+    rows = []
+    for offset, minute in enumerate(range(480, 487)):
+        rows.append(minute_row(day, minute, "rth", 10.0 + offset))
+    rows.append(minute_row(nxt, 480, "rth", 999.0))
+    path = tmp_path / "NIK_1min_filled_2026-06.csv.gz"
+    write_month(path, rows)
+    loaded = load_named(path, "NIK", bar_minutes=5)
+    first = loaded.frame.loc[loaded.frame["date"] == "2026-06-01"]
+    second = loaded.frame.loc[loaded.frame["date"] == "2026-06-02"]
+    assert list(first["minute"].astype(int)) == [480, 485]
+    assert list(first["partial"].astype(int)) == [0, 1]
+    assert float(first.iloc[0]["open"]) == 10.0
+    assert float(first.iloc[0]["high"]) < 20.0
+    assert float(first.iloc[1]["high"]) < 20.0
+    assert float(second.iloc[0]["open"]) == 999.0
+    assert int(second.iloc[0]["partial"]) == 1
+    assert float(first["high"].max()) != 999.0
+    rth = loaded.inspection.session_segments[0]
+    assert rth.label == "rth"
+    assert rth.start_minute == 480
+    assert (rth.start_minute, rth.end_minute) != (4 * 60, 19 * 60 + 59)
+
+
+def test_gapped_bucket_is_partial_even_when_the_span_looks_full():
+    rows = []
+    for minute in (571, 572, 573, 574, 576):
+        rows.append(
+            {
+                "timestamp_et": f"2026-10-01T{minute // 60:02d}:{minute % 60:02d}:00-04:00",
+                "epoch_utc": 1_700_000_000 + minute * 60,
+                "date": "2026-10-01",
+                "day": 0,
+                "weekday": 3,
+                "minute": minute,
+                "time": f"{minute // 60:02d}:{minute % 60:02d}",
+                "session": "rth",
+                "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
+                "volume": 10.0, "wap": 10.0, "count": 1, "filled": 0,
+                "short_session": 0, "symbol": "QQQ",
+            }
+        )
+    out = resample(pd.DataFrame(rows), 5)
+    assert list(out["minute"].astype(int)) == [571, 576]
+    assert list(out["partial"].astype(int)) == [1, 1]
+    assert int(out.iloc[0]["count"]) == 4
+
+
+def test_hours_are_inferred_and_not_a_us_template(tmp_path):
+    day = datetime(2026, 3, 2)
+    rows = [minute_row(day, minute, "rth", 10.0) for minute in (8 * 60, 14 * 60)]
+    path = tmp_path / "NIK_1min_filled_2026-03.csv.gz"
+    write_month(path, rows)
+    loaded = load_named(path, "NIK")
+    segment = loaded.inspection.session_segments[0]
+    assert (segment.start_minute, segment.end_minute) == (8 * 60, 14 * 60)
+    assert segment.as_dict()["start_clock"] == "08:00"
+    assert segment.as_dict()["end_clock"] == "14:00"
+    assert segment.gapped_sessions == 1
+    assert set(loaded.frame["short_session"].astype(int)) == {1}
+    assert any("15:59" in note for note in loaded.inspection.notes)
+    assert loaded.inspection.as_dict()["hours_assumed"] is False
+    assert "04:00" not in segment.as_dict()["start_clock"]
+
+
+def test_ambiguous_series_fail_loudly(tmp_path):
+    day = datetime(2026, 4, 1)
+    foreign = [minute_row(day, 480, "rth", 10.0)]
+    foreign[0]["timestamp_et"] = "2026-04-01T08:00:00+09:00"
+    foreign[0]["epoch_utc"] = int(datetime.fromisoformat(foreign[0]["timestamp_et"]).timestamp())
+    path = tmp_path / "NIK_1min_filled_2026-04.csv.gz"
+    write_month(path, foreign)
+    with pytest.raises(ValueError, match="offset"):
+        load_named(path, "NIK")
+
+    pair = [
+        minute_row(day, 480, "rth", 10.0),
+        minute_row(day, 481, "rth", 11.0),
+    ]
+    pair[1]["timestamp_et"] = "2026-04-01T08:01:00-06:00"
+    pair[1]["epoch_utc"] = int(datetime.fromisoformat(pair[1]["timestamp_et"]).timestamp())
+    write_month(path, pair)
+    with pytest.raises(ValueError, match="contradict the column name"):
+        load_named(path, "NIK")
+
+    broken = [
+        minute_row(day, 480, "pre", 10.0),
+        minute_row(day, 481, "rth", 10.0),
+        minute_row(day, 482, "pre", 10.0),
+    ]
+    write_month(path, broken)
+    with pytest.raises(ValueError, match="discontinuous"):
+        load_named(path, "NIK")
+
+    same_minute = [
+        minute_row(day, 480, "rth", 10.0),
+        minute_row(day, 480, "post", 11.0),
+    ]
+    same_minute[1]["timestamp_et"] = "2026-04-01T08:00:00-05:00"
+    same_minute[1]["epoch_utc"] = int(datetime.fromisoformat(same_minute[1]["timestamp_et"]).timestamp())
+    write_month(path, same_minute)
+    with pytest.raises(ValueError, match="Which session owns that minute"):
+        load_named(path, "NIK")
+
+    stale_bad = [
+        minute_row(day, 480, "rth", 10.0),
+        minute_row(day, 481, "rth", 10.0, filled=1),
+    ]
+    write_month(path, stale_bad)
+    with pytest.raises(ValueError, match="Fill policy|filled"):
+        load_named(path, "NIK")
+
+    flat = minute_row(day, 480, "rth", 10.0)
+    stale = minute_row(day, 481, "rth", 10.1, filled=1)
+    stale["open"] = stale["high"] = stale["low"] = stale["close"] = flat["close"]
+    stale["volume"] = 0
+    stale["wap"] = flat["close"]
+    write_month(path, [flat, stale])
+    loaded = load_named(path, "NIK")
+    assert loaded.inspection.fill_policy == "stale_forward_fill"
+    assert loaded.inspection.stale_when_filled is True
+
+    tied_a = [minute_row(datetime(2026, 4, 1), minute, "rth", 10.0) for minute in (480, 481)]
+    tied_b = [minute_row(datetime(2026, 4, 2), minute, "rth", 12.0) for minute in (500, 501, 502)]
+    write_month(path, tied_a + tied_b)
+    tied = load_named(path, "NIK")
+    assert any("no unique modal window" in note for note in tied.inspection.notes)
+    assert tied.inspection.session_segments[0].end_minute == 502
+    assert tied.inspection.session_segments[0].variants
+
+    spring = [minute_row(datetime(2026, 3, 2), minute, "rth", 10.0) for minute in (480, 481)]
+    fall = [minute_row(datetime(2026, 11, 2), minute, "rth", 12.0) for minute in (480, 481)]
+    for row in fall:
+        stamp = datetime.fromisoformat(row["timestamp_et"]).replace(tzinfo=timezone(timedelta(hours=-5)))
+        row["timestamp_et"] = stamp.isoformat()
+        row["epoch_utc"] = int(stamp.timestamp())
+    write_month(path, spring + fall)
+    dst = load_named(path, "NIK")
+    assert dst.inspection.timezone_offsets == ("-04:00", "-05:00")
+    assert dst.inspection.timezone_dst_pair is True
+    assert dst.inspection.session_segments[0].start_minute == 480
+
+    one_price = [minute_row(day, 480, "rth", 10.0)]
+    one_price[0]["open"] = one_price[0]["high"] = one_price[0]["low"] = one_price[0]["close"] = 10.0
+    one_price[0]["wap"] = 10.0
+    write_month(path, one_price)
+    with pytest.raises(ValueError, match="tick"):
+        load_named(path, "NIK")

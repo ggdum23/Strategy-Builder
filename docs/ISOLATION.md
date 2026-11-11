@@ -47,6 +47,15 @@ The design child also receives the strategy (the class, or the strategy file
 path when the class was loaded from a file) and the run kwargs. It does not
 receive the data directory, the CLI argv, or the locked frame.
 
+An anonymized pack run uses the same channels. `run_pack` reads the sidecar in
+the operator process, then drops that document before the spawn. The child
+receives the anonymized frame and the numeric `share_factor` (the price factor
+k, which the engine needs in order to bill real share counts). It does not
+receive the sidecar document, the date map, the ticker, the volume factor, the
+operator note, or the sidecar path. Heap, environment, argv, and cwd are the
+in-scope checks. A hardcoded absolute path can still open a file; that is the
+Phase 4 jail, not this one.
+
 `walk_forward` deletes the frame it was given. The command line passes that
 frame as the argument and does not keep another name for it. A caller that
 keeps its own variable still has that object. The design child still does not

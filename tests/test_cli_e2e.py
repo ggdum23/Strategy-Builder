@@ -29,8 +29,14 @@ def _run(args, cwd: Path):
 
 
 def test_stubs_return_2_without_writing():
-    for command in ("pack", "parallel", "referee", "report"):
+    for command in ("parallel", "referee", "report"):
         assert main([command]) == 2
+
+
+def test_pack_without_arguments_exits():
+    with pytest.raises(SystemExit) as caught:
+        main(["pack"])
+    assert caught.value.code == 2
 
 
 def test_arena_sample_month(tmp_path):

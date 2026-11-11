@@ -8,6 +8,18 @@ from pathlib import Path
 
 from .data import load_dividends, load_named
 from .profiles import ARENA, DESK
+from .registry import (
+    entry_from_inspection,
+    format_list,
+    format_show,
+    get_series,
+    load_or_new,
+    load_registry,
+    parse_phase_map,
+    parse_splits,
+    save_registry,
+    upsert_series,
+)
 from .report import write_json
 from .strategy_loader import load_strategy_class
 
@@ -22,11 +34,11 @@ def _repo_root() -> Path:
     )
 
 
-def _add_data_args(parser: argparse.ArgumentParser, *, require_out: bool) -> None:
+def _add_data_args(parser: argparse.ArgumentParser, *, require_out: bool, require_src: bool = True) -> None:
     parser.add_argument("--strategy", required=True, help="Path to a strategy.py that defines Strategy")
     parser.add_argument("--profile", required=True, choices=("arena", "desk"))
-    parser.add_argument("--src", required=True, help="Filled-file directory, or one monthly csv.gz")
-    parser.add_argument("--ticker", required=True)
+    parser.add_argument("--src", required=require_src, help="Filled-file directory, or one monthly csv.gz")
+    parser.add_argument("--ticker", required=require_src)
     parser.add_argument("--bar-minutes", type=int, default=1)
     parser.add_argument("--out", required=require_out)
     parser.add_argument("--share-factor", type=float, default=None, help="Default 1.0 on raw files")
@@ -56,7 +68,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="Run one strategy and the profile benchmarks")
-    _add_data_args(run, require_out=True)
+    _add_data_args(run, require_out=True, require_src=False)
+    run.add_argument("--pack", default=None, help="Chunked pack directory")
+    run.add_argument("--sidecar", default=None, help="Operator sidecar for that pack. Never ship this file.")
 
     walk = sub.add_parser("walkforward", help="Design window, then a locked tail")
     _add_data_args(walk, require_out=True)
@@ -70,16 +84,45 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Sessions of history before the locked tail. Profile decides what warm-up does.",
     )
 
-    ingest = sub.add_parser("ingest", help="Inspect filled files in place and write a JSON description")
+    ingest = sub.add_parser("ingest", help="Inspect filled files and, with --registry, record the series")
     ingest.add_argument("--ticker", required=True)
     ingest.add_argument("--src", required=True)
-    ingest.add_argument("--out", required=True)
+    ingest.add_argument("--out", default=None, help="Write the inspection JSON here")
     ingest.add_argument("--bar-minutes", type=int, default=1)
+    ingest.add_argument("--registry", default=None, help="Registry JSON to create or update")
+    ingest.add_argument("--profile", choices=("arena", "desk"), default=None)
+    ingest.add_argument("--borrow-rate", type=float, default=None, help="Omit to record the chosen profile's rate")
+    ingest.add_argument("--price-kind", choices=("raw", "total_return"), default=None)
+    ingest.add_argument("--splits", default=None, help="none, or YYYY-MM-DD:ratio pairs. Recorded, not applied.")
+    ingest.add_argument("--phase-map", default=None, help="label=pre,label=rth when the file does not use those names")
+
+    registry = sub.add_parser("registry", help="List or show recorded series")
+    registry_sub = registry.add_subparsers(dest="registry_command", required=True)
+    registry_list = registry_sub.add_parser("list", help="One line per series")
+    registry_list.add_argument("--registry", required=True)
+    registry_show = registry_sub.add_parser("show", help="What was inferred for one ticker")
+    registry_show.add_argument("--registry", required=True)
+    registry_show.add_argument("--ticker", required=True)
+
+    pack = sub.add_parser("pack", help="Write a chunked pack and an operator sidecar")
+    pack.add_argument("--ticker", required=True)
+    pack.add_argument("--src", required=True)
+    pack.add_argument("--out", required=True, help="Empty directory for the designer-facing pack")
+    pack.add_argument("--sidecar", required=True, help="Operator file. Must not be inside --out.")
+    pack.add_argument("--registry", required=True)
+    pack_mode = pack.add_mutually_exclusive_group(required=True)
+    pack_mode.add_argument("--anonymize", action="store_true", help="Rescale and hide the calendar")
+    pack_mode.add_argument("--named", action="store_true", help="Keep real dates. Share scale stays 1.")
+    pack.add_argument("--profile", choices=("arena", "desk"), default=None)
+    pack.add_argument("--bar-minutes", type=int, default=1)
+    pack.add_argument("--price-factor", type=float, default=None)
+    pack.add_argument("--volume-factor", type=float, default=None)
+    pack.add_argument("--price-kind", choices=("raw", "total_return"), default="raw")
+    pack.add_argument("--phase-map", default=None)
 
     sub.add_parser("test", help="Run the unit suite")
 
     for name, help_text in (
-        ("pack", "Anonymized pack builder (later phase)"),
         ("parallel", "Process-pool scoring (later phase)"),
         ("referee", "One-bar replay (later phase)"),
         ("report", "Report viewer (later phase)"),
@@ -120,12 +163,43 @@ def _print_headline(profile: str, payload: dict) -> None:
         )
     for warning in (payload.get("run") or {}).get("warnings") or []:
         print(f"warning: {warning}")
+    basis = payload.get("cost_basis") or {}
+    if basis:
+        print(
+            f"cost basis: share_scale={basis.get('share_scale')} "
+            f"schedule={basis.get('cost_schedule')} per_share={basis.get('per_share_fees')}"
+        )
 
 
 def _cmd_run(args) -> int:
-    from .runner import run_named
+    from .runner import run_named, run_pack
 
     strategy_cls = load_strategy_class(args.strategy)
+    if args.pack or args.sidecar:
+        if not args.pack or not args.sidecar:
+            raise ValueError("a pack run needs both --pack and --sidecar")
+        if args.src or args.ticker:
+            raise ValueError("a pack run does not take --src or --ticker. The sidecar holds those.")
+        if args.bar_minutes != 1:
+            raise ValueError("bar size is fixed when the pack is built. Build another pack to change it.")
+        payload = run_pack(
+            strategy_cls,
+            args.pack,
+            args.sidecar,
+            args.profile,
+            args.out,
+            borrow_rate_annual=args.borrow_rate,
+            financing_rate_annual=args.financing_rate,
+            fee_mult=args.fee_mult,
+            dividends=_dividends(args.dividends),
+            warmup_sessions=args.warmup_sessions,
+            initial_equity=args.initial_equity,
+        )
+        _print_headline(args.profile, payload)
+        print(f"wrote {args.out}")
+        return 0
+    if not args.src or not args.ticker:
+        raise ValueError("a named run needs --src and --ticker")
     payload = run_named(
         strategy_cls,
         args.src,
@@ -204,18 +278,107 @@ def _cmd_walk(args) -> int:
     return 0
 
 
+def _print_segments(info) -> None:
+    print("  hours inferred from the file:")
+    for segment in info.session_segments:
+        label = segment.label if segment.engine_phase == segment.label else f"{segment.label}->{segment.engine_phase}"
+        print(
+            f"    {label} {segment.as_dict()['start_clock']}-{segment.as_dict()['end_clock']} "
+            f"({segment.n_sessions} sessions, {segment.modal_bars} bars)"
+        )
+
+
 def _cmd_ingest(args) -> int:
-    loaded = load_named(args.src, args.ticker, bar_minutes=args.bar_minutes)
-    write_json(Path(args.out), loaded.inspection.as_dict())
-    info = loaded.inspection
-    print(
-        f"{info.symbol}: {info.n_rows} bars, {info.n_sessions} sessions, "
-        f"{info.first_timestamp_et} .. {info.last_timestamp_et}, "
-        f"sessions={','.join(info.session_labels)}, share_factor={info.share_factor}, "
-        f"prices={info.price_adjustment}"
+    if args.out is None and args.registry is None:
+        raise ValueError("ingest needs --out, --registry, or both")
+    if args.registry is not None and args.profile is None:
+        raise ValueError("recording a series needs --profile arena or desk. Refusing to guess from the ticker.")
+    if args.registry is not None and args.price_kind is None:
+        raise ValueError("recording a series needs --price-kind raw or total_return. Refusing to guess.")
+    price_kind = args.price_kind or "raw"
+    phase_map = parse_phase_map(args.phase_map)
+    splits = parse_splits(args.splits)
+    loaded = load_named(
+        args.src,
+        args.ticker,
+        bar_minutes=args.bar_minutes,
+        phase_map=phase_map,
+        price_kind=price_kind,
     )
+    info = loaded.inspection
+    if args.out is not None:
+        payload = info.as_dict()
+        if splits:
+            payload["declared_splits"] = list(splits)
+            payload["runnable"] = False
+        write_json(Path(args.out), payload)
+    print(
+        f"{info.symbol}: {info.native_rows} one-minute bars, {info.n_sessions} sessions, "
+        f"{info.first_timestamp_et} .. {info.last_timestamp_et}"
+    )
+    print(
+        f"  prices={info.price_adjustment} share_factor={info.share_factor} "
+        f"tick={info.native_tick} fill={info.fill_policy}"
+    )
+    _print_segments(info)
     _print_data_notes(info.notes)
-    print(f"wrote {args.out}")
+    if args.out is not None:
+        print(f"wrote {args.out}")
+    if args.registry is not None:
+        borrow = None if args.borrow_rate is None else args.borrow_rate
+        entry = entry_from_inspection(
+            info,
+            source_root=str(args.src),
+            profile=args.profile,
+            borrow_rate_annual=borrow,
+            splits=splits,
+        )
+        document = upsert_series(load_or_new(args.registry), entry)
+        save_registry(args.registry, document)
+        state = "runnable" if entry["runnable"] else "recorded, not runnable"
+        print(f"registry: {entry['symbol']} {entry['profile']} ({state}) -> {args.registry}")
+    return 0
+
+
+def _cmd_registry(args) -> int:
+    document = load_registry(args.registry)
+    if args.registry_command == "list":
+        print(format_list(document))
+        return 0
+    if args.registry_command == "show":
+        print(format_show(get_series(document, args.ticker)))
+        return 0
+    raise ValueError(f"unknown registry command {args.registry_command}")
+
+
+def _cmd_pack(args) -> int:
+    from .pack import build_pack
+
+    result = build_pack(
+        args.src,
+        args.ticker,
+        args.out,
+        args.sidecar,
+        anonymize=bool(args.anonymize),
+        profile=args.profile,
+        registry_path=args.registry,
+        bar_minutes=args.bar_minutes,
+        price_factor=args.price_factor,
+        volume_factor=args.volume_factor,
+        phase_map=parse_phase_map(args.phase_map),
+        price_kind=args.price_kind,
+    )
+    kind = "anonymized" if result.anonymized else "named"
+    print(
+        f"{kind} pack: {result.n_sessions} sessions in {result.n_chunks} file(s), "
+        f"bar_minutes={result.bar_minutes}"
+    )
+    if result.anonymized:
+        print("scale factors and the date map are only in the sidecar")
+    else:
+        print("named pack is unscaled (share_scale 1)")
+    print(f"pack: {result.pack_dir}")
+    print(f"sidecar: {result.sidecar_path}")
     return 0
 
 
@@ -236,10 +399,12 @@ def main(argv=None) -> int:
             return _cmd_walk(args)
         if args.command == "ingest":
             return _cmd_ingest(args)
+        if args.command == "registry":
+            return _cmd_registry(args)
+        if args.command == "pack":
+            return _cmd_pack(args)
         if args.command == "test":
             return _cmd_test()
-        if args.command == "pack":
-            raise NotImplementedError("Pack building is a later phase. Named runs do not anonymize.")
         if args.command == "parallel":
             raise NotImplementedError("Parallel scoring is a later phase.")
         if args.command == "referee":
@@ -248,7 +413,7 @@ def main(argv=None) -> int:
             raise NotImplementedError("A separate report command is a later phase. `run` already writes metrics.json.")
         parser.error(f"unknown command {args.command}")
         return 2
-    except (ValueError, FileNotFoundError, NotImplementedError, AttributeError) as exc:
+    except (ValueError, FileNotFoundError, NotImplementedError, AttributeError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

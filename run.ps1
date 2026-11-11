@@ -12,6 +12,10 @@
 #   .\run.ps1 run --profile desk --ticker SPY --strategy .\examples\desk\buy_and_hold.py `
 #     --src "C:\Users\Jeu\Desktop\Backtester\SPY\filled" `
 #     --out .\out\spy_desk
+#   .\run.ps1 ingest --ticker QQQ `
+#     --src "C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles\QQQ\filled" `
+#     --registry .\registry.json --profile arena --price-kind raw
+#   .\run.ps1 registry show --registry .\registry.json --ticker QQQ
 
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
