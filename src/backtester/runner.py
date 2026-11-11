@@ -17,6 +17,7 @@ import math
 import os
 import pickle
 import shutil
+import signal
 import sys
 import tempfile
 import threading
@@ -361,6 +362,136 @@ _CHILD_ARGV = ["backtester-design"]
 # Spawn copies the parent argv, cwd, and environment at Process.start.
 # Two books starting together must not interleave that scrub.
 _LAUNCH_LOCK = threading.Lock()
+# The child keeps at most this much of what a strategy prints. The rest is
+# discarded so a large print cannot fill the pipe the parent is reading, and
+# cannot fill the disk. The tail attached to an operator error is shorter.
+_STDIO_CAP_BYTES = 256 * 1024
+_STDIO_NAME = "stdio.log"
+
+
+class WorkerFailure(RuntimeError):
+    """A book process failed. ``tail`` is its own stdout/stderr, not a path."""
+
+    def __init__(self, message: str, *, tail: str = ""):
+        super().__init__(message)
+        self.tail = tail or ""
+
+
+class _StdioCapture:
+    """Redirect fd 1 and fd 2 into a capped file in the worker's directory.
+
+    The redirect is on the descriptors, so a C extension and a subprocess see
+    it. The reader keeps draining after the file is full, which is what stops
+    a large print from blocking the strategy.
+    """
+
+    def __init__(self, directory: str, limit: int = _STDIO_CAP_BYTES):
+        self.path = Path(directory) / _STDIO_NAME
+        self.limit = int(limit)
+        self._stored = 0
+        self._ring = bytearray()
+        self._ring_limit = 4096
+        self._lock = threading.Lock()
+        self._file = open(self.path, "wb")
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_inheritable(write_fd, True)
+        except OSError:
+            pass
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os.dup2(write_fd, 1)
+        os.dup2(write_fd, 2)
+        os.close(write_fd)
+        self._read = read_fd
+        self._thread = threading.Thread(target=self._drain, name="bt-stdio", daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                chunk = os.read(self._read, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            with self._lock:
+                self._ring.extend(chunk)
+                extra = len(self._ring) - self._ring_limit
+                if extra > 0:
+                    del self._ring[:extra]
+                room = self.limit - self._stored
+                if room > 0:
+                    piece = chunk[:room]
+                    self._file.write(piece)
+                    self._stored += len(piece)
+                    self._file.flush()
+
+    def tail(self, limit: int = 2000) -> str:
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        deadline = time.monotonic() + 0.5
+        previous = -1
+        stable = 0
+        while time.monotonic() < deadline and stable < 2:
+            with self._lock:
+                size = len(self._ring)
+            if size == previous:
+                stable += 1
+            else:
+                stable = 0
+                previous = size
+            time.sleep(0.02)
+        with self._lock:
+            data = bytes(self._ring[-limit:])
+        return data.decode("utf-8", "replace").replace("\x00", "")
+
+
+def _new_session() -> None:
+    """Make this worker a session leader so a group signal reaches its children.
+
+    Windows has no ``setsid``. The parent puts that worker in a job object
+    instead, before it releases the gate.
+    """
+    if os.name == "nt":
+        return
+    os.setsid()
+
+
+def _drop_directory(entries, banned: str) -> list:
+    """Remove one directory from a path list. Install paths stay."""
+    if not banned:
+        return list(entries)
+    try:
+        target = os.path.normcase(os.path.abspath(banned))
+    except OSError:
+        return list(entries)
+    kept = []
+    for entry in entries:
+        if not entry:
+            kept.append(entry)
+            continue
+        try:
+            resolved = os.path.normcase(os.path.abspath(entry))
+        except OSError:
+            kept.append(entry)
+            continue
+        if resolved == target:
+            continue
+        kept.append(entry)
+    return kept
 
 
 def _child_environ(source) -> dict:
@@ -376,14 +507,29 @@ def _enter_child(job):
     """Scrub the book process before any strategy code runs.
 
     Returns the argv and cwd spawn copied in, so a test can see that the copy
-    itself was already clean.
+    itself was already clean. The scrub runs again here even when spawn already
+    copied a clean argv and environment: a child that inherited the operator
+    process still drops them.
+
+    ``multiprocessing.process.ORIGINAL_DIR`` is the operator's directory from
+    when this interpreter first imported multiprocessing, and spawn puts that
+    directory on ``sys.path``. After the working directory is the empty temp
+    dir, both point there instead. Install paths stay on ``sys.path``.
     """
     inherited_argv = list(sys.argv)
     inherited_cwd = os.getcwd()
+    import multiprocessing.process as mp_process
+
+    operator_dir = mp_process.ORIGINAL_DIR or inherited_cwd
     sys.argv = list(_CHILD_ARGV)
     os.chdir(job["cwd"])
     os.environ.clear()
     os.environ.update(job["env"])
+    mp_process.ORIGINAL_DIR = os.path.abspath(os.getcwd())
+    if operator_dir and os.path.normcase(os.path.abspath(operator_dir)) != os.path.normcase(
+        os.getcwd()
+    ):
+        sys.path[:] = _drop_directory(sys.path, operator_dir)
     return inherited_argv, inherited_cwd
 
 
@@ -452,8 +598,11 @@ def _restore_dumpable(previous: int | None) -> None:
 
 
 def _books_worker(queue, job):
+    _new_session()
+    spool = None
     try:
         inherited_argv, inherited_cwd = _enter_child(job)
+        spool = _StdioCapture(job["cwd"])
         gate = job.get("gate")
         if gate is not None:
             gate["started"].set()
@@ -474,7 +623,13 @@ def _books_worker(queue, job):
         _note_child(books, inherited_argv, inherited_cwd)
         queue.put(("ok", _picklable_books(books)))
     except BaseException:
-        queue.put(("err", traceback.format_exc()))
+        tail = ""
+        if spool is not None:
+            try:
+                tail = spool.tail()
+            except Exception:
+                tail = ""
+        queue.put(("err", traceback.format_exc(), tail))
     finally:
         queue.close()
         queue.join_thread()
@@ -488,14 +643,57 @@ def _note_child(books, inherited_argv, inherited_cwd) -> None:
     observer.inherited_cwd = inherited_cwd
 
 
-def _stop_process(proc) -> None:
-    """End a worker. SIGTERM first, then a kill if it is still alive."""
-    if proc is None or not proc.is_alive():
+def _signal_group(pid: int, sig: int) -> None:
+    """Signal a worker's process group once ``setsid`` has made it the leader.
+
+    Before that, the worker still shares this process's group. ``killpg``
+    would hit the parent, so only that pid is signaled.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
         return
-    proc.terminate()
+    if pgid != pid:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        return
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return
+
+
+def _stop_process(proc, job=None) -> None:
+    """End a worker and the processes it started.
+
+    Linux sends SIGTERM to the worker's process group, then SIGKILL. Windows
+    terminates the job object, which contains the worker and its children.
+    Both waits are bounded. A no-op here leaves the worker running; the caller
+    still returns, and the test that watches the grandchild reaps it.
+    """
+    if job is not None:
+        try:
+            job.terminate()
+        except OSError:
+            pass
+    if proc is None:
+        return
+    pid = getattr(proc, "pid", None)
+    if pid and os.name != "nt":
+        _signal_group(pid, signal.SIGTERM)
+    elif proc.is_alive():
+        proc.terminate()
     proc.join(timeout=2)
     if proc.is_alive():
-        proc.kill()
+        if pid and os.name != "nt":
+            _signal_group(pid, signal.SIGKILL)
+        else:
+            try:
+                proc.kill()
+            except OSError:
+                pass
         proc.join(timeout=5)
 
 
@@ -508,13 +706,13 @@ def _cancelled(stop) -> bool:
     return bool(fn())
 
 
-def _wait_until_started(proc, event, queue, timeout: float, stop=None) -> None:
+def _wait_until_started(proc, event, queue, timeout: float, stop=None, job=None) -> None:
     import queue as queue_mod
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _cancelled(stop):
-            _stop_process(proc)
+            _stop_process(proc, job)
             raise RuntimeError("walk-forward worker cancelled")
         if event.wait(0.05):
             return
@@ -530,7 +728,7 @@ def _wait_until_started(proc, event, queue, timeout: float, stop=None) -> None:
     raise RuntimeError("walk-forward worker did not start")
 
 
-def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None):
+def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None):
     """Read the result, or raise as soon as the child exits without one.
 
     A dead child used to block on ``queue.get`` until the 600s timeout.
@@ -559,20 +757,114 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
                     f"walk-forward worker exited {proc.exitcode} without a result"
                 ) from None
         if _cancelled(stop):
-            _stop_process(proc)
+            _stop_process(proc, job)
             raise RuntimeError("walk-forward worker cancelled")
         if memory_bytes is not None:
             rss = process_tree_rss_bytes(proc.pid)
             if rss is not None and rss > int(memory_bytes):
-                _stop_process(proc)
+                _stop_process(proc, job)
                 raise RuntimeError(
                     f"walk-forward worker exceeded memory limit ({rss} > {int(memory_bytes)})"
                 )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _stop_process(proc)
+            _stop_process(proc, job)
             raise RuntimeError(f"walk-forward worker timed out (exit {proc.exitcode})")
         wait([reader, proc.sentinel], timeout=min(0.2, remaining))
+
+
+def _metric_delta(child, parent) -> list[str]:
+    """Top-level keys whose JSON forms differ. Empty means the books agree."""
+    from .report import json_ready
+
+    left = json_ready(child)
+    right = json_ready(parent)
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return ["metrics"]
+    bad = []
+    for key in sorted(set(left) | set(right)):
+        if left.get(key) != right.get(key):
+            bad.append(str(key))
+    return bad
+
+
+def _metrics_from_result(profile: str, result: dict, *, anonymized: bool, borrow_rate_annual):
+    """The statistics ``execute`` would attach, computed in this process."""
+    name = get_profile(profile).name
+    if name == "arena":
+        metrics = enrich_arena_metrics(result, engine_arena.metrics(result))
+        scale = float(result["share_scale"])
+        borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
+        metrics["share_factor"] = scale
+        metrics["borrow_rate_annual"] = borrow
+        metrics["financing_rate_annual"] = 0.0
+        metrics["cost_basis"] = _cost_basis(name, scale, anonymized=anonymized)
+        return metrics
+    if name == "desk":
+        metrics = engine_desk.metrics(result)
+        metrics["cost_basis"] = _cost_basis(name, float(metrics["share_factor"]), anonymized=anonymized)
+        return metrics
+    raise ValueError(f"unknown profile {profile}")
+
+
+def _accept_child_books(profile: str, frame, child_books: dict, kwargs: dict) -> dict:
+    """Recompute statistics here. A child that rewrote them fails the book.
+
+    The strategy's bars ran in the child, so a patched cost constant can still
+    change that book's fills. The numbers published for the book are computed
+    again from those fills in this process. Benchmarks are run again here, on
+    this process's copy of the engine. A mismatch fails the row instead of
+    publishing the child's copy. See docs/ISOLATION.md.
+    """
+    if "strategy" not in child_books:
+        raise RuntimeError("strategy process returned no strategy book")
+    strategy_result, child_metrics = child_books["strategy"]
+    anonymized = bool(kwargs.get("anonymized", False))
+    parent_metrics = _metrics_from_result(
+        profile,
+        strategy_result,
+        anonymized=anonymized,
+        borrow_rate_annual=kwargs.get("borrow_rate_annual"),
+    )
+    delta = _metric_delta(child_metrics, parent_metrics)
+    if delta:
+        shown = ", ".join(delta[:12])
+        raise RuntimeError(f"strategy metrics do not match the parent recomputation ({shown})")
+    books = {"strategy": (strategy_result, parent_metrics)}
+    if not kwargs.get("with_benchmarks", True):
+        return books
+    common = dict(
+        borrow_rate_annual=kwargs.get("borrow_rate_annual"),
+        financing_rate_annual=kwargs.get("financing_rate_annual"),
+        fee_mult=kwargs.get("fee_mult", 1.0),
+        dividends=kwargs.get("dividends"),
+        warmup_sessions=kwargs.get("warmup_sessions", 0),
+        initial_equity=kwargs.get("initial_equity", 1_000_000.0),
+        reset_day=kwargs.get("reset_day"),
+        max_day=kwargs.get("max_day"),
+        anonymized=anonymized,
+    )
+    billing = [float(kwargs.get("share_factor", 1.0))]
+    for label, cls in _benchmarks(get_profile(profile).name):
+        bench_result, bench_metrics = execute(
+            cls(), frame, profile, share_factor=_release(billing), **common
+        )
+        billing.append(bench_metrics["share_factor"])
+        child = child_books.get(label)
+        if child is None:
+            raise RuntimeError(f"{label} benchmark was not returned by the strategy process")
+        delta = _metric_delta(child[1], bench_metrics)
+        if delta:
+            shown = ", ".join(delta[:12])
+            raise RuntimeError(f"{label} benchmark does not match the parent recomputation ({shown})")
+        books[label] = (bench_result, bench_metrics)
+    return books
+
+
+def _failure_from_message(message) -> WorkerFailure:
+    detail = message[1] if len(message) > 1 else ""
+    tail = message[2] if len(message) > 2 and isinstance(message[2], str) else ""
+    return WorkerFailure(str(detail), tail=tail)
 
 
 def _isolated_books(
@@ -599,10 +891,14 @@ def _isolated_books(
     not part of the strategy budget. ``memory_bytes`` and ``stop`` stay in
     the parent. ``strategy_path``, when set, is loaded in the child so an
     import error belongs to that strategy.
+
+    The gate is always used. On Windows the job object is armed before the
+    gate opens, so a process the strategy starts is in that job. Statistics
+    and benchmarks are recomputed in this process from the child's result.
     """
     import multiprocessing
 
-    from .limits import limit_process_memory
+    from .limits import arm_worker_job
 
     if strategy_path is not None:
         spec = {"kind": "path", "path": str(strategy_path)}
@@ -612,9 +908,7 @@ def _isolated_books(
         spec = _strategy_spec(strategy_cls)
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
-    gate = None
-    if during is not None:
-        gate = {"started": ctx.Event(), "release": ctx.Event()}
+    gate = {"started": ctx.Event(), "release": ctx.Event()}
     job = {
         "strategy": spec,
         "frame": _standalone_frame(frame),
@@ -624,32 +918,36 @@ def _isolated_books(
     }
     proc = None
     cwd = None
-    cap = None
+    guard = None
     try:
         proc, cwd = _launch_book(ctx, result_queue, job)
-        if memory_bytes is not None:
-            cap = limit_process_memory(proc.pid, int(memory_bytes))
-        if gate is not None:
-            _wait_until_started(proc, gate["started"], result_queue, 60, stop)
-            try:
+        guard = arm_worker_job(proc.pid, None if memory_bytes is None else int(memory_bytes))
+        _wait_until_started(proc, gate["started"], result_queue, 60, stop, guard)
+        try:
+            if during is not None:
                 during()
-            finally:
-                gate["release"].set()
+        finally:
+            gate["release"].set()
         message = _take_result(
-            proc, result_queue, timeout, memory_bytes=memory_bytes, stop=stop
+            proc, result_queue, timeout, memory_bytes=memory_bytes, stop=stop, job=guard
         )
         proc.join(timeout=60)
-        if proc.exitcode != 0:
-            detail = "" if message[0] == "ok" else message[1]
-            raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n{detail}")
-        if message[0] == "ok":
-            return message[1]
-        raise RuntimeError(message[1])
+        if message[0] != "ok":
+            failure = _failure_from_message(message)
+            if proc.exitcode not in (0, None):
+                raise WorkerFailure(
+                    f"walk-forward worker exited {proc.exitcode}\n{failure}",
+                    tail=failure.tail,
+                )
+            raise failure
+        if proc.exitcode not in (0, None):
+            raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n")
+        return _accept_child_books(profile, _standalone_frame(frame), message[1], kwargs)
     finally:
         if proc is not None and proc.is_alive():
-            _stop_process(proc)
-        if cap is not None:
-            cap.close()
+            _stop_process(proc, guard)
+        if guard is not None:
+            guard.close()
         result_queue.close()
         result_queue.join_thread()
         if cwd is not None:

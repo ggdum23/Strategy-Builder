@@ -9,8 +9,12 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
 import shutil
+import sys
+import tempfile
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -94,14 +98,27 @@ DESIGNER_LEADERBOARD_COLUMNS = tuple(
     column for column in OPERATOR_LEADERBOARD_COLUMNS if column != "symbol"
 )
 
+# What ``load_report`` returns. The desktop window reads this shape.
+REPORT_CONTRACT = "strategy-builder.report.v1"
+
+# flock is per process. Threads in this process need their own lock, or two
+# register_run calls in one interpreter both pass the file lock.
+_INDEX_THREAD_LOCK = threading.Lock()
+
 
 def percent_up_days(equity, initial):
+    """Fraction of marks whose return is strictly positive.
+
+    A previous mark of 0 has no defined return. That session is not an up day
+    and it stays in the denominator. No marks returns null. The function does
+    not divide by zero.
+    """
     if not equity:
         return None
     previous = initial
     up = 0
     for value in equity:
-        if value / previous - 1.0 > 0.0:
+        if previous != 0 and value / previous - 1.0 > 0.0:
             up += 1
         previous = value
     return up / len(equity)
@@ -272,10 +289,10 @@ def _plot_equity(path: Path, profile: str, result: dict) -> None:
 
 def _scrub_text(value: str, symbol: str) -> str:
     text = _ISO_DATE.sub("", value)
-    if symbol and text == symbol:
+    if symbol and text.casefold() == symbol.casefold():
         return "ASSET"
     if symbol and len(symbol) >= 2:
-        text = re.sub(rf"\b{re.escape(symbol)}\b", "ASSET", text)
+        text = re.sub(rf"\b{re.escape(symbol)}\b", "ASSET", text, flags=re.IGNORECASE)
     return text
 
 
@@ -354,8 +371,12 @@ def assert_designer_clean(directory, *, symbol: str) -> None:
                 raise RuntimeError(f"{path.name} contains {token}")
         if _ISO_DATE.search(text):
             raise RuntimeError(f"{path.name} contains a calendar date")
-        if symbol and len(symbol) >= 2 and re.search(rf"\b{re.escape(symbol)}\b", text):
+        if symbol and len(symbol) >= 2 and re.search(
+            rf"\b{re.escape(symbol)}\b", text, flags=re.IGNORECASE
+        ):
             raise RuntimeError(f"{path.name} contains the ticker")
+        if symbol and path.name.casefold() == f"{symbol.casefold()}{path.suffix.casefold()}":
+            raise RuntimeError(f"{path.name} is named with the ticker")
 
 
 def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str) -> Path:
@@ -416,23 +437,81 @@ def read_leaderboard(path) -> list[dict]:
         return list(csv.DictReader(handle))
 
 
+def _lock_index(fd: int) -> str:
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.fstat(fd).st_size < 1:
+            os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        return "win"
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return "unix"
+
+
+def _unlock_index(fd: int, kind: str) -> None:
+    if kind == "win":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _replace_index(path: Path, document: dict) -> None:
+    """Write the index via a private temp file in the same directory."""
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(document, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    except Exception:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
 def register_run(index_path, run_id: str, run_dir, *, kind: str, profile: str) -> None:
-    """Record ``run_id`` → directory. The index is an operator file."""
+    """Record ``run_id`` → directory. The index is an operator file.
+
+    Concurrent callers share one lock file. Each writer then replaces the
+    index from its own temporary file, so two runs cannot tear the JSON or
+    drop a row the other one added.
+    """
     path = Path(index_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    document = {"schema_version": 1, "runs": {}}
-    if path.is_file():
-        document = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(document.get("runs"), dict):
-            raise ValueError(f"{path} is not a run index")
-    document["runs"][str(run_id)] = {
-        "path": str(Path(run_dir).resolve()),
-        "kind": kind,
-        "profile": profile,
-    }
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    lock_path = Path(str(path) + ".lock")
+    with _INDEX_THREAD_LOCK:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        kind_lock = None
+        try:
+            kind_lock = _lock_index(fd)
+            document = {"schema_version": 1, "runs": {}}
+            if path.is_file():
+                document = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(document, dict) or not isinstance(document.get("runs"), dict):
+                    raise ValueError(f"{path} is not a run index")
+            document["runs"][str(run_id)] = {
+                "path": str(Path(run_dir).resolve()),
+                "kind": kind,
+                "profile": profile,
+            }
+            _replace_index(path, document)
+        finally:
+            if kind_lock is not None:
+                _unlock_index(fd, kind_lock)
+            os.close(fd)
 
 
 def resolve_run(run, *, index_path=None) -> Path:
@@ -465,8 +544,49 @@ def _redact_row(row: dict, symbol: str) -> dict:
     return cleaned
 
 
+def _coerce_cell(value):
+    """Turn one leaderboard cell into the type the report contract uses.
+
+    Empty is null. ``true`` and ``false`` are booleans. A token with a decimal
+    point or an exponent is a float. A whole number is an int. Anything else
+    stays text. ``inf``, ``-inf``, and ``nan`` are floats here, so a parallel
+    cell is never the text ``inf``. The CSV file itself still stores that
+    text; ``read_leaderboard`` does not coerce it.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text == "":
+        return None
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered in {"inf", "+inf", "infinity"}:
+        return float("inf")
+    if lowered in {"-inf", "-infinity"}:
+        return float("-inf")
+    if lowered == "nan":
+        return float("nan")
+    try:
+        if any(mark in text for mark in (".", "e", "E")):
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _coerce_row(row: dict) -> dict:
+    return {str(key): _coerce_cell(value) for key, value in row.items()}
+
+
 def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
-    """Structured view of one run. ``designer`` never includes the operator secrets."""
+    """Structured view of one run. ``designer`` never includes the operator secrets.
+
+    Parallel rows use ``strategy-builder.report.v1``: numeric cells are numbers,
+    flags are booleans, and a blank cell is null.
+    """
     if audience not in {"operator", "designer"}:
         raise ValueError("audience must be operator or designer")
     directory = resolve_run(run, index_path=index_path)
@@ -491,6 +611,7 @@ def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
         if audience == "designer":
             summary = redact_metrics(summary, symbol=symbol or str(summary.get("symbol") or ""))
         return {
+            "contract": REPORT_CONTRACT,
             "audience": audience,
             "kind": "walkforward",
             "id": info.get("id"),
@@ -507,11 +628,12 @@ def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
         if audience == "designer" and root is directory:
             rows = [_redact_row(row, symbol) for row in rows]
         return {
+            "contract": REPORT_CONTRACT,
             "audience": audience,
             "kind": "parallel",
             "id": info.get("id"),
             "profile": info.get("profile"),
-            "rows": rows,
+            "rows": [_coerce_row(row) for row in rows],
             "cancelled": bool(info.get("cancelled")),
             "directory_name": root.name,
         }
@@ -522,6 +644,7 @@ def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
     if audience == "designer" and root is directory:
         metrics = redact_metrics(metrics, symbol=symbol or str(metrics.get("symbol") or ""))
     return {
+        "contract": REPORT_CONTRACT,
         "audience": audience,
         "kind": "book",
         "id": info.get("id") or metrics.get("run_id"),

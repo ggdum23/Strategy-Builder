@@ -37,6 +37,30 @@ def test_stubs_return_2_without_writing():
         assert caught.value.code == 2
 
 
+def test_pack_run_refuses_share_factor(tmp_path):
+    proc = _run(
+        [
+            "run",
+            "--profile",
+            "arena",
+            "--strategy",
+            str(HOLD),
+            "--pack",
+            "missing-pack",
+            "--sidecar",
+            "missing-side",
+            "--share-factor",
+            "0.9",
+            "--out",
+            str(tmp_path / "out"),
+        ],
+        tmp_path,
+    )
+    assert proc.returncode == 2
+    assert "share-factor" in proc.stderr
+    assert "sidecar" in proc.stderr
+
+
 def test_pack_without_arguments_exits():
     with pytest.raises(SystemExit) as caught:
         main(["pack"])

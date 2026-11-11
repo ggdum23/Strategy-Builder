@@ -2,8 +2,11 @@
 
 The cap is the worker's resident set, including children the strategy starts.
 It is not a fee, a fill rule, or a sandbox. Phase 4 still owns the OS jail.
-On Windows a job object is also armed, at a higher ceiling than the resident
-set, so a single allocation cannot exhaust the machine between polls.
+On Windows every worker is placed in a job object before it is allowed to run
+the strategy. The job has ``KILL_ON_JOB_CLOSE`` so the worker and anything it
+spawned die together. A memory cap, when one was requested, is a higher
+commit-charge ceiling than the resident set, so one allocation cannot exhaust
+the machine between polls.
 """
 
 from __future__ import annotations
@@ -54,13 +57,32 @@ def current_rss() -> int:
 def limit_process_memory(pid: int, memory_bytes: int):
     """Hard ceiling for a Windows worker. Linux polling enforces the same cap.
 
-    Returns an object with ``close()``, or None when this platform cannot arm
-    a job object. A failure to arm the job does not raise: the parent's
-    resident-set poll is still the cap the runner reports.
+    Returns an object with ``close()`` and ``terminate()``, or None when this
+    platform cannot arm a job object. A failure to arm the job does not raise:
+    the parent's resident-set poll is still the cap the runner reports.
+    """
+    if not isinstance(memory_bytes, int) or isinstance(memory_bytes, bool) or memory_bytes <= 0:
+        raise ValueError("memory cap must be a positive number of bytes")
+    return arm_worker_job(pid, memory_bytes)
+
+
+def arm_worker_job(pid: int, memory_bytes: int | None = None):
+    """Put a Windows worker in a job that dies with every process it starts.
+
+    The job is armed for every worker, including a run with no memory cap.
+    ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` is set so closing the last handle
+    kills the worker and the processes it spawned. ``terminate`` does that
+    immediately. A memory cap, when one was requested, is the same commit-charge
+    ceiling as before, added on top of that flag.
+
+    Linux returns None. The runner kills the process group there. A failure to
+    arm the job returns None and does not raise.
     """
     if sys.platform != "win32":
         return None
-    if not isinstance(memory_bytes, int) or isinstance(memory_bytes, bool) or memory_bytes <= 0:
+    if memory_bytes is not None and (
+        not isinstance(memory_bytes, int) or isinstance(memory_bytes, bool) or memory_bytes <= 0
+    ):
         raise ValueError("memory cap must be a positive number of bytes")
     try:
         return _WinJob.arm(pid, memory_bytes)
@@ -181,7 +203,7 @@ class _WinJob:
         self._handle = handle
 
     @classmethod
-    def arm(cls, pid: int, memory_bytes: int):
+    def arm(cls, pid: int, memory_bytes: int | None):
         # Win64 layout. A different size means the fields would be misread.
         if ctypes.sizeof(_JOBOBJECT_EXTENDED_LIMIT_INFORMATION) != 144:
             return None
@@ -201,6 +223,8 @@ class _WinJob:
         kernel32.OpenProcess.restype = ctypes.c_void_p
         kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.TerminateJobObject.restype = ctypes.c_int
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.c_int
 
@@ -213,13 +237,16 @@ class _WinJob:
             kernel32.CloseHandle(job)
             return None
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        # Commit charge, not the resident set. The poll enforces the resident
-        # cap. This ceiling stops one allocation from running away first.
-        ceiling = int(memory_bytes) * 4 + 256 * 1024 * 1024
-        info.ProcessMemoryLimit = ceiling
-        info.JobMemoryLimit = ceiling
-        # JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY
-        info.BasicLimitInformation.LimitFlags = 0x00000100 | 0x00000200
+        # KILL_ON_JOB_CLOSE is on every worker. A memory cap, when the caller
+        # asked for one, is a commit-charge ceiling above the resident-set poll.
+        flags = 0x2000
+        if memory_bytes is not None:
+            ceiling = int(memory_bytes) * 4 + 256 * 1024 * 1024
+            info.ProcessMemoryLimit = ceiling
+            info.JobMemoryLimit = ceiling
+            # JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY
+            flags |= 0x00000100 | 0x00000200
+        info.BasicLimitInformation.LimitFlags = flags
         # JobObjectExtendedLimitInformation = 9
         armed = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
         assigned = armed and kernel32.AssignProcessToJobObject(job, process)
@@ -228,6 +255,13 @@ class _WinJob:
             kernel32.CloseHandle(job)
             return None
         return cls(kernel32, job)
+
+    def terminate(self) -> None:
+        """Kill the worker and every process it started."""
+        handle = self._handle
+        if not handle:
+            return
+        self._kernel.TerminateJobObject(handle, 1)
 
     def close(self) -> None:
         handle = self._handle

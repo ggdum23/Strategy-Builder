@@ -148,11 +148,14 @@ python -m backtester test
 
 `parallel` runs one process per job. The worker count does not change a result.
 A strategy that crashes, hangs, or exceeds `--memory-mb` is one failed row, and
-the rest of the batch still finishes. `--timeout` starts after that process is
-up. One `--dividends` file applies to the whole batch. Arena rejects it. On an
-anonymized Desk pack the parent remaps each date and scales the amount before
-the child starts. `report --run` reads a run id from this directory's
-`.backtester-runs.json`, or a directory that contains `run.json`.
+the rest of the batch still finishes. A process that strategy starts is stopped
+with it. `--timeout` starts after that process is up. One `--dividends` file
+applies to the whole batch. Arena rejects it. On an anonymized Desk pack the
+parent remaps each date and scales the amount before the child starts. The
+parent recomputes the statistics and runs the benchmarks; a child that rewrites
+those figures fails that row. `report --run` reads a run id from this
+directory's `.backtester-runs.json`, or a directory that contains `run.json`.
+`--share-factor` is refused on a pack run. The sidecar holds the scale.
 
 `--borrow-rate` overrides that profile's borrow. `--financing-rate` and
 `--fee-mult` are Desk switches. Arena rejects a financing rate, a fee multiplier

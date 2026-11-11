@@ -34,6 +34,7 @@ from pathlib import Path
 from .profiles import get_profile
 from .report import (
     OPERATOR_LEADERBOARD_COLUMNS,
+    _scrub_text,
     assert_designer_clean,
     redact_metrics,
     register_run,
@@ -369,6 +370,12 @@ def run_parallel(
         except Exception as exc:
             status = _classify(exc)
             text = _clip(str(exc))
+            tail = getattr(exc, "tail", "") or ""
+            if tail:
+                scrubbed = _scrub_text(str(tail), market.symbol if market.symbol else "")
+                scrubbed = scrubbed.strip()
+                if scrubbed:
+                    text = _clip(text + "\n" + scrubbed[:2000])
             try:
                 _write_failure(
                     out / "jobs" / ref.strategy_id / source_id,
@@ -822,6 +829,20 @@ def _designer_error_text(item: JobResult) -> str:
     return "the strategy failed"
 
 
+def _designer_component(value: str, symbol: str, used: set) -> str:
+    """A designer path component. A case-variant of the ticker becomes ASSET."""
+    text = _scrub_text(str(value), symbol) if symbol else str(value)
+    if not text or text in {".", ".."}:
+        text = "ASSET"
+    candidate = text
+    suffix = 2
+    while candidate in used:
+        candidate = f"{text}-{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return _safe_component(candidate)
+
+
 def _bundle_designer(out, ranked_rows, assignments, results) -> None:
     """One directory a designer can be handed. Named jobs stay out of it."""
     selected = []
@@ -842,16 +863,29 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
     designer.mkdir(parents=True)
     by_job = {(item.strategy_id, item.source_id): item for item in results}
     cleaned = []
-    for row in selected:
+    used_names = set()
+    for row, assignment in _rows_with_markets(selected, assignments):
         item = by_job[(row["strategy_id"], row["source_id"])]
+        market = assignment[1]
+        symbol = market.symbol if isinstance(market, _Prepared) else ""
         source = Path(item.out_dir) / "designer"
         if source.is_dir():
-            dest = designer / row["strategy_id"] / row["source_id"]
+            folder = _designer_component(row["strategy_id"], symbol, used_names)
+            source_name = _designer_component(row["source_id"], symbol, set())
+            dest = designer / folder / source_name
             dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                shutil.rmtree(dest)
             shutil.copytree(source, dest)
-        copied = dict(row)
-        copied["error"] = _designer_error_text(item)
-        copied.pop("symbol", None)
+        copied = {}
+        for key, value in row.items():
+            if key == "symbol":
+                continue
+            if isinstance(value, str):
+                copied[key] = _scrub_text(value, symbol)
+            else:
+                copied[key] = value
+        copied["error"] = _scrub_text(_designer_error_text(item), symbol)
         cleaned.append(copied)
     for index, row in enumerate(cleaned, start=1):
         row["rank"] = index

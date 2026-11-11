@@ -30,6 +30,14 @@ bar of any phase.
 The first daily return is `equity[0] / initial_equity - 1`. Every later return
 is `equity[i] / equity[i - 1] - 1`. A flat day is a return of 0.
 
+A denominator of 0 has no defined return. That session's return is stored as
+0. It is not an up day. It does not raise, and it is not stored as infinity.
+`total_return` is 0 when initial equity is 0. `cagr` is -1 in that case: the
+ratio is undefined and is not reported as an infinite gain. A drawdown whose
+running peak is 0 is 0. A block whose starting equity is 0 has period return
+0. A path with no zero mark uses the same divisions as before, and Arena's
+byte comparison with the vendored reference still holds on those paths.
+
 ## Return, risk, and the path
 
 `total_return` is `final_equity / initial_equity - 1`.
@@ -65,13 +73,19 @@ last mark counts through that last mark.
 
 `calmar` is `cagr / abs(max_drawdown)` when max drawdown is negative. With no
 drawdown it is positive infinity. `metrics.json` writes non-finite numbers as
-JSON null. `leaderboard.csv` writes `inf` and `-inf`.
+JSON null. `leaderboard.csv` writes `inf` and `-inf`. `load_report` on a
+parallel run returns contract `strategy-builder.report.v1` and types those
+cells: a blank is null, `true` and `false` are booleans, `inf`, `-inf`, and
+`nan` are floats, and a whole number is an int. `read_leaderboard` still
+returns the CSV text, including the string `inf`.
 
 `best_day` and `worst_day` are the maximum and minimum daily returns.
 
 `percent_up_days` is the fraction of sessions whose return is strictly
 greater than 0. A flat session is not an up day. The first session is
-compared with initial equity. No marks produces null.
+compared with initial equity. A session whose previous mark is 0 is not an
+up day and stays in the denominator. No marks produces null. The function
+does not divide by zero.
 
 ## Trades
 
@@ -157,11 +171,13 @@ equity before, high-water, shares before, equity after, and shares after.
 
 ## Benchmarks and the leaderboard
 
-Benchmarks run through the same engine and the same costs as the strategy,
-in the same process, after the strategy. Arena's only benchmark is 1x
-buy-and-hold. Desk also runs a constant 2x long financed at 7% (or the run's
-financing rate, when one was passed). A crash before the benchmarks leaves
-them unrun.
+Benchmarks run through the same engine and the same costs as the strategy.
+Arena's only benchmark is 1x buy-and-hold. Desk also runs a constant 2x long
+financed at 7% (or the run's financing rate, when one was passed). On an
+isolated run the parent runs those benchmarks again and recomputes the
+strategy statistics from the child's equity and fills. A mismatch fails the
+row. The published figures are the parent's. A crash before the benchmarks
+leaves them unrun. See `docs/ISOLATION.md`.
 
 Desk is judged on raw total return against the 1x book. The leaderboard key
 is `excess_total_return = strategy total_return - buy_and_hold_1x total_return`

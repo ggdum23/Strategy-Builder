@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -10,11 +12,15 @@ import pytest
 
 from backtester.engine_desk import DeskConfig, metrics, run
 from backtester.report import (
+    REPORT_CONTRACT,
     assert_designer_clean,
     json_ready,
+    load_report,
     read_leaderboard,
     redact_metrics,
+    register_run,
     write_book,
+    write_json,
     write_leaderboard,
 )
 from backtester.runner import execute
@@ -177,3 +183,75 @@ def test_leaderboard_uses_lf_and_writes_inf():
         header = designer.read_text(encoding="utf-8").splitlines()[0]
         assert "symbol" not in header.split(",")
         assert "strategy_id" in header
+
+
+def test_register_run_keeps_every_id_under_threads_and_processes(tmp_path):
+    index = tmp_path / "runs.json"
+    register_run(index, "seed", tmp_path / "seed", kind="book", profile="arena")
+    ids = [f"t{number}" for number in range(8)] + ["p0", "p1"]
+
+    def once(run_id: str) -> None:
+        register_run(index, run_id, tmp_path / run_id, kind="parallel", profile="desk")
+
+    threads = [threading.Thread(target=once, args=(run_id,)) for run_id in ids[:8]]
+    ctx = multiprocessing.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=register_run,
+            args=(str(index), run_id, str(tmp_path / run_id)),
+            kwargs={"kind": "book", "profile": "arena"},
+        )
+        for run_id in ids[8:]
+    ]
+    for thread in threads:
+        thread.start()
+    for proc in processes:
+        proc.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    for proc in processes:
+        proc.join(timeout=60)
+        assert proc.exitcode == 0
+    document = json.loads(index.read_text(encoding="utf-8"))
+    assert set(document["runs"]) == set(["seed", *ids])
+    assert document["schema_version"] == 1
+    assert document["runs"]["seed"]["kind"] == "book"
+
+
+def test_load_report_types_parallel_cells(tmp_path):
+    rows = [
+        {
+            "rank": 1,
+            "strategy_id": "flat",
+            "source_id": "book",
+            "symbol": "NIK",
+            "profile": "arena",
+            "status": "ok",
+            "total_return": 0.125,
+            "excess_total_return": -0.5,
+            "calmar": float("inf"),
+            "n_fills": 4,
+            "disqualified": False,
+            "long_2x_total_return": None,
+            "error": "",
+        }
+    ]
+    write_json(tmp_path / "run.json", {"schema_version": 1, "id": "r1", "kind": "parallel", "profile": "arena"})
+    write_leaderboard(tmp_path / "leaderboard.csv", rows, audience="operator")
+    view = load_report(tmp_path)
+    assert view["contract"] == REPORT_CONTRACT == "strategy-builder.report.v1"
+    assert view["kind"] == "parallel"
+    row = view["rows"][0]
+    assert row["rank"] == 1 and isinstance(row["rank"], int)
+    assert row["n_fills"] == 4 and isinstance(row["n_fills"], int)
+    assert row["total_return"] == pytest.approx(0.125) and isinstance(row["total_return"], float)
+    assert row["excess_total_return"] == pytest.approx(-0.5)
+    assert row["calmar"] == float("inf")
+    assert row["disqualified"] is False
+    assert row["long_2x_total_return"] is None
+    assert row["strategy_id"] == "flat"
+    assert row["error"] is None
+    raw = read_leaderboard(tmp_path / "leaderboard.csv")
+    assert raw[0]["calmar"] == "inf"
+    assert raw[0]["disqualified"] == "false"

@@ -498,12 +498,31 @@ def test_design_child_has_no_source_path_and_parent_drops_the_locked_close(tmp_p
     assert token not in observer.cwd
     assert token not in observer.inherited_cwd
     assert os.path.normcase(observer.cwd) != os.path.normcase(str(source))
-    assert observer.cwd_listing == []
+    assert observer.cwd_listing == ["stdio.log"]
     assert token not in observer.env_text
     assert "MARKET_DATA_ROOT" not in observer.env_text
     assert needle in set(slices.locked["close"].tolist())
     assert needle not in set(slices.design["close"].tolist())
     assert summary["inspection_notes"] == []
+
+
+def test_walk_forward_rejects_a_share_factor_other_than_one(tmp_path):
+    class Flat:
+        def on_bar(self, _bar, _state):
+            return None
+
+    with pytest.raises(ValueError, match="share_factor"):
+        walk_forward(
+            Flat,
+            make_frame(4),
+            "arena",
+            tmp_path,
+            symbol="TEST",
+            bar_minutes=1,
+            design_end_day=1,
+            share_factor=0.9,
+            with_benchmarks=False,
+        )
 
 
 def test_systemexit_in_the_child_fails_fast(tmp_path):

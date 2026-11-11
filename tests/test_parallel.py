@@ -5,8 +5,10 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -79,21 +81,71 @@ TWO = (
 
 
 def test_rank_is_excess_return_then_id_and_failures_go_last():
+    # total_return order is the reverse of excess order. Ranking by the raw
+    # total would put high_total first and a/s last among the finite rows.
     rows = [
-        {"status": "ok", "excess_total_return": 0.1, "strategy_id": "b", "source_id": "s"},
-        {"status": "ok", "excess_total_return": 0.5, "strategy_id": "a", "source_id": "s"},
-        {"status": "ok", "excess_total_return": 0.5, "strategy_id": "a", "source_id": "t"},
-        {"status": "error", "excess_total_return": 9.0, "strategy_id": "c", "source_id": "s"},
-        {"status": "ok", "excess_total_return": float("nan"), "strategy_id": "d", "source_id": "s"},
+        {
+            "status": "ok",
+            "excess_total_return": 0.01,
+            "total_return": 0.90,
+            "strategy_id": "high_total",
+            "source_id": "s",
+        },
+        {
+            "status": "ok",
+            "excess_total_return": 0.5,
+            "total_return": 0.02,
+            "strategy_id": "a",
+            "source_id": "s",
+        },
+        {
+            "status": "ok",
+            "excess_total_return": 0.5,
+            "total_return": 0.99,
+            "strategy_id": "a",
+            "source_id": "t",
+        },
+        {
+            "status": "ok",
+            "excess_total_return": 0.1,
+            "total_return": 0.80,
+            "strategy_id": "b",
+            "source_id": "s",
+        },
+        {
+            "status": "error",
+            "excess_total_return": 9.0,
+            "total_return": 9.0,
+            "strategy_id": "c",
+            "source_id": "s",
+        },
+        {
+            "status": "ok",
+            "excess_total_return": float("nan"),
+            "total_return": 5.0,
+            "strategy_id": "d",
+            "source_id": "s",
+        },
     ]
     rows.sort(key=_rank_key)
-    assert [(row["strategy_id"], row["source_id"]) for row in rows] == [
+    ranked = [(row["strategy_id"], row["source_id"]) for row in rows]
+    assert ranked == [
         ("a", "s"),
         ("a", "t"),
         ("b", "s"),
+        ("high_total", "s"),
         ("d", "s"),
         ("c", "s"),
     ]
+    by_total = sorted(
+        rows,
+        key=lambda row: (
+            0 if row["status"] == "ok" else 1,
+            -(row["total_return"] if isinstance(row["total_return"], float) else 0.0),
+            row["strategy_id"],
+        ),
+    )
+    assert ranked != [(row["strategy_id"], row["source_id"]) for row in by_total]
 
 
 def test_discover_reads_immediate_children_and_disambiguates(tmp_path):
@@ -542,3 +594,553 @@ def test_windows_path_with_spaces_runs_from_the_command_line(tmp_path):
     assert reported.returncode == 0, reported.stderr
     assert "total_return=" in reported.stdout
     assert "symbol=NIK" in reported.stdout
+
+
+def _alive(pid: int) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        listed = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        # tasklist CSV quotes the pid. A substring match would treat 12 as 123.
+        return f"\"{pid}\"" in listed.stdout
+    stat = Path(f"/proc/{pid}/stat")
+    if not stat.exists():
+        return False
+    try:
+        text = stat.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    state = text.rsplit(")", 1)[-1].split()[0]
+    return state != "Z"
+
+
+def _reap(pid: int | None) -> None:
+    if not pid:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+        )
+        return
+    try:
+        os.killpg(int(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        os.kill(int(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _pids(path: Path) -> tuple[int | None, int | None]:
+    if not path.is_file():
+        return None, None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return int(payload["worker"]), int(payload["child"])
+
+
+def _sleeper_strategy(marker: Path, *, allocate: int = 0) -> str:
+    alloc = ""
+    if allocate:
+        alloc = (
+            "        blobs = []\n"
+            f"        remaining = {int(allocate)}\n"
+            "        while remaining > 0:\n"
+            "            chunk = bytearray(min(remaining, 8 * 1024 * 1024))\n"
+            "            for index in range(0, len(chunk), 4096):\n"
+            "                chunk[index] = 1\n"
+            "            blobs.append(chunk)\n"
+            "            remaining -= len(chunk)\n"
+            "        time.sleep(3)\n"
+        )
+    return (
+        "import json, os, subprocess, time\n"
+        "from pathlib import Path\n"
+        "def _spawn():\n"
+        "    if os.name == 'nt':\n"
+        "        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)\n"
+        "        return subprocess.Popen(['ping', '-n', '300', '127.0.0.1'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)\n"
+        "    return subprocess.Popen(['sleep', '300'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        child = _spawn()\n"
+        f"        Path({str(marker)!r}).write_text(json.dumps({{'worker': os.getpid(), 'child': child.pid}}))\n"
+        f"{alloc}"
+        "        time.sleep(300)\n"
+        "        return None\n"
+    )
+
+
+def _assert_grandchild_gone(marker: Path, label: str) -> None:
+    worker, child = _pids(marker)
+    try:
+        assert child is not None, f"{label}: strategy never started its child"
+        assert not _alive(child), f"{label}: grandchild {child} is still running"
+        if worker is not None:
+            assert not _alive(worker), f"{label}: worker {worker} is still running"
+    finally:
+        _reap(child)
+        _reap(worker)
+
+
+def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
+    """A long-lived child of the strategy dies on timeout, cancel, and the RSS kill.
+
+    Each scenario is bounded. If stopping the worker is a no-op, the assertion
+    fails and the cleanup signal still reaps the process so pytest can exit.
+    """
+    market = FrameMarket("book", "TEST", frame=_frame())
+
+    timeout_marker = tmp_path / "timeout.json"
+    _strategy(tmp_path / "timeout", "sleep", _sleeper_strategy(timeout_marker))
+    started = time.monotonic()
+    try:
+        timed = run_parallel(
+            discover_strategies(tmp_path / "timeout"),
+            [market],
+            tmp_path / "timeout-out",
+            profile="arena",
+            workers=1,
+            timeout_s=3,
+            with_benchmarks=False,
+        )
+        assert time.monotonic() - started < 20
+        assert timed.results[0].status == "timeout"
+    finally:
+        _assert_grandchild_gone(timeout_marker, "timeout")
+
+    cancel_marker = tmp_path / "cancel.json"
+    _strategy(tmp_path / "cancel", "sleep", _sleeper_strategy(cancel_marker))
+    token = CancelToken()
+
+    def _after_gate():
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if cancel_marker.is_file():
+                time.sleep(0.3)
+                token.cancel()
+                return
+            time.sleep(0.05)
+
+    watcher = threading.Thread(target=_after_gate, daemon=True)
+    watcher.start()
+    started = time.monotonic()
+    cancelled = None
+    try:
+        cancelled = run_parallel(
+            discover_strategies(tmp_path / "cancel"),
+            [market],
+            tmp_path / "cancel-out",
+            profile="arena",
+            workers=1,
+            timeout_s=25,
+            with_benchmarks=False,
+            cancel=token,
+        )
+        assert time.monotonic() - started < 12, [(item.status, item.error) for item in cancelled.results]
+        assert cancelled.results[0].status == "cancelled"
+        assert "cancelled" in cancelled.results[0].error
+    finally:
+        watcher.join(timeout=2)
+        _assert_grandchild_gone(cancel_marker, "cancel")
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import backtester.runner\nfrom backtester.limits import current_rss\nprint(current_rss())\n",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    baseline = int(probe.stdout.strip())
+    cap = baseline + 128 * 1024 * 1024
+    memory_marker = tmp_path / "memory.json"
+    _strategy(tmp_path / "memory", "hog", _sleeper_strategy(memory_marker, allocate=192 * 1024 * 1024))
+    _strategy(tmp_path / "memory", "good", FLAT)
+    try:
+        remembered = run_parallel(
+            discover_strategies(tmp_path / "memory"),
+            [market],
+            tmp_path / "memory-out",
+            profile="arena",
+            workers=2,
+            timeout_s=40,
+            memory_bytes=cap,
+            with_benchmarks=False,
+        )
+        by_id = {item.strategy_id: item for item in remembered.results}
+        detail = [(item.strategy_id, item.status, item.error) for item in remembered.results]
+        assert by_id["hog"].status == "memory", detail
+        assert "exceeded memory limit" in (by_id["hog"].error or "")
+        assert "MemoryError" not in (by_id["hog"].error or "")
+        assert by_id["good"].status == "ok", detail
+    finally:
+        _assert_grandchild_gone(memory_marker, "memory")
+
+
+def test_strategy_cannot_read_operator_metrics_through_original_dir_or_sys_path(tmp_path):
+    import multiprocessing.process as mp_process
+
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    secret = {"symbol": "ZZZX", "share_scale": 1.337}
+    (operator / "metrics.json").write_text(json.dumps(secret), encoding="utf-8")
+    side = tmp_path / "seen.json"
+    source = (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "import multiprocessing.process as mp\n"
+        "hits = []\n"
+        "roots = []\n"
+        "if mp.ORIGINAL_DIR:\n"
+        "    roots.append(mp.ORIGINAL_DIR)\n"
+        "roots.extend(sys.path)\n"
+        "for root in roots:\n"
+        "    if not root:\n"
+        "        root = os.getcwd()\n"
+        "    candidate = Path(root) / 'metrics.json'\n"
+        "    try:\n"
+        "        if candidate.is_file():\n"
+        "            hits.append(candidate.read_text(encoding='utf-8'))\n"
+        "    except OSError:\n"
+        "        pass\n"
+        f"Path({str(side)!r}).write_text(json.dumps({{'hits': hits, 'orig': mp.ORIGINAL_DIR, 'path': sys.path}}))\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        return None\n"
+    )
+    strategy = _strategy(tmp_path / "s", "reader", source)
+    old_original = mp_process.ORIGINAL_DIR
+    old_path = list(sys.path)
+    mp_process.ORIGINAL_DIR = str(operator.resolve())
+    sys.path.insert(0, str(operator.resolve()))
+    try:
+        result = run_parallel(
+            [strategy],
+            [FrameMarket("book", "TEST", frame=_frame())],
+            tmp_path / "out",
+            profile="arena",
+            workers=1,
+            timeout_s=30,
+            with_benchmarks=False,
+        )
+    finally:
+        mp_process.ORIGINAL_DIR = old_original
+        sys.path[:] = old_path
+    assert result.failures == 0, [(item.status, item.error) for item in result.results]
+    seen = json.loads(side.read_text(encoding="utf-8"))
+    assert seen["hits"] == []
+    dumped = json.dumps(seen)
+    assert "ZZZX" not in dumped
+    assert "1.337" not in dumped
+    assert Path(seen["orig"]).resolve() != operator.resolve()
+
+
+def test_a_large_print_is_not_a_timeout(tmp_path):
+    side = tmp_path / "size.txt"
+    source = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        print('X' * (8 * 1024 * 1024), flush=True)\n"
+        "        path = Path('stdio.log')\n"
+        "        deadline = time.time() + 5\n"
+        "        size = 0\n"
+        "        while time.time() < deadline:\n"
+        "            size = path.stat().st_size if path.is_file() else 0\n"
+        "            if size >= 64 * 1024:\n"
+        "                break\n"
+        "            time.sleep(0.05)\n"
+        f"        Path({str(side)!r}).write_text(str(size))\n"
+        "        return None\n"
+    )
+    result = run_parallel(
+        [_strategy(tmp_path / "s", "loud", source)],
+        [FrameMarket("book", "TEST", frame=_frame())],
+        tmp_path / "out",
+        profile="arena",
+        workers=1,
+        timeout_s=20,
+        with_benchmarks=False,
+    )
+    assert result.results[0].status == "ok", (result.results[0].status, result.results[0].error)
+    size = int(side.read_text(encoding="utf-8"))
+    assert 0 < size < 1_000_000
+
+
+def test_enter_child_scrubs_a_dirty_argv_and_environment(tmp_path):
+    import multiprocessing.process as mp_process
+
+    from backtester.runner import _enter_child
+
+    folder = tmp_path / "empty"
+    folder.mkdir()
+    old_argv = list(sys.argv)
+    old_cwd = os.getcwd()
+    old_env = dict(os.environ)
+    old_original = mp_process.ORIGINAL_DIR
+    old_path = list(sys.path)
+    sys.argv = ["backtester", "run", "--ticker", "QQQ", "--src", "secret-path"]
+    os.environ["BT_OPERATOR_SECRET"] = "canary-value"
+    try:
+        inherited_argv, _inherited_cwd = _enter_child(
+            {"cwd": str(folder), "env": {"PATH": old_env.get("PATH", "")}}
+        )
+        assert "QQQ" in inherited_argv
+        assert sys.argv == ["backtester-design"]
+        assert "BT_OPERATOR_SECRET" not in os.environ
+        assert os.environ.get("PATH") == old_env.get("PATH", "")
+        assert os.path.normcase(os.getcwd()) == os.path.normcase(str(folder))
+        assert os.path.normcase(mp_process.ORIGINAL_DIR) == os.path.normcase(str(folder))
+    finally:
+        sys.argv = old_argv
+        os.chdir(old_cwd)
+        os.environ.clear()
+        os.environ.update(old_env)
+        mp_process.ORIGINAL_DIR = old_original
+        sys.path[:] = old_path
+
+
+def _anon_pack(tmp_path: Path, symbol: str):
+    from backtester.data import load_named
+    from backtester.pack import build_pack
+    from backtester.registry import entry_from_inspection, save_registry, upsert_series
+
+    src = _named_series(tmp_path / "src", symbol)
+    loaded = load_named(src, symbol)
+    registry = tmp_path / "registry.json"
+    entry = entry_from_inspection(loaded.inspection, source_root=str(src), profile="arena")
+    save_registry(registry, upsert_series({"schema_version": 1, "series": []}, entry))
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "operator" / "secret.json"
+    built = build_pack(
+        src,
+        symbol,
+        pack,
+        sidecar,
+        anonymize=True,
+        profile="arena",
+        registry_path=registry,
+        price_factor=1.1,
+        volume_factor=0.5,
+    )
+    return pack, sidecar, built
+
+
+def test_designer_error_hides_the_operator_traceback(tmp_path):
+    pack, sidecar, _built = _anon_pack(tmp_path, "NIK")
+    source = (
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        print('OPERATOR-STDIO-CANARY', flush=True)\n"
+        "        raise RuntimeError('boom-isolated')\n"
+    )
+    result = run_parallel(
+        [_strategy(tmp_path / "s", "boom", source)],
+        [PackMarket(str(pack), str(sidecar))],
+        tmp_path / "out",
+        profile="arena",
+        workers=1,
+        timeout_s=30,
+        with_benchmarks=False,
+    )
+    assert result.results[0].status == "error"
+    operator = json.loads((Path(result.results[0].out_dir) / "error.json").read_text(encoding="utf-8"))
+    designer = json.loads(
+        (Path(result.results[0].out_dir) / "designer" / "error.json").read_text(encoding="utf-8")
+    )
+    assert "Traceback" in operator["error"]
+    assert "boom-isolated" in operator["error"]
+    assert "OPERATOR-STDIO-CANARY" in operator["error"]
+    assert designer["error"] == "the strategy failed"
+    assert "Traceback" not in designer["error"]
+    assert "boom-isolated" not in designer["error"]
+    assert "OPERATOR-STDIO-CANARY" not in designer["error"]
+    tree = []
+    for path in (tmp_path / "out" / "designer").rglob("*"):
+        if path.is_file() and path.suffix.lower() != ".png":
+            tree.append(path.read_text(encoding="utf-8"))
+    blob = "\n".join(tree)
+    assert "Traceback" not in blob
+    assert "OPERATOR-STDIO-CANARY" not in blob
+    assert "boom-isolated" not in blob
+
+
+def test_ticker_scrub_ignores_case(tmp_path):
+    pack, sidecar, _built = _anon_pack(tmp_path, "ZZZX")
+    result = run_parallel(
+        [_strategy(tmp_path / "strategies", "zzzx", FLAT)],
+        [PackMarket(str(pack), str(sidecar))],
+        tmp_path / "out",
+        profile="arena",
+        workers=1,
+        timeout_s=30,
+        with_benchmarks=False,
+    )
+    assert result.failures == 0, [(item.status, item.error) for item in result.results]
+    designer = tmp_path / "out" / "designer"
+    board = (designer / "leaderboard.csv").read_text(encoding="utf-8")
+    assert "zzzx" not in board.casefold()
+    names = [path.name for path in designer.rglob("*")]
+    assert all("zzzx" not in name.casefold() for name in names)
+    for path in designer.rglob("*"):
+        if path.is_file() and path.suffix.lower() != ".png":
+            assert "zzzx" not in path.read_text(encoding="utf-8").casefold()
+    assert_designer_clean(designer, symbol="ZZZX")
+    operator = [
+        path
+        for path in (tmp_path / "out" / "jobs").rglob("metrics.json")
+        if "designer" not in path.parts
+    ]
+    assert "ZZZX" in operator[0].read_text(encoding="utf-8")
+
+
+def test_parent_rejects_metrics_the_child_rewrote(tmp_path):
+    source = (
+        "import backtester.engine_arena as arena\n"
+        "_real = arena.metrics\n"
+        "def lied(res, period_label_of_day=None):\n"
+        "    out = _real(res, period_label_of_day)\n"
+        "    out['total_return'] = 123.0\n"
+        "    return out\n"
+        "arena.metrics = lied\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        return None\n"
+    )
+    result = run_parallel(
+        [_strategy(tmp_path / "s", "liar", source)],
+        [FrameMarket("book", "TEST", frame=_frame())],
+        tmp_path / "out",
+        profile="arena",
+        workers=1,
+        timeout_s=30,
+    )
+    assert result.results[0].status == "error"
+    assert "do not match the parent recomputation" in (result.results[0].error or "")
+    assert "total_return" in (result.results[0].error or "")
+
+
+def test_parent_rejects_a_benchmark_run_at_a_patched_financing_rate(tmp_path):
+    source = (
+        "import backtester.engine_desk as desk\n"
+        "desk.D.FINANCING_RATE_ANNUAL = 0.0\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        return None\n"
+    )
+    result = run_parallel(
+        [_strategy(tmp_path / "s", "patched", source)],
+        [FrameMarket("book", "TEST", frame=_frame())],
+        tmp_path / "out",
+        profile="desk",
+        workers=1,
+        timeout_s=30,
+    )
+    assert result.results[0].status == "error"
+    assert "benchmark does not match the parent recomputation" in (result.results[0].error or "")
+
+
+def test_cancel_after_the_gate_stops_the_worker(tmp_path):
+    marker = tmp_path / "running.json"
+    source = (
+        "import os, time\n"
+        "from pathlib import Path\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        f"        Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+        "        time.sleep(60)\n"
+        "        return None\n"
+    )
+    token = CancelToken()
+
+    def _after_gate():
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if marker.is_file():
+                time.sleep(0.3)
+                token.cancel()
+                return
+            time.sleep(0.05)
+
+    watcher = threading.Thread(target=_after_gate, daemon=True)
+    watcher.start()
+    started = time.monotonic()
+    try:
+        result = run_parallel(
+            [_strategy(tmp_path / "s", "slow", source)],
+            [FrameMarket("book", "TEST", frame=_frame())],
+            tmp_path / "out",
+            profile="arena",
+            workers=1,
+            timeout_s=25,
+            with_benchmarks=False,
+            cancel=token,
+        )
+    finally:
+        watcher.join(timeout=2)
+        if marker.is_file():
+            _reap(int(marker.read_text(encoding="utf-8")))
+    assert time.monotonic() - started < 12
+    assert result.results[0].status == "cancelled"
+    assert "cancelled" in (result.results[0].error or "")
+
+
+def test_rss_poll_kills_without_a_memory_error(tmp_path):
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import backtester.runner\nfrom backtester.limits import current_rss\nprint(current_rss())\n",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    baseline = int(probe.stdout.strip())
+    cap = baseline + 96 * 1024 * 1024
+    source = (
+        "import time\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        blobs = []\n"
+        "        remaining = 160 * 1024 * 1024\n"
+        "        while remaining > 0:\n"
+        "            chunk = bytearray(min(remaining, 8 * 1024 * 1024))\n"
+        "            for index in range(0, len(chunk), 4096):\n"
+        "                chunk[index] = 1\n"
+        "            blobs.append(chunk)\n"
+        "            remaining -= len(chunk)\n"
+        "        time.sleep(3)\n"
+        "        return None\n"
+    )
+    _strategy(tmp_path / "s", "hog", source)
+    _strategy(tmp_path / "s", "good", FLAT)
+    result = run_parallel(
+        discover_strategies(tmp_path / "s"),
+        [FrameMarket("book", "TEST", frame=_frame())],
+        tmp_path / "out",
+        profile="arena",
+        workers=2,
+        timeout_s=30,
+        memory_bytes=cap,
+        with_benchmarks=False,
+    )
+    by_id = {item.strategy_id: item for item in result.results}
+    detail = [(item.strategy_id, item.status, item.error) for item in result.results]
+    assert by_id["hog"].status == "memory", detail
+    assert "exceeded memory limit" in (by_id["hog"].error or "")
+    assert "MemoryError" not in (by_id["hog"].error or "")
+    assert by_id["good"].status == "ok", detail

@@ -197,6 +197,10 @@ def _cmd_run(args) -> int:
 
     strategy_cls = load_strategy_class(args.strategy)
     if args.pack or args.sidecar:
+        if args.share_factor is not None:
+            raise ValueError(
+                "a pack run does not take --share-factor. The sidecar holds the scale."
+            )
         if not args.pack or not args.sidecar:
             raise ValueError("a pack run needs both --pack and --sidecar")
         if args.src or args.ticker:

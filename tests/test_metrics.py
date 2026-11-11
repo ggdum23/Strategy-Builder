@@ -199,6 +199,31 @@ def test_cagr_over_252_sessions_is_the_total_return_when_the_year_is_exact():
     assert reported["cagr"] != pytest.approx((final / initial) ** (365 / 252) - 1)
 
 
+def test_a_zero_mark_does_not_divide_and_is_not_an_up_day():
+    assert percent_up_days([0.0, 50.0], 0.0) == 0.0
+    assert percent_up_days([150.0, 0.0, 10.0], 100.0) == pytest.approx(1 / 3)
+    arena, _ = _arena(equity=[0.0, 50.0], initial=0.0)
+    assert arena["total_return"] == 0.0
+    assert arena["cagr"] == -1.0
+    assert arena["best_day"] == 0.0
+    assert arena["worst_day"] == 0.0
+    assert math.isfinite(arena["sharpe"])
+    assert arena["max_drawdown"] == 0.0
+    arena_path, _ = _arena(equity=[150.0, 0.0, 10.0], initial=100.0)
+    assert arena_path["best_day"] == pytest.approx(0.5)
+    assert arena_path["worst_day"] == pytest.approx(-1.0)
+    assert math.isfinite(arena_path["sharpe"])
+    desk, _ = _desk(equity=[0.0, 50.0], initial=0.0)
+    assert desk["total_return"] == 0.0
+    assert desk["cagr"] == -1.0
+    assert desk["percent_up_days"] == 0.0
+    assert desk["max_drawdown"] == 0.0
+    desk_path, _ = _desk(equity=[150.0, 0.0, 10.0], initial=100.0)
+    assert desk_path["best_day"] == pytest.approx(0.5)
+    assert desk_path["worst_day"] == pytest.approx(-1.0)
+    assert desk_path["percent_up_days"] == pytest.approx(1 / 3)
+
+
 def test_percent_up_days_is_report_only_and_flat_is_not_up():
     reported, result = _arena(equity=[100.0, 101.0], initial=100.0)
     assert "percent_up_days" not in reported

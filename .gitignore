@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .backtester-runs.json
+.backtester-runs.json.lock
 .mypy_cache/
 *.egg-info/
 .venv/

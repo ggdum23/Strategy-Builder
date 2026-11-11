@@ -305,11 +305,24 @@ def metrics(res, period_label_of_day=None):
     days = np.array([x[0] for x in d]); eq = np.array([x[1] for x in d], float)
     expo = np.array([x[2] for x in d], float)
     prev = np.r_[E0, eq[:-1]]
-    r = eq / prev - 1.0
+    # A zero mark has no defined return. Store 0 for that session. Every other
+    # session uses the same division as the reference, so a path with no zero
+    # mark stays byte-identical.
+    if np.any(prev == 0):
+        r = np.zeros(len(eq), dtype=float)
+        safe = prev != 0
+        np.divide(eq, prev, out=r, where=safe)
+        r[safe] -= 1.0
+    else:
+        r = eq / prev - 1.0
     n = len(r)
     yrs = n / 252.0
-    tot = eq[-1] / E0 - 1.0
-    cagr = (eq[-1] / E0) ** (1 / yrs) - 1 if eq[-1] > 0 else -1.0
+    if E0 == 0:
+        tot = 0.0
+        cagr = -1.0
+    else:
+        tot = eq[-1] / E0 - 1.0
+        cagr = (eq[-1] / E0) ** (1 / yrs) - 1 if eq[-1] > 0 else -1.0
     sd = r.std(ddof=1) if n > 1 else 0.0
     vol = sd * math.sqrt(252)
     sharpe = r.mean() / sd * math.sqrt(252) if sd > 0 else 0.0
@@ -317,7 +330,13 @@ def metrics(res, period_label_of_day=None):
     sortino = r.mean() / dd_dev * math.sqrt(252) if dd_dev > 0 else 0.0
     path = np.r_[E0, eq]
     peak = np.maximum.accumulate(path)
-    dd = path / peak - 1
+    if np.any(peak == 0):
+        dd = np.zeros_like(path, dtype=float)
+        safe_peak = peak != 0
+        np.divide(path, peak, out=dd, where=safe_peak)
+        dd[safe_peak] -= 1.0
+    else:
+        dd = path / peak - 1
     mdd = dd.min()
     # longest drawdown duration in sessions (peak to recovery or end)
     longest = 0; cur = 0
@@ -372,7 +391,9 @@ def metrics(res, period_label_of_day=None):
             per[L] = [prev_end, None]
         per[L][1] = eq[i]
         prev_end = eq[i]
-    out["period_returns"] = {L: float(v[1] / v[0] - 1) for L, v in per.items()}
+    out["period_returns"] = {
+        L: (0.0 if v[0] == 0 else float(v[1] / v[0] - 1)) for L, v in per.items()
+    }
     return out
 
 

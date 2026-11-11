@@ -277,3 +277,47 @@ def test_gzip_members_carry_no_name_comment_or_mtime(tmp_path):
             assert_anonymized_pack_clean(pack, symbol="NIK")
         target.write_bytes(original)
     assert_anonymized_pack_clean(pack, symbol="NIK")
+
+
+def test_volume_is_scaled_and_trade_count_is_not(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=1.7, volume_factor=0.42,
+    )
+    loaded = load_pack(pack)
+    assert float(loaded.frame.iloc[0]["volume"]) == pytest.approx(100 * 0.42)
+    assert int(loaded.frame.iloc[0]["count"]) == 3
+    assert float(loaded.frame.iloc[0]["open"]) == pytest.approx(10.0 * 1.7)
+
+
+def test_gzip_audit_checks_every_member(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    hidden = _recompress(b"hidden\n", filename="QQQ.csv")
+    target.write_bytes(original + hidden)
+    with pytest.raises(ValueError, match="gzip"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    target.write_bytes(original)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+
+
+def test_load_pack_rejects_duplicate_manifest_keys(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
+    )
+    manifest = pack / "manifest.json"
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text("{\n  \"schema_version\": 9," + text[1:], encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate JSON key 'schema_version'"):
+        load_pack(pack)

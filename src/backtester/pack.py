@@ -20,6 +20,8 @@ import math
 import re
 import secrets
 import shutil
+import struct
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -229,10 +231,13 @@ def _token_present(symbol: str, text: str) -> bool:
     return re.search(rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])", text) is not None
 
 
-def _gzip_member(blob: bytes) -> tuple[int, bytes, bool]:
-    """mtime, file name, and whether an FCOMMENT is present.
+def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, int]:
+    """mtime, file name, whether an FCOMMENT is present, and the deflate offset.
 
     RFC 1952 order after the 10-byte header is FEXTRA, FNAME, FCOMMENT, FHCRC.
+    ``blob`` is one member, or a member followed by further members. Only the
+    first header is read here. The offset is where the raw deflate stream
+    begins, so a later member is not swallowed with this one.
     """
     if len(blob) < 10 or blob[:2] != b"\x1f\x8b":
         raise ValueError("gzip member is not gzip")
@@ -244,14 +249,52 @@ def _gzip_member(blob: bytes) -> tuple[int, bytes, bool]:
             raise ValueError("gzip extra field is truncated")
         extra = int.from_bytes(blob[pos : pos + 2], "little")
         pos += 2 + extra
+        if pos > len(blob):
+            raise ValueError("gzip extra field is truncated")
     fname = b""
     if flags & 0x08:
         end = blob.find(b"\x00", pos)
         if end < 0:
             raise ValueError("gzip file name is truncated")
         fname = blob[pos:end]
+        pos = end + 1
     has_comment = bool(flags & 0x10)
-    return mtime, fname, has_comment
+    if flags & 0x10:
+        end = blob.find(b"\x00", pos)
+        if end < 0:
+            raise ValueError("gzip comment is truncated")
+        pos = end + 1
+    if flags & 0x02:
+        pos += 2
+    if pos > len(blob):
+        raise ValueError("gzip member is truncated")
+    return mtime, fname, has_comment, pos
+
+
+def _gzip_members(blob: bytes):
+    """Every gzip member in ``blob``, not only the first.
+
+    A concatenated second member can carry a file name or a comment that the
+    first header does not. Each header is checked. The payloads are returned
+    in order so the caller can scan the text. ``GzipFile.read`` follows every
+    member in one call, so each member is inflated on its own with zlib.
+    """
+    rest = blob
+    while True:
+        rest = rest.lstrip(b"\x00")
+        if not rest:
+            return
+        mtime, fname, has_comment, start = _gzip_member(rest)
+        inflator = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
+        payload = inflator.decompress(rest[start:])
+        unused = inflator.unused_data
+        if not inflator.eof or len(unused) < 8:
+            raise ValueError("gzip member is truncated")
+        crc, length = struct.unpack("<II", unused[:8])
+        if crc != zlib.crc32(payload) or length != (len(payload) & 0xFFFFFFFF):
+            raise ValueError("gzip member failed its checksum")
+        yield (mtime, fname, has_comment), payload
+        rest = unused[8:]
 
 
 def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
@@ -268,15 +311,19 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
             raise ValueError(f"{name} leaks identity in the file name")
         raw = path.read_bytes()
         if path.suffix == ".gz":
-            mtime, fname, has_comment = _gzip_member(raw)
-            if mtime != 0:
-                raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
-            if fname:
-                shown = fname.decode("utf-8", "replace")
-                raise ValueError(f"{name} gzip file name is {shown!r}")
-            if has_comment:
-                raise ValueError(f"{name} gzip member has an FCOMMENT")
-            text = gzip.decompress(raw).decode("utf-8")
+            parts = []
+            for (mtime, fname, has_comment), payload in _gzip_members(raw):
+                if mtime != 0:
+                    raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
+                if fname:
+                    shown = fname.decode("utf-8", "replace")
+                    raise ValueError(f"{name} gzip file name is {shown!r}")
+                if has_comment:
+                    raise ValueError(f"{name} gzip member has an FCOMMENT")
+                parts.append(payload.decode("utf-8"))
+            if not parts:
+                raise ValueError(f"{name} gzip member is not gzip")
+            text = "".join(parts)
         else:
             try:
                 text = raw.decode("utf-8")
@@ -601,7 +648,10 @@ def load_pack(pack_dir) -> LoadedPack:
     manifest_path = root / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"pack manifest is missing: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"), object_pairs_hook=_json_pairs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"pack manifest is not JSON: {exc}") from exc
     _validate_manifest(manifest)
     frames = []
     hashed = []
