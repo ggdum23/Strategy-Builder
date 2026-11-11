@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .audience import peek_scale, peek_symbols, scrub_text
 from .pages.data_page import DataPage
 from .pages.history_page import HistoryPage
 from .pages.packs_page import PacksPage
@@ -70,6 +71,7 @@ class MainWindow(QMainWindow):
         self._supervisor.failed.connect(self._on_failed)
         self._supervisor.cancelled.connect(self._on_cancelled)
         self._status_path: Path | None = None
+        self._status_text = ""
 
         shell = QWidget()
         shell.setObjectName("appRoot")
@@ -185,7 +187,57 @@ class MainWindow(QMainWindow):
         self.results_page._redraw()
 
     def set_status(self, text: str) -> None:
-        self._status.showMessage(text)
+        self._status_text = text
+        self._publish_status()
+
+    def note_results_audience(self) -> None:
+        """A designer report must not leave a ticker in the status bar or the root chip."""
+        self._publish_status()
+        self._refresh_chip()
+
+    def _results_are_designer(self) -> bool:
+        page = getattr(self, "results_page", None)
+        report = getattr(page, "_report", None) if page is not None else None
+        return getattr(report, "audience", "") == "designer"
+
+    def _chrome_symbols(self) -> tuple[str, ...]:
+        found: list[str] = []
+        page = getattr(self, "results_page", None)
+        source = getattr(page, "_source_path", "") if page is not None else ""
+        if source:
+            found.extend(peek_symbols(Path(source)))
+        data = getattr(self, "data_page", None)
+        if data is not None:
+            ticker = data.ticker.text().strip()
+            if ticker:
+                found.append(ticker)
+        last = str(self.preferences.data.get("last_ticker") or "").strip()
+        if last:
+            found.append(last)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for symbol in found:
+            key = symbol.casefold()
+            if not symbol or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(symbol)
+        return tuple(ordered)
+
+    def _chrome_scale(self) -> float | None:
+        page = getattr(self, "results_page", None)
+        source = getattr(page, "_source_path", "") if page is not None else ""
+        if not source:
+            return None
+        return peek_scale(Path(source))
+
+    def _public_text(self, text: str) -> str:
+        if not text or not self._results_are_designer():
+            return text
+        return scrub_text(text, self._chrome_symbols(), scale=self._chrome_scale())
+
+    def _publish_status(self) -> None:
+        self._status.showMessage(self._public_text(self._status_text))
 
     def remember(self, **values: str) -> None:
         for key, value in values.items():
@@ -214,7 +266,7 @@ class MainWindow(QMainWindow):
         thread = FunctionThread(fn)
         thread.succeeded.connect(on_success)
         thread.failed.connect(on_error)
-        thread.finished.connect(lambda: self.set_status(self._status.currentMessage() or "Ready"))
+        thread.finished.connect(lambda: self.set_status(self._status_text or "Ready"))
         self._thread = thread
         self.set_status("Working…")
         thread.start()
@@ -282,7 +334,7 @@ class MainWindow(QMainWindow):
         self._refresh_chip()
 
     def _refresh_chip(self) -> None:
-        root = self.data_page.root_path.text()
+        root = self._public_text(self.data_page.root_path.text())
         self.root_chip.setText(root)
         self.root_chip.setToolTip(root)
 

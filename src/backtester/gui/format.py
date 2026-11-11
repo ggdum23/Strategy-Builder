@@ -60,9 +60,9 @@ def format_number(kind: str, value: Any) -> str:
     if kind == "fraction":
         return _fraction_text(number)
     if kind == "money":
-        return "$" + _grouped(number, 2)
+        return _money_text(number, 2)
     if kind == "money_full":
-        return "$" + _grouped(number, _money_digits(number))
+        return _money_text(number, _money_digits(number))
     if kind == "count":
         if float(number).is_integer():
             return f"{int(number):,}"
@@ -80,6 +80,12 @@ def format_number(kind: str, value: Any) -> str:
             return f"{int(number):,}"
         return f"{number:.6g}"
     return str(value)
+
+
+def _money_text(number: float, digits: int) -> str:
+    """Dollars with the sign in front of the symbol: ``-$340.25``."""
+    sign = "-" if number < 0 else ""
+    return sign + "$" + f"{abs(number):,.{digits}f}"
 
 
 def _money_digits(number: float) -> int:

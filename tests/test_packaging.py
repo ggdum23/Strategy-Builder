@@ -218,6 +218,17 @@ def test_freeze_support_runs_before_the_application():
     assert "main" not in calls[:3]
 
 
+def test_frozen_smoke_requires_the_gui_launcher():
+    import smoke_frozen
+
+    source = (PACKAGING / "smoke_frozen.py").read_text(encoding="utf-8")
+    assert "require_gui_launcher(report_text)" in source
+    assert "launcher-check: placeholder" not in source
+    smoke_frozen.require_gui_launcher("launcher-check: gui")
+    with pytest.raises(SystemExit, match="placeholder"):
+        smoke_frozen.require_gui_launcher("launcher-check: placeholder")
+
+
 def test_version_and_placeholder_and_launcher_check(tmp_path, capsys):
     env = _env(tmp_path)
     defaults = tmp_path / "defaults.json"

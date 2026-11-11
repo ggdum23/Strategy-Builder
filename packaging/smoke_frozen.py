@@ -193,6 +193,12 @@ def _gui_executable(cli: Path) -> Path:
     return cli.with_name(name)
 
 
+def require_gui_launcher(report_text: str) -> None:
+    """The gui extra ships, so the frozen window must report the real launcher."""
+    if report_text != "launcher-check: gui":
+        raise SystemExit(f"unexpected launcher report {report_text!r}")
+
+
 def smoke(exe: Path, repo: Path, work: Path) -> None:
     exe = exe.resolve()
     repo = repo.resolve()
@@ -227,8 +233,7 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
     if not report.is_file():
         raise SystemExit(f"launcher check wrote no report\n{gui_proc.stdout}\n{gui_proc.stderr}")
     report_text = report.read_text(encoding="utf-8").strip()
-    if report_text not in {"launcher-check: placeholder", "launcher-check: gui"}:
-        raise SystemExit(f"unexpected launcher report {report_text!r}")
+    require_gui_launcher(report_text)
     packaging = str(repo / "packaging")
     if packaging not in sys.path:
         sys.path.insert(0, packaging)

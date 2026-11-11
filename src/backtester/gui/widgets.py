@@ -33,14 +33,17 @@ class PageHeader(QWidget):
         layout.setSpacing(2)
         kick = QLabel(kicker.upper())
         kick.setObjectName("kicker")
-        heading = QLabel(title)
-        heading.setObjectName("pageTitle")
+        self.heading = QLabel(title)
+        self.heading.setObjectName("pageTitle")
         body = QLabel(lede)
         body.setObjectName("muted")
         body.setWordWrap(True)
         layout.addWidget(kick)
-        layout.addWidget(heading)
+        layout.addWidget(self.heading)
         layout.addWidget(body)
+
+    def set_title(self, title: str) -> None:
+        self.heading.setText(title)
 
 
 class Banner(QFrame):
@@ -367,6 +370,9 @@ class PeriodHeat(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(6)
         self.setObjectName("periodHeat")
+
+    def clear(self) -> None:
+        clear_layout(self._layout)
 
     def set_periods(self, payload, theme) -> None:
         clear_layout(self._layout)

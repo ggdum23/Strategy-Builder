@@ -22,26 +22,48 @@ _MONTH = (
     r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
     r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
 )
-# Longer spellings first. A bare year is last so ``2024-01`` is one token.
+_ORDINAL = r"(?:st|nd|rd|th)"
+# Longer spellings first. A bare year is last so ``2024-01`` and ``2024-1-4`` stay one token.
 # A year glued to a decimal, or the word "day" in front of a session index, is a number.
 _BARE_YEAR = re.compile(r"(?<![A-Za-z0-9.])(?<!day )(?:19|20)\d{2}(?![A-Za-z0-9.])", re.IGNORECASE)
 _DATE_PATTERNS = (
-    re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?)?"),
-    re.compile(r"(?:19|20)\d{2}[/.]\d{1,2}[/.]\d{1,2}"),
-    re.compile(r"\d{1,2}[/-]\d{1,2}[/-](?:19|20)\d{2}"),
-    re.compile(rf"\d{{1,2}}[\s.\-]+{_MONTH}[\s,.\-]+(?:19|20)\d{{2}}", re.IGNORECASE),
-    re.compile(rf"{_MONTH}[\s\-]+\d{{1,2}},?[\s\-]+(?:19|20)\d{{2}}", re.IGNORECASE),
-    re.compile(r"(?:19|20)\d{2}-\d{2}(?!\d)"),
-    re.compile(rf"{_MONTH}[\s.\-]+(?:19|20)\d{{2}}", re.IGNORECASE),
+    # ISO, padded or not, with an optional time: 2024-01-04, 2024-1-4.
+    re.compile(
+        r"(?<!\d)(?:19|20)\d{2}-\d{1,2}-\d{1,2}(?!\d)"
+        r"(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?)?"
+    ),
+    re.compile(r"(?<!\d)(?:19|20)\d{2}[/.]\d{1,2}[/.]\d{1,2}(?!\d)"),
+    # Dotted, slashed, or dashed day-month-year: 01.04.2024, 04.01.2024, 1.4.2024.
+    re.compile(r"(?<!\d)\d{1,2}[./-]\d{1,2}[./-](?:19|20)\d{2}(?!\d)"),
+    re.compile(
+        rf"(?<!\d)\d{{1,2}}[\s.\-]+{_MONTH}(?![A-Za-z])\.?[\s,.\-]*(?:19|20)\d{{2}}(?!\d)",
+        re.IGNORECASE,
+    ),
+    # Dotted abbreviation and ordinal day: Jan. 4, 2024 and January 4th, 2024.
+    re.compile(
+        rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])\.?\s+\d{{1,2}}{_ORDINAL}?(?:,\s*|\s+)(?:19|20)\d{{2}}(?!\d)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?<!\d)(?:19|20)\d{2}-\d{2}(?!\d)"),
+    re.compile(
+        rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])\.?[\s.\-]+(?:19|20)\d{{2}}(?!\d)",
+        re.IGNORECASE,
+    ),
     _BARE_YEAR,
 )
 # The allow-list keeps a bare year. A day index or a price such as 2024.50 is not a date.
 _EXPORT_DATE_PATTERNS = tuple(pattern for pattern in _DATE_PATTERNS if pattern is not _BARE_YEAR)
+_SECRET_TOKENS = ("share_scale", "share_factor", "price_factor", "volume_factor", "date_map")
 _SECRET_WORDS = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:share_scale|share_factor|price_factor|volume_factor|date_map)(?![A-Za-z0-9_])"
 )
+# A Windows path may contain spaces (``Strategy Builder\QQQ\data.csv``). After the
+# drive or UNC prefix, keep going until a quote, a comma, or the end of the field.
 _ABS_PATH = re.compile(
-    r'(?:[A-Za-z]:[\\/][^\s\'",<>|*?]*)|(?:/(?:[\w.\-]+/)+[\w.\-]+)'
+    r"(?:[A-Za-z]:[\\/][^'\"<>|*?,\r\n]*)"
+    r"|(?:\\\\[^\\/'\"<>|*?,\r\n]+[\\/][^'\"<>|*?,\r\n]*)"
+    r"|(?:[/]{2}[^/'\"<>|*?,\r\n]+/[^'\"<>|*?,\r\n]*)"
+    r"|(?:/(?:[\w.\-]+/)+[\w.\-]+)"
 )
 
 # Keys a designer tree is not allowed to carry. ``cost_basis`` holds the
@@ -86,28 +108,101 @@ PRICE_COLUMNS = frozenset(
 )
 
 
-def _ticker_pattern(symbol: str) -> re.Pattern[str]:
-    """Letter boundaries, so ``QQQ1`` matches and ``MA`` does not match inside ``max_drawdown``."""
-    return re.compile(rf"(?i)(?<![A-Za-z]){re.escape(symbol)}(?![A-Za-z])")
+def _casefold_index(text: str) -> tuple[str, list[int]]:
+    """Casefold ``text`` and remember which original character each fold came from.
+
+    The same index the report token rule uses. ``ß`` becomes ``ss`` and ``ﬁ``
+    becomes ``fi``, and a hit can be mapped back onto ``text``.
+    """
+    folded: list[str] = []
+    origins: list[int] = []
+    for index, char in enumerate(text):
+        piece = char.casefold()
+        folded.append(piece)
+        origins.extend([index] * len(piece))
+    return "".join(folded), origins
+
+
+def _ticker_spans(text: str, symbol: str) -> list[tuple[int, int]]:
+    """Original spans where ``symbol`` is its own token, matched on casefold.
+
+    The boundary is a letter, not a digit: ``QQQ1`` matches ``QQQ`` and ``MA``
+    does not match inside ``max_drawdown``. Matching uses ``str.casefold``, so
+    ``ß`` matches ``SS`` and ``ﬁ`` matches ``FI``, including a fold that is
+    longer than the original character.
+    """
+    if not text or not symbol:
+        return []
+    needle = symbol.casefold()
+    if not needle:
+        return []
+    folded, origins = _casefold_index(text)
+    spans: list[tuple[int, int]] = []
+    start = 0
+    limit = len(folded)
+    size = len(needle)
+    while start <= limit - size:
+        found = folded.find(needle, start)
+        if found < 0:
+            break
+        end = found + size
+        before = found == 0 or not folded[found - 1].isalpha()
+        after = end == limit or not folded[end].isalpha()
+        if not before or not after:
+            start = found + 1
+            continue
+        orig_start = origins[found]
+        orig_end = origins[end - 1] + 1
+        if orig_end > orig_start and (not spans or orig_start >= spans[-1][1]):
+            spans.append((orig_start, orig_end))
+        start = end
+    return spans
+
+
+def _replace_ticker(text: str, symbol: str) -> str:
+    spans = _ticker_spans(text, symbol)
+    if not spans:
+        return text
+    pieces: list[str] = []
+    last = 0
+    for start, end in spans:
+        pieces.append(text[last:start])
+        pieces.append("ASSET")
+        last = end
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+def _symbol_order(symbols: tuple[str, ...]) -> tuple[str, ...]:
+    """Longer casefolds first, so ``SS`` is considered before ``S``."""
+    ranked = sorted((symbol for symbol in symbols if symbol), key=lambda item: len(item.casefold()), reverse=True)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for symbol in ranked:
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        ordered.append(symbol)
+    return tuple(ordered)
 
 
 def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = None) -> str:
     """Remove calendar dates, scale words, the scale number, and ticker tokens.
 
-    ISO dates, slash dates, dotted dates, month names, ``YYYY-MM`` keys, and a
-    bare year all count. ``2024.50``, ``0.2024``, and ``day 2024`` stay, because
-    those are numbers. Session ids such as ``S01`` stay. A one-letter ticker is
-    a ticker. A digit glued to a ticker is still that ticker.
+    ISO dates, unpadded ISO, slash dates, dotted DMY and MDY, month names,
+    dotted abbreviations, ordinal days, ``YYYY-MM`` keys, and a bare year all
+    count. ``2024.50``, ``0.2024``, and ``day 2024`` stay, because those are
+    numbers. Session ids such as ``S01`` stay. A one-letter ticker is a ticker.
+    A digit glued to a ticker is still that ticker. Ticker matching uses
+    casefold, so ``ß`` and ``ﬁ`` count.
     """
     text = value
     for pattern in _DATE_PATTERNS:
         text = pattern.sub("", text)
     text = _SECRET_WORDS.sub("", text)
     text = _scrub_scale_number(text, scale)
-    for symbol in symbols:
-        if not symbol:
-            continue
-        text = _ticker_pattern(symbol).sub("ASSET", text)
+    for symbol in _symbol_order(symbols):
+        text = _replace_ticker(text, symbol)
     return text
 
 
@@ -523,12 +618,13 @@ def _itxt_text(chunk: bytes) -> str:
 def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) -> bool:
     """False when a file still contains operator-only text."""
     folded = text.casefold()
-    if "share_scale" in folded or "price_factor" in folded or "volume_factor" in folded or "date_map" in folded:
+    # Same case-insensitive token check for every invoice word, including share_factor.
+    if any(token in folded for token in _SECRET_TOKENS):
         return False
     if any(pattern.search(text) for pattern in _EXPORT_DATE_PATTERNS):
         return False
     for symbol in symbols:
-        if symbol and _ticker_pattern(symbol).search(text):
+        if symbol and _ticker_spans(text, symbol):
             return False
     if scale is not None and abs(scale - 1.0) > 1e-9:
         rendered = f"{scale:.10g}"

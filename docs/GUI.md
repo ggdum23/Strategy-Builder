@@ -65,7 +65,7 @@ A finished book directory:
 `metrics.json` fields the cards know about, with units:
 
 - Fractions, displayed × 100: `total_return`, `cagr`, `ann_vol`, `max_drawdown`, `hit_rate`, `percent_up_days`, `best_day`, `worst_day`, `financing_rate_annual`, `borrow_rate_annual`.
-- Dollars: `initial_equity`, `final_equity`, `fees_total`, `slippage_cost`, `borrow_cost`, `costs_total`, `financing_cost`, `dividends_net`.
+- Dollars: `initial_equity`, `final_equity`, `fees_total`, `slippage_cost`, `borrow_cost`, `costs_total`, `financing_cost`, `dividends_net`. A negative amount is `-$340.25`.
 - Ratios on a card, three decimals: `sharpe`, `sortino`, `calmar`, `turnover_per_year`, exposure fields, `worst_equity_over_hwm`, `share_factor`, `fee_mult`. The leaderboard prints ratios to two decimals.
 - Infinity is ∞ and negative infinity is −∞. Null and NaN are an em dash. The leaderboard sorts infinity as a number and NaN with the blanks.
 - Counts: `n_fills`, `round_trips`, `sessions`, `max_dd_duration_sessions`, margin-call counts.
@@ -86,9 +86,11 @@ The fee table lists components only. Each component keeps enough decimal places 
 
 The Run page hides fields the selected mode and profile do not use. A blank rate is labeled "profile default". The longer contract text is on the tooltip. Walk-forward uses named files: choosing it clears Pack. The form stays as tall as its fields. The worker log takes the space underneath.
 
-A designer view scrubs calendar dates in several spellings, including `2024/01/04`, `04-Jan-2024`, `04.Jan.2024`, and `January 2024`. A bare year goes too, but not a number that merely contains one (`2024.50`, `0.2024`, `day 2024`). Monthly and yearly period keys are shown as `M1`, `M2` and `Y1`, `Y2`, and every stored value stays. The scale words, the scale number, and a ticker with a digit glued on (`QQQ1`) are removed. One-letter tickers count. `MA` inside `max_drawdown` does not. Benchmark rows use the same names as the chart (`1× buy and hold`). A failure is the exception summary, with the filesystem path removed. The operator view still has the traceback.
+A designer view scrubs calendar dates in several spellings, including `2024/01/04`, `2024-1-4`, `01.04.2024`, `1.4.2024`, `04-Jan-2024`, `04.Jan.2024`, `Jan. 4, 2024`, `January 4th, 2024`, and `January 2024`. A bare year goes too, but not a number that merely contains one (`2024.50`, `0.2024`, `day 2024`). Monthly and yearly period keys are shown as `M1`, `M2` and `Y1`, `Y2`, and every stored value stays. The scale words, including `share_factor`, the scale number, and a ticker with a digit glued on (`QQQ1`) are removed. One-letter tickers count. `MA` inside `max_drawdown` does not. Ticker matching uses casefold, so `ß` matches `SS` and `ﬁ` matches `FI`. Benchmark rows use the same names as the chart (`1× buy and hold`). A failure is the exception summary. A Windows path is removed through spaces, including a UNC path, and the operator view still has the traceback.
 
-Load keeps the real directory. The field may show a scrubbed path. Switching audience reloads the real directory, and Load follows the field when it was edited. A designer export runs the same allow-list on `metrics.json`, `displayed_metrics.csv`, and `leaderboard_view.csv` after writing them, and withholds a file that fails. PNG text is checked after decompression, including a compressed `iTXt` chunk. A percent that would print as eight zeros is shown in scientific form.
+The page title follows the audience (`Operator report` or `Designer report`). While a designer report is open, the status bar and the data-root chip are scrubbed, so an earlier `Inspected QQQ` does not stay on screen. A failed load clears the previous book: the invoice line, the chart and its caption, the readout, and the activity, benchmark, fee, period, and detail tables.
+
+Load keeps the real directory. The field may show a scrubbed path. Switching audience reloads the real directory, and Load follows the field when it was edited. A designer export runs the same allow-list on `metrics.json`, `displayed_metrics.csv`, and `leaderboard_view.csv` after writing them, and withholds a file that fails. `share_factor` fails that check the same way `share_scale` does. PNG text is checked after decompression, including a compressed `iTXt` chunk. A percent that would print as eight zeros is shown in scientific form.
 
 ## Screenshots
 

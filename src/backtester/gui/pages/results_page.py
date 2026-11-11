@@ -54,14 +54,13 @@ class ResultsPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 16)
         root.setSpacing(10)
-        root.addWidget(
-            PageHeader(
-                "05  Results",
-                "Operator report",
-                "Headline figures, then the equity curve and its drawdown picture, then the tables. "
-                "An anonymized book opens as a designer view: ticker, calendar, and invoice scale stay off the screen.",
-            )
+        self.header = PageHeader(
+            "05  Results",
+            "Operator report",
+            "Headline figures, then the equity curve and its drawdown picture, then the tables. "
+            "An anonymized book opens as a designer view: ticker, calendar, and invoice scale stay off the screen.",
         )
+        root.addWidget(self.header)
         bar = QHBoxLayout()
         self.path = PathField("Run directory", "Folder that contains metrics.json, or a walk-forward, or a batch")
         self.audience = QComboBox()
@@ -267,6 +266,7 @@ class ResultsPage(QWidget):
 
     def show_report(self, report: RunReport) -> None:
         self._report = report
+        self._apply_heading(report.audience)
         self._set_audience_combo(report.audience)
         clear_layout(self.banners)
         for warning in report.warnings:
@@ -288,6 +288,12 @@ class ResultsPage(QWidget):
             self.leg.setVisible(False)
             self.leg.clear()
         self._render_active()
+        note = getattr(self.host, "note_results_audience", None)
+        if callable(note):
+            note()
+
+    def _apply_heading(self, audience: str) -> None:
+        self.header.set_title("Designer report" if audience == "designer" else "Operator report")
 
     def _visible_missing(self, report: RunReport) -> list[str]:
         """Drop the saved-figure name when the interactive chart already has the curve."""
@@ -350,25 +356,20 @@ class ResultsPage(QWidget):
                 if report.audience == "designer"
                 else "Each row is a stored result. This window did not rank or recompute it."
             )
-            self._set_cards({})
-            self._show_chart(False)
-            self._show_section(self.activity_title, self.activity, False)
-            self._show_section(self.benchmark_title, self.benchmarks, False)
-            self._show_section(self.fees_title, self.fees, False)
-            self.fees_footer.setText("")
-            self.fees_footer.setVisible(False)
-            self.period_title.setVisible(False)
-            self.periods.setVisible(False)
+            self.cost_line.setToolTip("")
+            self._wipe_book_surface()
             self._fill_jobs(report)
             self._fill_leaderboard(report)
             self._show_failures(report)
-            self._clear_book_tables()
             return
         if book is None:
             self.identity.setText(report.kind)
-            self.fees_footer.setText("")
-            self.fees_footer.setVisible(False)
-            self._set_cards({})
+            self.cost_line.setText("")
+            self.cost_line.setToolTip("")
+            self._wipe_book_surface()
+            self._fill_jobs(report)
+            self._fill_leaderboard(report)
+            self._show_failures(report)
             return
         metrics = book.metrics
         self.identity.setText(self._identity_text(report, book))
@@ -723,6 +724,40 @@ class ResultsPage(QWidget):
             self.figure_label.setText(f"Could not read {book.figure.name}")
         else:
             self.figure_label.setPixmap(pixmap.scaledToWidth(960, Qt.TransformationMode.SmoothTransformation))
+
+    def _wipe_book_surface(self) -> None:
+        """Drop the previous book's picture, tables, and invoice line contents."""
+        self._set_cards({})
+        self._show_chart(False)
+        self.chart.set_study(
+            equity=[],
+            drawdown=[],
+            sessions=[],
+            equity_note="",
+            drawdown_note="",
+        )
+        self.chart.caption.setToolTip("")
+        self.chart.dd_caption.setToolTip("")
+        self._show_section(self.activity_title, self.activity, False)
+        self.activity.set_records(("metric",), [])
+        self._show_section(self.benchmark_title, self.benchmarks, False)
+        self.benchmarks.set_records(("book",), [])
+        self._show_section(self.fees_title, self.fees, False)
+        self.fees.set_records(("component",), [])
+        self.fees_footer.setText("")
+        self.fees_footer.setVisible(False)
+        self.period_title.setVisible(False)
+        self.periods.clear()
+        self.periods.setVisible(False)
+        self._clear_book_tables()
+        self.fills_note.setText("")
+        self.trades_note.setText("")
+        self.figure_label.setPixmap(QPixmap())
+        self.figure_label.setText("")
+        self.figure_note.setText("")
+        clear_layout(self.desk_banners)
+        clear_layout(self.desk_grid)
+        self.desk_cards = {}
 
     def _clear_book_tables(self) -> None:
         self.other.set_records(("field",), [])
