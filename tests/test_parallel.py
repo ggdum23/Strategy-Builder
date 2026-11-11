@@ -924,7 +924,7 @@ def test_enter_child_scrubs_a_dirty_argv_and_environment(tmp_path):
         sys.path[:] = old_path
 
 
-def _anon_pack(tmp_path: Path, symbol: str, name: str = "", price_factor: float = 1.1):
+def _anon_pack(tmp_path: Path, symbol: str, name: str = "", price_factor: float = 1.1, profile: str = "arena"):
     from backtester.data import load_named
     from backtester.pack import build_pack
     from backtester.registry import entry_from_inspection, save_registry, upsert_series
@@ -933,7 +933,7 @@ def _anon_pack(tmp_path: Path, symbol: str, name: str = "", price_factor: float 
     src = _named_series(root / "src", symbol)
     loaded = load_named(src, symbol)
     registry = root / "registry.json"
-    entry = entry_from_inspection(loaded.inspection, source_root=str(src), profile="arena")
+    entry = entry_from_inspection(loaded.inspection, source_root=str(src), profile=profile)
     save_registry(registry, upsert_series({"schema_version": 1, "series": []}, entry))
     pack = root / "pack"
     sidecar = root / "operator" / "secret.json"
@@ -943,7 +943,7 @@ def _anon_pack(tmp_path: Path, symbol: str, name: str = "", price_factor: float 
         pack,
         sidecar,
         anonymize=True,
-        profile="arena",
+        profile=profile,
         registry_path=registry,
         price_factor=price_factor,
         volume_factor=0.5,
@@ -1877,12 +1877,12 @@ def test_a_file_named_v_json_fails_only_that_job(tmp_path, monkeypatch):
 
 
 def _assert_ids_match_directories(designer):
-    from backtester.report import read_leaderboard
+    from backtester.report import designer_file_kind, designer_leaderboard_path, read_leaderboard
 
     folders = [path for path in designer.iterdir() if path.is_dir()]
     names = [path.name for path in folders]
     assert len(names) == len({name.casefold() for name in names})
-    board = read_leaderboard(designer / "leaderboard.csv")
+    board = read_leaderboard(designer_leaderboard_path(designer))
     assert {row["strategy_id"] for row in board} == set(names)
     for row in board:
         source = designer / row["strategy_id"] / row["source_id"]
@@ -1890,7 +1890,28 @@ def _assert_ids_match_directories(designer):
     for folder in folders:
         sources = [path.name for path in folder.iterdir() if path.is_dir()]
         assert len(sources) == len({name.casefold() for name in sources})
+        for source in folder.iterdir():
+            if not source.is_dir():
+                continue
+            for path in source.rglob("*"):
+                if not path.is_file() or designer_file_kind(path) != "json":
+                    continue
+                document = json.loads(path.read_text(encoding="utf-8"))
+                _assert_published_ids(document, folder.name, source.name)
     return board
+
+
+def _assert_published_ids(document, folder: str, source: str) -> None:
+    if isinstance(document, dict):
+        if isinstance(document.get("strategy_id"), str):
+            assert document["strategy_id"] == folder
+        if isinstance(document.get("source_id"), str):
+            assert document["source_id"] == source
+        for value in document.values():
+            _assert_published_ids(value, folder, source)
+    elif isinstance(document, list):
+        for item in document:
+            _assert_published_ids(item, folder, source)
 
 
 def test_designer_components_are_casefold_unique_and_screened():
@@ -2042,3 +2063,161 @@ def test_a_forced_ticker_suffix_is_renamed_off_disk(tmp_path, monkeypatch):
         assert any(folder.rglob("metrics.json"))
     assert_designer_clean(designer, symbol="2")
     assert_designer_clean(designer, symbol="QQQ")
+
+
+_ADVERSARIAL_SYMBOLS = ("asset", "EQUITY", "PNG", "CSV", "BUY", "HOLD", "LONG", "2", "10", "SS")
+
+
+def _publish_profile(symbol: str) -> tuple[str, bool]:
+    if symbol == "LONG":
+        return "desk", True
+    if symbol in {"BUY", "HOLD"}:
+        return "arena", True
+    return "arena", False
+
+
+def _assert_operator_names(out: Path, *, benchmarks: bool, profile: str) -> None:
+    books = [
+        source
+        for strategy in (out / "jobs").iterdir()
+        if strategy.is_dir()
+        for source in strategy.iterdir()
+        if source.is_dir() and (source / "metrics.json").is_file()
+    ]
+    assert books
+    for book in books:
+        assert (book / "equity_curve.csv").is_file()
+        assert (book / "equity.csv").is_file()
+        assert (book / "equity.png").is_file()
+        if benchmarks:
+            assert (book / "benchmarks" / "buy_and_hold_1x").is_dir()
+            if profile == "desk":
+                assert (book / "benchmarks" / "long_2x").is_dir()
+
+
+def _assert_designer_names(designer: Path, symbols) -> None:
+    from backtester.report import ticker_token_spans
+
+    for symbol in symbols:
+        for path in [designer, *designer.rglob("*")]:
+            assert ticker_token_spans(path.name, symbol) == [], (symbol, path)
+
+
+@pytest.mark.parametrize("symbol", _REQUIRED_SYMBOLS + _ADVERSARIAL_SYMBOLS)
+def test_every_symbol_publishes_a_clean_book(tmp_path, symbol):
+    """Every row stays ok, the designer tree audits clean, and in-book ids match."""
+    from backtester.report import read_leaderboard
+
+    profile, benchmarks = _publish_profile(symbol)
+    if symbol == "2":
+        pack, sidecar, _built = _pack_for_ticker_two(tmp_path, "sym", 1.5)
+    else:
+        pack, sidecar, _built = _anon_pack(
+            tmp_path, symbol, name="pack", price_factor=1.25, profile=profile
+        )
+    strategy_id = f"my_{symbol}_v2"
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "flat", FLAT),
+            _strategy(tmp_path / "strategies", strategy_id, FLAT),
+        ],
+        [PackMarket(str(pack), str(sidecar))],
+        out,
+        profile=profile,
+        workers=2,
+        timeout_s=90,
+        with_benchmarks=benchmarks,
+        index_path=tmp_path / "runs.json",
+    )
+    assert result.failures == 0, (symbol, [(item.strategy_id, item.status, item.error) for item in result.results])
+    operator = read_leaderboard(out / "leaderboard.csv")
+    assert {row["strategy_id"] for row in operator} == {"flat", strategy_id}
+    assert {row["status"] for row in operator} == {"ok"}
+    for row in operator:
+        assert row["total_return"] != ""
+    _assert_operator_names(out, benchmarks=benchmarks, profile=profile)
+    designer = out / "designer"
+    board = _assert_ids_match_directories(designer)
+    assert {row["status"] for row in board} == {"ok"}
+    _assert_designer_names(designer, [symbol])
+    assert_designer_clean(designer, symbol="")
+    assert_designer_clean(designer, symbol=symbol)
+    assert (out / "jobs" / "flat").is_dir()
+    assert (out / "jobs" / strategy_id).is_dir()
+
+
+def test_batch_stand_in_keeps_each_book_id(tmp_path):
+    """COST scrubbed to ASSET, then the batch stand-in BOOK, still keeps ``-N``."""
+    from backtester.report import read_leaderboard
+
+    cost_pack, cost_side, _built = _anon_pack(tmp_path, "COST", name="cost", price_factor=1.3)
+    asset_pack, asset_side, _built = _anon_pack(tmp_path, "asset", name="asset", price_factor=1.4)
+    out = tmp_path / "out"
+    result = run_parallel(
+        [
+            _strategy(tmp_path / "strategies", "My_COST_v2", FLAT),
+            _strategy(tmp_path / "strategies", "my_cost_v2", FLAT),
+            _strategy(tmp_path / "strategies", "my_asset_v2", FLAT),
+        ],
+        [
+            PackMarket(str(cost_pack), str(cost_side)),
+            PackMarket(str(asset_pack), str(asset_side)),
+        ],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=90,
+        with_benchmarks=False,
+        index_path=tmp_path / "runs.json",
+    )
+    assert result.failures == 0, [
+        (item.strategy_id, item.source_id, item.status, item.error) for item in result.results
+    ]
+    designer = out / "designer"
+    board = _assert_ids_match_directories(designer)
+    assert {row["status"] for row in board} == {"ok"}
+    folders = [path.name for path in designer.iterdir() if path.is_dir()]
+    assert any(name.casefold().endswith(("-2", "-3")) for name in folders)
+    _assert_designer_names(designer, ["COST", "asset"])
+    assert_designer_clean(designer, symbol="COST")
+    assert_designer_clean(designer, symbol="asset")
+    operator = read_leaderboard(out / "leaderboard.csv")
+    assert {row["status"] for row in operator} == {"ok"}
+    assert {row["strategy_id"] for row in operator} == {"My_COST_v2", "my_cost_v2", "my_asset_v2"}
+    for row in operator:
+        assert row["total_return"] != ""
+
+
+def test_a_clean_per_job_name_is_screened_for_the_union(tmp_path):
+    """An AAPL book keeps ``equity.png`` until the batch also contains EQUITY."""
+    from backtester.report import read_leaderboard
+
+    aapl_pack, aapl_side, _built = _anon_pack(tmp_path, "AAPL", name="aapl", price_factor=1.2)
+    equity_pack, equity_side, _built = _anon_pack(tmp_path, "EQUITY", name="equity", price_factor=1.35)
+    out = tmp_path / "out"
+    result = run_parallel(
+        [_strategy(tmp_path / "strategies", "flat", FLAT)],
+        [
+            PackMarket(str(aapl_pack), str(aapl_side)),
+            PackMarket(str(equity_pack), str(equity_side)),
+        ],
+        out,
+        profile="arena",
+        workers=2,
+        timeout_s=90,
+        with_benchmarks=False,
+        index_path=tmp_path / "runs.json",
+    )
+    assert result.failures == 0, [(item.source_id, item.status, item.error) for item in result.results]
+    designer = out / "designer"
+    board = _assert_ids_match_directories(designer)
+    assert {row["status"] for row in board} == {"ok"}
+    assert not any(path.name == "equity_curve.csv" for path in designer.rglob("*"))
+    assert not any(path.name == "equity.png" for path in designer.rglob("*"))
+    _assert_operator_names(out, benchmarks=False, profile="arena")
+    assert_designer_clean(designer, symbol="AAPL")
+    assert_designer_clean(designer, symbol="EQUITY")
+    operator = read_leaderboard(out / "leaderboard.csv")
+    assert {row["status"] for row in operator} == {"ok"}
+    assert all(row["total_return"] != "" for row in operator)

@@ -142,6 +142,29 @@ def test_a_session_is_not_split_and_a_failed_build_keeps_an_old_sidecar(tmp_path
         )
 
 
+@pytest.mark.parametrize("symbol", ["asset", "ASSET"])
+def test_symbol_asset_uses_a_screened_stand_in(tmp_path, symbol):
+    src, registry = _series(tmp_path, 1, symbol=symbol)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "secret.json"
+    build_pack(
+        src,
+        symbol,
+        pack,
+        sidecar,
+        anonymize=True,
+        registry_path=registry,
+        profile="arena",
+        price_factor=1.5,
+        volume_factor=0.5,
+    )
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["asset_name"] == "BOOK"
+    loaded = load_pack(pack)
+    assert loaded.manifest["asset_name"] == "BOOK"
+    assert_anonymized_pack_clean(pack, symbol=symbol)
+
+
 def test_named_pack_is_unscaled_and_factors_of_one_are_refused(tmp_path):
     src, registry = _series(tmp_path, 1)
     pack = tmp_path / "named"

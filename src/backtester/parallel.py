@@ -38,6 +38,7 @@ from .report import (
     _scrub_text,
     assert_designer_clean,
     redact_metrics,
+    screen_designer_tree,
     scrub_designer_tree,
     scrub_symbols,
     register_run,
@@ -1061,6 +1062,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             shutil.rmtree(dest)
         try:
             shutil.copytree(source, dest)
+            screen_designer_tree(dest, unique_symbols)
             scrub_designer_tree(
                 dest,
                 unique_symbols,
@@ -1142,6 +1144,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         write_leaderboard(out / "leaderboard.csv", ranked_rows, audience="operator")
 
     def assert_tree() -> None:
+        screen_designer_tree(designer, unique_symbols)
         assert_designer_clean(designer, symbol="")
         for symbol in unique_symbols:
             assert_designer_clean(designer, symbol=symbol)
@@ -1367,4 +1370,5 @@ def _write_failure(
             symbol=symbol or "",
         )
         write_json(designer / "error.json", cleaned)
+        screen_designer_tree(designer, [symbol] if symbol else [])
         assert_designer_clean(designer, symbol=symbol or "")

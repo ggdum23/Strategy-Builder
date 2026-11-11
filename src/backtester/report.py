@@ -431,27 +431,170 @@ def _exempt_designer_value(key: str, text: str) -> bool:
     return False
 
 
+# One vocabulary for every designer-visible stand-in and fixed name. The first
+# spelling the token rule accepts for the whole symbol set is the one we
+# publish. Later spellings exist so a ticker that is a token of the usual
+# name (``asset``, ``equity.png``, ``buy_and_hold_1x``) still has a clean label.
+_DESIGNER_LABELS: dict[str, tuple[str, ...]] = {
+    "stand_in": ("ASSET", "BOOK", "RUN", "NAME", "SLOT", "ITEM"),
+    "equity_curve": ("equity_curve.csv", "session_marks.tbl", "levels.tbl"),
+    "equity_mirror": ("equity.csv", "closes.tbl", "session_levels.tbl"),
+    "equity_png": ("equity.png", "session_chart.img", "levels_chart.img"),
+    "chart_title": ("equity", "marks", "levels"),
+    "fills": ("fills.csv", "orders.tbl", "executions.tbl"),
+    "trades": ("trades.csv", "episodes.tbl", "round_trips.tbl"),
+    "metrics": ("metrics.json", "summary.json", "result.json"),
+    "liquidation": ("liquidation.json", "closeout.json", "unwind.json"),
+    "error": ("error.json", "failure.json", "stopped.json"),
+    "leaderboard": ("leaderboard.csv", "ranking.tbl", "scores.tbl"),
+    "benchmarks": ("benchmarks", "references", "comparisons"),
+    "buy_and_hold_1x": ("buy_and_hold_1x", "reference_1x", "passive_1x"),
+    "long_2x": ("long_2x", "constant_2x", "levered_2x"),
+    "bars_part": ("bars_part_{part}.csv.gz", "bars_part_{part}.tbl.gz", "bars_{part}.bin.gz"),
+    "daily": ("daily_rth.csv.gz", "daily_rth.tbl.gz", "sessions.tbl.gz"),
+}
+_PATH_ROLES: dict[str, str] = {}
+for _role, _choices in _DESIGNER_LABELS.items():
+    if _role in {"stand_in", "chart_title", "bars_part", "daily"}:
+        continue
+    for _choice in _choices:
+        if _choice in _PATH_ROLES:
+            raise RuntimeError(f"designer name {_choice} is used twice")
+        _PATH_ROLES[_choice] = _role
+_CSV_ROLES = frozenset({"equity_curve", "equity_mirror", "fills", "trades", "leaderboard"})
+_JSON_ROLES = frozenset({"metrics", "liquidation", "error"})
+
+
+def _text_dirty(text: str, symbols) -> bool:
+    """True when free text would fail the designer audit for any of ``symbols``."""
+    if not isinstance(text, str) or text == "":
+        return False
+    seen: set[str] = set()
+    for probe in (*_symbol_order(symbols), ""):
+        if probe in seen:
+            continue
+        seen.add(probe)
+        if _designer_value_error("caption", text, probe):
+            return True
+    return False
+
+
+def _name_unsafe(candidate: str, symbols) -> bool:
+    """True when this path component would fail the designer audit."""
+    if not isinstance(candidate, str) or candidate == "" or candidate in {".", ".."}:
+        return True
+    if any(ch in candidate for ch in '\\/:*?"<>|') or candidate.endswith(" ") or candidate.endswith("."):
+        return True
+    return _text_dirty(candidate, symbols)
+
+
+def _render_label(template: str, part: str) -> str:
+    if "{part}" in template:
+        return template.format(part=part or "000")
+    return template
+
+
+def designer_visible_name(role: str, symbols, *, used: set[str] | None = None, part: str = "") -> str:
+    """The published spelling of one designer-visible stand-in or fixed name.
+
+    ``role`` selects the stand-in, a report file or directory (``equity_curve``,
+    ``equity_png``, ``buy_and_hold_1x``, ``long_2x``, ...), the chart caption,
+    or a pack file (``bars_part``, ``daily``). The choice is screened against
+    every symbol, so a batch ticker cannot be a token of the name that
+    replaces it. ``used`` stores casefolded names already taken beside this one.
+    """
+    choices = _DESIGNER_LABELS[role]
+    for template in choices:
+        candidate = _render_label(template, part)
+        if _name_unsafe(candidate, symbols):
+            continue
+        if used is not None and candidate.casefold() in used:
+            continue
+        if used is not None:
+            used.add(candidate.casefold())
+        return candidate
+    preferred = _render_label(choices[0], part)
+    suffix = "".join(Path(preferred).suffixes)
+    for length in range(2, 48):
+        stem = "q" * length
+        options = [f"{stem}{suffix}", stem]
+        if part:
+            options.insert(0, f"{stem}_{part}{suffix}")
+        for candidate in options:
+            if _name_unsafe(candidate, symbols):
+                continue
+            if used is not None and candidate.casefold() in used:
+                continue
+            if used is not None:
+                used.add(candidate.casefold())
+            return candidate
+    raise RuntimeError(f"no screened designer name for {role}")
+
+
+def accepted_stand_in(name: str) -> bool:
+    """True when an anonymized manifest may store this asset name.
+
+    Load does not know the hidden symbol. It accepts the stand-in vocabulary
+    and a generated ``q`` run, including the historical spelling ``ASSET``.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if name in _DESIGNER_LABELS["stand_in"]:
+        return True
+    return 1 <= len(name) <= 47 and set(name) == {"q"}
+
+
+def designer_leaderboard_path(directory) -> Path:
+    """The designer leaderboard, including a name chosen because ``csv`` was a ticker."""
+    root = Path(directory)
+    if root.is_dir():
+        for name in _DESIGNER_LABELS["leaderboard"]:
+            candidate = root / name
+            if candidate.is_file():
+                return candidate
+    return root / "leaderboard.csv"
+
+
+def _png_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    with path.open("rb") as handle:
+        return handle.read(8) == _PNG_SIGNATURE
+
+
+def designer_file_kind(path) -> str:
+    """How to parse a designer file after a screened rename.
+
+    A chart whose name can no longer end in ``.png`` is still a PNG. A table
+    whose name can no longer end in ``.csv`` is still a CSV, so headers stay
+    schema labels and numeric cells stay exempt.
+    """
+    file = Path(path)
+    if _png_file(file):
+        return "png"
+    role = _PATH_ROLES.get(file.name)
+    if role in _CSV_ROLES:
+        return "csv"
+    if role in _JSON_ROLES:
+        return "json"
+    suffix = file.suffix.lower()
+    if suffix == ".png":
+        return "png"
+    if suffix == ".json":
+        return "json"
+    if suffix == ".csv":
+        return "csv"
+    return "text"
+
+
 def _safe_stand_in(symbols) -> str:
     """The replacement token. ``ASSET`` unless that token is itself a batch ticker."""
-    ordered = _symbol_order(symbols)
-    folded = {symbol.casefold() for symbol in ordered}
-    for candidate in ("ASSET", "BOOK", "RUN", "NAME", "SLOT", "ITEM"):
-        if candidate.casefold() in folded:
-            continue
-        if any(ticker_token_spans(candidate, symbol) for symbol in ordered):
-            continue
-        return candidate
-    for length in range(2, 48):
-        candidate = "q" * length
-        if candidate.casefold() in folded:
-            continue
-        if any(ticker_token_spans(candidate, symbol) for symbol in ordered):
-            continue
-        return candidate
-    return "q"
+    return designer_visible_name("stand_in", symbols)
 
 
-def _scrub_text(value: str, symbol: str, *, key: str = "", replacement: str = "ASSET") -> str:
+def _scrub_text(value: str, symbol: str, *, key: str = "", replacement: str | None = None) -> str:
+    if replacement is None:
+        replacement = designer_visible_name("stand_in", [symbol] if symbol else ())
     if key and _exempt_designer_value(key, value):
         return value
     text = _ISO_DATE.sub("", value)
@@ -553,20 +696,28 @@ def scrub_designer_tree(
 ) -> None:
     """Rewrite free-text values so they use the batch's scrubbed ids.
 
-    File names are left alone. A file that is still named with a ticker fails
-    the audit. ``folder`` and ``source_name`` are the disambiguated path
-    components (``ASSET``, ``ASSET-2``). A strategy id that already scrubbed
-    to the shared base is rewritten to that component, so the text matches
-    the directory.
+    File names are left alone. ``screen_designer_tree`` renames the fixed
+    report names before the audit. ``folder`` and ``source_name`` are the
+    disambiguated path components, suffix included. A per-job scrub may
+    already have replaced the ticker with a different stand-in than the
+    batch uses. The value is still this row's id when scrubbing it and
+    scrubbing the original id produce the same text, and the file then
+    receives the directory component, ``-N`` included.
     """
     root = Path(directory)
-    strategy_base = scrub_symbols(strategy_id, symbols, key="strategy_id") if strategy_id else ""
-    source_base = scrub_symbols(source_id, symbols, key="source_id") if source_id else ""
+
+    def same_row_id(value: str, original: str) -> bool:
+        if not original or not value:
+            return False
+        if value == original:
+            return True
+        scrubbed = scrub_symbols(value, symbols, key="strategy_id")
+        return bool(scrubbed) and scrubbed == scrub_symbols(original, symbols, key="strategy_id")
 
     def scrub_value(key: str, value: str) -> str:
-        if key == "strategy_id" and folder and value in {strategy_id, strategy_base}:
+        if key == "strategy_id" and folder and (value == folder or same_row_id(value, strategy_id)):
             return folder
-        if key == "source_id" and source_name and value in {source_id, source_base}:
+        if key == "source_id" and source_name and (value == source_name or same_row_id(value, source_id)):
             return source_name
         return scrub_symbols(value, symbols, key=key)
 
@@ -582,16 +733,16 @@ def scrub_designer_tree(
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        suffix = path.suffix.lower()
-        if suffix == ".png":
+        kind = designer_file_kind(path)
+        if kind == "png":
             continue
-        if suffix == ".json":
+        if kind == "json":
             document = json.loads(path.read_text(encoding="utf-8"))
             rewritten = walk("", document)
             if rewritten != document:
                 write_json(path, rewritten)
             continue
-        if suffix == ".csv":
+        if kind == "csv":
             text = path.read_text(encoding="utf-8")
             rows = list(csv.reader(io.StringIO(text)))
             if not rows:
@@ -776,6 +927,122 @@ def _audit_png_file(path: Path, symbol: str) -> None:
         _raise_designer_value(path.name, "caption", text, symbol)
 
 
+def _screen_caption(text: str, symbols) -> str:
+    if not _text_dirty(text, symbols):
+        return text
+    return designer_visible_name("chart_title", symbols)
+
+
+def _screen_png_chunk(kind: bytes, data: bytes, symbols) -> bytes:
+    """Replace a dirty caption inside one PNG text chunk. Other chunks stay."""
+    if kind == b"tEXt":
+        keyword, sep, text = data.partition(b"\x00")
+        if sep != b"\x00":
+            return data
+        new_keyword = _screen_caption(keyword.decode("latin-1"), symbols).encode("latin-1")
+        new_text = _screen_caption(text.decode("latin-1"), symbols).encode("latin-1")
+        return new_keyword + b"\x00" + new_text
+    if kind == b"zTXt":
+        keyword, sep, rest = data.partition(b"\x00")
+        if sep != b"\x00" or not rest or rest[0] != 0:
+            return data
+        try:
+            text = zlib.decompress(rest[1:]).decode("latin-1")
+        except zlib.error:
+            return data
+        new_keyword = _screen_caption(keyword.decode("latin-1"), symbols).encode("latin-1")
+        new_text = _screen_caption(text, symbols).encode("latin-1")
+        return new_keyword + b"\x00" + bytes([rest[0]]) + zlib.compress(new_text)
+    if kind == b"iTXt":
+        keyword, sep, rest = data.partition(b"\x00")
+        if sep != b"\x00" or len(rest) < 2:
+            return data
+        flag = rest[0]
+        method = rest[1]
+        language, sep_lang, rest = rest[2:].partition(b"\x00")
+        if sep_lang != b"\x00":
+            return data
+        translated, sep_tr, text = rest.partition(b"\x00")
+        if sep_tr != b"\x00":
+            return data
+        new_keyword = _screen_caption(keyword.decode("latin-1"), symbols).encode("latin-1")
+        new_language = language
+        if language:
+            new_language = _screen_caption(language.decode("latin-1"), symbols).encode("latin-1")
+        new_translated = translated
+        if translated:
+            new_translated = _screen_caption(translated.decode("utf-8", "replace"), symbols).encode("utf-8")
+        if flag == 0:
+            raw = text.decode("utf-8", "replace")
+            new_text = _screen_caption(raw, symbols).encode("utf-8")
+        elif flag == 1 and method == 0:
+            try:
+                raw = zlib.decompress(text).decode("utf-8")
+            except zlib.error:
+                return data
+            new_text = zlib.compress(_screen_caption(raw, symbols).encode("utf-8"))
+        else:
+            return data
+        return new_keyword + b"\x00" + bytes([flag, method]) + new_language + b"\x00" + new_translated + b"\x00" + new_text
+    return data
+
+
+def _screen_png_file(path: Path, symbols) -> None:
+    blob = path.read_bytes()
+    if not blob.startswith(_PNG_SIGNATURE):
+        return
+    out = bytearray(_PNG_SIGNATURE)
+    pos = 8
+    changed = False
+    while pos + 8 <= len(blob):
+        length = struct.unpack(">I", blob[pos : pos + 4])[0]
+        kind = blob[pos + 4 : pos + 8]
+        end = pos + 8 + length
+        if length < 0 or end + 4 > len(blob):
+            return
+        data = blob[pos + 8 : end]
+        new_data = _screen_png_chunk(kind, data, symbols)
+        if new_data != data:
+            changed = True
+        crc = zlib.crc32(kind + new_data) & 0xFFFFFFFF
+        out += struct.pack(">I", len(new_data)) + kind + new_data + struct.pack(">I", crc)
+        pos = end + 4
+        if kind == b"IEND":
+            break
+    if changed:
+        path.write_bytes(bytes(out))
+
+
+def screen_designer_tree(directory, symbols) -> None:
+    """Rename dirty fixed report names, and retitle a chart whose caption is one.
+
+    Strategy directories are not fixed names, so a folder called ``ASSET`` stays.
+    A file or directory we always write (``equity_curve.csv``, ``equity.png``,
+    ``benchmarks/buy_and_hold_1x``, ``long_2x``) is renamed when its spelling
+    contains a batch ticker. The new spelling comes from ``designer_visible_name``.
+    Operator trees are never passed here.
+    """
+    root = Path(directory)
+    if not root.exists():
+        return
+    folders = [path for path in root.rglob("*") if path.is_dir()]
+    folders.append(root)
+    folders.sort(key=lambda path: len(path.parts), reverse=True)
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        for path in list(folder.iterdir()):
+            if path.is_file() and _png_file(path):
+                _screen_png_file(path, symbols)
+            role = _PATH_ROLES.get(path.name)
+            if role is None or not _name_unsafe(path.name, symbols):
+                continue
+            used = {item.name.casefold() for item in folder.iterdir() if item != path}
+            screened = designer_visible_name(role, symbols, used=used)
+            if screened != path.name:
+                path.rename(path.with_name(screened))
+
+
 def assert_designer_clean(directory, *, symbol: str) -> None:
     """Raise if a designer tree still carries a ticker, a date, or a factor.
 
@@ -794,16 +1061,16 @@ def assert_designer_clean(directory, *, symbol: str) -> None:
         _raise_designer_name(path.name, symbol)
         if not path.is_file():
             continue
-        suffix = path.suffix.lower()
-        if suffix == ".png":
+        kind = designer_file_kind(path)
+        if kind == "png":
             _audit_png_file(path, symbol)
             continue
         if path.stat().st_size == 0:
             continue
-        if suffix == ".json":
+        if kind == "json":
             _audit_json_file(path, symbol)
             continue
-        if suffix == ".csv":
+        if kind == "csv":
             _audit_csv_file(path, symbol)
             continue
         try:
@@ -829,6 +1096,7 @@ def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symb
             safe_frame,
         )
     write_json(root / "metrics.json", redact_metrics(wrapper, symbol=symbol))
+    screen_designer_tree(root, [symbol] if symbol else [])
     assert_designer_clean(root, symbol=symbol)
     return root
 
@@ -1055,9 +1323,10 @@ def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
             "directory_name": directory.name if audience == "operator" else "designer",
         }
     if kind == "parallel":
-        board = root / "leaderboard.csv"
-        if audience == "designer" and (designer_root / "leaderboard.csv").is_file():
-            board = designer_root / "leaderboard.csv"
+        if audience == "designer" and designer_root.is_dir():
+            board = designer_leaderboard_path(designer_root)
+        else:
+            board = root / "leaderboard.csv"
         rows = read_leaderboard(board) if board.is_file() else []
         if audience == "designer" and root is directory:
             rows = [_redact_row(row, symbol) for row in rows]
