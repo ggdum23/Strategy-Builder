@@ -2,9 +2,10 @@
 
 The fast files share a shard. The walk-forward file and the accounting file
 each have their own, because a single walk is the slow call. Parallel tests
-are chunks of 12, so a chunk still finishes if every test uses the whole
-60-second cap. ``tests/test_jailed_examples.py`` stays in the jailed-examples
-job.
+are packed so the sum of their Windows timeouts stays at or under 12 minutes,
+which is well under the 25-minute job cap. A test marked ``windows_jails(n)``
+is budgeted at 90 seconds per jail. Every other test is budgeted at 60.
+``tests/test_jailed_examples.py`` stays in the jailed-examples job.
 """
 
 from __future__ import annotations
@@ -18,6 +19,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PARALLEL_CHUNK = 12
+DEFAULT_TEST_S = 60
+JAIL_BUDGET_S = 90
+# 12 minutes. The job cap is 25, so a shard that burns its whole budget
+# still has room to start and to print the summary.
+SHARD_BUDGET_S = 12 * 60
+SHARD_HARD_S = 18 * 60
 
 FILE_SHARDS = {
     "fast": (
@@ -53,15 +60,24 @@ FILE_SHARDS = {
 _FILE_TO_SHARD = {path: name for name, paths in FILE_SHARDS.items() for path in paths}
 
 
-def collect() -> list[str]:
-    """Node ids for the suite, without the separate jailed-examples job."""
+def _windows_budget(item) -> int:
+    """Seconds this test may use on a Windows runner."""
+    mark = item.get_closest_marker("windows_jails")
+    if mark is None or not mark.args:
+        return DEFAULT_TEST_S
+    return JAIL_BUDGET_S * int(mark.args[0])
+
+
+def collect() -> list[tuple[str, int]]:
+    """Node ids and Windows budgets, without the jailed-examples job."""
     import pytest
 
-    found: list[str] = []
+    found: list[tuple[str, int]] = []
 
     class Collect:
         def pytest_collection_finish(self, session) -> None:
-            found.extend(item.nodeid for item in session.items)
+            for item in session.items:
+                found.append((item.nodeid, _windows_budget(item)))
 
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
@@ -75,35 +91,68 @@ def collect() -> list[str]:
     return found
 
 
-def assign(nodeids: list[str]) -> dict[str, list[str]]:
+def assign(items: list[tuple[str, int]]) -> dict[str, list[str]]:
     """Each collected test in exactly one shard. Unknown files land in ``rest``."""
     shards: dict[str, list[str]] = {name: [] for name in FILE_SHARDS}
-    parallel: list[str] = []
+    parallel: list[tuple[str, int]] = []
     rest: list[str] = []
-    for nodeid in nodeids:
+    for nodeid, seconds in items:
         path = nodeid.split("::", 1)[0].replace("\\", "/")
         if path == "tests/test_parallel.py":
-            parallel.append(nodeid)
+            parallel.append((nodeid, seconds))
         elif path in _FILE_TO_SHARD:
             shards[_FILE_TO_SHARD[path]].append(nodeid)
         else:
             rest.append(nodeid)
-    for index in range(0, len(parallel), PARALLEL_CHUNK):
-        shards[f"parallel-{index // PARALLEL_CHUNK + 1}"] = parallel[index : index + PARALLEL_CHUNK]
+    # A test budgeted at the whole 12 minutes cannot share a shard. Pull
+    # those out first so a 60-second test is not left sitting alone between
+    # them. The rest pack in collection order.
+    heavy = [(nodeid, seconds) for nodeid, seconds in parallel if seconds + DEFAULT_TEST_S > SHARD_BUDGET_S]
+    light = [(nodeid, seconds) for nodeid, seconds in parallel if seconds + DEFAULT_TEST_S <= SHARD_BUDGET_S]
+    bucket: list[str] = []
+    used = 0
+    number = 1
+
+    def flush() -> None:
+        nonlocal bucket, used, number
+        if not bucket:
+            return
+        shards[f"parallel-{number}"] = bucket
+        number += 1
+        bucket = []
+        used = 0
+
+    for nodeid, seconds in light:
+        if bucket and (used + seconds > SHARD_BUDGET_S or len(bucket) >= PARALLEL_CHUNK):
+            flush()
+        bucket.append(nodeid)
+        used += seconds
+    flush()
+    for nodeid, _seconds in heavy:
+        shards[f"parallel-{number}"] = [nodeid]
+        number += 1
     if rest:
         shards["rest"] = rest
     return {name: nodes for name, nodes in shards.items() if nodes}
 
 
-def problems(nodeids: list[str], shards: dict[str, list[str]]) -> list[str]:
+def problems(items: list[tuple[str, int]], shards: dict[str, list[str]]) -> list[str]:
     errors = []
+    budgets = {nodeid: seconds for nodeid, seconds in items}
+    nodeids = [nodeid for nodeid, _seconds in items]
     if "rest" in shards:
         sample = ", ".join(shards["rest"][:5])
         errors.append(f"unassigned tests: {sample}")
     seen: dict[str, str] = {}
     for name, nodes in shards.items():
-        if name.startswith("parallel-") and len(nodes) > PARALLEL_CHUNK:
-            errors.append(f"{name} has {len(nodes)} tests")
+        if name.startswith("parallel-"):
+            if len(nodes) > PARALLEL_CHUNK:
+                errors.append(f"{name} has {len(nodes)} tests")
+            cost = sum(budgets.get(nodeid, DEFAULT_TEST_S) for nodeid in nodes)
+            if cost > SHARD_HARD_S:
+                errors.append(f"{name} budget is {cost}s")
+            if cost > SHARD_BUDGET_S and len(nodes) > 1:
+                errors.append(f"{name} packs {cost}s into {len(nodes)} tests")
         for nodeid in nodes:
             if nodeid in seen:
                 errors.append(f"{nodeid} is in {seen[nodeid]} and {name}")
@@ -134,22 +183,22 @@ def _pytest(targets: list[str]) -> int:
     return subprocess.call(command, cwd=ROOT)
 
 
-def _load() -> tuple[list[str], dict[str, list[str]], list[str]]:
-    nodeids = collect()
-    shards = assign(nodeids)
-    return nodeids, shards, problems(nodeids, shards)
+def _load() -> tuple[list[tuple[str, int]], dict[str, list[str]], list[str]]:
+    items = collect()
+    shards = assign(items)
+    return items, shards, problems(items, shards)
 
 
 def main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[1] == "plan":
-        _nodeids, shards, found = _load()
+        _items, shards, found = _load()
         if found:
             print("\n".join(found), file=sys.stderr)
             return 2
         print("shards=" + json.dumps(list(shards)))
         return 0
     if len(argv) == 2 and argv[1] == "check":
-        _nodeids, shards, found = _load()
+        _items, shards, found = _load()
         if found:
             print("\n".join(found), file=sys.stderr)
             return 2
@@ -157,7 +206,7 @@ def main(argv: list[str]) -> int:
             print(f"{name} {len(nodes)}")
         return 0
     if len(argv) == 3 and argv[1] == "run":
-        _nodeids, shards, found = _load()
+        _items, shards, found = _load()
         if found:
             print("\n".join(found), file=sys.stderr)
             return 2

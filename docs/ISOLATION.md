@@ -298,12 +298,12 @@ A seccomp filter returns EPERM for `socket`, `connect`, `accept`, `accept4`,
 The io_uring numbers are 425, 426, and 427. Those three are also the generic
 aarch64 numbers, but the other numbers differ, so a machine that is not
 x86_64 still refuses the launch instead of using a partial table. `clone` is
-allowed only when `CLONE_THREAD` is set. `clone3` stays allowed: glibc creates
-threads with it, and classic BPF cannot read the flag pointer. A `clone3`
-task inherits the filter, the mount namespace, and the network namespace, and
-it dies with the pid namespace when the referee exits. It cannot call
-`setsid`. `RLIMIT_NPROC` is 64, so a `clone3` that starts another process
-stops at that ceiling with EAGAIN.
+allowed only when `CLONE_THREAD` is set. `clone3` returns ENOSYS. Classic BPF
+cannot read its flag pointer, so the whole call is refused and glibc creates
+threads with `clone` instead. A process cannot use `clone3` to skip the
+`CLONE_THREAD` check. `RLIMIT_NPROC` is 64 inside the user namespace. The
+child environment sets `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, and
+`MKL_NUM_THREADS` to 1.
 
 The host `/proc` is not mounted. `os.getppid()` inside the jail is the
 bubblewrap process in the new pid namespace, not the referee. Opening
@@ -313,7 +313,7 @@ visible and is why the child's command line carries no data path, no ticker,
 and no scale. The private directory path is on that command line because it
 is the child's own work directory.
 
-`RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_NPROC` (64), and `RLIMIT_CPU` are set
+`RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_NPROC`, and `RLIMIT_CPU` are set
 before the strategy is loaded. The parent also enforces the wall-clock
 per-call timeout and kills the sandbox on the way out. `--die-with-parent`
 covers a referee that dies without running that cleanup.
@@ -321,15 +321,21 @@ covers a referee that dies without running that cleanup.
 ### Linux without bubblewrap
 
 If `bwrap` cannot start a namespace, the launch uses landlock plus the same
-seccomp filter, the same rlimits, and `PR_SET_PDEATHSIG` set to `SIGKILL`.
-Landlock allows reading the interpreter, the staged package directories, and
-the directory that holds `/etc/ld.so.cache`, and writing the private
-directory. The child is still `python -I -S`, so site-packages is not on
-`sys.path`. Opening a data path returns EPERM. There is no pid namespace and
-no network namespace, so the network block is the seccomp filter alone,
-including `io_uring_setup`. `/proc` is not in the allow-list. A raw `clone3`
-task on this backend is not reaped by a pid namespace; bubblewrap is the
-stronger backend and is the one CI installs.
+seccomp filter and `PR_SET_PDEATHSIG` set to `SIGKILL`. Landlock allows
+reading the interpreter, the staged package directories, and the directory
+that holds `/etc/ld.so.cache`, and writing the private directory. The child
+is still `python -I -S`, so site-packages is not on `sys.path`. Opening a
+data path returns EPERM. There is no pid namespace and no network namespace,
+so the network block is the seccomp filter alone, including `io_uring_setup`,
+`io_uring_enter`, and `io_uring_register` (425, 426, 427). `/proc` is not in
+the allow-list. There is no user namespace, so `RLIMIT_NPROC` counts every
+task of this uid, not just the jail. The parent counts those tasks before
+the ruleset is applied and sets the ceiling to that count plus 64. The same
+seccomp filter returns ENOSYS for `clone3` and EPERM for `fork`, `vfork`,
+and `clone` without `CLONE_THREAD`, so the extra headroom is for threads
+(numpy, and a thread the strategy starts) and not for a fork bomb. The
+child environment sets the same one-thread BLAS variables as bubblewrap.
+Bubblewrap is the stronger backend and is the one CI installs.
 If landlock cannot be applied either, the launch is refused.
 
 ### Open Windows items
@@ -338,9 +344,12 @@ These are the Windows-only cases left for a live check on the owner PC.
 Linux runs the same assertions and does not take the `xfail`. The mark is
 `xfail(strict=False, reason="verify live on owner Windows PC")`. A pass on
 Windows is an xpass. Windows CI runs one shard per group of files, on
-Python 3.11, 3.12, and 3.13. Each shard stops at 25 minutes and each test
-stops at 60 seconds (`pytest-timeout`). A parallel shard holds at most 12
-tests, so a shard ends in a pass or a fail instead of being cancelled.
+Python 3.11, 3.12, and 3.13. Each shard stops at 25 minutes. The default
+per-test cap is 60 seconds (`pytest-timeout`). A test that starts several
+AppContainer jails is marked `windows_jails(n)` and, on Windows only, gets
+90 seconds per jail. Linux keeps the suite default. A parallel shard holds
+at most 12 tests, and the sum of those Windows budgets stays at or under
+12 minutes, so a shard ends in a pass or a fail instead of being cancelled.
 The thread timer raises in that test instead of calling `os._exit`, so one
 slow test does not discard the rest of the run. A hang cannot hold the job
 for hours.
@@ -422,6 +431,30 @@ in-process, with `/etc/ld.so.cache` bound and the parent's import order on
 `tests/test_referee.py` and `tests/test_reserved.py` are one of those shards,
 with the same 60-second test cap and 25-minute job cap. Ubuntu still runs
 the whole suite in one job per Python version.
+
+### AppContainer startup
+
+On the GitHub-hosted Windows runners a jail is silent for about 16–20
+seconds (`walk-forward wait` climbs to that, `pipe_bytes=0`, the child
+alive) and then the call returns. A test that starts eight jails — two
+strategies, two anonymized packs, and both the designer child and the
+operator child — does not fit in 60 seconds. Those four tests are not
+`xfail`. They have to pass. Their Windows budget is 90 seconds times the
+eight launches, and each one sits in its own shard so that budget stays
+inside the 12-minute pack.
+
+This is an owner-PC item, not a CI waiver. Time one jail and the
+private-directory grant, and compare it with the 16–20 second GitHub
+number. The thing to tighten is the profile startup and the per-launch
+grant, not the test.
+
+```
+python -m pytest -vv -s --timeout=180 --timeout-method=thread tests/test_parallel.py::test_ticker_scrub_ignores_case
+```
+
+That test is one strategy and one anonymized pack, so it starts the
+designer jail and the operator jail. Record the duration and divide by
+two for one jail.
 
 ### Live Windows checklist
 

@@ -601,14 +601,43 @@ def test_a_spawn_loop_is_capped_on_both_backends(monkeypatch):
     if sys.platform != "linux":
         pytest.skip("RLIMIT_NPROC is the Linux process ceiling")
     _needs_jail()
-    # The loop clones this interpreter. The address-space cap has to hold
-    # those copies, or the loop stops on ENOMEM before the process ceiling.
     _probe_bubblewrap_and_landlock(
         SELFTEST / "nproc.py",
         monkeypatch,
         memory_bytes=8 * 1024 * 1024 * 1024,
         call_timeout=30,
     )
+
+
+def test_numpy_runs_on_both_backends(monkeypatch):
+    if sys.platform != "linux":
+        pytest.skip("the landlock process ceiling is a Linux limit")
+    _needs_jail()
+    _probe_bubblewrap_and_landlock(
+        SELFTEST / "numpy_bar.py",
+        monkeypatch,
+        call_timeout=30,
+        startup_timeout=30,
+    )
+
+
+def test_keyboard_interrupt_is_a_strategy_error_on_both_backends(monkeypatch):
+    if sys.platform != "linux":
+        pytest.skip("the child boundary is covered with the Linux jails")
+    _needs_jail()
+    import backtester.sandbox as sandbox
+
+    def once():
+        with pytest.raises(Disqualified) as caught:
+            probe(SELFTEST / "interrupt.py", call_timeout=8, startup_timeout=20)
+        assert caught.value.reason == "strategy"
+        assert "KeyboardInterrupt" in caught.value.detail
+
+    once()
+    if not sandbox._landlock_available():
+        pytest.skip("landlock is not available")
+    monkeypatch.setattr(sandbox, "_bwrap_available", lambda: False)
+    once()
 
 
 def test_landlock_blocks_the_data_file_when_bubblewrap_is_hidden(tmp_path, monkeypatch):

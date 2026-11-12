@@ -18,7 +18,7 @@ import pandas as pd
 import pytest
 from pathlib import PureWindowsPath
 
-from windows_open import OWNER_PC
+from windows_open import OWNER_PC, windows_jails
 
 from backtester.parallel import (
     CancelToken,
@@ -1779,6 +1779,7 @@ def test_casefold_embedded_ids_publish(tmp_path, symbol, strategy_id):
     assert rows[0]["strategy_id"] == "my_RANDOM_v2"
 
 
+@windows_jails(8)
 def test_one_embedded_id_does_not_fail_the_mixed_batch(tmp_path):
     from backtester.report import read_leaderboard
 
@@ -1853,6 +1854,7 @@ def test_an_id_carrying_both_batch_tickers_is_scrubbed(tmp_path):
     assert_designer_clean(designer, symbol="ZZZX")
 
 
+@windows_jails(8)
 def test_colliding_tickers_keep_distinct_designer_ids(tmp_path):
     from backtester.report import read_leaderboard
 
@@ -2029,6 +2031,7 @@ def test_case_variant_designer_dirs_stay_distinct(tmp_path):
     assert_designer_clean(designer, symbol="COST")
 
 
+@windows_jails(8)
 def test_numeric_ticker_suffix_is_not_published(tmp_path):
     from backtester.report import ticker_token_spans
 
@@ -2065,6 +2068,7 @@ def test_numeric_ticker_suffix_is_not_published(tmp_path):
     assert_designer_clean(designer, symbol="QQQ")
 
 
+@windows_jails(8)
 def test_a_forced_ticker_suffix_is_renamed_off_disk(tmp_path, monkeypatch):
     """A directory named with a ticker must not survive the audit."""
     from backtester.parallel import _designer_component as real_component

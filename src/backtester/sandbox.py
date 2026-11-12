@@ -53,6 +53,7 @@ _SECCOMP_RET_ALLOW = 0x7FFF0000
 _SECCOMP_RET_ERRNO = 0x00050000
 _SECCOMP_RET_KILL = 0x80000000
 _EPERM = 1
+_ENOSYS = 38
 _AUDIT_ARCH_X86_64 = 0xC000003E
 _PR_SET_PDEATHSIG = 1
 _PR_SET_NO_NEW_PRIVS = 38
@@ -171,12 +172,14 @@ def _filter_bytes(*, deny: tuple[str, ...], allow_threads: bool) -> bytes:
         program.append(_insn(_RET_K, 0, 0, _SECCOMP_RET_ERRNO | _EPERM))
     if allow_threads:
         # clone is allowed only when CLONE_THREAD is set, so a thread can
-        # start and a process cannot. clone3 is not listed: glibc uses it for
-        # threads, and classic BPF cannot read the flag struct it points at.
-        clone = numbers["clone"]
+        # start and a process cannot. clone3's flag pointer is not visible to
+        # classic BPF, so the whole call returns ENOSYS and glibc falls back
+        # to clone. A fork bomb cannot use clone3 to skip that check.
         program.extend(
             (
-                _insn(_JMP_JEQ, 0, 4, clone),
+                _insn(_JMP_JEQ, 0, 1, numbers["clone3"]),
+                _insn(_RET_K, 0, 0, _SECCOMP_RET_ERRNO | _ENOSYS),
+                _insn(_JMP_JEQ, 0, 4, numbers["clone"]),
                 _insn(_LD_W_ABS, 0, 0, 16),
                 _insn(_ALU_AND, 0, 0, _CLONE_THREAD),
                 _insn(_JMP_JEQ, 1, 0, _CLONE_THREAD),
@@ -292,17 +295,17 @@ def _bwrap_guarantees() -> dict:
         ),
         "process": (
             "new pid namespace and die-with-parent. seccomp denies setsid, setpgid, "
-            "fork, vfork, and clone without CLONE_THREAD. clone3 stays allowed because "
-            "glibc creates threads with it and classic BPF cannot read its flag pointer. "
-            "A clone3 task inherits the filter, the mount namespace, and the network "
-            "namespace, and it dies with the pid namespace."
+            "fork, vfork, and clone without CLONE_THREAD. clone3 returns ENOSYS so "
+            "glibc creates threads with clone. Classic BPF cannot read clone3's flag "
+            "pointer, and a process started that way would not be stopped by the "
+            "CLONE_THREAD check."
         ),
         "parent_memory": (
             "the host /proc is not mounted. ptrace and process_vm_readv return EPERM"
         ),
         "memory": (
-            "RLIMIT_AS, RLIMIT_DATA, and RLIMIT_NPROC (64) hard caps, set before "
-            "the strategy is loaded"
+            "RLIMIT_AS, RLIMIT_DATA, and RLIMIT_NPROC hard caps, set before the "
+            "strategy is loaded. The process ceiling is 64 inside the user namespace."
         ),
         "cpu": "RLIMIT_CPU hard cap, plus the parent's wall-clock per-call timeout",
         "fail_closed": True,
@@ -326,12 +329,16 @@ def _landlock_guarantees() -> dict:
         ),
         "process": (
             "seccomp denies setsid, setpgid, fork, vfork, and clone without CLONE_THREAD. "
-            "PR_SET_PDEATHSIG is SIGKILL. There is no pid namespace, so a raw clone3 task "
-            "can outlive the strategy process if it is not killed with it. bubblewrap is "
-            "the stronger backend and is used when it runs."
+            "clone3 returns ENOSYS, the same as bubblewrap, so a fork bomb cannot skip "
+            "the CLONE_THREAD check. PR_SET_PDEATHSIG is SIGKILL. There is no pid "
+            "namespace. bubblewrap is the stronger backend and is used when it runs."
         ),
         "parent_memory": "/proc is not in the allow-list, so /proc/<pid>/mem cannot be opened. ptrace is denied.",
-        "memory": "RLIMIT_AS, RLIMIT_DATA, and RLIMIT_NPROC (64) hard caps",
+        "memory": (
+            "RLIMIT_AS, RLIMIT_DATA, and RLIMIT_NPROC hard caps. The process ceiling "
+            "is the uid's current task count plus 64, counted before the jail starts, "
+            "because this backend has no user namespace."
+        ),
         "cpu": "RLIMIT_CPU hard cap, plus the parent's wall-clock per-call timeout",
         "fail_closed": True,
     }
@@ -513,20 +520,29 @@ def launch(
         for banned in denied:
             if work == banned or banned in work.parents or work in banned.parents:
                 raise SandboxError("the private directory overlaps a denied directory")
+        if sys.platform == "win32":
+            backend = "windows"
+        elif sys.platform == "linux" and _bwrap_available():
+            backend = "bubblewrap"
+        elif sys.platform == "linux" and _landlock_available():
+            backend = "landlock"
+        else:
+            backend = None
         _write_workspace(
             work,
             strategy,
             memory_bytes=memory_bytes,
             cpu_seconds=cpu_seconds,
             capture_stdio=capture_stdio,
+            nproc=_nproc_ceiling(backend),
         )
-        if sys.platform == "win32":
+        if backend == "windows":
             return _launch_windows(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
         if sys.platform != "linux":
             raise SandboxError(f"no referee jail for {sys.platform}; refusing to run the strategy")
-        if _bwrap_available():
+        if backend == "bubblewrap":
             return _launch_bwrap(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
-        if _landlock_available():
+        if backend == "landlock":
             return _launch_landlock(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
         raise SandboxError(
             "bubblewrap is not available and landlock cannot be applied; refusing to run the strategy"
@@ -559,6 +575,65 @@ def _deny_roots(paths) -> list[Path]:
     return roots
 
 
+# Tasks a jail may create beyond the ones that already exist. Bubblewrap
+# counts only its user namespace, so 64 is the whole jail. Landlock counts
+# the host uid, so the same 64 is headroom on top of that count.
+_NPROC_HEADROOM = 64
+
+
+def _uid_task_count() -> int:
+    """Threads on this uid. RLIMIT_NPROC counts tasks, not thread groups.
+
+    Landlock does not hide ``/proc``, but the child cannot read it after the
+    ruleset is applied. The parent counts first and writes the ceiling down.
+    """
+    uid = os.getuid()
+    total = 0
+    proc = Path("/proc")
+    try:
+        names = list(proc.iterdir())
+    except OSError as exc:
+        raise SandboxError(f"cannot count tasks for the process ceiling: {exc}") from exc
+    for entry in names:
+        if not entry.name.isdigit():
+            continue
+        try:
+            text = (entry / "status").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        real = None
+        threads = 0
+        for line in text.splitlines():
+            if line.startswith("Uid:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        real = int(parts[1])
+                    except ValueError:
+                        real = None
+            elif line.startswith("Threads:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        threads = int(parts[1])
+                    except ValueError:
+                        threads = 0
+        if real == uid:
+            total += threads
+    if total < 1:
+        raise SandboxError("cannot count tasks for the process ceiling")
+    return total
+
+
+def _nproc_ceiling(backend: str | None) -> int | None:
+    """The RLIMIT_NPROC hard cap for this backend, or None off Linux."""
+    if backend == "bubblewrap":
+        return _NPROC_HEADROOM
+    if backend == "landlock":
+        return _uid_task_count() + _NPROC_HEADROOM
+    return None
+
+
 def _write_workspace(
     work: Path,
     strategy: Path,
@@ -566,6 +641,7 @@ def _write_workspace(
     memory_bytes: int,
     cpu_seconds: int,
     capture_stdio: bool,
+    nproc: int | None = None,
 ) -> None:
     shim = Path(__file__).resolve().parent / "sandbox_child.py"
     (work / "strategy.py").write_bytes(strategy.read_bytes())
@@ -580,6 +656,8 @@ def _write_workspace(
         "cpu_seconds": int(cpu_seconds),
         "capture_stdio": bool(capture_stdio),
     }
+    if nproc is not None:
+        limits["nproc"] = int(nproc)
     (work / "limits.json").write_text(json.dumps(limits), encoding="utf-8")
     _stage_packages(work)
 
@@ -757,6 +835,11 @@ def _child_env(work: Path) -> dict:
         "PYTHONUTF8": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
+        # One BLAS thread. The process ceiling still has to leave room for a
+        # strategy thread; this only stops the default pool from taking it.
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
     }
     return env
 
@@ -2155,6 +2238,9 @@ def _windows_env(work: Path) -> dict:
         "PYTHONUTF8": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
     }
     return {key: value for key, value in env.items() if value}
 

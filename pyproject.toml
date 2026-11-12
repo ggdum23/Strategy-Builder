@@ -28,4 +28,5 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
     "jailed_sample: full October sample, jailed file strategy versus in-process",
+    "windows_jails(count): Windows pytest-timeout budget of 90 seconds per AppContainer jail",
 ]

@@ -142,10 +142,14 @@ def _apply_limits() -> bool:
     if os.name != "nt":
         import resource
 
-        # Threads count against this ceiling. 64 leaves room for the ones
-        # numpy starts. clone3 stays allowed so those threads can be created.
-        # A further process gets EAGAIN.
-        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+        # The parent wrote this ceiling. Bubblewrap's user namespace makes 64
+        # the whole jail. Landlock shares the host uid, so the ceiling is the
+        # task count from before the ruleset plus the same 64-task headroom.
+        # clone3 returns ENOSYS; threads use clone with CLONE_THREAD, and a
+        # further process is EPERM from the filter.
+        nproc = spec.get("nproc")
+        if isinstance(nproc, int) and not isinstance(nproc, bool) and nproc > 0:
+            _set_nproc(int(nproc))
         memory = int(spec.get("memory_bytes") or 0)
         cpu = int(spec.get("cpu_seconds") or 0)
         if memory > 0:
@@ -154,6 +158,18 @@ def _apply_limits() -> bool:
         if cpu > 0:
             resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
     return capture
+
+
+def _set_nproc(ceiling: int) -> None:
+    """Apply the parent's process ceiling without raising the hard limit."""
+    import resource
+
+    _soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    limit = int(ceiling)
+    infinity = getattr(resource, "RLIM_INFINITY", -1)
+    if hard != infinity and limit > int(hard):
+        limit = int(hard)
+    resource.setrlimit(resource.RLIMIT_NPROC, (limit, limit))
 
 
 def _extend_path() -> None:
@@ -355,7 +371,7 @@ def main() -> int:
             return 1
         try:
             strategy, wants, has_day_end = _load()
-        except Exception as exc:
+        except BaseException as exc:
             # Wait for hello so the error is the reply, not a write into a
             # pipe the parent has not opened yet.
             _recv()
@@ -385,7 +401,7 @@ def main() -> int:
             if op == "bar":
                 try:
                     target = strategy.on_bar(message["bar"], _second(message))
-                except (Exception, SystemExit) as exc:
+                except BaseException as exc:
                     _send({"op": "error", "error": f"{type(exc).__name__}: {exc}"})
                     return 1
                 _send({"op": "decision", "target": _encode(target)})
@@ -395,7 +411,7 @@ def main() -> int:
                     hook = getattr(strategy, "on_day_end", None)
                     if callable(hook):
                         hook(message.get("summary") or {})
-                except (Exception, SystemExit) as exc:
+                except BaseException as exc:
                     _send({"op": "error", "error": f"{type(exc).__name__}: {exc}"})
                     return 1
                 _send({"op": "decision", "target": None})
@@ -404,7 +420,7 @@ def main() -> int:
             return 2
     except BrokenPipeError:
         return 0
-    except Exception as exc:
+    except BaseException as exc:
         try:
             _send({"op": "error", "error": f"{type(exc).__name__}: {exc}"})
         except Exception:

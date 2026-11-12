@@ -1,13 +1,13 @@
-"""Return 0.0 when clone3 stops at the process ceiling, else 1.0.
+"""Return 0.0 when a new process is refused.
 
-fork is already denied. clone3 with no flags still creates a process, so
-the ceiling is RLIMIT_NPROC. The loop stops at the first EAGAIN and reaps
-every child it started.
+fork is EPERM. clone3 is ENOSYS, so glibc falls back to clone, and clone
+without CLONE_THREAD is EPERM. A thread is still allowed to start.
 """
 
 import ctypes
 import errno
 import os
+import threading
 
 
 class _CloneArgs(ctypes.Structure):
@@ -25,29 +25,38 @@ class _CloneArgs(ctypes.Structure):
 
 class Strategy:
     def on_bar(self, bar, state):
-        libc = ctypes.CDLL(None, use_errno=True)
-        libc.syscall.restype = ctypes.c_long
-        kids = []
-        capped = False
-        for _ in range(80):
-            args = _CloneArgs()
-            args.exit_signal = 17
-            pid = libc.syscall(435, ctypes.byref(args), ctypes.c_size_t(ctypes.sizeof(args)))
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            if exc.errno != errno.EPERM:
+                return 1.0
+        else:
             if pid == 0:
                 os._exit(0)
-            if pid > 0:
-                kids.append(int(pid))
-                continue
-            if ctypes.get_errno() == errno.EAGAIN:
-                capped = True
-                break
-            capped = False
-            break
-        for child in kids:
+            return 1.0
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        args = _CloneArgs()
+        args.exit_signal = 17
+        spawned = libc.syscall(435, ctypes.byref(args), ctypes.c_size_t(ctypes.sizeof(args)))
+        if spawned == 0:
+            os._exit(0)
+        if spawned > 0:
             try:
-                os.waitpid(child, 0)
+                os.waitpid(int(spawned), 0)
             except OSError:
                 pass
-        if capped and len(kids) <= 64:
-            return 0.0
-        return 1.0
+            return 1.0
+        if ctypes.get_errno() != errno.ENOSYS:
+            return 1.0
+        started = []
+
+        def run():
+            started.append(1)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=2)
+        if not started or thread.is_alive():
+            return 1.0
+        return 0.0
