@@ -38,6 +38,7 @@ class RunPage(QWidget):
         self.host = host
         self._profile = ""
         self._strategies: list[str] = []
+        self._failure_text: str | None = None
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 16)
         root.setSpacing(12)
@@ -420,6 +421,8 @@ class RunPage(QWidget):
         issues = validate_config(draft)
         self.run_button.setEnabled(not issues and not self.host.run_in_progress())
         clear_layout(self.banners)
+        if self._failure_text:
+            self.banners.addWidget(Banner("error", self._failure_text))
         if issues:
             self.banners.addWidget(Banner("warn", issues[0] if len(issues) == 1 else f"{len(issues)} items to fix. The first: {issues[0]}"))
 
@@ -439,6 +442,8 @@ class RunPage(QWidget):
     def set_running(self, running: bool) -> None:
         self.cancel_button.setEnabled(running)
         if running:
+            self._failure_text = None
+            clear_layout(self.banners)
             self.run_button.setEnabled(False)
         else:
             self.refresh()
@@ -459,6 +464,8 @@ class RunPage(QWidget):
             self.batch_table.set_records(("strategy", "state", "error"), kept)
 
     def on_finished(self, payload: dict) -> None:
+        self._failure_text = None
+        clear_layout(self.banners)
         result = payload.get("result") or {}
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
@@ -480,10 +487,12 @@ class RunPage(QWidget):
         self.progress.setValue(0)
         self.progress.setFormat("Failed")
         self.log.setPlainText(failure_detail(failure))
+        self._failure_text = failure_message(failure)
         clear_layout(self.banners)
-        self.banners.addWidget(Banner("error", failure_message(failure)))
+        self.banners.addWidget(Banner("error", self._failure_text))
 
     def on_cancelled(self) -> None:
+        self._failure_text = None
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setFormat("Cancelled")
