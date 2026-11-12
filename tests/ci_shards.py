@@ -70,6 +70,7 @@ FILE_SHARDS = {
         "tests/gui/test_review13.py",
         "tests/gui/test_review15.py",
         "tests/gui/test_review16.py",
+        "tests/gui/test_review17.py",
         "tests/gui/test_review2.py",
         "tests/gui/test_review3.py",
         "tests/gui/test_review4.py",
@@ -91,6 +92,7 @@ FILE_SHARDS = {
         "tests/test_review14_surface.py",
         "tests/test_review15_surface.py",
         "tests/test_review16_surface.py",
+        "tests/test_review17_surface.py",
     ),
 }
 

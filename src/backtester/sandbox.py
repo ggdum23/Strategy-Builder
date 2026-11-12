@@ -413,8 +413,11 @@ def _windows_guarantees() -> dict:
             "temp directory, an app-data directory it created, and the interpreter "
             "when that copy is outside Windows, Program Files, the drive root, and "
             "the user-profile root. System directories are not edited. Ancestors "
-            "this app does not own are not rewritten; a missing traverse ACE fails "
-            "the launch. Data, market, and repository trees are not granted. "
+            "this app does not own are not rewritten. An interpreter whose "
+            "ancestors lack traverse is copied under an app-created directory "
+            "that the container can already reach, and only the copy is granted. "
+            "If no such directory exists, the launch fails and names the ancestor. "
+            "Data, market, and repository trees are not granted. "
             "LOCALAPPDATA is the host value the profile needs, and its DACL is not "
             "edited. A child that is not an AppContainer is not resumed."
         ),
@@ -543,13 +546,14 @@ def _interpreter_command(script: Path, *, child: bool = False) -> list[str]:
     is this executable again, with ``--sandbox-child`` and the private
     directory as its cwd. No strategy path is put on that command line.
     """
+    executable = _child_executable()
     if child and getattr(sys, "frozen", False):
-        return [sys.executable, "--sandbox-child"]
+        return [executable, "--sandbox-child"]
     if getattr(sys, "frozen", False):
-        return [sys.executable, str(script)]
+        return [executable, str(script)]
     if child:
-        return [sys.executable, "-I", "-S", "-B", str(script)]
-    return [sys.executable, "-I", "-S", "-B", str(script)]
+        return [executable, "-I", "-S", "-B", str(script)]
+    return [executable, "-I", "-S", "-B", str(script)]
 
 
 def launch(
@@ -569,6 +573,10 @@ def launch(
         raise ValueError("memory cap must be a positive number of bytes")
     if not isinstance(cpu_seconds, int) or isinstance(cpu_seconds, bool) or cpu_seconds <= 0:
         raise ValueError("cpu cap must be a positive number of seconds")
+    # The workspace junctions have to point at the staged interpreter. On
+    # Windows that copy is decided while the profile is granted, which is
+    # before the private directory is written.
+    warm_windows_profile()
     strategy = Path(strategy_path).resolve()
     if not strategy.is_file():
         raise FileNotFoundError(f"strategy file not found: {strategy}")
@@ -911,21 +919,24 @@ def _stage_packages(work: Path) -> list[Path]:
     slots: dict[Path, Path] = {}
     index = 0
     for path in packages:
+        source = _translate_runtime(path)
         if path.name.endswith(".libs"):
             owner = path.parent / path.name[: -len(".libs")]
             if slots.get(owner) is not None:
                 # Not linked into the slot. os.add_dll_directory rejects that
                 # junction on Windows, and the loader raises before the import.
-                dlls.append(str(path))
+                # The path is the staged copy when the original prefix cannot
+                # be traversed. A junction back to that prefix would not open.
+                dlls.append(str(source))
                 continue
         slot = stage / f"{index:02d}"
         slot.mkdir()
-        _link_into(path, slot / path.name)
+        _link_into(source, slot / path.name)
         slots[path] = slot
         entries.append(f"pydeps/{index:02d}")
         index += 1
         if path.name.endswith(".libs"):
-            dlls.append(str(path))
+            dlls.append(str(source))
     (work / "deps.json").write_text(
         json.dumps({"path": entries, "dlls": dlls}),
         encoding="utf-8",
@@ -1598,7 +1609,7 @@ def _clear_loopback(name: str, sid_text: str) -> None:
 _ACL_MARKER_VERSION = 2
 
 
-def _recorded_grants(sid_text: str):
+def _recorded_grants(sid_text: str, roots):
     path = _grant_marker_path()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1608,11 +1619,11 @@ def _recorded_grants(sid_text: str):
         return None
     if payload.get("sid") != sid_text:
         return None
-    expected = [os.path.normcase(str(item)) for item in _windows_grant_roots()]
+    expected = [os.path.normcase(str(item)) for item in roots]
     recorded_roots = [os.path.normcase(str(item)) for item in payload.get("roots") or []]
     if recorded_roots != expected:
         return None
-    allow = [str(item) for item in _windows_grant_roots()]
+    allow = [str(item) for item in roots]
     exact, trees = protected_acl_layout(os.environ)
     grants = []
     for item in payload.get("grants") or []:
@@ -1625,11 +1636,11 @@ def _recorded_grants(sid_text: str):
     return grants
 
 
-def _write_grant_marker(sid_text: str, grants, *, loopback_cleared: bool) -> None:
+def _write_grant_marker(sid_text: str, grants, roots, *, loopback_cleared: bool) -> None:
     payload = {
         "version": _ACL_MARKER_VERSION,
         "sid": sid_text,
-        "roots": [str(path) for path in _windows_grant_roots()],
+        "roots": [str(path) for path in roots],
         "grants": [[str(path), bool(recurse)] for path, recurse in grants],
         "local_denied": False,
         "loopback_cleared": bool(loopback_cleared),
@@ -1693,14 +1704,29 @@ def _win_lease_open(lease: _WinLease) -> None:
     lease.kernel = kernel
 
     def ensure_grants():
-        roots = _windows_grant_roots()
-        lease.acl_allow = [str(path) for path in roots]
+        roots = _prepare_runtime_grant_roots()
+        lease.acl_allow = _dedupe_acl(
+            [str(path) for path in roots] + [str(path) for path in _CREATED_APP_DIRS]
+        )
         # Read-only. A missing package ACE fails the grant before any write,
-        # including on the marker fast path.
+        # including on the marker fast path. An interpreter the container
+        # cannot walk to is copied under an app-owned directory. Its
+        # ancestors are not edited.
         _require_unowned_runtime_access(roots)
         for root in roots:
             _require_existing_ancestor_traverse(root, lease.acl_allow)
-        recorded = _recorded_grants(sid_text)
+        made: list[tuple[Path, bool]] = []
+        try:
+            made = _materialize_runtime_copies(lease)
+        except Exception:
+            lease.grant_paths = made
+            try:
+                for path, recurse in made:
+                    _win_remove_aces(lease, [path], recurse=recurse)
+            except Exception:
+                pass
+            raise
+        recorded = _recorded_grants(sid_text, roots)
         marker = {}
         try:
             marker = json.loads(_grant_marker_path().read_text(encoding="utf-8"))
@@ -1711,6 +1737,7 @@ def _win_lease_open(lease: _WinLease) -> None:
             and marker.get("loopback_cleared")
             and marker.get("firewall_blocked")
             and marker.get("sid") == sid_text
+            and _runtime_copies_ready()
         ):
             lease.grant_paths = recorded
             return
@@ -1718,15 +1745,16 @@ def _win_lease_open(lease: _WinLease) -> None:
         # a strategy timeout, so a later process must not run them again.
         _clear_loopback(name, sid_text)
         _win_block_network(sid_text)
-        if recorded is not None:
+        if recorded is not None and _runtime_copies_ready():
             lease.grant_paths = recorded
-            _write_grant_marker(sid_text, recorded, loopback_cleared=True)
+            _write_grant_marker(sid_text, recorded, roots, loopback_cleared=True)
             return
-        grants: list[tuple[Path, bool]] = []
+        grants: list[tuple[Path, bool]] = list(made)
         try:
             for root in roots:
-                _win_grant(lease, root, "(OI)(CI)(RX)", recurse=True)
-                grants.append((root, True))
+                recurse = _runtime_grant_recurse(root)
+                _win_grant(lease, root, "(OI)(CI)(RX)", recurse=recurse)
+                grants.append((root, recurse))
         except Exception:
             lease.grant_paths = grants
             try:
@@ -1736,7 +1764,7 @@ def _win_lease_open(lease: _WinLease) -> None:
                 pass
             raise
         lease.grant_paths = grants
-        _write_grant_marker(sid_text, grants, loopback_cleared=True)
+        _write_grant_marker(sid_text, grants, roots, loopback_cleared=True)
 
     try:
         # Every process that launches a jail holds this filter. A scrubbed
@@ -2116,15 +2144,384 @@ def _acl_same_prefix(path: Path) -> bool:
     return acl_same(path, sys.prefix) and not acl_same(sys.prefix, sys.base_prefix)
 
 
-def _require_existing_ancestor_traverse(path, allow) -> None:
-    """Fail when an unowned ancestor has no package traverse ACE. Never writes."""
-    for parent in acl_ancestor_paths(str(path)):
+# (source, dest) for an interpreter the container cannot walk to.
+# The dest is an app-owned copy. The source's ancestors are not edited.
+_RUNTIME_COPIES: list[tuple[str, str]] = []
+_RUNTIME_COPY_VERSION = "1"
+
+
+def _child_executable() -> str:
+    """Interpreter the AppContainer starts.
+
+    A copy under an app-owned directory replaces an interpreter whose
+    ancestors the container cannot traverse. Those ancestors are not edited.
+    """
+    return str(_translate_runtime(sys.executable))
+
+
+def first_blocked_ancestor(path, allow, accessible) -> str | None:
+    """Nearest unowned ancestor ``accessible`` rejects, or None.
+
+    Ancestors that are an allow root, or that sit inside one, are skipped.
+    This does not write an ACL.
+    """
+    for parent in acl_ancestor_paths(path):
         if any(acl_same(parent, root) or _acl_inside(parent, root) for root in allow):
             continue
-        if _existing_package_access(parent, read=False, traverse=True):
+        if accessible(parent):
             continue
+        return parent
+    return None
+
+
+def stage_unreachable_runtimes(roots, *, allow, accessible, stage_root):
+    """Grant roots after an unreachable interpreter is replaced by a copy.
+
+    ``copies`` is ``(source, dest)``. A reachable root stays. An unreachable
+    root is omitted and its dest, under ``stage_root``, is granted instead.
+    ``stage_root`` itself is granted when several copies sit under it.
+    When no parent is available for the copy, the error names the blocked
+    ancestor and that ancestor is not added as a target.
+    """
+    blocked = []
+    grant = []
+    for root in roots:
+        if root is None or root == "":
+            continue
+        parent = first_blocked_ancestor(str(root), allow, accessible)
+        if parent is None:
+            grant.append(str(root))
+        else:
+            blocked.append((str(root), parent))
+    if not blocked:
+        kept = _dedupe_acl(grant)
+        kept.sort(key=_acl_parts)
+        return kept, []
+    if not stage_root:
         raise SandboxError(
-            f"the AppContainer cannot traverse {parent}; this process will not rewrite a directory it does not own"
+            f"the AppContainer cannot traverse {blocked[0][1]}; "
+            "this process will not rewrite a directory it does not own"
+        )
+    stage_blocked = first_blocked_ancestor(str(stage_root), allow, accessible)
+    if stage_blocked is not None:
+        raise SandboxError(
+            f"the AppContainer cannot traverse {stage_blocked}; "
+            "this process will not rewrite a directory it does not own"
+        )
+    if len(blocked) == 1:
+        dests = [str(stage_root)]
+    else:
+        dests = [str(Path(str(stage_root)) / str(index)) for index in range(len(blocked))]
+        grant.append(str(stage_root))
+    copies = []
+    for (source, _parent), dest in zip(blocked, dests):
+        copies.append((source, dest))
+        grant.append(dest)
+    kept = _dedupe_acl(grant)
+    kept.sort(key=_acl_parts)
+    return kept, copies
+
+
+def translate_staged_path(path, copies) -> str:
+    """Map a path through the longest staged interpreter prefix."""
+    text = str(path)
+    best = None
+    best_len = -1
+    for source, dest in copies:
+        if not (acl_same(text, source) or _acl_inside(text, source)):
+            continue
+        length = len(_acl_parts(source)[1])
+        if length > best_len:
+            best = (str(source), str(dest))
+            best_len = length
+    if best is None:
+        return text
+    source, dest = best
+    _drive, parts = _split_acl_path(text)
+    _source_drive, source_parts = _split_acl_path(source)
+    relative = parts[len(source_parts) :]
+    dest_drive, dest_parts = _split_acl_path(dest)
+    return _acl_join(dest_drive, dest_parts + relative)
+
+
+def rewrite_pyvenv_home(text: str, translate) -> str:
+    """Point a copied virtualenv at the staged base prefix."""
+    lines = []
+    for line in text.splitlines(keepends=True):
+        newline = ""
+        body = line
+        if body.endswith("\r\n"):
+            newline = "\r\n"
+            body = body[:-2]
+        elif body.endswith("\n"):
+            newline = "\n"
+            body = body[:-1]
+        key, sep, value = body.partition("=")
+        if sep and key.strip().casefold() == "home":
+            home = value.strip()
+            updated = str(translate(home))
+            if updated != home:
+                lines.append(f"{key}{sep} {updated}{newline}")
+                continue
+        lines.append(line)
+    return "".join(lines)
+
+
+def runtime_relpath_is_copied(parts, *, is_dir: bool, package_prefixes) -> bool:
+    """Files the child interpreter opens, not the whole site-packages tree.
+
+    ``package_prefixes`` are casefolded relative paths of imported packages,
+    such as ``Lib/site-packages/numpy``. A ``._pth`` file is left behind so
+    the copy does not redirect the child at the original prefix.
+    """
+    folded = tuple(part.casefold() for part in parts)
+    if any(
+        part.casefold() == "__pycache__"
+        or part.casefold().endswith(".dist-info")
+        or part.casefold().endswith(".egg-info")
+        for part in parts
+    ):
+        return False
+    if folded and (folded[-1].endswith("._pth") or folded[-1].endswith(".pth")):
+        return False
+    if not folded:
+        return True
+    # The CPython regression suite is not opened by the child. Copying it
+    # dominates the time and is not granted as a separate tree.
+    if len(folded) >= 2 and folded[0] == "lib" and folded[1] in {"test", "idlelib", "turtledemo"}:
+        return False
+    if len(folded) >= 2 and folded[0] == "lib" and folded[1] == "site-packages":
+        for prefix in package_prefixes:
+            if folded[: len(prefix)] == prefix or prefix[: len(folded)] == folded:
+                return True
+        return False
+    if folded[0] in {"lib", "dlls"}:
+        return True
+    return len(folded) == 1 and not is_dir
+
+
+def _translate_runtime(path) -> Path:
+    if not _RUNTIME_COPIES:
+        return Path(path)
+    return Path(translate_staged_path(path, _RUNTIME_COPIES))
+
+
+def _staged_source(path) -> bool:
+    for source, _dest in _RUNTIME_COPIES:
+        if acl_same(path, source) or _acl_inside(path, source):
+            return True
+    return False
+
+
+def _ancestor_accessible(path) -> bool:
+    return _existing_package_access(path, read=False, traverse=True)
+
+
+def _runtime_stamp_path() -> Path:
+    return _grant_marker_path().with_name("strategybuilderjail-runtime.json")
+
+
+def _load_runtime_stamp() -> list:
+    try:
+        payload = json.loads(_runtime_stamp_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict) or payload.get("version") != _RUNTIME_COPY_VERSION:
+        return []
+    copies = payload.get("copies")
+    return copies if isinstance(copies, list) else []
+
+
+def _remember_runtime_stamp() -> None:
+    payload = {
+        "version": _RUNTIME_COPY_VERSION,
+        "copies": [{"source": source, "dest": dest} for source, dest in _RUNTIME_COPIES],
+    }
+    _runtime_stamp_path().write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _runtime_copy_ready(dest: Path, src: Path) -> bool:
+    exe_name = "python.exe" if os.name == "nt" else "python"
+    if not (dest / exe_name).is_file() or not (dest / "Lib" / "os.py").is_file():
+        return False
+    for item in _load_runtime_stamp():
+        if not isinstance(item, dict):
+            continue
+        if acl_same(item.get("source", ""), src) and acl_same(item.get("dest", ""), dest):
+            return True
+    return False
+
+
+def _runtime_copies_ready() -> bool:
+    for source, dest in _RUNTIME_COPIES:
+        if not _runtime_copy_ready(Path(dest), Path(source)):
+            return False
+    return True
+
+
+def _rewrite_staged_pyvenv(dest: Path) -> None:
+    path = dest / "pyvenv.cfg"
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    rewritten = rewrite_pyvenv_home(
+        text, lambda home: translate_staged_path(home, _RUNTIME_COPIES)
+    )
+    if rewritten != text:
+        path.write_text(rewritten, encoding="utf-8")
+
+
+def _package_prefixes(src: Path, package_dirs) -> tuple:
+    try:
+        base = src.resolve()
+    except OSError:
+        base = src
+    found = []
+    for package in package_dirs:
+        try:
+            resolved = Path(package).resolve()
+        except OSError:
+            resolved = Path(package)
+        try:
+            relative = resolved.relative_to(base)
+        except ValueError:
+            continue
+        found.append(tuple(part.casefold() for part in relative.parts))
+    return tuple(found)
+
+
+def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set) -> None:
+    try:
+        entries = list(src.iterdir())
+    except OSError as exc:
+        raise SandboxError(f"could not read the interpreter at {src}: {exc}") from exc
+    for entry in entries:
+        relative = parts + (entry.name,)
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            continue
+        if not runtime_relpath_is_copied(relative, is_dir=is_dir, package_prefixes=prefixes):
+            continue
+        try:
+            resolved = entry.resolve()
+        except OSError:
+            resolved = entry
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        target = dest / entry.name
+        if is_dir:
+            target.mkdir(exist_ok=True)
+            _copy_runtime_into(entry, target, relative, prefixes, seen)
+            continue
+        if target.exists():
+            continue
+        try:
+            shutil.copy2(entry, target)
+        except OSError as exc:
+            raise SandboxError(
+                f"could not copy {entry.name} into the app-owned interpreter: {exc}"
+            ) from exc
+
+
+def _copy_runtime_tree(src: Path, dest: Path, package_dirs) -> None:
+    """Copy the interpreter files the child opens. The source tree is not granted."""
+    dest.mkdir(parents=True, exist_ok=True)
+    _copy_runtime_into(src, dest, (), _package_prefixes(src, package_dirs), set())
+
+
+def _prepare_runtime_grant_roots() -> list[Path]:
+    """Owned grant roots. An unreachable interpreter is replaced by its copy."""
+    global _RUNTIME_COPIES
+    roots = [str(path) for path in _windows_grant_roots()]
+    if sys.platform != "win32":
+        _RUNTIME_COPIES = []
+        return [Path(path) for path in roots]
+    allow = _dedupe_acl(roots + [str(path) for path in _CREATED_APP_DIRS])
+    blocked = any(first_blocked_ancestor(root, allow, _ancestor_accessible) for root in roots)
+    stage_root = None
+    if blocked:
+        parent = _owned_work_parent()
+        if parent is not None:
+            stage_root = str((parent / "runtime").resolve())
+            allow = _dedupe_acl(allow + [str(path) for path in _CREATED_APP_DIRS] + [stage_root])
+    grant, copies = stage_unreachable_runtimes(
+        roots,
+        allow=allow,
+        accessible=_ancestor_accessible,
+        stage_root=stage_root,
+    )
+    _RUNTIME_COPIES = [(source, dest) for source, dest in copies]
+    return [Path(path) for path in grant]
+
+
+def _remove_tree(path: Path) -> None:
+    def onerror(func, name, _exc):
+        try:
+            os.chmod(name, 0o700)
+            func(name)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onerror=onerror)
+
+
+def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:
+    """Copy interpreter files into the app-owned dest and let new files inherit.
+
+    The inheritable ACE is written on the empty directory first. A file that
+    does not inherit it is granted by a tree walk. The stamp lives beside the
+    grant marker, outside the tree the child can read.
+    """
+    granted: list[tuple[Path, bool]] = []
+    if not _RUNTIME_COPIES:
+        return granted
+    packages = _runtime_package_dirs()
+    changed = False
+    for source, dest in _RUNTIME_COPIES:
+        src = Path(source)
+        target = Path(dest)
+        if _runtime_copy_ready(target, src):
+            continue
+        changed = True
+        if target.exists():
+            _remove_tree(target)
+        target.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            _win_grant(lease, target, "(OI)(CI)(RX)", recurse=False)
+            granted.append((target, False))
+        note_phase(f"runtime-copy-start {target.name}")
+        _copy_runtime_tree(src, target, packages)
+        _rewrite_staged_pyvenv(target)
+        note_phase(f"runtime-copy-done {target.name}")
+        if sys.platform == "win32":
+            probe = target / "python.exe"
+            if probe.is_file() and not _win_ace_present(lease, probe, _RX_MASK, 0):
+                _win_grant_tree(lease, target, _RX_MASK, _INHERIT_BOTH)
+                granted.append((target, True))
+    if changed:
+        _remember_runtime_stamp()
+    return granted
+
+
+def _runtime_grant_recurse(root: Path) -> bool:
+    """A directory that only holds staged copies is not walked."""
+    text = str(root)
+    dests = [dest for _source, dest in _RUNTIME_COPIES]
+    if any(acl_same(text, dest) for dest in dests):
+        return True
+    if any(_acl_inside(dest, text) for dest in dests):
+        return False
+    return True
+
+
+def _require_existing_ancestor_traverse(path, allow) -> None:
+    """Fail when an unowned ancestor has no package traverse ACE. Never writes."""
+    blocked = first_blocked_ancestor(str(path), allow, _ancestor_accessible)
+    if blocked is not None:
+        raise SandboxError(
+            f"the AppContainer cannot traverse {blocked}; this process will not rewrite a directory it does not own"
         )
 
 
@@ -2135,6 +2532,8 @@ def _require_unowned_runtime_access(owned: list[Path]) -> None:
         directory = package if package.is_dir() else package.parent
         paths.append(directory)
     for path in paths:
+        if _staged_source(path):
+            continue
         if any(acl_same(path, root) or _acl_inside(path, root) for root in owned):
             continue
         try:
@@ -3089,6 +3488,7 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
         info.StartupInfo.hStdOutput = stdout_w
         info.StartupInfo.hStdError = stderr_w
         info.lpAttributeList = ctypes.cast(attributes, ctypes.c_void_p)
+        executable = _child_executable()
         command = subprocess.list2cmdline(_interpreter_command(work / "sandbox_child.py", child=True))
         command_buf = ctypes.create_unicode_buffer(command)
         env_buf = _windows_env_block(_windows_env(work))
@@ -3104,7 +3504,7 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
         for extra, label in ((0x01000000, "breakaway"), (0, "in-job")):
             note_phase(f"createprocess-{label}")
             ok = kernel.CreateProcessW(
-                sys.executable,
+                executable,
                 command_buf,
                 None,
                 None,
@@ -3124,10 +3524,10 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
                 break
         if not ok:
             code = failed
-            executable = Path(sys.executable)
+            executable_path = Path(executable)
             raise SandboxError(
                 "CreateProcessW failed (winerror %s); executable %s exists=%s cwd=%s cwd_exists=%s"
-                % (code, executable, executable.is_file(), work, work.is_dir())
+                % (code, executable_path, executable_path.is_file(), work, work.is_dir())
             )
         process = created.hProcess
         thread = created.hThread
@@ -3229,7 +3629,7 @@ def _windows_env(work: Path) -> dict:
     if not local:
         raise SandboxError("LOCALAPPDATA is not set; refusing to start the sandbox")
     system = os.environ.get("SystemRoot", "")
-    parts = [os.path.dirname(sys.executable)]
+    parts = [os.path.dirname(_child_executable())]
     if system:
         parts.append(str(Path(system) / "System32"))
         parts.append(system)

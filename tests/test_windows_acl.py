@@ -14,12 +14,17 @@ import pytest
 
 from backtester.sandbox import (
     SandboxError,
+    _copy_runtime_tree,
     acl_ancestor_paths,
     acl_revoke_problem,
     acl_same,
     planned_acl_targets,
     refuse_acl_target,
+    rewrite_pyvenv_home,
+    runtime_relpath_is_copied,
     should_write_ace,
+    stage_unreachable_runtimes,
+    translate_staged_path,
 )
 
 ENV = {
@@ -163,6 +168,154 @@ def _suite_conftest():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _open(path: str):
+    def accessible(candidate: str) -> bool:
+        return not acl_same(candidate, path)
+
+    return accessible
+
+
+def test_a_blocked_toolcache_ancestor_is_replaced_by_an_app_owned_copy():
+    stage = APP + r"\runtime"
+    version = r"C:\hostedtoolcache\windows\Python\3.12"
+    grant, copies = stage_unreachable_runtimes(
+        [PREFIX],
+        allow=[PREFIX, stage],
+        accessible=_open(version),
+        stage_root=stage,
+    )
+    assert len(copies) == 1
+    assert acl_same(copies[0][0], PREFIX)
+    assert acl_same(copies[0][1], stage)
+    assert _same_set(grant, [stage])
+    for path in (version, r"C:\hostedtoolcache", r"C:\ProgramData", SYSTEM, r"C:\\"):
+        assert not any(acl_same(item, path) for item in grant)
+        with pytest.raises(SandboxError, match="refusing to edit the ACL"):
+            refuse_acl_target(path, allow=grant, environ=ENV)
+    refuse_acl_target(stage, allow=grant, environ=ENV)
+    assert acl_same(
+        translate_staged_path(PREFIX + r"\Lib\site-packages\numpy", copies),
+        stage + r"\Lib\site-packages\numpy",
+    )
+    assert translate_staged_path(SYSTEM, copies) == SYSTEM
+
+
+def test_a_blocked_ancestor_is_not_granted_when_no_copy_parent_exists():
+    with pytest.raises(SandboxError, match="3.12"):
+        stage_unreachable_runtimes(
+            [PREFIX],
+            allow=[PREFIX],
+            accessible=_open(r"C:\hostedtoolcache\windows\Python\3.12"),
+            stage_root=None,
+        )
+
+
+def test_the_copy_parent_is_not_rewritten_when_it_also_blocks_traverse():
+    stage = APP + r"\runtime"
+    with pytest.raises(SandboxError, match="ProgramData"):
+        stage_unreachable_runtimes(
+            [PREFIX],
+            allow=[PREFIX, r"C:\ProgramData\Strategy Builder", APP, stage],
+            accessible=lambda path: not (
+                acl_same(path, r"C:\hostedtoolcache\windows\Python\3.12")
+                or acl_same(path, r"C:\ProgramData")
+            ),
+            stage_root=stage,
+        )
+
+
+def test_a_reachable_interpreter_is_not_copied():
+    grant, copies = stage_unreachable_runtimes(
+        [PREFIX],
+        allow=[PREFIX],
+        accessible=lambda _path: True,
+        stage_root=APP + r"\runtime",
+    )
+    assert copies == []
+    assert _same_set(grant, [PREFIX])
+
+
+def test_two_unreachable_runtimes_stay_under_one_app_owned_directory():
+    stage = APP + r"\runtime"
+    grant, copies = stage_unreachable_runtimes(
+        [PREFIX, VENV],
+        allow=[PREFIX, VENV],
+        accessible=lambda path: not (
+            acl_same(path, r"C:\hostedtoolcache\windows\Python\3.12")
+            or acl_same(path, r"C:\Users\runner")
+        ),
+        stage_root=stage,
+    )
+    assert len(copies) == 2
+    assert acl_same(copies[0][0], PREFIX)
+    assert acl_same(copies[1][0], VENV)
+    assert _same_set(grant, [stage, stage + r"\0", stage + r"\1"])
+    assert not any(acl_same(item, r"C:\Users\runner") for item in grant)
+    assert not any(acl_same(item, PREFIX) for item in grant)
+
+
+def test_the_staged_interpreter_keeps_the_child_files_only(tmp_path):
+    prefix = tmp_path / "x64"
+    numpy = prefix / "Lib" / "site-packages" / "numpy"
+    numpy.mkdir(parents=True)
+    (numpy / "__init__.py").write_text("numpy", encoding="utf-8")
+    pip = prefix / "Lib" / "site-packages" / "pip"
+    pip.mkdir(parents=True)
+    (pip / "__init__.py").write_text("pip", encoding="utf-8")
+    (prefix / "Lib" / "os.py").write_text("os", encoding="utf-8")
+    regression = prefix / "Lib" / "test"
+    regression.mkdir()
+    (regression / "test_os.py").write_text("test", encoding="utf-8")
+    cache = prefix / "Lib" / "__pycache__"
+    cache.mkdir()
+    (cache / "os.pyc").write_bytes(b"pyc")
+    (prefix / "python.exe").write_bytes(b"exe")
+    (prefix / "python311._pth").write_text("import site", encoding="utf-8")
+    (prefix / "DLLs").mkdir()
+    (prefix / "DLLs" / "_ctypes.pyd").write_bytes(b"dll")
+    include = prefix / "include"
+    include.mkdir()
+    (include / "Python.h").write_text("h", encoding="utf-8")
+    (prefix / "pyvenv.cfg").write_text(
+        "home = C:\\hostedtoolcache\\windows\\Python\\3.12\\x64\ninclude-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    stage = tmp_path / "runtime"
+    _copy_runtime_tree(prefix, stage, [numpy])
+    assert (stage / "python.exe").read_bytes() == b"exe"
+    assert (stage / "Lib" / "os.py").is_file()
+    assert (stage / "DLLs" / "_ctypes.pyd").is_file()
+    assert (stage / "Lib" / "site-packages" / "numpy" / "__init__.py").is_file()
+    assert not (stage / "Lib" / "site-packages" / "pip").exists()
+    assert not (stage / "Lib" / "__pycache__").exists()
+    assert not (stage / "Lib" / "test").exists()
+    assert not (stage / "include").exists()
+    assert not (stage / "python311._pth").exists()
+    assert not runtime_relpath_is_copied(("python311._pth",), is_dir=False, package_prefixes=())
+    rewritten = rewrite_pyvenv_home(
+        (stage / "pyvenv.cfg").read_text(encoding="utf-8"),
+        lambda home: translate_staged_path(home, [(PREFIX, r"C:\ProgramData\Strategy Builder\jail\runtime")]),
+    )
+    assert acl_same(
+        rewritten.split("=", 1)[1].strip().splitlines()[0],
+        r"C:\ProgramData\Strategy Builder\jail\runtime",
+    )
+
+
+def test_the_child_command_uses_the_staged_interpreter(monkeypatch):
+    import backtester.sandbox as sandbox
+
+    sandbox._RUNTIME_COPIES = [(PREFIX, APP + r"\runtime")]
+    monkeypatch.setattr(sandbox.sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sandbox.sys, "executable", PREFIX + r"\python.exe")
+    try:
+        command = sandbox._interpreter_command(Path(r"C:\work\sandbox_child.py"), child=True)
+        assert acl_same(command[0], APP + r"\runtime\python.exe")
+        assert command[1:4] == ["-I", "-S", "-B"]
+    finally:
+        sandbox._RUNTIME_COPIES = []
 
 
 def test_a_grant_refusal_fails_each_test_and_does_not_abort(monkeypatch):
