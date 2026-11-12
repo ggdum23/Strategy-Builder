@@ -17,6 +17,7 @@ from backtester.data import load_named
 from backtester.pack import (
     CHUNK_SESSIONS,
     MAX_FILE_BYTES,
+    _DATE_RE,
     _factor_mac_message,
     canonical_price_factor,
     _gzip_csv,
@@ -532,6 +533,44 @@ def test_unicode_digit_dates_fail_the_anonymized_leak_scan(tmp_path):
         assert_anonymized_pack_clean(pack, symbol="NIK")
     target.write_bytes(original)
     assert_anonymized_pack_clean(pack, symbol="NIK")
+
+
+def test_format_characters_cannot_hide_a_date_from_the_leak_scan(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    zwsp = "\u200b"
+    note = pack / "note.txt"
+    note.write_text("\uff12" + zwsp + "\uff10\uff12\uff14\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="calendar date"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    note.write_text("2024" + zwsp + "-01-02\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="calendar date"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    for mark in ("\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad"):
+        note.write_text(f"2024{mark}-01-02\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="calendar date"):
+            assert_anonymized_pack_clean(pack, symbol="NIK")
+    note.unlink()
+    hidden_name = f"bars_20{zwsp}24.csv.gz"
+    hidden = pack / hidden_name
+    hidden.write_bytes(b"")
+    with pytest.raises(ValueError, match="file name"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    hidden.unlink()
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["chunks"][0]["file"] = hidden_name
+    _write_json(manifest_path, manifest)
+    with pytest.raises(ValueError, match="not allowed"):
+        load_pack(pack)
+    assert _DATE_RE.fullmatch("2024" + zwsp + "-01-02") is None
+    assert _DATE_RE.fullmatch("2024-01-02")
 
 
 def test_mac_binds_pack_id_date_map_and_share_scale(tmp_path):

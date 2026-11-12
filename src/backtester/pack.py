@@ -527,19 +527,42 @@ def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
     return payloads
 
 
+def _is_leak_ignorable(char: str) -> bool:
+    """Default-ignorable code points and format characters (category Cf).
+
+    Zero-width spaces, joiners, soft hyphens, and the byte-order mark are
+    invisible, so they must not split a year or a date before the regexes.
+    Session-id and date_map acceptance does not use this and stays ASCII.
+    """
+    if unicodedata.category(char) == "Cf":
+        return True
+    code = ord(char)
+    if 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF:
+        return True
+    if 0x180B <= code <= 0x180D or 0xFFF0 <= code <= 0xFFF8:
+        return True
+    return code in {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0}
+
+
 def _fold_decimal_digits(text: str) -> tuple[str, list[bool]]:
-    """NFKC, then map remaining decimal digits to ASCII.
+    """Drop ignorables, NFKC, then map remaining decimal digits to ASCII.
 
     Fullwidth and superscript digits become ASCII under NFKC. Arabic-Indic
     and Devanagari digits do not, so those still go through ``digit()``.
+    Format characters are removed before either step so ``2024\\u200b-01-02``
+    and ``bars_20\\u200b24`` still match the ASCII year and date regexes.
     The second list says whether each output character came from an ASCII
     source character. A year made of ASCII digits is not, by itself, a leak.
     """
     folded: list[str] = []
     ascii_source: list[bool] = []
     for char in text:
+        if _is_leak_ignorable(char):
+            continue
         pieces = unicodedata.normalize("NFKC", char)
         for piece in pieces:
+            if _is_leak_ignorable(piece):
+                continue
             if unicodedata.category(piece) == "Nd":
                 folded.append(str(unicodedata.digit(piece)))
             else:
@@ -921,9 +944,10 @@ def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
 def _require_anonymized_flag(manifest: dict, session_ids: list[str]) -> None:
     """Tie structural anonymization markers to the manifest flag.
 
-    ``S#####`` session ids and the stand-in asset name are anonymized packs.
-    A named pack's session ids are calendar dates, and that is the only shape
-    allowed to load without an operator MAC.
+    ``S#####`` session ids and the stand-in asset name require
+    ``anonymized`` true. A named pack's session ids are ASCII calendar
+    dates. Anything else is refused. The operator MAC is checked on the
+    sidecar, not here.
     """
     anonymized = manifest["anonymized"] is True
     if not anonymized and manifest.get("asset_name") == TICKER_STAND_IN:
