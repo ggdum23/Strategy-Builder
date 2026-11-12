@@ -814,6 +814,49 @@ def _raise_designer_name(name: str, symbol: str) -> None:
         raise RuntimeError(f"{name} contains {reason}")
 
 
+def designer_component_problem(name: str, *, symbols=(), scale: float | None = None) -> str | None:
+    """Why a path component cannot be published, or None when it can.
+
+    A strategy id is designer-supplied. A decimal in the id is not a price.
+    The scale, a ticker, a calendar date, and a reserved token still fail.
+    The directory check and the publication audit both call this.
+    """
+    if not isinstance(name, str) or name == "":
+        return "an empty name"
+    if name in {".", ".."} or any(ch in name for ch in '\\/:*?"<>|') or name.endswith((" ", ".")):
+        return "an unsafe name"
+    text = unicodedata.normalize("NFKC", name)
+    for token in _BANNED_DESIGNER_TEXT:
+        if token in text:
+            return token
+    if _ISO_DATE.search(text):
+        return "a calendar date"
+    from .gui.audience import _GLUED_YEAR, _contains_scale, normalize_surface
+
+    stored = normalize_surface(text)
+    if _GLUED_YEAR.search(stored):
+        return "a calendar date"
+    seen: set[str] = set()
+    for symbol in symbols or ():
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        if ticker_token_spans(stored, symbol):
+            return "the ticker"
+    if _contains_scale(stored, scale):
+        return "the scale"
+    return None
+
+
+def _fallback_component(symbols=(), scale: float | None = None, stems: tuple[str, ...] = ()) -> str:
+    """An opaque path component that passes :func:`designer_component_problem`."""
+    choices = stems or ("strategy", "book", "result", "entry")
+    for stem in choices:
+        if designer_component_problem(stem, symbols=symbols, scale=scale) is None:
+            return stem
+    return "q"
+
+
 def _raise_schema_label(filename: str, label: str) -> None:
     """A JSON key or a CSV header. The ticker pattern does not apply."""
     label = unicodedata.normalize("NFKC", label)
@@ -1001,9 +1044,10 @@ def _audit_publication(root: Path, *, symbol: str, scale: float | None) -> None:
 
     symbols = (symbol,) if symbol else ()
     for path in [root, *list(root.rglob("*"))]:
-        reason = scan_publication(path.name, symbols=symbols, scale=scale)
-        if reason:
-            raise RuntimeError(f"{path.name} contains {reason}")
+        # The same predicate as a designer path component. A strategy id is
+        # not a price. The message does not repeat the rejected name.
+        if designer_component_problem(path.name, symbols=symbols, scale=scale):
+            raise RuntimeError("a designer folder failed the designer check")
         if not path.is_file():
             continue
         blob = path.read_bytes()

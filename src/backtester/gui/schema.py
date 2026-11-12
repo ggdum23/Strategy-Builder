@@ -149,8 +149,8 @@ METRICS: tuple[MetricSpec, ...] = (
         "Cost drag",
         "bps",
         "activity",
-        "Fees divided by initial equity, in basis points, rounded half-up to 0.1 bp. "
-        "Designer surfaces show this figure. The dollar fee total is an operator field.",
+        "Cost drag reported on the book, in basis points. "
+        "The window shows that figure and does not recompute it. The dollar fee total is an operator field.",
     ),
     MetricSpec("slippage_cost", "Slippage", "money", "activity", "Slippage dollars recorded by the engine. Unit: dollars."),
     MetricSpec("borrow_cost", "Borrow", "money", "activity", "Short-borrow dollars recorded by the engine. Unit: dollars."),

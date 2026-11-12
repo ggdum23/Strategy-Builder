@@ -211,9 +211,12 @@ an opaque id on this tree. The operator copy keeps the original id.
 
 A string on an allow-listed key has to match that key: a phase, a session
 label, a clock time, an accounting enum, or a safe id (`strategy_id`,
-`source_id`, `name`). Free text is omitted. `publish_designer` scans the
-tree with the operator scale and does not leave the directory behind when
-that scan fails.
+`source_id`, `name`). Free text is omitted. A strategy id may contain a
+decimal. It is not scanned as a price. The scan still applies the scale,
+the ticker, and dates. `publish_designer` scans the tree with the operator
+scale and does not leave the directory behind when that scan fails. The
+publication scan and the export check both read a `pack_` hex id as the
+letter id this tree stores.
 
 The designer tree is an allow-list. Share counts, prices, notionals,
 per-component fees, the dollar `fees_total`, and accounting dollars are not

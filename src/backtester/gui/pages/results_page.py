@@ -32,6 +32,7 @@ from ..audience import (
     apply_designer,
     designer_surface_text,
     export_allowed,
+    export_block_reason,
     export_text,
     peek_scale,
     peek_symbols,
@@ -614,7 +615,7 @@ class ResultsPage(QWidget):
             self.fees.set_records(
                 ("component", "of_equity"),
                 rows,
-                {"component": "Component", "of_equity": "Of equity"},
+                {"component": "Component", "of_equity": "Basis points"},
                 {"of_equity": "bps"},
             )
             self._fit_table(self.fees, len(rows) or 1)
@@ -967,13 +968,14 @@ class ResultsPage(QWidget):
         target = Path(dest)
         target.mkdir(parents=True, exist_ok=True)
         written = []
+        withheld: list[tuple[str, str]] = []
         designer = report is not None and report.audience == "designer"
         opened = (report.opened if report is not None else None) or (book.directory if book is not None else None)
         symbols = peek_symbols(opened) if designer and opened is not None else ()
         scale = peek_scale(opened) if designer and opened is not None else None
         if book is not None:
             if designer:
-                self._export_shown(target, book, symbols, scale, written)
+                self._export_shown(target, book, symbols, scale, written, withheld)
             else:
                 folder = book.directory
                 for name in COPY_FILES:
@@ -992,37 +994,59 @@ class ResultsPage(QWidget):
             if designer:
                 sheet = target / "metrics.json"
                 sheet.write_text(json.dumps(book.metrics, indent=2, default=str) + "\n", encoding="utf-8")
-                if self._keep_export(sheet, symbols=symbols, scale=scale):
+                reason = self._keep_export(sheet, symbols=symbols, scale=scale)
+                if reason is None:
                     if sheet.name not in written:
                         written.append(sheet.name)
-                elif sheet.name in written:
-                    written.remove(sheet.name)
+                else:
+                    if sheet.name in written:
+                        written.remove(sheet.name)
+                    withheld.append((sheet.name, reason))
             rows = ["key,raw,display"]
             for key, card in self._cards.items():
                 raw = book.metrics.get(key) if key in book.metrics else ""
                 rows.append(f"{key},{_csv(raw)},{_csv(card.value.text())}")
             display = target / "displayed_metrics.csv"
             display.write_text("\n".join(rows) + "\n", encoding="utf-8")
-            if self._keep_export(display, symbols=symbols, scale=scale, designer=designer):
+            reason = self._keep_export(display, symbols=symbols, scale=scale, designer=designer)
+            if reason is None:
                 written.append(display.name)
+            elif designer:
+                withheld.append((display.name, reason))
         if report is not None and report.leaderboard is not None and self.leaderboard.isVisible():
             model = self.leaderboard.model()
             if model is not None and model.columnCount():
-                headers = [str(model.headerData(column, Qt.Orientation.Horizontal) or "") for column in range(model.columnCount())]
-                lines = [",".join(_csv(header) for header in headers)]
-                for row in range(model.rowCount()):
-                    cells = []
-                    for column in range(model.columnCount()):
-                        cells.append(_csv(model.data(model.index(row, column))))
-                    lines.append(",".join(cells))
+                columns = list(getattr(model, "columns", []))
+                titles = getattr(model, "titles", {}) or {}
+                if designer and columns:
+                    headers = [
+                        _designer_column_header(str(key), str(titles.get(key, key)), symbols, scale)
+                        for key in columns
+                    ]
+                else:
+                    headers = [
+                        str(model.headerData(column, Qt.Orientation.Horizontal) or "")
+                        for column in range(model.columnCount())
+                    ]
                 board = target / "leaderboard_view.csv"
-                board.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                if self._keep_export(board, symbols=symbols, scale=scale, designer=designer):
+                with board.open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.writer(handle, lineterminator="\n")
+                    writer.writerow(headers)
+                    for row in range(model.rowCount()):
+                        cells = []
+                        for column in range(model.columnCount()):
+                            cell = model.data(model.index(row, column))
+                            cells.append("" if cell is None else cell)
+                        writer.writerow(cells)
+                reason = self._keep_export(board, symbols=symbols, scale=scale, designer=designer)
+                if reason is None:
                     written.append(board.name)
-        self.host.set_status("Exported " + ", ".join(written) if written else "Nothing to export")
+                elif designer:
+                    withheld.append((board.name, reason))
+        self.host.set_status(_export_status(written, withheld))
         return written
 
-    def _export_shown(self, target: Path, book, symbols, scale, written: list[str]) -> None:
+    def _export_shown(self, target: Path, book, symbols, scale, written: list[str], withheld: list[tuple[str, str]]) -> None:
         """Write the scrubbed columns on screen. Do not copy the operator CSVs.
 
         ``equity.csv`` is the raw curve's byte copy, so it is not written here.
@@ -1042,38 +1066,56 @@ class ResultsPage(QWidget):
                 columns.append("exposure")
             path = target / EQUITY_CURVE_FILE
             _write_csv(path, columns, rows)
-            if self._keep_export(path, symbols=symbols, scale=scale):
+            reason = self._keep_export(path, symbols=symbols, scale=scale)
+            if reason is None:
                 written.append(path.name)
+            else:
+                withheld.append((path.name, reason))
         if book.fills is not None and book.fills.columns:
             path = target / FILLS_FILE
             _write_csv(path, book.fills.columns, book.fills.rows)
-            if self._keep_export(path, symbols=symbols, scale=scale):
+            reason = self._keep_export(path, symbols=symbols, scale=scale)
+            if reason is None:
                 written.append(path.name)
+            else:
+                withheld.append((path.name, reason))
         if book.episodes is not None and book.episodes.columns:
             path = target / TRADES_FILE
             _write_csv(path, book.episodes.columns, book.episodes.rows)
-            if self._keep_export(path, symbols=symbols, scale=scale):
+            reason = self._keep_export(path, symbols=symbols, scale=scale)
+            if reason is None:
                 written.append(path.name)
+            else:
+                withheld.append((path.name, reason))
         figure = book.directory / FIGURE_FILE
         if figure.is_file():
             status, clean = self._designer_png(figure)
             if status == "ok" and clean is not None:
                 (target / FIGURE_FILE).write_bytes(clean)
                 written.append(FIGURE_FILE)
+            elif status == "withheld":
+                reason = "the designer check"
+                try:
+                    caption = png_caption(canonical_png(figure.read_bytes()))
+                    reason = export_block_reason(caption, symbols=symbols, scale=scale) or reason
+                except (OSError, ValueError, MemoryError):
+                    reason = "could not be read"
+                withheld.append((FIGURE_FILE, reason))
 
-    def _keep_export(self, path: Path, *, symbols, scale, designer: bool = True) -> bool:
-        """Run the allow-list on a file this export just wrote. A failure is deleted."""
+    def _keep_export(self, path: Path, *, symbols, scale, designer: bool = True) -> str | None:
+        """None when the file stays. Otherwise the reason, and the file is deleted."""
         if not designer:
-            return True
+            return None
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             path.unlink(missing_ok=True)
-            return False
+            return "could not be read"
         if export_allowed(text, symbols=symbols, scale=scale):
-            return True
+            return None
+        reason = export_block_reason(text, symbols=symbols, scale=scale) or "the designer check"
         path.unlink(missing_ok=True)
-        return False
+        return reason
 
 
 def _unreadable_report(path: str, audience: str, exc: BaseException) -> RunReport:
@@ -1120,6 +1162,28 @@ def _benchmark_row(label: str, metrics: dict) -> dict:
     ):
         row[key] = metrics.get(key) if isinstance(metrics, dict) and key in metrics else None
     return row
+
+
+def _designer_column_header(key: str, label: str, symbols, scale) -> str:
+    """The allow-listed key, with a display label only when that label is safe.
+
+    The label is never what makes the column safe. ``2× return`` at scale 2
+    is omitted and the key ``long_2x_total_return`` stays.
+    """
+    if not label or label == key:
+        return key
+    if export_block_reason(label, symbols=symbols, scale=scale) is None:
+        return f"{key}|{label}"
+    return key
+
+
+def _export_status(written: list[str], withheld: list[tuple[str, str]]) -> str:
+    """Name every file that was saved, and every file that was withheld."""
+    kept = "Exported " + ", ".join(written) if written else ""
+    held = "; ".join(f"{name} withheld: {reason}" for name, reason in withheld)
+    if kept and held:
+        return f"{kept}. {held}"
+    return kept or held or "Nothing to export"
 
 
 def _write_csv(path: Path, columns, rows) -> None:

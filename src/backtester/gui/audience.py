@@ -145,6 +145,11 @@ _SURFACE_TOKEN = re.compile(
     rf"|{_WORD_WITH_EXP}"
 )
 _GLUED_YEAR = re.compile(r"(?i)(?:[A-Za-z](?:19|20)\d{2}|(?:19|20)\d{2}[A-Za-z])")
+# The designer tree stores pack_ plus hex as pack- plus letters. Both gates
+# read that stored form, so a glued year inside the hex is not a second verdict.
+_PACK_ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])pack_[0-9a-fA-F]{8,64}(?![A-Za-z0-9_])")
+# Strategy and source ids are designer-supplied names. A decimal in one is not a price.
+_ID_COLUMNS = frozenset({"strategy_id", "source_id"})
 _MONTH_IN_TOKEN = re.compile(rf"(?i)(?<![A-Za-z]){_MONTH}(?![A-Za-z])")
 _YEAR_IN_TOKEN = re.compile(r"(?:19|20)\d{2}")
 # Designer surfaces say RANDOM where a ticker was. The operator view keeps the ticker.
@@ -222,6 +227,11 @@ _DASH_TO_HYPHEN = str.maketrans(
 def normalize_surface(text: str) -> str:
     """NFKC, then unicode minus and dash characters become ASCII ``-``."""
     return unicodedata.normalize("NFKC", str(text)).translate(_DASH_TO_HYPHEN)
+
+
+def _as_stored_ids(text: str) -> str:
+    """Replace each ``pack_`` hex id with the letter id the designer tree stores."""
+    return _PACK_ID_IN_TEXT.sub(lambda match: designer_source_id(match.group(0)), text)
 
 
 def _hide_column(name: str, *, drop_prices: bool, allow_list: bool = False) -> bool:
@@ -748,8 +758,10 @@ def _scale_in_token(token: str, scale: float | None) -> bool:
         whole = match.start() == 0 and match.end() == len(probed)
         if bare_integer and not whole:
             continue
-        # ``185e2`` inside ``pack_185e2…`` is an identifier, not a scale.
-        # A decimal significand (``7.777e3``) and a signed exponent still count.
+        # An unsigned integer exponent is an identifier only when the whole
+        # token is a pack_ hex id the designer tree stores as letters.
+        # ``note25e2`` is still the scale. A decimal significand (``7.777e3``)
+        # and a signed exponent still count.
         parts = _scientific_parts(literal)
         if (
             parts is not None
@@ -757,6 +769,7 @@ def _scale_in_token(token: str, scale: float | None) -> bool:
             and "." not in parts[0]
             and parts[1][:1] not in "+-"
             and "." not in parts[1]
+            and designer_source_id(probed) != probed
         ):
             continue
         if _literal_is_scale(literal, number):
@@ -1141,7 +1154,7 @@ def scan_publication(text: str, *, symbols: tuple[str, ...] = (), scale: float |
     inside a hex id is not a price. Tickers and dates are the other audit.
     """
     del symbols
-    normalized = normalize_surface(text)
+    normalized = _as_stored_ids(normalize_surface(text))
     if _publication_has_scale(normalized, scale):
         return "the scale"
     if _publication_has_price(normalized):
@@ -1188,12 +1201,34 @@ def _json_has_scale(value, scale: float | None, key: str | None = None) -> bool:
     return _free_has_scale(str(value), scale)
 
 
+def _header_parts(name: str) -> tuple[str, str]:
+    """Allow-listed column key, and a display label when the header carries one.
+
+    ``sharpe|Sharpe`` is the key ``sharpe`` plus a label. The label never
+    decides that a column is safe. A header with no listed key stays one cell.
+    """
+    text = name.strip()
+    if "|" not in text:
+        return text, ""
+    key, label = text.split("|", 1)
+    key = key.strip()
+    label = label.strip()
+    if key and redacted_key_allowed(key):
+        return key, label
+    return text, ""
+
+
+def _listed_number(cell: str) -> bool:
+    """A raw or formatted number sitting under an allow-listed column key."""
+    return _numeric_cell(cell) or _formatted_number(cell)
+
+
 def _csv_has_scale(rows: list[list[str]], scale: float | None) -> bool:
     header = [cell.strip() for cell in rows[0]]
-    for name in header:
-        if _free_has_scale(name, scale):
-            return True
     if header == ["key", "raw", "display"]:
+        for name in header:
+            if _free_has_scale(name, scale):
+                return True
         for row in rows[1:]:
             if not row:
                 continue
@@ -1201,15 +1236,21 @@ def _csv_has_scale(rows: list[list[str]], scale: float | None) -> bool:
                 return True
             listed = redacted_key_allowed(row[0])
             for cell in row[1:]:
-                if listed and (_numeric_cell(cell) or _formatted_number(cell)):
+                if listed and _listed_number(cell):
                     continue
                 if _free_has_scale(cell, scale):
                     return True
         return False
-    listed = [redacted_key_allowed(name) for name in header]
+    keys: list[str] = []
+    for name in header:
+        key, label = _header_parts(name)
+        keys.append(key)
+        if _free_has_scale(key, scale) or (label and _free_has_scale(label, scale)):
+            return True
     for row in rows[1:]:
         for index, cell in enumerate(row):
-            if index < len(listed) and listed[index] and _numeric_cell(cell):
+            key = keys[index] if index < len(keys) else ""
+            if key and redacted_key_allowed(key) and key not in _ID_COLUMNS and _listed_number(cell):
                 continue
             if _free_has_scale(cell, scale):
                 return True
@@ -1247,46 +1288,77 @@ def _free_text_has_price(text: str) -> bool:
 
 
 def _json_has_price(value, key: str | None = None) -> bool:
-    del key
     if isinstance(value, dict):
         for child_key, item in value.items():
-            if _free_text_has_price(str(child_key)) or _json_has_price(item):
+            name = str(child_key)
+            if _free_text_has_price(name) or _json_has_price(item, name):
                 return True
         return False
     if isinstance(value, list):
-        return any(_json_has_price(item) for item in value)
+        return any(_json_has_price(item, key) for item in value)
     if isinstance(value, str):
+        if key in _ID_COLUMNS:
+            return False
         return _free_text_has_price(value)
     return False
 
 
 def _csv_has_price(rows: list[list[str]]) -> bool:
     header = [cell.strip() for cell in rows[0]]
-    for name in header:
-        if _free_text_has_price(name):
-            return True
     if header == ["key", "raw", "display"]:
+        for name in header:
+            if _free_text_has_price(name):
+                return True
         for row in rows[1:]:
             if not row:
                 continue
+            if _free_text_has_price(row[0]):
+                return True
             listed = redacted_key_allowed(row[0])
-            for cell in row[1:]:
-                if listed and (_numeric_cell(cell) or _formatted_number(cell)):
+            for index, cell in enumerate(row[1:], start=1):
+                if listed and _listed_number(cell):
+                    continue
+                if row[0] in _ID_COLUMNS:
                     continue
                 if _free_text_has_price(cell):
                     return True
         return False
-    listed = [redacted_key_allowed(name) for name in header]
+    keys: list[str] = []
+    for name in header:
+        key, label = _header_parts(name)
+        keys.append(key)
+        if _free_text_has_price(key) or (label and _free_text_has_price(label)):
+            return True
     for row in rows[1:]:
         for index, cell in enumerate(row):
-            safe = index < len(listed) and listed[index] and (
-                _numeric_cell(cell) or _formatted_number(cell)
-            )
-            if safe:
+            key = keys[index] if index < len(keys) else ""
+            if key in _ID_COLUMNS:
+                continue
+            if key and redacted_key_allowed(key) and _listed_number(cell):
                 continue
             if _free_text_has_price(cell):
                 return True
     return False
+
+
+def export_block_reason(text: str, *, symbols: tuple[str, ...], scale: float | None) -> str | None:
+    """Why ``text`` cannot be exported, or None when it can.
+
+    The reason names the file's problem for the status bar: a secret, a date,
+    a path, a ticker, the scale, or a price. Pack hex is read as the letter
+    id the designer tree stores. A strategy or source id is not a price.
+    """
+    text = _as_stored_ids(normalize_surface(text))
+    structured = _structured_document(text)
+    if structured is None:
+        return _free_text_reason(text, symbols, scale)
+    reason = _preamble_reason(text, symbols)
+    if reason:
+        return reason
+    kind, payload = structured
+    if kind == "json":
+        return _json_reason(payload, symbols, scale)
+    return _csv_reason(payload, symbols, scale)
 
 
 def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) -> bool:
@@ -1297,50 +1369,74 @@ def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) 
     is one the date list has not named yet.
 
     JSON and CSV are structured. A numeric value of an allow-listed key is
-    not scale-scanned. Free text, identifiers, filenames, labels, and string
+    not scale-scanned, and neither is a formatted number under that same key.
+    The column key is the allow-list, not the display label. A strategy or
+    source id is not a price. Free text, filenames, labels, and other string
     values still are. Text is NFKC-normalized, and unicode minus and dash
-    characters are ASCII ``-``, before that scan.
+    characters are ASCII ``-``, before that scan. A ``pack_`` hex id is read
+    as the letter id the designer tree stores.
     """
-    text = normalize_surface(text)
-    structured = _structured_document(text)
-    if structured is None:
-        return _free_text_allowed(text, symbols, scale)
-    if not _preamble_allowed(text, symbols):
-        return False
-    kind, payload = structured
-    if kind == "json":
-        return _json_allowed(payload, symbols, scale)
-    return _csv_allowed(payload, symbols, scale)
+    return export_block_reason(text, symbols=symbols, scale=scale) is None
 
 
-def _preamble_allowed(text: str, symbols: tuple[str, ...]) -> bool:
+def _preamble_reason(text: str, symbols: tuple[str, ...]) -> str | None:
     """Secrets, dates, paths, and tickers. Scale is a separate pass."""
     folded = text.casefold()
     if any(token in folded for token in _SECRET_TOKENS):
-        return False
+        return "a secret"
     if any(pattern.search(text) for pattern in _EXPORT_DATE_PATTERNS):
-        return False
-    if _month_near_year(text) or _consume_paths(text, "") != text:
-        return False
+        return "a date"
+    if _month_near_year(text):
+        return "a date"
+    if _consume_paths(text, "") != text:
+        return "a path"
     for symbol in symbols:
         if symbol and _ticker_spans(text, symbol):
-            return False
-    return True
+            return "a ticker"
+    return None
 
 
-def _free_text_allowed(text: str, symbols: tuple[str, ...], scale: float | None) -> bool:
-    """Free text on the screen's export check. A price is rejected, as in ``scan_publication``.
+def _preamble_allowed(text: str, symbols: tuple[str, ...]) -> bool:
+    return _preamble_reason(text, symbols) is None
 
-    Allow-listed numeric cells never reach this function. A clock is not a price.
+
+def _free_text_reason(
+    text: str,
+    symbols: tuple[str, ...],
+    scale: float | None,
+    *,
+    price: bool = True,
+) -> str | None:
+    """Why free text fails the export check, or None.
+
+    Allow-listed numeric cells never reach this function. A clock is not a
+    price. ``price`` is false for a strategy or source id: a decimal there is
+    the name, and the scale, ticker, and date checks still run.
     """
-    if not _preamble_allowed(text, symbols):
-        return False
+    reason = _preamble_reason(text, symbols)
+    if reason:
+        return reason
     if _contains_scale(text, scale):
-        return False
-    if _free_text_has_price(text):
-        return False
+        return "the scale"
+    if price and _free_text_has_price(text):
+        return "a price"
     _pieces, allowed = _surface_pieces(text, scale=scale)
-    return allowed
+    if allowed:
+        return None
+    if _GLUED_YEAR.search(text):
+        return "a date"
+    return "a withheld token"
+
+
+def _free_text_allowed(
+    text: str,
+    symbols: tuple[str, ...],
+    scale: float | None,
+    *,
+    price: bool = True,
+) -> bool:
+    """Free text on the screen's export check. A price is rejected, as in ``scan_publication``."""
+    return _free_text_reason(text, symbols, scale, price=price) is None
 
 
 def _structured_document(text: str):
@@ -1387,58 +1483,96 @@ def _formatted_number(cell: str) -> bool:
     return _numeric_cell(token)
 
 
-def _json_allowed(value, symbols: tuple[str, ...], scale: float | None, *, key: str | None = None) -> bool:
+def _json_reason(value, symbols: tuple[str, ...], scale: float | None, *, key: str | None = None) -> str | None:
     if isinstance(value, dict):
         for child_key, item in value.items():
             name = str(child_key)
-            if not _free_text_allowed(name, symbols, scale):
-                return False
-            if not _json_allowed(item, symbols, scale, key=name):
-                return False
-        return True
+            reason = _free_text_reason(name, symbols, scale)
+            if reason:
+                return reason
+            reason = _json_reason(item, symbols, scale, key=name)
+            if reason:
+                return reason
+        return None
     if isinstance(value, list):
-        return all(_json_allowed(item, symbols, scale, key=key) for item in value)
+        for item in value:
+            reason = _json_reason(item, symbols, scale, key=key)
+            if reason:
+                return reason
+        return None
     if isinstance(value, str):
-        return _free_text_allowed(value, symbols, scale)
+        return _free_text_reason(value, symbols, scale, price=key not in _ID_COLUMNS)
     if isinstance(value, bool) or value is None:
-        return True
+        return None
     if isinstance(value, (int, float)):
         if key is not None and redacted_key_allowed(key):
-            return True
-        return not _contains_scale(str(value), scale)
-    return _free_text_allowed(str(value), symbols, scale)
+            return None
+        if _contains_scale(str(value), scale):
+            return "the scale"
+        return None
+    return _free_text_reason(str(value), symbols, scale)
 
 
-def _csv_allowed(rows: list[list[str]], symbols: tuple[str, ...], scale: float | None) -> bool:
+def _json_allowed(value, symbols: tuple[str, ...], scale: float | None, *, key: str | None = None) -> bool:
+    return _json_reason(value, symbols, scale, key=key) is None
+
+
+def _csv_reason(rows: list[list[str]], symbols: tuple[str, ...], scale: float | None) -> str | None:
     header = [cell.strip() for cell in rows[0]]
     if header == ["key", "raw", "display"]:
         for name in header:
-            if not _free_text_allowed(name, symbols, scale):
-                return False
+            reason = _free_text_reason(name, symbols, scale)
+            if reason:
+                return reason
         for row in rows[1:]:
             if not row:
                 continue
             metric = row[0]
-            if not _free_text_allowed(metric, symbols, scale):
-                return False
+            reason = _free_text_reason(metric, symbols, scale)
+            if reason:
+                return reason
             listed = redacted_key_allowed(metric)
             for cell in row[1:]:
-                if listed and (_numeric_cell(cell) or _formatted_number(cell)):
-                    if not _preamble_allowed(cell, symbols):
-                        return False
+                if metric in _ID_COLUMNS:
+                    reason = _free_text_reason(cell, symbols, scale, price=False)
+                    if reason:
+                        return reason
                     continue
-                if not _free_text_allowed(cell, symbols, scale):
-                    return False
-        return True
+                if listed and _listed_number(cell):
+                    reason = _preamble_reason(cell, symbols)
+                    if reason:
+                        return reason
+                    continue
+                reason = _free_text_reason(cell, symbols, scale)
+                if reason:
+                    return reason
+        return None
+    keys: list[str] = []
     for name in header:
-        if not _free_text_allowed(name, symbols, scale):
-            return False
-    listed = [redacted_key_allowed(name) for name in header]
+        key, label = _header_parts(name)
+        keys.append(key)
+        reason = _free_text_reason(key, symbols, scale)
+        if reason:
+            return reason
+        if label:
+            reason = _free_text_reason(label, symbols, scale)
+            if reason:
+                return reason
     for row in rows[1:]:
         for index, cell in enumerate(row):
-            safe = index < len(listed) and listed[index] and _numeric_cell(cell)
-            if safe:
+            key = keys[index] if index < len(keys) else ""
+            if key in _ID_COLUMNS:
+                reason = _free_text_reason(cell, symbols, scale, price=False)
+                if reason:
+                    return reason
                 continue
-            if not _free_text_allowed(cell, symbols, scale):
-                return False
-    return True
+            if key and redacted_key_allowed(key) and _listed_number(cell):
+                continue
+            reason = _free_text_reason(cell, symbols, scale)
+            if reason:
+                return reason
+    return None
+
+
+def _csv_allowed(rows: list[list[str]], symbols: tuple[str, ...], scale: float | None) -> bool:
+    return _csv_reason(rows, symbols, scale) is None
