@@ -19,7 +19,7 @@ from backtester.parallel import FrameMarket, StrategyRef, run_parallel
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 from backtester.runner import walk_forward
 from backtester.strategy_loader import load_strategy_class
-from windows_open import OWNER_PC, runner_timeout
+from windows_open import OWNER_PC, runner_timeout, windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 SELFTEST = ROOT / "examples" / "selftest"
@@ -145,6 +145,7 @@ def _parallel(tmp_path: Path, strategy_path: Path, name: str):
     return metrics
 
 
+@windows_jails(20)
 @OWNER_PC
 def test_absolute_read_arm_memory_and_network_stay_in_the_jail(tmp_path):
     secret = tmp_path / "reader" / "secret.txt"
@@ -219,6 +220,7 @@ def test_absolute_read_arm_memory_and_network_stay_in_the_jail(tmp_path):
     assert _parallel(tmp_path, SELFTEST / "net.py", "parallel-net")["n_fills"] == 0
 
 
+@windows_jails(2)
 def test_a_jailed_walk_forward_does_not_receive_the_locked_ex_date(tmp_path):
     dates = ["2024-06-03", "2024-06-04", "2024-06-05", "2024-06-06"]
     rows = []

@@ -33,10 +33,13 @@ from .data import frame_to_desk_bars, load_dividends, load_named
 from .engine_desk import DeskConfig
 from .profiles import get_profile
 from .report import enrich_arena_metrics, require_anonymizable_symbol, write_json
-from .sandbox import SandboxError, describe_isolation, launch
+from .sandbox import WINDOWS_JAIL_STARTUP_S, SandboxError, describe_isolation, launch
 
 DEFAULT_CALL_TIMEOUT_S = 10.0
-DEFAULT_STARTUP_TIMEOUT_S = 60.0
+# The jailed strategy's ready-wait is 90s on Windows. Replay and probe use
+# the same default. Linux keeps 60s. Callers that pass startup_timeout keep
+# the value they passed.
+DEFAULT_STARTUP_TIMEOUT_S = float(WINDOWS_JAIL_STARTUP_S) if os.name == "nt" else 60.0
 DEFAULT_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_CPU_SECONDS = 3600
 ARENA_WARMUP_DAYS = engine_arena.VALIDATION_WARMUP_DAYS
@@ -718,6 +721,7 @@ class _Pipe:
         # the parent poll is what classifies it as memory.
         self._memory_cap = None
         self._rss_mark = None
+        self._noted_byte = False
         self._stdout_thread = threading.Thread(target=self._read_fd, args=(box.stdout_fd, False), daemon=True)
         self._stderr_thread = threading.Thread(target=self._read_fd, args=(box.stderr_fd, True), daemon=True)
         self._stdout_thread.start()
@@ -742,6 +746,11 @@ class _Pipe:
                     else:
                         if not self._awaiting:
                             self._protocol = "child wrote when no request was outstanding"
+                        if not self._noted_byte:
+                            self._noted_byte = True
+                            from .sandbox import note_phase
+
+                            note_phase("first-byte")
                         self._buf.extend(chunk)
                         if len(self._buf) > 1_000_000:
                             self._protocol = "child wrote more than 1 MB"
@@ -768,7 +777,7 @@ class _Pipe:
             return
         self._memory_cap = int(memory_bytes)
 
-    def _read_line(self, timeout: float) -> bytes:
+    def _read_line(self, timeout: float, *, extend: bool = True) -> bytes:
         deadline = time.monotonic() + timeout
         while True:
             with self._cv:
@@ -791,7 +800,10 @@ class _Pipe:
                 if remaining > 0:
                     self._cv.wait(remaining)
                     continue
-            if self._allocation_still_under_cap():
+            # Hello is not the allocation. Extending it once doubled the
+            # ready-wait to the parent's whole budget, so a child that never
+            # wrote ready was reported as an empty pipe.
+            if extend and self._allocation_still_under_cap():
                 deadline = time.monotonic() + timeout
                 continue
             break
@@ -833,8 +845,11 @@ class _Pipe:
             return self._err.decode("utf-8", "replace").strip()
 
     def hello(self, timeout: float) -> dict:
+        from .sandbox import note_phase
+
+        note_phase("hello-wait")
         self._write({"op": "hello"})
-        payload = self._message(self._read_line(timeout))
+        payload = self._message(self._read_line(timeout, extend=False))
         if payload.get("op") == "error":
             raise Disqualified("strategy", str(payload.get("error") or "strategy failed to load"))
         if payload.get("op") != "ready":
@@ -960,6 +975,9 @@ def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_sec
         deny_paths=deny_paths,
         capture_stdio=True,
     )
+    from .sandbox import note_phase
+
+    note_phase(f"child-pid {box.process.pid}")
     pipe = _Pipe(box)
     pipe.set_memory_cap(memory_cap)
     try:
@@ -970,6 +988,9 @@ def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_sec
 
         startup = float(WINDOWS_JAIL_STARTUP_S) if os.name == "nt" else min(60.0, float(call_timeout))
         ready = pipe.hello(startup)
+        from .sandbox import note_phase
+
+        note_phase("hello-ok")
         remote = _Remote(pipe, profile, box, call_timeout=float(call_timeout))
         remote.arm(ready)
         yield remote

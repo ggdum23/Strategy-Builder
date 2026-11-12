@@ -4,9 +4,12 @@ The cap is the worker's resident set, including children the strategy starts.
 It is not a fee, a fill rule, or a sandbox. Phase 4 still owns the OS jail.
 On Windows every worker is placed in a job object before it is allowed to run
 the strategy. The job has ``KILL_ON_JOB_CLOSE`` so the worker and anything it
-spawned die together. A memory cap, when one was requested, is a higher
-commit-charge ceiling than the resident set, so one allocation cannot exhaust
-the machine between polls.
+spawned die together. It does not set a process or job commit limit: on the
+GitHub runner that limit makes ``CreateProcess`` of an AppContainer child
+wait for the whole parent budget, and the result pipe stays empty. A higher
+ceiling did not stop the wait. The resident-set poll is the cap that is
+reported. ``BREAKAWAY_OK`` is set when the nested job accepts it, so the
+jailed child can leave this job; the sandbox job still bounds that child.
 """
 
 from __future__ import annotations
@@ -27,8 +30,31 @@ def process_rss_bytes(pid: int) -> int | None:
     return None
 
 
-def process_tree_rss_bytes(pid: int) -> int | None:
-    """Resident set of ``pid`` plus the processes it has started."""
+def process_commit_bytes(pid: int) -> int | None:
+    """Commit charge of one process, or None when it cannot be read."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if sys.platform != "win32":
+        return None
+    return _windows_memory_field(pid, "PagefileUsage")
+
+
+def process_tree_detail(pid: int) -> str:
+    """One line: this process and the children toolhelp can see."""
+    parts = [f"worker_rss={process_rss_bytes(pid)}", f"worker_commit={process_commit_bytes(pid)}"]
+    shown = []
+    for child in _child_pids(pid)[:8]:
+        shown.append(f"{child}:rss={process_rss_bytes(child)}:commit={process_commit_bytes(child)}")
+    parts.append("children=" + (",".join(shown) if shown else "none"))
+    return " ".join(parts)
+
+
+def process_tree_rss_bytes(pid: int, extra_pids=()) -> int | None:
+    """Resident set of ``pid``, the processes it has started, and ``extra_pids``.
+
+    ``extra_pids`` are jailed children toolhelp did not list (an AppContainer
+    can be missing there). A pid already in the tree is not added twice.
+    """
     own = process_rss_bytes(pid)
     if own is None:
         return None
@@ -44,6 +70,13 @@ def process_tree_rss_bytes(pid: int) -> int | None:
         if child_rss is not None:
             total += child_rss
         stack.extend(_child_pids(child))
+    for extra in extra_pids:
+        if not isinstance(extra, int) or isinstance(extra, bool) or extra in seen:
+            continue
+        seen.add(extra)
+        child_rss = process_rss_bytes(extra)
+        if child_rss is not None:
+            total += child_rss
     return total
 
 
@@ -167,13 +200,22 @@ def _windows_child_pids(pid: int) -> list[int]:
 
 
 def _windows_rss(pid: int) -> int | None:
+    return _windows_memory_field(pid, "WorkingSetSize")
+
+
+def _windows_memory_field(pid: int, field: str) -> int | None:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
-    # PROCESS_QUERY_LIMITED_INFORMATION
-    handle = kernel32.OpenProcess(0x1000, 0, pid)
+    # Limited information first. An AppContainer child can refuse that and
+    # still answer QUERY_INFORMATION | VM_READ from the process that created it.
+    handle = None
+    for access in (0x1000, 0x0410):
+        handle = kernel32.OpenProcess(access, 0, pid)
+        if handle:
+            break
     if not handle:
         return None
     try:
@@ -185,7 +227,7 @@ def _windows_rss(pid: int) -> int | None:
         ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
         if not ok:
             return None
-        return int(counters.WorkingSetSize)
+        return int(getattr(counters, field))
     finally:
         kernel32.CloseHandle(handle)
 
@@ -249,7 +291,12 @@ class _WinJob:
         self._handle = handle
 
     @classmethod
-    def arm(cls, pid: int, memory_bytes: int | None):
+    def arm(cls, pid: int, _memory_bytes: int | None):
+        # ``_memory_bytes`` is the cap the parent poll enforces. It is not a
+        # job commit limit: that limit made CreateProcess of the AppContainer
+        # child wait on the runner, even when the ceiling was gigabytes above
+        # the working set. The result pipe stayed empty and the sibling
+        # blocked on the profile mutex.
         # Win64 layout. A different size means the fields would be misread.
         if ctypes.sizeof(_JOBOBJECT_EXTENDED_LIMIT_INFORMATION) != 144:
             return None
@@ -274,31 +321,31 @@ class _WinJob:
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.c_int
 
-        job = kernel32.CreateJobObjectW(None, None)
-        if not job:
-            return None
         # PROCESS_SET_QUOTA | PROCESS_TERMINATE, required to assign a job.
         process = kernel32.OpenProcess(0x0100 | 0x0001, 0, pid)
         if not process:
-            kernel32.CloseHandle(job)
             return None
-        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        # KILL_ON_JOB_CLOSE is on every worker. A memory cap, when the caller
-        # asked for one, is a commit-charge ceiling above the resident-set poll.
-        flags = 0x2000
-        if memory_bytes is not None:
-            ceiling = int(memory_bytes) * 4 + 256 * 1024 * 1024
-            info.ProcessMemoryLimit = ceiling
-            info.JobMemoryLimit = ceiling
-            # JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY
-            flags |= 0x00000100 | 0x00000200
-        info.BasicLimitInformation.LimitFlags = flags
-        # JobObjectExtendedLimitInformation = 9
-        armed = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
-        assigned = armed and kernel32.AssignProcessToJobObject(job, process)
+        # KILL_ON_JOB_CLOSE, then the same flag with BREAKAWAY_OK. A nested
+        # job rejects breakaway; the child then stays in this job and dies
+        # with it. Either way there is no commit ceiling.
+        job = None
+        for flags in (0x2000 | 0x0800, 0x2000):
+            candidate = kernel32.CreateJobObjectW(None, None)
+            if not candidate:
+                continue
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = flags
+            # JobObjectExtendedLimitInformation = 9
+            armed = kernel32.SetInformationJobObject(
+                candidate, 9, ctypes.byref(info), ctypes.sizeof(info)
+            )
+            assigned = armed and kernel32.AssignProcessToJobObject(candidate, process)
+            if assigned:
+                job = candidate
+                break
+            kernel32.CloseHandle(candidate)
         kernel32.CloseHandle(process)
-        if not assigned:
-            kernel32.CloseHandle(job)
+        if not job:
             return None
         return cls(kernel32, job)
 
@@ -314,3 +361,73 @@ class _WinJob:
         self._handle = None
         if handle:
             self._kernel.CloseHandle(handle)
+
+    def _query(self, kind: int, info) -> bool:
+        kernel = self._kernel
+        kernel.QueryInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel.QueryInformationJobObject.restype = ctypes.c_int
+        return bool(
+            kernel.QueryInformationJobObject(self._handle, kind, ctypes.byref(info), ctypes.sizeof(info), None)
+        )
+
+    def describe(self) -> str:
+        """Limit flags and the job's peak commit, for a hang log."""
+        if not self._handle:
+            return "job=closed"
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        if not self._query(9, info):
+            return f"job_query_failed={ctypes.get_last_error()}"
+        return (
+            "job_flags=0x%x process_limit=%s job_limit=%s peak_job=%s peak_process=%s"
+            % (
+                int(info.BasicLimitInformation.LimitFlags),
+                int(info.ProcessMemoryLimit),
+                int(info.JobMemoryLimit),
+                int(info.PeakJobMemoryUsed),
+                int(info.PeakProcessMemoryUsed),
+            )
+        )
+
+    def member_pids(self) -> list[int]:
+        found = self._member_pids()
+        return list(found or [])
+
+    def member_rss(self) -> int | None:
+        """Working set of every process still in this job.
+
+        Toolhelp follows parent pids. An AppContainer child can be missing
+        there and still be in the job when it did not break away. The larger
+        of the two sums is the cap the parent enforces.
+        """
+        pids = self._member_pids()
+        if not pids:
+            return None
+        total = 0
+        seen = False
+        for pid in pids:
+            rss = process_rss_bytes(int(pid))
+            if rss is None:
+                continue
+            seen = True
+            total += rss
+        return total if seen else None
+
+    def _member_pids(self) -> list[int] | None:
+        class _List(ctypes.Structure):
+            _fields_ = (
+                ("NumberOfAssignedProcesses", ctypes.c_uint32),
+                ("NumberOfProcessIdsInList", ctypes.c_uint32),
+                ("ProcessIdList", ctypes.c_size_t * 32),
+            )
+
+        info = _List()
+        if not self._handle or not self._query(3, info):
+            return None
+        count = min(int(info.NumberOfProcessIdsInList), 32)
+        return [int(info.ProcessIdList[index]) for index in range(count)]

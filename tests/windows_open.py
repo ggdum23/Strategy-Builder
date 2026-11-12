@@ -21,12 +21,20 @@ OWNER_PC = pytest.mark.xfail(
 # the Windows ready-wait in the referee jail.
 
 
+# The Windows job cap is 25 minutes. One test's timer stays inside the
+# 18-minute shard hard limit in tests/ci_shards.py, even when the mark
+# counts more jails than that. The mark's count is still the real number
+# of launches; the timer is what the runner can finish.
+_TIMER_CAP_S = 18 * 60
+
+
 def windows_jails(count: int):
     """Windows pytest-timeout of ``JAIL_BUDGET_S`` per AppContainer jail.
 
     Linux does not take the timeout mark, so the suite default is unchanged.
     The ``windows_jails`` mark is present on every platform so the shard
-    planner can budget the same groups.
+    planner can budget the same groups. A test that launches a jail without
+    this mark is a failure: it would otherwise sit in the 60-second file shard.
     """
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ValueError("jail count must be a positive integer")
@@ -34,7 +42,7 @@ def windows_jails(count: int):
     def decorate(fn):
         marked = pytest.mark.windows_jails(count)(fn)
         if sys.platform == "win32":
-            marked = pytest.mark.timeout(JAIL_BUDGET_S * count, method="thread")(marked)
+            marked = pytest.mark.timeout(min(JAIL_BUDGET_S * count, _TIMER_CAP_S), method="thread")(marked)
         return marked
 
     return decorate

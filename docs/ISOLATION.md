@@ -248,12 +248,14 @@ The backend name is `job+appcontainer`.
 - The token is an AppContainer profile with zero capabilities, so it has no
   network capability. A socket call fails with access denied (10013).
 -   One AppContainer profile (`strategybuilderjail`) is created per machine.
-  `icacls` grants read/execute on the Python runtime and the Windows
+  The Win32 ACL API grants read/execute on the Python runtime and the Windows
   directory once, traverse-only on the directories between those and the
-  volume root. The volume root itself is not edited. Later launches see a
-  marker and do not walk that tree again. Each launch grants the private
-  temp directory only. An `icacls` invocation that does not return in 45
-  seconds fails the launch. There is no per-launch recursive deny: the container
+  volume root. The volume root itself is not edited. An allow ACE that is
+  already present is not written again. Later launches see a marker and do
+  not walk that tree again. Each launch grants the private temp directory
+  only. A tree walk that is still going after 180 seconds fails that grant.
+  The failure is a test error. It does not abort the pytest session. There
+  is no per-launch recursive deny: the container
   token is not the user, so a directory that was not granted is not readable.
   A child whose token is not an AppContainer, or whose token has a
   capability, is not resumed. Loopback exemptions for this profile are
@@ -449,16 +451,46 @@ that starts several jails does not fit in 60 seconds. Those tests are not
 `xfail`. They have to pass. `windows_jails(n)` and `runner_timeout` give
 each one 90 seconds times its jail count, on the pytest timer and on the
 worker timer. A test whose budget is above 60 seconds is packed on its own
-shard group so that budget stays inside the 12-minute pack.
+shard group so that budget stays inside the 12-minute pack. The Windows
+timer and the shard budget stop at 18 minutes, under the 25-minute job,
+when the mark counts more jails than that. The mark's count is still
+checked against the launches. A test that starts a jail without
+`windows_jails` fails. Replay and probe wait 90 seconds for `ready` on
+Windows, the same default as the jailed strategy. Linux replay and probe
+stay at 60 seconds.
 
 The per-launch ancestor ACL update is serialized with `CreateProcessW`
-under the profile lock. Two workers rewriting the same DACL could drop the
-traverse ACE. AppContainer then reports `CreateProcessW` winerror 2
-(`ERROR_FILE_NOT_FOUND`) even though the interpreter exists, because the
-new token cannot resolve its current directory. The lock covers the grant
-and the spawn, including `ResumeThread`. It does not cover the 16–20
-second boot. The failure still names the executable path, whether that
-file exists, and whether the work directory exists. It is not retried.
+under a named mutex, `Local\strategybuilderjail`. Two workers rewriting
+the same DACL could drop the traverse ACE. AppContainer then reports
+`CreateProcessW` winerror 2 (`ERROR_FILE_NOT_FOUND`) even though the
+interpreter exists, because the new token cannot resolve its current
+directory. The mutex covers the grant and the spawn, including
+`ResumeThread`. It does not cover the 16–20 second boot. The kernel
+releases it when the holder exits, including when the holder is killed,
+so the next jail does not inherit a lock file. The failure still names
+the executable path, whether that file exists, and whether the work
+directory exists. It is not retried.
+
+The worker job does not set a process or job commit limit. On the GitHub
+runner that limit makes `CreateProcess` of the AppContainer child wait for
+the whole parent budget. Raising the ceiling did not help: the memory hog
+whose cap was already `max(rss, 600 MiB) + 500 MiB` (a ceiling near 4.6 GiB)
+still came back `timeout` with `alive=1` and `pipe_bytes=0` on 5 of 6
+parallel-2 jobs, and the flat strategy beside it wrote nothing because it
+was waiting on the profile mutex. The reported stop is the resident-set
+poll. The worker writes the jailed pid on the phase log as soon as
+`CreateProcess` returns, and the poll adds that pid when toolhelp and the
+job member list both miss it. The job still tries `BREAKAWAY_OK` so the
+child can leave it; a nested job that rejects the flag is armed with only
+`KILL_ON_JOB_CLOSE`. The sandbox job keeps its own memory limit. A child
+that never writes `ready` fails the hello wait once. That wait is not
+extended for memory growth. Replay and probe use the same 90 second
+default on Windows.
+
+A hang logs, every ten seconds, the last phase lines (spawned, entered,
+released, lock, grant, createprocess, resume, hello, first byte), the job's
+limit flags and peak commit, the worker and child working sets and commit,
+and whether the mutex is free, held, or abandoned.
 
 This is an owner-PC item, not a CI waiver. Time one jail and the
 private-directory grant, and compare it with the 16–20 second GitHub

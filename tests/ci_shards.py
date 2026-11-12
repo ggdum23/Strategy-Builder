@@ -64,11 +64,16 @@ _FILE_TO_SHARD = {path: name for name, paths in FILE_SHARDS.items() for path in 
 
 
 def _windows_budget(item) -> int:
-    """Seconds this test may use on a Windows runner."""
+    """Seconds this test may use on a Windows runner.
+
+    The mark's count is the number of jails. The budget is 90 seconds each,
+    and it stops at the shard hard limit so one long mark is still a job
+    the 25-minute runner can finish.
+    """
     mark = item.get_closest_marker("windows_jails")
     if mark is None or not mark.args:
         return DEFAULT_TEST_S
-    return JAIL_BUDGET_S * int(mark.args[0])
+    return min(JAIL_BUDGET_S * int(mark.args[0]), SHARD_HARD_S)
 
 
 def collect() -> list[tuple[str, int]]:

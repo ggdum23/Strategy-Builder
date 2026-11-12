@@ -898,11 +898,20 @@ def _books_worker(queue, job):
     try:
         inherited_argv, inherited_cwd = _enter_child(job)
         spool = _StdioCapture(job["cwd"])
+        if os.name == "nt":
+            from .sandbox import note_phase, watch_phase
+
+            watch_phase(str(Path.cwd() / "phase.log"))
+            note_phase("worker-entered")
         gate = job.get("gate")
         if gate is not None:
             gate["started"].set()
             if not gate["release"].wait(timeout=180):
                 raise RuntimeError("design parent did not release the walk-forward child")
+            if os.name == "nt":
+                from .sandbox import note_phase
+
+                note_phase("worker-released")
         spec = job["strategy"]
         frame = job["frame"]
         profile = job["profile"]
@@ -1169,8 +1178,82 @@ def _pipe_bytes(reader) -> int | None:
         return -1
 
 
-def _note_windows_wait(proc, pending: int | None, started: float) -> None:
-    """One line on the real stderr every two seconds, for the Windows CI log."""
+def _phase_child_pids(phase_dir) -> list[int]:
+    """Jailed pids the worker recorded. Toolhelp can miss an AppContainer."""
+    if not phase_dir:
+        return []
+    try:
+        text = (Path(phase_dir) / "phase.log").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    found = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "child-pid":
+            try:
+                found.append(int(parts[2]))
+            except ValueError:
+                continue
+    return found
+
+
+def _watched_rss(pid: int, job, phase_dir=None):
+    """Resident set of the worker, its children, and any jailed pid it named.
+
+    Job members and phase-log pids that toolhelp already listed are not
+    counted twice. The larger of the two views is not used: a missed child
+    is added once.
+    """
+    from .limits import process_tree_rss_bytes
+
+    extra = _phase_child_pids(phase_dir)
+    if job is not None and hasattr(job, "member_pids"):
+        try:
+            extra = list(extra) + [int(item) for item in job.member_pids() if int(item) != int(pid)]
+        except Exception:
+            pass
+    return process_tree_rss_bytes(pid, extra)
+
+
+def _windows_hang_detail(proc, job, phase_dir) -> str:
+    """Phase, job accounting, commit, and who holds the profile mutex."""
+    parts = []
+    if phase_dir:
+        path = Path(phase_dir) / "phase.log"
+        try:
+            lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except OSError:
+            lines = []
+        parts.append("phase=" + (" | ".join(lines[-6:]) if lines else "missing"))
+    if job is not None and hasattr(job, "describe"):
+        try:
+            parts.append(job.describe())
+        except Exception as exc:
+            parts.append(f"job_describe_failed={exc}")
+    try:
+        from .limits import process_tree_detail
+
+        parts.append(process_tree_detail(int(proc.pid)))
+    except Exception as exc:
+        parts.append(f"proc_detail_failed={exc}")
+    try:
+        from .sandbox import profile_lock_state
+
+        parts.append(f"lock={profile_lock_state()}")
+    except Exception as exc:
+        parts.append(f"lock_failed={exc}")
+    text = " ".join(parts)
+    return text[:1500]
+
+
+def _note_windows_wait(proc, pending: int | None, started: float, job=None, phase_dir=None) -> None:
+    """One line on the real stderr every two seconds, for the Windows CI log.
+
+    Every ten seconds the line includes the phase file, the job limits, the
+    worker commit, and whether the profile mutex is held. A pytest timeout
+    kills the test before the worker-timeout exception is raised, so the
+    diagnosis has to be on this path.
+    """
     waited = time.monotonic() - started
     slot = int(waited // 2)
     if slot < 1 or getattr(proc, "_sb_wait_note", -1) == slot:
@@ -1184,10 +1267,18 @@ def _note_windows_wait(proc, pending: int | None, started: float) -> None:
         "walk-forward wait waited=%.1fs alive=%s exit=%s pipe_bytes=%s\n"
         % (waited, int(alive), proc.exitcode, pending)
     )
+    if slot % 5 == 0:
+        try:
+            detail = _windows_hang_detail(proc, job, phase_dir)
+        except Exception as exc:
+            detail = f"diag_failed={exc}"
+        sys.__stderr__.write(f"walk-forward diag waited={waited:.1f}s {detail}\n")
     sys.__stderr__.flush()
 
 
-def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None, pgid=None):
+def _take_result(
+    proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None, pgid=None, phase_dir=None
+):
     """Read the result, or raise as soon as the child exits without one.
 
     A dead child used to block on ``queue.get`` until the 600s timeout.
@@ -1199,8 +1290,6 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
     import queue as queue_mod
     from multiprocessing.connection import wait
 
-    from .limits import process_tree_rss_bytes
-
     deadline = time.monotonic() + timeout
     started = time.monotonic()
     reader = queue._reader
@@ -1210,14 +1299,14 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
         if os.name == "nt":
             queued = pending is not None and pending > 0
             if not queued:
-                _note_windows_wait(proc, pending, started)
+                _note_windows_wait(proc, pending, started, job, phase_dir)
         elif wait([reader], timeout=0):
             queued = True
         if queued:
             # A timeout posted as the resident set crosses the cap is the
             # memory stop. The cap is what the caller asked to enforce.
             if memory_bytes is not None:
-                rss = process_tree_rss_bytes(proc.pid)
+                rss = _watched_rss(proc.pid, job, phase_dir)
                 if rss is not None and rss > int(memory_bytes):
                     _stop_process(proc, job, pgid)
                     raise RuntimeError(
@@ -1239,7 +1328,7 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
             _stop_process(proc, job, pgid)
             raise RuntimeError("walk-forward worker cancelled")
         if memory_bytes is not None:
-            rss = process_tree_rss_bytes(proc.pid)
+            rss = _watched_rss(proc.pid, job, phase_dir)
             if rss is not None and rss > int(memory_bytes):
                 _stop_process(proc, job, pgid)
                 raise RuntimeError(
@@ -1254,7 +1343,7 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
                 alive = False
             detail = f"exit {proc.exitcode}"
             if os.name == "nt":
-                detail += f", alive={int(alive)}, pipe_bytes={_pipe_bytes(reader)}"
+                detail += f", alive={int(alive)}, pipe_bytes={_pipe_bytes(reader)} {_windows_hang_detail(proc, job, phase_dir)}"
             _stop_process(proc, job, pgid)
             raise RuntimeError(f"walk-forward worker timed out ({detail})")
         if os.name == "nt":
@@ -1425,6 +1514,11 @@ def _isolated_books(
         raise ValueError("strategy is missing")
     else:
         spec = _strategy_spec(strategy_cls)
+    if spec.get("kind") == "path":
+        # launch() runs in the worker, where the pytest observer is not set.
+        from .sandbox import note_launch
+
+        note_launch()
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     gate = {"started": ctx.Event(), "release": ctx.Event()}
@@ -1444,6 +1538,12 @@ def _isolated_books(
     pgid = None
     try:
         proc, cwd = _launch_book(ctx, result_queue, job)
+        if os.name == "nt" and cwd:
+            try:
+                with (Path(cwd) / "phase.log").open("a", encoding="utf-8") as handle:
+                    handle.write("%.3f parent-spawned\n" % time.monotonic())
+            except OSError:
+                pass
         guard = arm_worker_job(proc.pid, None if memory_bytes is None else int(memory_bytes))
         if os.name == "nt" and guard is None:
             raise RuntimeError("the worker could not be placed in a job object")
@@ -1465,6 +1565,7 @@ def _isolated_books(
             stop=stop,
             job=guard,
             pgid=pgid,
+            phase_dir=cwd,
         )
         proc.join(timeout=60)
         if message[0] != "ok":

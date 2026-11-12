@@ -27,6 +27,7 @@ from backtester.accounting import (
 )
 from backtester.engine_desk import DeskConfig
 from backtester.report import assert_designer_clean, write_json, write_leaderboard
+from windows_open import windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 ET = timezone(timedelta(hours=-4))
@@ -757,6 +758,7 @@ def _locked_sample(tmp_path):
     "profile,price_basis",
     [("arena", "total_return"), ("desk", None)],
 )
+@windows_jails(2)
 def test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo(tmp_path, profile, price_basis):
     main, src, dividends, strategy = _locked_sample(tmp_path)
     argv = [
@@ -783,6 +785,7 @@ def test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo(tmp_path,
     assert main(argv) == 0
 
 
+@windows_jails(1)
 def test_run_rejects_a_dividend_date_outside_the_sample(tmp_path, capsys):
     main, src, _dividends, strategy = _locked_sample(tmp_path)
     typo = tmp_path / "typo.csv"
@@ -954,6 +957,7 @@ def _walk_cli(tmp_path, profile, dividends_text, *, price_basis=None):
         ("arena", None, 2),
     ],
 )
+@windows_jails(2)
 def test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date(
     tmp_path, capsys, profile, price_basis, expect
 ):

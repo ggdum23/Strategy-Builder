@@ -19,6 +19,7 @@ from backtester.__main__ import main
 from backtester.data import load_named
 from backtester.pack import build_pack
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
+from windows_open import windows_jails
 
 ET = timezone(timedelta(hours=-4))
 SOURCE = """
@@ -152,6 +153,7 @@ def _prepared_sample(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["run", "pack", "walkforward", "parallel"])
+@windows_jails(2)
 def test_cli_paths_do_not_import_the_strategy(tmp_path, capsys, capture_books, kind):
     src, nik_pack, nik_side = _prepared_sample(tmp_path)
     before = _modules()
@@ -223,6 +225,7 @@ def test_unsafe_in_process_warns_and_refuses_a_pack(tmp_path, capsys):
     assert "cannot run a pack" in capsys.readouterr().err
 
 
+@windows_jails(1)
 def test_worker_failure_is_exit_2_without_a_traceback(tmp_path, capsys):
     src = tmp_path / "src"
     _write_days(src, "TEST", 2)

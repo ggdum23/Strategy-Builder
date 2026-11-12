@@ -12,6 +12,7 @@ import pytest
 from backtester.data import load_named
 from backtester.runner import _isolated_books, run_books
 from backtester.strategy_loader import load_strategy_class
+from windows_open import windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 QQQ = ROOT / "assets" / "sample" / "QQQ" / "filled"
@@ -34,6 +35,7 @@ def _same_failure(local: BaseException, remote: BaseException) -> None:
 @pytest.mark.jailed_sample
 @pytest.mark.parametrize("name", NAMES)
 @pytest.mark.parametrize("profile", ["arena", "desk"])
+@windows_jails(1)
 def test_jailed_example_matches_in_process(october, name, profile):
     path = STRATEGIES / name / "strategy.py"
     cls = load_strategy_class(path)

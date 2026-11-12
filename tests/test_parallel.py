@@ -303,6 +303,7 @@ def test_a_crash_a_hang_signal_and_bad_syntax_stay_inside_one_row(tmp_path):
         assert written[key] == live[key]
 
 
+@windows_jails(2)
 @OWNER_PC
 def test_a_hang_times_out_without_stopping_the_other_strategy(tmp_path):
     _strategy(tmp_path / "s", "fast", FLAT)
@@ -390,7 +391,10 @@ def test_cancel_stops_the_batch(tmp_path):
         on_progress=on_progress,
         cancel=token,
     )
-    assert time.monotonic() - started < windows_limit(45, 2)
+    # 45s plus two jail budgets is 225s, past the 180s pytest cap, so the
+    # bound could not fail. One jail of slack is under that cap. Linux stays
+    # at 45s. A cancel that never arrives still runs until the worker budget.
+    assert time.monotonic() - started < windows_limit(45, 1)
     assert result.cancelled is True
     assert result.failures == len(result.results)
     assert all(item.status != "ok" for item in result.results)
@@ -1187,6 +1191,7 @@ def test_parent_rejects_a_benchmark_run_at_a_patched_financing_rate(tmp_path):
             assert payload["financing_rate_annual"] == D.FINANCING_RATE_ANNUAL
 
 
+@windows_jails(1)
 def test_cancel_after_the_gate_stops_the_worker(tmp_path):
     source = (
         "import time\n"
@@ -1519,6 +1524,7 @@ def _registered(index: Path, run_id: str, out: Path) -> None:
     assert Path(index_doc["runs"][run_id]["path"]) == out.resolve()
 
 
+@windows_jails(16)
 @OWNER_PC
 def test_schema_token_tickers_publish_and_register(tmp_path):
     """Headers such as borrow_cost are not the ticker COST."""
@@ -1654,6 +1660,7 @@ def test_a_ticker_in_a_value_fails_only_that_row(tmp_path, monkeypatch):
     assert_designer_clean(out / "designer", symbol="COST")
 
 
+@windows_jails(4)
 def test_parallel_cli_exits_without_a_traceback_when_one_row_fails(tmp_path, monkeypatch, capsys):
     from backtester.__main__ import main
 

@@ -24,7 +24,7 @@ from backtester.report import (
     reserved_symbol_conflict,
 )
 from backtester.runner import run_pack
-from windows_open import OWNER_PC, runner_timeout
+from windows_open import OWNER_PC, runner_timeout, windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 _README_SYMBOLS = (
@@ -215,6 +215,7 @@ def test_run_pack_rejects_a_reserved_symbol_before_output(tmp_path):
     assert not out.exists()
 
 
+@windows_jails(2)
 @OWNER_PC
 def test_a_passing_symbol_publishes_canonical_benchmark_names(tmp_path):
     from backtester.parallel import PackMarket, run_parallel

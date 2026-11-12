@@ -40,6 +40,44 @@ class SandboxError(RuntimeError):
 # cost is not the strategy's call timeout. Tests use the same number.
 WINDOWS_JAIL_STARTUP_S = 90
 
+# The pytest process registers this. A spawned worker does not, so a jail
+# the worker starts is counted by the parent that decided to start it.
+_LAUNCH_OBSERVER = None
+_PHASE_PATH = None
+_PHASE_LOCK = threading.Lock()
+_LOCK_DEPTH = threading.local()
+
+
+def set_launch_observer(observer) -> None:
+    """Count successful jails. The observer runs in this process only."""
+    global _LAUNCH_OBSERVER
+    _LAUNCH_OBSERVER = observer
+
+
+def note_launch() -> None:
+    observer = _LAUNCH_OBSERVER
+    if observer is not None:
+        observer()
+
+
+def watch_phase(path) -> None:
+    """Append phase lines to this file. The parent reads them on a hang."""
+    global _PHASE_PATH
+    _PHASE_PATH = None if path is None else str(path)
+
+
+def note_phase(name: str) -> None:
+    path = _PHASE_PATH
+    if not path:
+        return
+    line = f"{time.monotonic():.3f} {name}\n"
+    with _PHASE_LOCK:
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line)
+        except OSError:
+            pass
+
 
 # seccomp / BPF
 _BPF_LD = 0x00
@@ -553,16 +591,19 @@ def launch(
             nproc=_nproc_ceiling(backend),
         )
         if backend == "windows":
-            return _launch_windows(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
-        if sys.platform != "linux":
+            box = _launch_windows(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        elif sys.platform != "linux":
             raise SandboxError(f"no referee jail for {sys.platform}; refusing to run the strategy")
-        if backend == "bubblewrap":
-            return _launch_bwrap(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
-        if backend == "landlock":
-            return _launch_landlock(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
-        raise SandboxError(
-            "bubblewrap is not available and landlock cannot be applied; refusing to run the strategy"
-        )
+        elif backend == "bubblewrap":
+            box = _launch_bwrap(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        elif backend == "landlock":
+            box = _launch_landlock(work, denied, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        else:
+            raise SandboxError(
+                "bubblewrap is not available and landlock cannot be applied; refusing to run the strategy"
+            )
+        note_launch()
+        return box
     except Exception:
         shutil.rmtree(work, ignore_errors=True)
         raise
@@ -1208,9 +1249,9 @@ _ALREADY_EXISTS = 0x800700B7
 def warm_windows_profile() -> None:
     """Create the AppContainer and its runtime ACLs once per machine.
 
-    The first jail in a process pays for ``icacls`` on the interpreter.
-    Later launches, including workers spawned after this returns, reuse the
-    marker and only grant their private directory.
+    The first jail in a process pays for the Win32 ACL walk of the
+    interpreter. Later launches, including workers spawned after this
+    returns, reuse the marker and only grant their private directory.
     """
     if sys.platform != "win32":
         return
@@ -1227,33 +1268,78 @@ def _grant_marker_path() -> Path:
 
 
 def _with_profile_lock(action):
-    local = _local_app_data()
-    if local is None:
-        raise SandboxError("LOCALAPPDATA is not set; refusing to start the sandbox")
-    lock = local / "strategybuilderjail.lock"
-    deadline = time.monotonic() + 300
-    while True:
-        try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            break
-        except FileExistsError:
-            try:
-                if time.time() - lock.stat().st_mtime > 600:
-                    lock.unlink()
-                    continue
-            except OSError:
-                pass
-            if time.monotonic() > deadline:
-                raise SandboxError("timed out waiting for the AppContainer grant")
-            time.sleep(0.25)
+    """One grant or spawn at a time. The kernel drops the mutex if the holder dies.
+
+    A file lock in ``LOCALAPPDATA`` survived ``TerminateProcess`` for the
+    stale window, and the next jail then sat on it until its own timeout.
+    ``icacls`` on that same directory also blocked behind the open file.
+    A named mutex is released on process exit, including an abandoned one
+    left by a killed holder. Nested calls on this thread reuse it.
+    """
+    if sys.platform != "win32":
+        return action()
+    depth = getattr(_LOCK_DEPTH, "n", 0)
+    if depth:
+        return action()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    kernel.ReleaseMutex.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    handle = kernel.CreateMutexW(None, 0, "Local\\strategybuilderjail")
+    if not handle:
+        raise _win_fail("CreateMutexW failed")
+    note_phase("lock-wait")
+    # WAIT_OBJECT_0 is 0. WAIT_ABANDONED is 0x80: the previous holder died
+    # and this thread now owns the mutex.
+    result = kernel.WaitForSingleObject(handle, 300_000)
+    if result not in (0, 0x80):
+        kernel.CloseHandle(handle)
+        raise SandboxError("timed out waiting for the AppContainer grant")
+    note_phase("lock-held")
+    _LOCK_DEPTH.n = 1
     try:
         return action()
     finally:
-        os.close(fd)
-        try:
-            lock.unlink()
-        except OSError:
-            pass
+        _LOCK_DEPTH.n = 0
+        note_phase("lock-released")
+        kernel.ReleaseMutex(handle)
+        kernel.CloseHandle(handle)
+
+
+def profile_lock_state() -> str:
+    """``free``, ``held``, or ``abandoned``. Used on the Windows hang path."""
+    if sys.platform != "win32":
+        return "n/a"
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    kernel.ReleaseMutex.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    handle = kernel.CreateMutexW(None, 0, "Local\\strategybuilderjail")
+    if not handle:
+        return f"mutex-error={ctypes.get_last_error()}"
+    result = kernel.WaitForSingleObject(handle, 0)
+    try:
+        if result == 0:
+            return "free"
+        if result == 0x80:
+            return "abandoned"
+        if result == 0x102:
+            return "held"
+        return f"wait={result}"
+    finally:
+        if result in (0, 0x80):
+            kernel.ReleaseMutex(handle)
+        kernel.CloseHandle(handle)
 
 
 _WFP_ENGINE = None
@@ -1774,16 +1860,243 @@ def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
             kernel.LocalFree(updated)
 
 
+# FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, and FILE_ALL_ACCESS.
+_RX_MASK = 0x1200A9
+_FULL_MASK = 0x1F01FF
+_READ_MASK = 0x120089
+# OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+_INHERIT_BOTH = 0x3
+
+
+class _ACE_HEADER(ctypes.Structure):
+    _fields_ = (
+        ("AceType", ctypes.c_ubyte),
+        ("AceFlags", ctypes.c_ubyte),
+        ("AceSize", ctypes.c_ushort),
+    )
+
+
+class _ACL_HEADER(ctypes.Structure):
+    _fields_ = (
+        ("AclRevision", ctypes.c_ubyte),
+        ("Sbz1", ctypes.c_ubyte),
+        ("AclSize", ctypes.c_ushort),
+        ("AceCount", ctypes.c_ushort),
+        ("Sbz2", ctypes.c_ushort),
+    )
+
+
+def _win_bind_acl(lease: _WinLease) -> None:
+    advapi = lease.advapi
+    advapi.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi.GetAce.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.GetAce.restype = ctypes.c_int
+    advapi.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    advapi.EqualSid.restype = ctypes.c_int
+    advapi.SetEntriesInAclW.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.SetEntriesInAclW.restype = ctypes.c_uint32
+    advapi.SetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi.SetNamedSecurityInfoW.restype = ctypes.c_uint32
+
+
+def _win_ace_present(lease: _WinLease, path: Path, mask: int, ace_type: int) -> bool:
+    """True when this SID already has the allow bits, or a NULL DACL allows them.
+
+    A NULL DACL grants everyone. Replacing it with only our ACE would lock
+    the user out of the file. A deny is not implied by a NULL DACL.
+    """
+    advapi = lease.advapi
+    kernel = lease.kernel
+    _win_bind_acl(lease)
+    dacl = ctypes.c_void_p()
+    security = ctypes.c_void_p()
+    status = advapi.GetNamedSecurityInfoW(
+        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+    )
+    if status != 0 or not security.value:
+        return False
+    try:
+        if not dacl.value:
+            return ace_type == 0
+        header = _ACL_HEADER.from_address(int(dacl.value))
+        for index in range(min(int(header.AceCount), 128)):
+            ace = ctypes.c_void_p()
+            if not advapi.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
+                continue
+            info = _ACE_HEADER.from_address(int(ace.value))
+            if int(info.AceType) != ace_type:
+                continue
+            if not advapi.EqualSid(ctypes.c_void_p(int(ace.value) + 8), lease.sid):
+                continue
+            if ace_type == 1:
+                return True
+            have = int(ctypes.c_uint32.from_address(int(ace.value) + 4).value)
+            if (have & mask) == mask:
+                return True
+        return False
+    finally:
+        if security.value:
+            kernel.LocalFree(security)
+
+
+def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit: int) -> None:
+    """Merge one ACE. ``mode`` 1 grants and 3 denies. An existing match is left."""
+    if _win_ace_present(lease, path, mask, 0 if mode == 1 else 1):
+        return
+    advapi = lease.advapi
+    kernel = lease.kernel
+
+    class Trustee(ctypes.Structure):
+        _fields_ = (
+            ("pMultipleTrustee", ctypes.c_void_p),
+            ("MultipleTrusteeOperation", ctypes.c_uint32),
+            ("TrusteeForm", ctypes.c_uint32),
+            ("TrusteeType", ctypes.c_uint32),
+            ("ptstrName", ctypes.c_void_p),
+        )
+
+    class ExplicitAccess(ctypes.Structure):
+        _fields_ = (
+            ("grfAccessPermissions", ctypes.c_uint32),
+            ("grfAccessMode", ctypes.c_uint32),
+            ("grfInheritance", ctypes.c_uint32),
+            ("Trustee", Trustee),
+        )
+
+    dacl = ctypes.c_void_p()
+    security = ctypes.c_void_p()
+    status = advapi.GetNamedSecurityInfoW(
+        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+    )
+    if status != 0:
+        raise SandboxError(f"could not read the ACL on {path} (winerror {status})")
+    if not dacl.value:
+        # A NULL DACL already allows everyone. Replacing it with one ACE
+        # would drop that access. A deny on a NULL DACL is the same trap.
+        if security.value:
+            kernel.LocalFree(security)
+        return
+    entry = ExplicitAccess()
+    entry.grfAccessPermissions = int(mask)
+    entry.grfAccessMode = int(mode)
+    entry.grfInheritance = int(inherit)
+    entry.Trustee.TrusteeForm = 0
+    entry.Trustee.ptstrName = lease.sid
+    advapi.SetEntriesInAclW.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(ExplicitAccess),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    updated = ctypes.c_void_p()
+    try:
+        status = advapi.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(updated))
+        if status != 0:
+            raise SandboxError(f"could not edit the ACL on {path} (winerror {status})")
+        status = advapi.SetNamedSecurityInfoW(str(path), 1, 4, None, None, updated, None)
+        if status != 0:
+            raise SandboxError(f"could not write the ACL on {path} (winerror {status})")
+    finally:
+        if security.value:
+            kernel.LocalFree(security)
+        if updated.value:
+            kernel.LocalFree(updated)
+
+
+def _grant_already_present(lease: _WinLease, root: Path, mask: int) -> bool:
+    """The tree was granted before the marker was written."""
+    if not root.is_dir():
+        return _win_ace_present(lease, root, mask, 0)
+    probes = [root]
+    for relative in (Path("python.exe"), Path("Lib") / "os.py"):
+        candidate = root / relative
+        if candidate.is_file():
+            probes.append(candidate)
+    return all(_win_ace_present(lease, probe, mask, 0) for probe in probes)
+
+
+def _win_grant_tree(lease: _WinLease, root: Path, mask: int, inherit: int) -> None:
+    """Propagate an allow ACE. ``icacls /T`` on the Python prefix exceeds 45s.
+
+    The walk is in-process and stops at 180s with the directory named.
+    ``__pycache__`` and distribution metadata are not read by the child.
+    A file that cannot be edited is skipped, matching ``icacls /C``. The
+    root itself must succeed.
+    """
+    deadline = time.monotonic() + 180
+    pending = [root]
+    seen = 0
+    while pending:
+        if time.monotonic() > deadline:
+            raise SandboxError(f"ACL grant on {root} did not finish in 180s ({seen} entries)")
+        current = pending.pop()
+        try:
+            is_dir = current.is_dir()
+        except OSError:
+            continue
+        if is_dir and current != root:
+            name = current.name
+            if name == "__pycache__" or name.endswith(".dist-info") or name.endswith(".egg-info"):
+                continue
+        try:
+            _win_change_ace(lease, current, mask, 1, inherit if is_dir else 0)
+        except SandboxError:
+            if current == root:
+                raise
+            continue
+        seen += 1
+        if not is_dir:
+            continue
+        try:
+            pending.extend(current.iterdir())
+        except OSError:
+            continue
+
+
 def _win_grant(lease: _WinLease, path: Path, rights: str, *, recurse: bool) -> None:
     if not path.exists():
         return
     if not recurse and rights == "(X)":
         _win_grant_traverse(lease, path)
         return
-    command = [_icacls(), str(path), "/grant", f"*{lease.sid_text}:{rights}", "/C", "/Q"]
+    if rights == "(OI)(CI)(RX)":
+        mask, inherit = _RX_MASK, _INHERIT_BOTH
+    elif rights == "(OI)(CI)(F)":
+        mask, inherit = _FULL_MASK, _INHERIT_BOTH
+    else:
+        raise SandboxError(f"unsupported grant {rights}")
+    note_phase(f"grant-start {path.name}")
+    if recurse and _grant_already_present(lease, path, mask):
+        note_phase(f"grant-skip {path.name}")
+        return
     if recurse:
-        command.append("/T")
-    _icacls_run(command)
+        _win_grant_tree(lease, path, mask, inherit)
+    else:
+        _win_change_ace(lease, path, mask, 1, inherit if path.is_dir() else 0)
+    note_phase(f"grant-done {path.name}")
 
 
 def _win_deny(lease: _WinLease, path: Path) -> None:
@@ -1792,9 +2105,17 @@ def _win_deny(lease: _WinLease, path: Path) -> None:
 
 
 def _win_deny_shallow(lease: _WinLease, path: Path) -> None:
-    """Deny reading the directory itself. Children keep the ACEs they have."""
-    command = [_icacls(), str(path), "/deny", f"*{lease.sid_text}:(R)", "/C", "/Q"]
-    _icacls_run(command)
+    """Deny reading the directory itself. Children keep the ACEs they have.
+
+    ``icacls /deny`` on ``LOCALAPPDATA`` blocked while the profile lock file
+    in that directory was open. The deny is one non-inherited ACE, and it
+    is skipped when that ACE is already present.
+    """
+    if not path.exists():
+        return
+    if _win_ace_present(lease, path, _READ_MASK, 1):
+        return
+    _win_change_ace(lease, path, _READ_MASK, 3, 0)
 
 
 def _win_sweep_orphans() -> None:
@@ -2138,20 +2459,35 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
         created = _WinProcessInformation()
         # CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
         flags = 0x00000004 | 0x00080000 | 0x08000000 | 0x00000400
-        ok = kernel.CreateProcessW(
-            sys.executable,
-            command_buf,
-            None,
-            None,
-            1,
-            flags,
-            ctypes.cast(env_buf, ctypes.c_void_p),
-            str(work),
-            ctypes.byref(info),
-            ctypes.byref(created),
-        )
+        # CREATE_BREAKAWAY_FROM_JOB. The worker job's commit ceiling must
+        # not charge this child: that wait is the empty result pipe. If the
+        # outer job forbids breakaway, start in the worker job instead.
+        # That is not a retry of a missing executable.
+        ok = False
+        failed = 0
+        for extra, label in ((0x01000000, "breakaway"), (0, "in-job")):
+            note_phase(f"createprocess-{label}")
+            ok = kernel.CreateProcessW(
+                sys.executable,
+                command_buf,
+                None,
+                None,
+                1,
+                flags | extra,
+                ctypes.cast(env_buf, ctypes.c_void_p),
+                str(work),
+                ctypes.byref(info),
+                ctypes.byref(created),
+            )
+            if ok:
+                note_phase(f"createprocess-ok-{label}")
+                break
+            failed = ctypes.get_last_error()
+            note_phase(f"createprocess-fail-{label}-{failed}")
+            if extra == 0 or failed != 5:
+                break
         if not ok:
-            code = ctypes.get_last_error()
+            code = failed
             executable = Path(sys.executable)
             raise SandboxError(
                 "CreateProcessW failed (winerror %s); executable %s exists=%s cwd=%s cwd_exists=%s"
@@ -2159,10 +2495,14 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
             )
         process = created.hProcess
         thread = created.hThread
+        note_phase("token-check")
         _win_require_container(lease, process)
+        note_phase("job-arm")
         job = _win_arm_job(kernel, process, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        note_phase("resume")
         if kernel.ResumeThread(thread) == 0xFFFFFFFF:
             raise _win_fail("ResumeThread failed")
+        note_phase("resumed")
         kernel.CloseHandle(thread)
         thread = None
         for handle in (stdin_r, stdout_w, stderr_w):

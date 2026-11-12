@@ -25,7 +25,7 @@ from backtester.referee import (
 from backtester.runner import execute
 from backtester.sandbox import describe_isolation, launch
 from backtester.strategy_loader import load_strategy_class
-from windows_open import OWNER_PC
+from windows_open import OWNER_PC, windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 SELFTEST = ROOT / "examples" / "selftest"
@@ -136,6 +136,16 @@ def _assert_same_book(left, right):
     assert left["daily"] == right["daily"]
     assert left["fees"]["total"] == right["fees"]["total"]
     assert left["n_fills"] == right["n_fills"]
+
+
+def test_windows_startup_default_matches_the_jail_budget():
+    from backtester.referee import DEFAULT_STARTUP_TIMEOUT_S
+    from backtester.sandbox import WINDOWS_JAIL_STARTUP_S
+
+    if sys.platform == "win32":
+        assert DEFAULT_STARTUP_TIMEOUT_S == float(WINDOWS_JAIL_STARTUP_S)
+    else:
+        assert DEFAULT_STARTUP_TIMEOUT_S == 60.0
 
 
 def test_bare_referee_command_exits_2(capsys):
@@ -286,6 +296,7 @@ def test_colliding_pack_session_ids_stay_distinct_and_keep_the_calendar():
         prepare_book(same, profile="arena", train=same, warmup_days=1)
 
 
+@windows_jails(1)
 def test_calendar_month_changes_the_fee_and_matches_the_engine(tmp_path):
     dates = _dates(22, "2024-01-02")
     frame = _frame(dates, price=10.0)
@@ -301,6 +312,7 @@ def test_calendar_month_changes_the_fee_and_matches_the_engine(tmp_path):
     _assert_same_book(remote, calendar)
 
 
+@windows_jails(2)
 def test_short_sample_matches_the_normal_runner(tmp_path):
     _needs_jail()
     frame = _frame(_dates(3, "2024-03-04"), price=100.0)
@@ -325,6 +337,7 @@ def test_short_sample_matches_the_normal_runner(tmp_path):
     assert [row["equity"] for row in desk_remote["daily"]] == [row["equity"] for row in desk_official["daily"]]
 
 
+@windows_jails(2)
 def test_warmup_replay_matches_the_in_process_engine(tmp_path):
     _needs_jail()
     train = _frame(_dates(4, "2024-04-01"), minutes=(570,), price=100.0)
@@ -346,6 +359,7 @@ def test_warmup_replay_matches_the_in_process_engine(tmp_path):
     assert set(_dates(4, "2024-04-01")).isdisjoint({row["session"] for row in desk_remote["fills"]})
 
 
+@windows_jails(1)
 def test_share_scale_bills_in_the_parent_and_is_not_visible(tmp_path):
     _needs_jail()
     repo = str(ROOT)
@@ -420,6 +434,7 @@ class Strategy:
         ("arm.py", 0.0),
     ],
 )
+@windows_jails(1)
 def test_selftest_probes_are_blocked(name, expect):
     _needs_jail()
     if name == "setsid.py" and sys.platform != "linux":
@@ -445,6 +460,7 @@ def test_selftest_probes_are_blocked(name, expect):
             leftover.unlink()
 
 
+@windows_jails(1)
 def test_hidden_file_and_arm_file_stay_on_the_host(tmp_path):
     _needs_jail()
     secret = tmp_path / "secret.txt"
@@ -481,6 +497,7 @@ class Strategy:
             marker.unlink()
 
 
+@windows_jails(2)
 def test_a_crash_and_a_protocol_break_are_disqualified(tmp_path):
     _needs_jail()
     with pytest.raises(Disqualified) as crashed:
@@ -505,6 +522,7 @@ class Strategy:
     assert protocol.value.reason == "protocol"
 
 
+@windows_jails(2)
 @OWNER_PC
 def test_sleep_and_lookahead_are_disqualified_within_eight_seconds():
     """The call budget is 1s. The wall clock includes startup and must stay under 8s.
@@ -526,6 +544,7 @@ def test_sleep_and_lookahead_are_disqualified_within_eight_seconds():
     assert time.monotonic() - started < 8
 
 
+@windows_jails(1)
 def test_memory_cap_stops_the_allocation():
     _needs_jail()
     try:
@@ -541,6 +560,7 @@ def test_memory_cap_stops_the_allocation():
         assert target == 0.0
 
 
+@windows_jails(1)
 def test_child_does_not_outlive_the_referee():
     _needs_jail()
     box = launch(
@@ -629,6 +649,7 @@ def test_x32_syscall_numbers_are_killed(tmp_path):
     assert "getpid failed" not in completed.stderr
 
 
+@windows_jails(2)
 def test_io_uring_setup_is_denied_on_both_backends(monkeypatch):
     if sys.platform != "linux":
         pytest.skip("io_uring is the Linux seccomp gap")
@@ -636,6 +657,7 @@ def test_io_uring_setup_is_denied_on_both_backends(monkeypatch):
     _probe_bubblewrap_and_landlock(SELFTEST / "iouring.py", monkeypatch)
 
 
+@windows_jails(2)
 def test_a_spawn_loop_is_capped_on_both_backends(monkeypatch):
     if sys.platform != "linux":
         pytest.skip("RLIMIT_NPROC is the Linux process ceiling")
@@ -648,6 +670,7 @@ def test_a_spawn_loop_is_capped_on_both_backends(monkeypatch):
     )
 
 
+@windows_jails(2)
 def test_numpy_runs_on_both_backends(monkeypatch):
     if sys.platform != "linux":
         pytest.skip("the landlock process ceiling is a Linux limit")
@@ -660,6 +683,7 @@ def test_numpy_runs_on_both_backends(monkeypatch):
     )
 
 
+@windows_jails(2)
 def test_keyboard_interrupt_is_a_strategy_error_on_both_backends(monkeypatch):
     if sys.platform != "linux":
         pytest.skip("the child boundary is covered with the Linux jails")
@@ -679,6 +703,7 @@ def test_keyboard_interrupt_is_a_strategy_error_on_both_backends(monkeypatch):
     once()
 
 
+@windows_jails(1)
 def test_landlock_blocks_the_data_file_when_bubblewrap_is_hidden(tmp_path, monkeypatch):
     if sys.platform != "linux":
         pytest.skip("landlock is the Linux fallback")
