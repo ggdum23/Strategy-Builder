@@ -208,9 +208,12 @@ are not rewritten into that tree.
 
 `cost_comparison.json` sits beside the operator report, not under `designer/`.
 It shows the real-fee result, the designer-cost result, and the difference
-(designer minus real) for the strategy and the benchmarks. Walk-forward splits
-that file into a design window and a locked window. The locked window is not
-published under `designer/`.
+(designer minus real) for the strategy and the benchmarks. The difference
+omits `final_equity`; each side still has it in its own unit, and
+`total_return` is the comparable gap. Walk-forward splits that file into a
+design window and a locked window. The locked window is not published under
+`designer/`. A designer audience of that walk reads `designer/metrics.json`
+only and does not include the operator design or locked statistics.
 
 The equity chart is session index against equity. The title is `equity`.
 It has no ticker and no date axis. PNG bytes are not part of the determinism

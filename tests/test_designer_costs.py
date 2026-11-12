@@ -6,8 +6,11 @@ import ast
 import csv
 import gzip
 import hashlib
+import io
 import json
+import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
@@ -27,10 +30,10 @@ from backtester.costs_designer import (
 )
 from backtester.data import load_named, slice_walkforward
 from backtester.designer_run import execute as designer_execute
-from backtester.engine_desk import DeskConfig
+from backtester.engine_desk import BuyAndHold, DeskConfig
 from backtester.pack import build_pack, load_pack, load_sidecar
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
-from backtester.report import assert_designer_clean
+from backtester.report import assert_designer_clean, load_report
 from backtester.runner import execute, run_named, run_pack, walk_forward, walk_pack
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -314,11 +317,11 @@ def _build(tmp_path, src, registry, *, symbol="NIK", price_factor=1.7, volume_fa
     return pack, sidecar
 
 
-def _rewrite(sidecar, **changes):
+def _rewrite(sidecar, *, allow_scale_mismatch=False, **changes):
     document = json.loads(Path(sidecar).read_text(encoding="utf-8"))
     document.update(changes)
     Path(sidecar).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    load_sidecar(sidecar)
+    return load_sidecar(sidecar, allow_scale_mismatch=allow_scale_mismatch)
 
 
 def _tree(root: Path) -> dict[str, bytes]:
@@ -346,11 +349,26 @@ def test_designer_tree_is_identical_across_share_scales(tmp_path, profile):
     trees = []
     operator_fees = []
     for scale in SCALES:
-        _rewrite(sidecar, share_scale=scale)
+        _rewrite(sidecar, allow_scale_mismatch=True, share_scale=scale)
         out = tmp_path / f"{profile}-{scale}"
-        payload = run_pack(BuyThenSell, pack, sidecar, profile, out, with_benchmarks=False)
-        assert payload["cost_basis"]["share_scale"] == scale
-        assert payload["cost_basis"]["per_share_fees"] == "real_share_counts"
+        payload = run_pack(
+            BuyThenSell,
+            pack,
+            sidecar,
+            profile,
+            out,
+            with_benchmarks=False,
+            allow_scale_mismatch=True,
+        )
+        basis = payload["cost_basis"]
+        assert basis["share_scale"] == scale
+        if scale == 1.7:
+            assert basis["per_share_fees"] == "real_share_counts"
+            assert "price_factor" not in basis
+        else:
+            assert basis["per_share_fees"] == "billing_override"
+            assert basis["price_factor"] == 1.7
+            assert basis["share_scale"] == scale
         assert "cost_model" not in payload
         designer = json.loads((out / "designer" / "metrics.json").read_text(encoding="utf-8"))
         assert designer["cost_model"] == "designer cost model: 0.8 bp flat"
@@ -365,6 +383,9 @@ def test_designer_tree_is_identical_across_share_scales(tmp_path, profile):
         assert block["difference"]["total_return"] == (
             block["designer_cost"]["total_return"] - block["real_fees"]["total_return"]
         )
+        assert "final_equity" not in block["difference"]
+        assert "final_equity" in block["real_fees"]
+        assert "final_equity" in block["designer_cost"]
         fills = list(csv.DictReader((out / "designer" / "fills.csv").open(encoding="utf-8")))
         signs = [float(row["shares_delta"]) > 0 for row in fills]
         assert True in signs and False in signs
@@ -398,20 +419,94 @@ def test_designer_equity_ignores_the_operator_account(tmp_path):
     assert left["final_equity"] != right["final_equity"]
 
 
-def test_sidecar_ticker_and_price_do_not_change_designer_bytes(tmp_path):
+def test_sidecar_ticker_does_not_change_designer_bytes(tmp_path):
     src, registry = _write_series(tmp_path, days=1)
     pack, sidecar = _build(tmp_path, src, registry, symbol="NIK", price_factor=1.7)
     _rewrite(sidecar, share_scale=1.7)
     base = tmp_path / "base"
     run_pack(BuyThenSell, pack, sidecar, "desk", base, with_benchmarks=False)
     base_tree = _tree(base / "designer")
-    for symbol, price_factor in (("COST", 3.3), ("BP", 1.7), ("FLAT", 2.2)):
-        _rewrite(sidecar, symbol=symbol, price_factor=price_factor)
+    for symbol in ("COST", "FLAT"):
+        _rewrite(sidecar, symbol=symbol)
         out = tmp_path / symbol
         payload = run_pack(BuyThenSell, pack, sidecar, "desk", out, with_benchmarks=False)
         assert payload["symbol"] == symbol
         assert _tree(out / "designer") == base_tree
         assert_designer_clean(out / "designer", symbol=symbol)
+
+
+def test_edited_price_factor_is_rejected(tmp_path):
+    src, registry = _write_series(tmp_path, days=1)
+    pack, sidecar = _build(tmp_path, src, registry, symbol="NIK", price_factor=1.7)
+    _rewrite(sidecar, allow_scale_mismatch=True, price_factor=3.3, share_scale=3.3)
+    with pytest.raises(ValueError, match="sealed"):
+        run_pack(BuyThenSell, pack, sidecar, "desk", tmp_path / "out", with_benchmarks=False)
+
+
+def test_anonymized_sidecar_rejects_a_share_scale_other_than_the_price_factor(tmp_path):
+    src, registry = _write_series(tmp_path, days=1)
+    _pack, sidecar = _build(tmp_path, src, registry, symbol="NIK", price_factor=1.7)
+    with pytest.raises(ValueError, match="build-time price factor"):
+        _rewrite(sidecar, share_scale=0.25)
+
+
+def test_designer_dividend_is_real_div_times_build_price_factor(tmp_path):
+    """A $1.25 dividend on a 1.7x pack pays 2.125 per pack share, at every billing scale."""
+    src, registry = _write_series(tmp_path, days=2)
+    pack, sidecar = _build(tmp_path, src, registry, price_factor=1.7)
+    dividends = {"2024-03-05": 1.25}
+    trees = []
+    per_share = []
+    for scale in SCALES:
+        _rewrite(sidecar, allow_scale_mismatch=True, share_scale=scale)
+        out = tmp_path / f"div-{scale}"
+        run_pack(
+            BuyAndHold,
+            pack,
+            sidecar,
+            "desk",
+            out,
+            dividends=dividends,
+            with_benchmarks=False,
+            allow_scale_mismatch=True,
+        )
+        designer = json.loads((out / "designer" / "metrics.json").read_text(encoding="utf-8"))
+        curve = list(csv.DictReader((out / "designer" / "equity_curve.csv").open(encoding="utf-8")))
+        shares = int(float(curve[0]["shares"]))
+        assert shares > 0
+        cash = designer["dividends_net"]
+        assert cash / shares == pytest.approx(2.125)
+        assert cash == pytest.approx(shares * 1.25 * 1.7)
+        assert cash != pytest.approx(shares * 1.25)
+        assert cash != pytest.approx(shares * 1.25 * scale) or scale == 1.7
+        trees.append(_tree(out / "designer"))
+        per_share.append(cash / shares)
+        _assert_no_scale(_tree(out / "designer"))
+    for tree in trees[1:]:
+        assert tree == trees[0]
+    assert per_share[0] == pytest.approx(2.125)
+
+
+def test_cost_model_path_does_not_bind_share_scale():
+    from test_engine import make_bars
+
+    seen = []
+
+    class Probe:
+        def on_bar(self, _bar, _state):
+            frame = sys._getframe()
+            while frame is not None:
+                if frame.f_code.co_name == "run" and frame.f_code.co_filename.endswith("engine_arena.py"):
+                    seen.append("share_scale" in frame.f_locals)
+                frame = frame.f_back
+            return None
+
+    engine_arena.run(Probe(), make_bars(days=1), cost_model=DesignerCostModel(0.8), share_scale=7.777)
+    assert seen
+    assert not any(seen)
+    seen.clear()
+    engine_arena.run(Probe(), make_bars(days=1), share_scale=1.7)
+    assert any(seen)
 
 
 def test_named_run_stays_on_the_real_schedule(tmp_path):
@@ -480,8 +575,51 @@ def test_walk_pack_charges_the_flat_fee_in_both_windows(tmp_path):
     operator = json.loads((out / "design" / "metrics.json").read_text(encoding="utf-8"))
     assert operator["symbol"] == "NIK"
     assert operator["cost_basis"]["share_scale"] == 1.7
+    assert operator["cost_basis"]["anonymized"] is True
+    assert operator["cost_basis"]["per_share_fees"] == "real_share_counts"
+    assert "price_factor" not in operator["cost_basis"]
     assert operator["initial_equity"] == 2_000_000.0
     assert "cost_model" not in operator
+    locked_operator = json.loads((out / "locked" / "metrics.json").read_text(encoding="utf-8"))
+    assert locked_operator["cost_basis"]["anonymized"] is True
+    diff = comparison["windows"]["design"]["books"]["strategy"]["difference"]
+    assert "final_equity" not in diff
+    assert "final_equity" in comparison["windows"]["design"]["books"]["strategy"]["real_fees"]
+    walk = json.loads((out / "walkforward.json").read_text(encoding="utf-8"))
+    (out / "run.json").write_text(
+        json.dumps({"schema_version": 1, "id": "rwalk", "kind": "walkforward", "profile": "arena"}) + "\n",
+        encoding="utf-8",
+    )
+    designer_view = load_report(out, audience="designer")
+    blob = json.dumps(designer_view)
+    assert "summary" not in designer_view
+    assert "cost_comparison" not in designer_view
+    assert designer_view["metrics"]["total_return"] == designer["total_return"]
+    assert designer_view["metrics"]["fees_total"] == designer["fees_total"]
+    for number in (
+        walk["design"]["total_return"],
+        walk["locked"]["total_return"],
+        walk["design"]["fees_total"],
+        walk["locked"]["fees_total"],
+    ):
+        assert number != designer_view["metrics"]["total_return"]
+        assert number != designer_view["metrics"]["fees_total"]
+        assert json.dumps(number) not in blob
+    from backtester.__main__ import _cmd_report
+
+    designer_out = io.StringIO()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys, "stdout", designer_out)
+        _cmd_report(SimpleNamespace(run=str(out), audience="designer"))
+    printed = designer_out.getvalue()
+    assert "locked total_return" not in printed
+    assert "design total_return" not in printed
+    for number in (walk["design"]["total_return"], walk["locked"]["total_return"], walk["design"]["fees_total"], walk["locked"]["fees_total"]):
+        assert str(number) not in printed
+    assert f"total_return={designer['total_return']}" in printed
+    operator_view = load_report(out, audience="operator")
+    assert operator_view["summary"]["locked"]["total_return"] == walk["locked"]["total_return"]
+    assert "cost_comparison" in operator_view
     named = walk_forward(
         BuyThenSell,
         load_named(src, "NIK").frame,
@@ -495,6 +633,8 @@ def test_walk_pack_charges_the_flat_fee_in_both_windows(tmp_path):
     assert named[0]["symbol"] == "NIK"
     assert not (tmp_path / "named-walk" / "designer").exists()
     assert not (tmp_path / "named-walk" / "cost_comparison.json").exists()
+    named_metrics = json.loads((tmp_path / "named-walk" / "design" / "metrics.json").read_text(encoding="utf-8"))
+    assert named_metrics["cost_basis"]["anonymized"] is False
 
 
 def test_model_slippage_matches_the_published_one_basis_point():

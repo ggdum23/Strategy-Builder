@@ -6,8 +6,10 @@ only to the sidecar. Designer-facing file names carry neither a ticker nor a
 year. A chunk is about 250 trading sessions and each file stays under 25 MB.
 
 Prices multiplied by k are paired with share_scale = k. The sidecar file is
-where that number is stored. The runner reads it and passes it to the child
-engine so per-share fees use real share counts. The pack files do not contain it.
+where that number is stored. The manifest stores a seal of k, not k. The
+runner accepts the sidecar price factor only when it matches that seal, and
+passes share_scale to the operator child so per-share fees use real share
+counts. The pack files do not contain the factor.
 """
 
 from __future__ import annotations
@@ -85,6 +87,7 @@ _MANIFEST_KEYS = {
     "daily_file",
     "n_sessions",
     "price_basis",
+    "price_seal",
 }
 _CHUNK_KEYS = {"file", "first_day", "last_day", "sessions"}
 _DATE_RE = re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b")
@@ -155,7 +158,35 @@ def _keys(value, expected: set[str], path: str) -> None:
         _fail(path, f"missing field {missing[0]!r}")
 
 
-def validate_sidecar(document: dict) -> None:
+def price_factor_seal(price_factor: float) -> str:
+    """sha256 of the build-time price factor. The factor is not the digest."""
+    value = float(price_factor)
+    if isinstance(price_factor, bool) or not math.isfinite(value) or value <= 0.0:
+        raise ValueError("price factor must be a positive finite number")
+    token = json.dumps(value, allow_nan=False)
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def require_build_price_factor(manifest: dict, price_factor: float) -> float:
+    """The price factor sealed when the pack was built.
+
+    A sidecar price factor that was edited after the build does not match.
+    """
+    sealed = manifest.get("price_seal") if isinstance(manifest, dict) else None
+    try:
+        actual = price_factor_seal(price_factor)
+    except ValueError as exc:
+        raise ValueError(
+            "sidecar price_factor does not match the factor sealed when the pack was built"
+        ) from exc
+    if not isinstance(sealed, str) or sealed != actual:
+        raise ValueError(
+            "sidecar price_factor does not match the factor sealed when the pack was built"
+        )
+    return float(price_factor)
+
+
+def validate_sidecar(document: dict, *, allow_scale_mismatch: bool = False) -> None:
     if not isinstance(document, dict):
         _fail("", "the file is not an object")
     _keys(document, _SIDECAR_KEYS, "")
@@ -173,11 +204,15 @@ def validate_sidecar(document: dict) -> None:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0.0:
             _fail(name, "expected a positive finite number")
     if document["anonymized"]:
-        # The builder writes share_scale equal to price_factor. The loader
-        # accepts any positive billing scale, including 1, so an operator
-        # invoice can be stated on its own. Designer runs do not read it.
+        # The builder writes share_scale equal to the price factor sealed into
+        # the pack. A later sidecar may not bill a different scale and still
+        # say the invoice used real share counts. allow_scale_mismatch is the
+        # test override that keeps one pack's designer tree comparable across
+        # billing scales. The caller records both factors in that case.
         if float(document["price_factor"]) == 1.0 or float(document["volume_factor"]) == 1.0:
             _fail("price_factor", "an anonymized pack must actually rescale prices and volume")
+        if not allow_scale_mismatch and float(document["share_scale"]) != float(document["price_factor"]):
+            _fail("share_scale", "must equal the build-time price factor")
     else:
         if float(document["share_scale"]) != 1.0 or float(document["price_factor"]) != 1.0 or float(document["volume_factor"]) != 1.0:
             _fail("share_scale", "a named pack is unscaled, so every factor is 1")
@@ -624,6 +659,7 @@ def build_pack(
             "daily_file": daily_name,
             "n_sessions": int(frame["day"].nunique()),
             "price_basis": loaded.inspection.price_adjustment,
+            "price_seal": price_factor_seal(price),
         }
         (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         if anonymize:
@@ -676,13 +712,13 @@ def _json_pairs(pairs):
     return document
 
 
-def load_sidecar(path) -> dict:
+def load_sidecar(path, *, allow_scale_mismatch: bool = False) -> dict:
     file = Path(path)
     try:
         document = json.loads(file.read_text(encoding="utf-8"), object_pairs_hook=_json_pairs)
     except json.JSONDecodeError as exc:
         raise ValueError(f"sidecar {file} is not JSON: {exc}") from exc
-    validate_sidecar(document)
+    validate_sidecar(document, allow_scale_mismatch=allow_scale_mismatch)
     return document
 
 
@@ -701,6 +737,9 @@ def _validate_manifest(document: dict) -> None:
         raise ValueError("pack anonymized flag is not true or false")
     if document["anonymized"] and document["asset_name"] != TICKER_STAND_IN:
         raise ValueError(f"an anonymized pack must call the asset {TICKER_STAND_IN}")
+    seal = document.get("price_seal")
+    if not isinstance(seal, str) or len(seal) != 64 or any(char not in "0123456789abcdef" for char in seal):
+        raise ValueError("pack price_seal is not a sha256 hex digest")
     if list(document["columns"]) != list(PACK_COLUMNS):
         raise ValueError("pack columns do not match the schema")
     if not isinstance(document["chunks"], list) or not document["chunks"]:

@@ -2,9 +2,12 @@
 
 The worker is the same book process as a pack run: spawn, argv
 ``['backtester-design']``, an empty working directory, and the environment
-allowlist. The sidecar, the date map, and the unscaled dividend amounts stay
-in the parent. ``share_scale`` is passed the same way a single pack run passes
-it. Desk dividends are remapped here before the child starts.
+allowlist. The sidecar, the date map, and the dividend file stay in the
+parent. The designer child receives cash per pack share (the file amount
+times the price factor sealed at build). The operator child receives the
+file amount times its billing scale. ``share_scale`` is passed the same way
+a single pack run passes it. Desk dividends are remapped here before the
+child starts.
 
 Results do not depend on how many workers ran or which job finished first.
 A strategy that crashes, hangs, or exceeds the resident-set cap is one failed
@@ -731,7 +734,7 @@ def _prepare_one(market, dividends, borrow_rate_annual, runner_mod, *, price_bas
 
 
 def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod, *, price_basis) -> _Prepared:
-    from .pack import load_pack, load_sidecar
+    from .pack import load_pack, load_sidecar, require_build_price_factor
 
     loaded = load_pack(market.pack_dir)
     secret = load_sidecar(market.sidecar_path)
@@ -741,6 +744,7 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod,
         if bool(secret["anonymized"]) != loaded.anonymized:
             raise ValueError("sidecar anonymized flag does not match the pack")
         anonymized = bool(secret["anonymized"])
+        price_factor = require_build_price_factor(loaded.manifest, secret["price_factor"])
         share_scale = float(secret["share_scale"])
         symbol = str(secret["symbol"])
         child_dividends = runner_mod._pack_dividends(
@@ -751,9 +755,9 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod,
         )
         designer_dividends = None
         if anonymized:
-            from .designer_run import session_dividends
-
-            designer_dividends = session_dividends(dividends, secret["date_map"])
+            designer_dividends = runner_mod._designer_dividends(
+                dividends, secret["date_map"], price_factor
+            )
         borrow = borrow_rate_annual
         if borrow is None and secret["borrow_rate_source"] == "explicit":
             borrow = float(secret["borrow_rate_annual"])

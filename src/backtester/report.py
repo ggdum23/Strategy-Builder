@@ -996,7 +996,7 @@ def _comparison_side(metrics: dict) -> dict:
 
 def _comparison_difference(real: dict, designer: dict) -> dict:
     difference = {}
-    for key in ("total_return", "final_equity", "fees_total", "fee_drag_bps", "sharpe", "cagr", "max_drawdown"):
+    for key in ("total_return", "fees_total", "fee_drag_bps", "sharpe", "cagr", "max_drawdown"):
         left = real.get(key)
         right = designer.get(key)
         if isinstance(left, bool) or isinstance(right, bool):
@@ -1297,12 +1297,25 @@ def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
     designer_root = directory / "designer"
     root = designer_root if audience == "designer" and designer_root.is_dir() else directory
     if kind == "walkforward":
+        if audience == "designer":
+            metrics_path = designer_root / "metrics.json"
+            if not metrics_path.is_file():
+                raise FileNotFoundError(f"no designer metrics for this walk-forward in {directory}")
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            return {
+                "contract": REPORT_CONTRACT,
+                "audience": audience,
+                "kind": "walkforward",
+                "id": info.get("id"),
+                "profile": info.get("profile") or metrics.get("profile"),
+                "metrics": metrics,
+                "cancelled": False,
+                "directory_name": "designer",
+            }
         summary_path = directory / "walkforward.json"
         if not summary_path.is_file():
             raise FileNotFoundError(f"no walkforward.json in {directory}")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        if audience == "designer":
-            summary = redact_metrics(summary, symbol=symbol or str(summary.get("symbol") or ""))
         return _with_comparison(
             {
                 "contract": REPORT_CONTRACT,

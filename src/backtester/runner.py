@@ -151,6 +151,39 @@ def _pack_dividends(dividends, *, anonymized: bool, share_scale: float, date_map
     return scaled
 
 
+def _designer_dividends(dividends, date_map, price_factor: float):
+    """Cash per pack share is the file amount times the build-time price factor.
+
+    The child receives the restated map. This is not ``share_scale``.
+    """
+    from .designer_run import session_dividends
+
+    if not dividends:
+        return session_dividends(dividends, date_map)
+    restated = {str(key): float(amount) * float(price_factor) for key, amount in dividends.items()}
+    return session_dividends(restated, date_map)
+
+
+def _record_scale_override(books, *, price_factor: float, share_scale: float) -> None:
+    """Name both factors when the billing scale is not the build-time price factor.
+
+    Equal factors keep the invoice label the operator files already use.
+    """
+    if float(price_factor) == float(share_scale):
+        return
+    note = (
+        f"share_scale={share_scale} differs from the build-time price factor {price_factor}. "
+        "Per-share fees are not real share counts."
+    )
+    for _result, metrics in books.values():
+        basis = metrics.get("cost_basis")
+        if not isinstance(basis, dict):
+            continue
+        basis["price_factor"] = float(price_factor)
+        basis["per_share_fees"] = "billing_override"
+        basis["note"] = note
+
+
 def _summary(profile: str, metrics: dict) -> dict:
     keys = _DESK_KEYS if profile == "desk" else _ARENA_KEYS
     return {key: metrics.get(key) for key in keys}
@@ -1520,6 +1553,7 @@ def walk_forward(
     series_kind: str = "raw",
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
+    anonymized: bool = False,
 ):
     """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
 
@@ -1544,7 +1578,8 @@ def walk_forward(
 
     The books written here are operator books. They keep the original ticker.
     There is no designer tree, so a symbol that is reserved for anonymized
-    reports is allowed.
+    reports is allowed. ``anonymized`` stamps those operator books. Named
+    walks leave it false.
     """
     if share_factor != 1.0 and not allow_scale:
         raise ValueError(
@@ -1599,6 +1634,7 @@ def walk_forward(
         series_kind=series_kind,
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
+        anonymized=anonymized,
     )
     notes = [str(note) for note in (inspection_notes or ())]
     previous_dumpable = _set_dumpable(False)
@@ -1714,27 +1750,33 @@ def run_pack(
     price_basis: str = "raw",
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
+    allow_scale_mismatch: bool = False,
 ):
     """Run a pack. The sidecar stays in this process.
 
     The operator child is billed on real share counts (``share_scale``).
     An anonymized pack also runs a designer child: flat fee, canonical
-    equity, no scale factor. Dividend amounts for that child are re-keyed
-    to session ids and are not multiplied by the scale. The operator child
-    still receives scaled amounts. Neither child receives the sidecar
-    document, the date map, the ticker, the volume factor, or the note.
+    equity, no scale factor. Dividend cash per pack share for that child is
+    the file amount times the price factor sealed at build, never
+    ``share_scale``. The operator child still receives amounts times
+    ``share_scale``. Neither child receives the sidecar document, the date
+    map, the ticker, the volume factor, or the note.
+
+    ``allow_scale_mismatch`` is the test override that bills a scale other
+    than the sealed price factor. The invoice then records both factors.
     """
-    from .pack import load_pack, load_sidecar
+    from .pack import load_pack, load_sidecar, require_build_price_factor
 
     if _report_inside_pack(pack_dir, out_dir):
         raise ValueError("the report must not live inside the pack directory")
     loaded = load_pack(pack_dir)
-    secret = load_sidecar(sidecar_path)
+    secret = load_sidecar(sidecar_path, allow_scale_mismatch=allow_scale_mismatch)
     if secret["pack_id"] != loaded.pack_id:
         raise ValueError("sidecar does not match this pack")
     if bool(secret["anonymized"]) != loaded.anonymized:
         raise ValueError("sidecar anonymized flag does not match the pack")
     anonymized = bool(secret["anonymized"])
+    price_factor = require_build_price_factor(loaded.manifest, secret["price_factor"])
     share_scale = float(secret["share_scale"])
     symbol = str(secret["symbol"])
     series_kind = str(loaded.manifest["price_basis"])
@@ -1748,11 +1790,7 @@ def run_pack(
 
         require_anonymizable_symbol(symbol)
     date_map = secret["date_map"]
-    designer_dividends = None
-    if anonymized:
-        from .designer_run import session_dividends
-
-        designer_dividends = session_dividends(dividends, date_map)
+    designer_dividends = _designer_dividends(dividends, date_map, price_factor) if anonymized else None
     child_dividends = _pack_dividends(
         dividends,
         anonymized=anonymized,
@@ -1806,6 +1844,7 @@ def run_pack(
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
     )
+    _record_scale_override(books, price_factor=price_factor, share_scale=share_scale)
     payload = write_books(
         out_dir,
         get_profile(profile).name,
@@ -1857,8 +1896,8 @@ def walk_pack(
     window stays an operator book. ``cost_comparison.json`` shows both
     windows on both cost models.
     """
-    from .designer_run import session_dividends, spawn_kwargs
-    from .pack import load_pack, load_sidecar
+    from .designer_run import spawn_kwargs
+    from .pack import load_pack, load_sidecar, require_build_price_factor
     from .report import publish_designer, write_cost_comparison
 
     if _report_inside_pack(pack_dir, out_dir):
@@ -1870,6 +1909,7 @@ def walk_pack(
     if bool(secret["anonymized"]) != loaded.anonymized:
         raise ValueError("sidecar anonymized flag does not match the pack")
     anonymized = bool(secret["anonymized"])
+    price_factor = require_build_price_factor(loaded.manifest, secret["price_factor"])
     share_scale = float(secret["share_scale"])
     symbol = str(secret["symbol"])
     series_kind = str(loaded.manifest["price_basis"])
@@ -1883,7 +1923,7 @@ def walk_pack(
 
         require_anonymizable_symbol(symbol)
     date_map = secret["date_map"]
-    designer_dividends = session_dividends(dividends, date_map) if anonymized else None
+    designer_dividends = _designer_dividends(dividends, date_map, price_factor) if anonymized else None
     child_dividends = _pack_dividends(
         dividends,
         anonymized=anonymized,
@@ -1917,6 +1957,7 @@ def walk_pack(
         series_kind=series_kind,
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
+        anonymized=anonymized,
     )
     if not anonymized:
         return summary

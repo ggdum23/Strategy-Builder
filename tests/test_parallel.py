@@ -526,7 +526,7 @@ def test_anonymized_pack_keeps_the_sidecar_in_the_parent(tmp_path, monkeypatch):
         assert "share_factor" not in kwargs
         assert "share_scale" not in kwargs
         assert "initial_equity" not in kwargs
-        assert kwargs["dividends"] == {"S00001": 2.0}
+        assert kwargs["dividends"] == {"S00001": 2.0 * 1.5}
         for banned in ("date_map", "symbol", "volume_factor", "operator_note", "sidecar", "anonymized"):
             assert banned not in kwargs
         assert symbol not in item["csv"]

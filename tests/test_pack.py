@@ -19,6 +19,8 @@ from backtester.pack import (
     build_pack,
     load_pack,
     load_sidecar,
+    price_factor_seal,
+    require_build_price_factor,
 )
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 
@@ -97,6 +99,11 @@ def test_chunk_defaults_and_anonymized_scrub(tmp_path):
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["asset_name"] == "RANDOM"
     assert manifest["anonymized"] is True
+    assert manifest["price_seal"] == price_factor_seal(1.7)
+    assert "price_factor" not in (pack / "manifest.json").read_text(encoding="utf-8")
+    assert require_build_price_factor(manifest, 1.7) == 1.7
+    with pytest.raises(ValueError, match="sealed"):
+        require_build_price_factor(manifest, 1.8)
     secret = load_sidecar(sidecar)
     assert secret["symbol"] == "NIK"
     assert secret["price_factor"] == 1.7

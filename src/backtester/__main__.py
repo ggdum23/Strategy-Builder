@@ -703,6 +703,12 @@ def _cmd_report(args) -> int:
             print("cancelled")
         return 0
     if view["kind"] == "walkforward":
+        if args.audience == "designer":
+            metrics = view["metrics"]
+            for key in ("total_return", "fees_total", "cost_model"):
+                if key in metrics and metrics[key] is not None:
+                    print(f"{key}={metrics[key]}")
+            return 0
         summary = view["summary"]
         for key in ("design_end_date", "locked_start_date", "design_sessions", "locked_sessions", "warmup_rule"):
             if key in summary and not (args.audience == "designer" and key.endswith("_date")):

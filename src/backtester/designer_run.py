@@ -21,9 +21,9 @@ from .report import enrich_arena_metrics
 def session_dividends(dividends, date_map):
     """Calendar amounts keyed by pack session id.
 
-    The amount is the cash figure on the dividend file. It is not restated
-    by a price factor. ``None`` stays ``None`` (no file). An empty map means
-    the file was present and this window has no ex-date only when the caller
+    The caller passes cash per pack share. This function only remaps the
+    calendar date. ``None`` stays ``None`` (no file). An empty map means the
+    file was present and this window has no ex-date only when the caller
     already filtered it.
     """
     if not dividends:

@@ -183,8 +183,12 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
       is credited at that day's boundary, before the fill, on the shares in that snap.
     cost_model: None uses costs.fill_costs and costs.slipped_price, including
       share_scale. A model prices the fill itself and this loop does not read
-      share_scale for that fill. The default, None, is the operator schedule.
+      share_scale for that fill. The name is unbound before the bar loop so a
+      strategy cannot see the default 1.0. The default model, None, is the
+      operator schedule and still binds share_scale.
     """
+    if cost_model is not None:
+        del share_scale
     month_of_day = month_of_day or _local_month
     taf_active_of_day = taf_active_of_day or (lambda d: True)
     wants_ext = bool(getattr(strategy, "WANTS_EXTENDED_HOURS", False))
@@ -413,8 +417,7 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
     if ep is not None:
         open_ep = {"side": ep["side"], "start_day": ep["start_day"], "end_day": cur_day, "bars": ep_bar_count[0],
                    "pnl": ep["cf"] + shares * last_close, "entry_notional": ep["entry_notional"], "open": True}
-    out = {
-        "initial_equity": initial_equity, "share_scale": share_scale,
+    body = {
         "daily": daily, "fills": fills, "episodes": episodes, "open_episode": open_ep,
         "fees": fees_tot, "slippage": slip_tot, "borrow": borrow_tot, "traded_notional": traded_notional,
         "eth_notional": eth_notional, "n_fills": n_fills, "busted": busted,
@@ -422,8 +425,10 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                          "frac_short": n_short / n_exp if n_exp else 0.0, "n_bars": n_exp},
         "wants_extended_hours": wants_ext, "period_label_of_day": period_label_of_day,
     }
-    if cost_model is not None:
-        out.pop("share_scale", None)
+    if cost_model is None:
+        out = {"initial_equity": initial_equity, "share_scale": share_scale, **body}
+    else:
+        out = {"initial_equity": initial_equity, **body}
     if carry is not None:
         out["financing"] = carry.financing
         out["cash_interest"] = carry.cash_interest

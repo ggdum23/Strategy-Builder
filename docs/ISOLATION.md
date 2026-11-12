@@ -76,7 +76,9 @@ per-share schedule. That book is not the designer tree.
 The designer child is a second process. It is not given `share_scale`,
 `share_factor`, or the operator account size. Fills use the flat fee in
 `docs/COSTS_DESIGNER.md`. Equity starts at the canonical index. Dividend
-amounts are remapped to session ids and are not multiplied by the scale.
+cash per pack share is the file amount times the price factor sealed at
+build, never `share_scale`. When that child runs Arena, the engine unbinds
+`share_scale` before the bar loop, so the default 1.0 is not a local.
 The exact-equity plus per-share-schedule residual is closed for that process
 and for everything written under `designer/`: there is no per-share term, the
 flat constant is not derived from the ticker or the pack, and the equity unit
@@ -114,7 +116,7 @@ is the same one a pack run uses: argv `['backtester-design']`, an empty working
 directory, and the environment allowlist. The parent keeps the sidecar, the
 date map, and the unscaled dividend amounts. An anonymized job spawns the
 designer child first (flat fee, canonical equity, no billing scale, dividend
-amounts remapped and not multiplied by the scale) and the operator child
+cash per pack share restated by the sealed price factor) and the operator child
 second. The operator child receives `share_scale` the same way `run_pack`
 passes it, and its dividends are scaled. A named job spawns once.
 

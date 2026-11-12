@@ -20,7 +20,7 @@ abs(shares) * slipped_fill_price * flat_bps * fee_mult * 1e-4
 
 Slippage stays the published 1 bp, adverse, applied to the fill price and reported separately. It is not inside the flat fee.
 
-Borrow, financing, and cash interest stay the profile rates. Dividend cash on a designer run is the dividend-file amount times the pack share count. The amount is not multiplied by `share_scale`. Multiplying by the sidecar scale would put that scale into the designer result, and the designer tree has to be byte-identical across scales. The file amount is a rate in the units of the file, not a per-share regulatory schedule.
+Borrow, financing, and cash interest stay the profile rates. Dividend cash per pack share is `real_div × k`. `k` is the price factor fixed when the pack was built, the same factor baked into the pack prices, so the yield matches `real_div / real_price`. The manifest stores a seal of `k`, not `k`. The runner accepts the sidecar price factor only when it matches that seal, so editing the sidecar afterward does not restate the cash. Designer dividend cash is never multiplied by `share_scale`. The designer tree stays byte-identical across billing scales. The file amount is a rate in the units of the file, not a per-share regulatory schedule.
 
 ## Calibration
 
@@ -78,4 +78,4 @@ The label on designer metrics and the designer leaderboard is `designer cost mod
 
 ## Where it runs
 
-`run --pack`, walk-forward design on a pack, parallel on a pack, and anything written under `designer/` use this model. The operator files next to them keep the real schedule and the real share counts. `cost_comparison.json` is an operator file. It shows both results and the difference (designer minus real) so the flat fee can be compared with the invoice. `total_return` is the comparison that does not depend on account size. `final_equity` is in each book's own unit: the operator account, or the canonical index.
+`run --pack`, walk-forward design on a pack, parallel on a pack, and anything written under `designer/` use this model. The operator files next to them keep the real schedule and the real share counts. `cost_comparison.json` is an operator file. It shows both results and the difference (designer minus real) so the flat fee can be compared with the invoice. `total_return` is the comparison that does not depend on account size. Each side still carries `final_equity` in its own unit (the operator account, or the canonical index). The difference does not subtract those two equities. A designer audience of a pack walk-forward reads `designer/metrics.json` only. It does not include the operator design or locked statistics, and it does not print the locked return.
