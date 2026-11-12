@@ -8,6 +8,9 @@ import hashlib
 import hmac
 import io
 import json
+import os
+import socket
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -20,6 +23,8 @@ from backtester.pack import (
     CHUNK_SESSIONS,
     MAX_FILE_BYTES,
     _DATE_RE,
+    _canonical_bars_name,
+    _entry_is_regular_pack_file,
     _factor_mac_message,
     canonical_price_factor,
     _gzip_csv,
@@ -531,7 +536,7 @@ def test_unicode_digit_dates_fail_the_anonymized_leak_scan(tmp_path):
     assert_anonymized_pack_clean(pack, symbol="NIK")
     load_pack(pack)
     original = (pack / "bars_part_001.csv.gz").read_bytes()
-    priced = _with_cell(_bars_text(pack), "open", "2024.50")
+    priced = _with_cell(_bars_text(pack), "open", "2024.5")
     priced = _with_cell(priced, "volume", "20240102")
     _write_bars(pack, priced.encode("utf-8"))
     _rewrite_pack_id(pack)
@@ -623,28 +628,32 @@ def test_anonymized_pack_rejects_non_ascii_and_real_dates(tmp_path):
     manifest["chunks"][0]["first_day"] = 20240102
     manifest["chunks"][0]["last_day"] = 20240102
     _write_json(manifest_path, manifest)
-    with pytest.raises(ValueError, match="calendar date"):
+    with pytest.raises(ValueError, match="day range"):
         assert_anonymized_pack_clean(pack, symbol="NIK")
-    with pytest.raises(ValueError, match="calendar date"):
+    with pytest.raises(ValueError, match="day range"):
         load_pack(pack)
     manifest_path.write_text(original_manifest, encoding="utf-8")
     hidden = pack / "NI\u200bK"
     hidden.write_bytes(b"")
-    with pytest.raises(ValueError, match="file name"):
+    with pytest.raises(ValueError, match="regular pack file") as caught:
         assert_anonymized_pack_clean(pack, symbol="NIK")
+    assert "NI" not in str(caught.value)
     hidden.unlink()
     chunk = "bars_20\u180f24.csv.gz"
     planted = pack / chunk
     planted.write_bytes(b"")
-    with pytest.raises(ValueError, match="file name"):
+    with pytest.raises(ValueError, match="regular pack file") as caught:
         assert_anonymized_pack_clean(pack, symbol="NIK")
+    assert "bars_20" not in str(caught.value)
     planted.unlink()
     manifest_path = pack / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["chunks"][0]["file"] = chunk
     _write_json(manifest_path, manifest)
-    with pytest.raises(ValueError, match="not allowed"):
+    with pytest.raises(ValueError, match="unicode escape"):
         load_pack(pack)
+    with pytest.raises(ValueError, match="unicode escape"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
     secret = json.loads(sidecar.read_text(encoding="utf-8"))
     dated = secret["date_map"]["1"]
     for key in ("1\u200b", "\uff11", "01"):
@@ -1127,3 +1136,196 @@ def test_load_pack_rejects_duplicate_manifest_keys(tmp_path):
     manifest.write_text("{\n  \"schema_version\": 9," + text[1:], encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate JSON key 'schema_version'"):
         load_pack(pack)
+
+
+def test_anonymized_schema_gate_refuses_review_repros(tmp_path):
+    """Directory entries, typed cells, and the manifest. One verdict for both gates."""
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    load_pack(pack, symbol="NIK")
+    bars = pack / "bars_part_001.csv.gz"
+    original_bars = bars.read_bytes()
+    base = gzip.decompress(original_bars).decode("ascii")
+    manifest_path = pack / "manifest.json"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+
+    def both(match):
+        with pytest.raises(ValueError, match=match) as audit:
+            assert_anonymized_pack_clean(pack, symbol="NIK")
+        with pytest.raises(ValueError, match=match) as loaded:
+            load_pack(pack, symbol="NIK")
+        return str(audit.value), str(loaded.value)
+
+    # A canonical name that points at a clean gzip is still not a regular file.
+    target = tmp_path / "HIDDEN-TARGET.csv.gz"
+    target.write_bytes(original_bars)
+    link = pack / "bars_part_002.csv.gz"
+    try:
+        os.symlink(target, link)
+    except OSError:
+        assert not _entry_is_regular_pack_file(stat.S_IFLNK | 0o777, "bars_part_002.csv.gz")
+    else:
+        audit_message, load_message = both("regular pack file")
+        assert "HIDDEN-TARGET" not in audit_message
+        assert "HIDDEN-TARGET" not in load_message
+        assert "bars_part_002" not in audit_message
+        assert "bars_part_002" not in load_message
+        link.unlink()
+        broken = pack / "HIDDEN-ENTRY"
+        os.symlink(tmp_path / "HIDDEN-TARGET-MISSING", broken)
+        audit_message, load_message = both("regular pack file")
+        assert "HIDDEN-ENTRY" not in audit_message
+        assert "HIDDEN-TARGET" not in load_message
+        broken.unlink()
+
+    empty = pack / "empty-dir"
+    empty.mkdir()
+    audit_message, _ = both("regular pack file")
+    assert "empty-dir" not in audit_message
+    empty.rmdir()
+    nested = pack / "full-dir"
+    nested.mkdir()
+    (nested / "inside.txt").write_text("x\n", encoding="utf-8")
+    audit_message, _ = both("regular pack file")
+    assert "full-dir" not in audit_message
+    assert "inside.txt" not in audit_message
+    (nested / "inside.txt").unlink()
+    nested.rmdir()
+
+    assert not _entry_is_regular_pack_file(stat.S_IFIFO | 0o600, "HIDDEN-FIFO")
+    if hasattr(os, "mkfifo"):
+        fifo = pack / "HIDDEN-FIFO"
+        try:
+            os.mkfifo(fifo)
+        except OSError:
+            fifo = None
+        if fifo is not None:
+            audit_message, load_message = both("regular pack file")
+            assert "HIDDEN-FIFO" not in audit_message
+            assert "HIDDEN-FIFO" not in load_message
+            fifo.unlink()
+    sock_path = pack / "HIDDEN-SOCKET"
+    if hasattr(socket, "AF_UNIX"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(str(sock_path))
+        except OSError:
+            sock.close()
+        else:
+            try:
+                audit_message, load_message = both("regular pack file")
+                assert "HIDDEN-SOCKET" not in audit_message
+                assert "HIDDEN-SOCKET" not in load_message
+            finally:
+                sock.close()
+                if sock_path.exists():
+                    sock_path.unlink()
+    assert not _entry_is_regular_pack_file(stat.S_IFCHR | 0o600, "bars_part_002.csv.gz")
+    assert not _entry_is_regular_pack_file(stat.S_IFBLK | 0o600, "manifest.json")
+    if hasattr(os, "mknod"):
+        device = pack / "HIDDEN-DEVICE"
+        try:
+            os.mknod(device, stat.S_IFCHR | 0o600, os.makedev(1, 3))
+        except OSError:
+            device = None
+        if device is not None:
+            audit_message, load_message = both("regular pack file")
+            assert "HIDDEN-DEVICE" not in audit_message
+            device.unlink()
+
+    text_forms = (
+        "2 January 2024",
+        "01/02/24",
+        "2024-W01",
+        "2024-001",
+        "1704067200",
+        "2024 - 01 - 02",
+        "2024\t01\t02",
+    )
+    for leak in text_forms:
+        _write_bars(pack, _with_cell(base, "session", leak).encode("ascii"))
+        both("builder form")
+    _write_bars(pack, _with_cell(base, "minute", "1704067200").encode("ascii"))
+    both("builder form")
+    _write_bars(pack, base.replace(",", "\t", 1).encode("ascii"))
+    both("header")
+    priced = _with_cell(base, "open", "2024.5")
+    priced = _with_cell(priced, "volume", "20240102")
+    priced = _with_cell(priced, "wap", "1704067200")
+    _write_bars(pack, priced.encode("ascii"))
+    _rewrite_pack_id(pack)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    load_pack(pack, symbol="NIK")
+    _write_bars(pack, _with_cell(base, "open", "2024.50").encode("ascii"))
+    both("builder form")
+    bars.write_bytes(original_bars)
+
+    header = base.replace(",session,", ",note,", 1)
+    _write_bars(pack, header.encode("ascii"))
+    both("header")
+    bars.write_bytes(original_bars)
+
+    escaped = original_manifest.replace("RANDOM", r"\u0032\u0030\u0032\u0034-\u0030\u0031-\u0030\u0032", 1)
+    manifest_path.write_text(escaped, encoding="utf-8")
+    both("unicode escape")
+    legal = original_manifest.replace("RANDOM", r"\u0052ANDOM", 1)
+    manifest_path.write_text(legal, encoding="utf-8")
+    both("unicode escape")
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    digest = ("20240102" + ("ab" * 28))
+    assert len(digest) == 64
+    masked = json.loads(original_manifest)
+    masked["price_basis"] = digest
+    _write_json(manifest_path, masked)
+    both("price_basis")
+    masked = json.loads(original_manifest)
+    masked["pack_id"] = digest
+    _write_json(manifest_path, masked)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    with pytest.raises(ValueError, match="pack_id") as caught:
+        load_pack(pack, symbol="NIK")
+    assert "calendar date" not in str(caught.value)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    duplicate = original_manifest.replace(
+        '"asset_name": "RANDOM"',
+        '"asset_name": "RANDOM",\n  "asset_name": "NIK"',
+        1,
+    )
+    manifest_path.write_text(duplicate, encoding="utf-8")
+    both("duplicate JSON key 'asset_name'")
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    assert _canonical_bars_name("bars_part_1000.csv.gz")
+    assert _canonical_bars_name(f"bars_part_{1000:03d}.csv.gz")
+    assert not _canonical_bars_name("bars_part_01000.csv.gz")
+    assert not _canonical_bars_name("bars_part_1.csv.gz")
+    assert not _canonical_bars_name("bars_part_000.csv.gz")
+    assert not _canonical_bars_name("BARS_PART_1000.csv.gz")
+    assert not _canonical_bars_name("bars_part_1000.CSV.gz")
+    wide = pack / "bars_part_1000.csv.gz"
+    bars.rename(wide)
+    renamed = json.loads(original_manifest)
+    renamed["chunks"][0]["file"] = "bars_part_1000.csv.gz"
+    _write_json(manifest_path, renamed)
+    _rewrite_pack_id(pack)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    loaded = load_pack(pack, symbol="NIK")
+    assert loaded.manifest["chunks"][0]["file"] == "bars_part_1000.csv.gz"
+    odd = pack / "bars_part_01000.csv.gz"
+    wide.rename(odd)
+    audit_message, load_message = both("regular pack file")
+    assert "01000" not in audit_message
+    assert "01000" not in load_message
+    odd.rename(wide)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+    wide.rename(bars)
+    _rewrite_pack_id(pack)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
