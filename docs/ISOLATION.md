@@ -248,10 +248,14 @@ The backend name is `job+appcontainer`.
 - The token is an AppContainer profile with zero capabilities, so it has no
   network capability. A socket call fails with access denied (10013).
 -   One AppContainer profile (`strategybuilderjail`) is created per machine.
-  The Win32 ACL API grants read/execute on the Python runtime and the Windows
-  directory once, traverse-only on the directories between those and the
-  volume root. The volume root itself is not edited. An allow ACE that is
-  already present is not written again. Later launches see a marker and do
+  The Win32 ACL API grants read/execute on the Python runtime once,
+  traverse-only on the directories between that tree and the volume root.
+  `C:\Windows` is traverse-only. Access denied there is skipped: All
+  Application Packages can already cross it, and writing the ACE returns
+  winerror 5. The volume root itself is not edited. An allow ACE that is
+  already present is not written again. A failed grant drops the ACEs it
+  added with the same API. `icacls` on `C:\hostedtoolcache` does not return,
+  so that cleanup does not call it. Later launches see a marker and do
   not walk that tree again. Each launch grants the private temp directory
   only. A tree walk that is still going after 180 seconds fails that grant.
   The failure is a test error. It does not abort the pytest session. There

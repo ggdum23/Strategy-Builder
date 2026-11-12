@@ -1657,9 +1657,16 @@ def _win_lease_open(lease: _WinLease) -> None:
         grants: list[tuple[Path, bool]] = []
         try:
             for root in _windows_grant_roots():
-                recurse = root != _system_root()
-                _win_grant(lease, root, "(OI)(CI)(RX)", recurse=recurse)
-                grants.append((root, recurse))
+                if _same_dir(root, _system_root()):
+                    # C:\Windows already grants traverse to All Application
+                    # Packages. Writing an inheritable ACE there is access
+                    # denied (winerror 5), and the old icacls cleanup of the
+                    # Python prefix then hangs on C:\hostedtoolcache.
+                    _win_grant_protected(lease, root)
+                    grants.append((root, False))
+                    continue
+                _win_grant(lease, root, "(OI)(CI)(RX)", recurse=True)
+                grants.append((root, True))
                 for parent in _ancestors(root):
                     if parent == root or any(parent == earlier for earlier, _flag in grants):
                         continue
@@ -1672,8 +1679,11 @@ def _win_lease_open(lease: _WinLease) -> None:
                 local_denied = True
         except Exception:
             lease.grant_paths = grants
-            for path, recurse in grants:
-                _win_remove_aces(lease, [path], recurse=recurse)
+            try:
+                for path, recurse in grants:
+                    _win_remove_aces(lease, [path], recurse=recurse)
+            except Exception:
+                pass
             raise
         lease.grant_paths = grants
         _write_grant_marker(
@@ -1690,6 +1700,15 @@ def _win_lease_open(lease: _WinLease) -> None:
         if created:
             userenv.DeleteAppContainerProfile(name)
         raise
+
+
+def _same_dir(left: Path, right: Path | None) -> bool:
+    if right is None:
+        return False
+    try:
+        return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(Path(right).resolve()))
+    except OSError:
+        return os.path.normcase(str(left)) == os.path.normcase(str(right))
 
 
 def _system_root() -> Path | None:
@@ -2076,6 +2095,110 @@ def _win_grant_tree(lease: _WinLease, root: Path, mask: int, inherit: int) -> No
             continue
 
 
+def _win_grant_protected(lease: _WinLease, path: Path) -> None:
+    """Traverse-only grant. Access denied means the OS ACL already allows it.
+
+    ``SetNamedSecurityInfo`` on ``C:\\Windows`` returns winerror 5. The
+    directory grants traverse to All Application Packages, which is the
+    AppContainer. Failing the jail here made every test report the cleanup
+    timeout instead of the strategy result.
+    """
+    try:
+        _win_grant_traverse(lease, path)
+    except SandboxError as exc:
+        if "winerror 5" not in str(exc):
+            raise
+        note_phase(f"grant-skip-protected {path.name}")
+
+
+def _win_revoke_ace(lease: _WinLease, path: Path) -> None:
+    """Drop this profile's ACEs from one file. Does not walk children."""
+    if not path.exists():
+        return
+    advapi = lease.advapi
+    kernel = lease.kernel
+
+    class Trustee(ctypes.Structure):
+        _fields_ = (
+            ("pMultipleTrustee", ctypes.c_void_p),
+            ("MultipleTrusteeOperation", ctypes.c_uint32),
+            ("TrusteeForm", ctypes.c_uint32),
+            ("TrusteeType", ctypes.c_uint32),
+            ("ptstrName", ctypes.c_void_p),
+        )
+
+    class ExplicitAccess(ctypes.Structure):
+        _fields_ = (
+            ("grfAccessPermissions", ctypes.c_uint32),
+            ("grfAccessMode", ctypes.c_uint32),
+            ("grfInheritance", ctypes.c_uint32),
+            ("Trustee", Trustee),
+        )
+
+    _win_bind_acl(lease)
+    dacl = ctypes.c_void_p()
+    security = ctypes.c_void_p()
+    status = advapi.GetNamedSecurityInfoW(
+        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+    )
+    if status != 0 or not dacl.value:
+        if security.value:
+            kernel.LocalFree(security)
+        return
+    entry = ExplicitAccess()
+    entry.grfAccessMode = 4  # REVOKE_ACCESS
+    entry.Trustee.TrusteeForm = 0
+    entry.Trustee.ptstrName = lease.sid
+    advapi.SetEntriesInAclW.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(ExplicitAccess),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    updated = ctypes.c_void_p()
+    try:
+        status = advapi.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(updated))
+        if status != 0:
+            raise SandboxError(f"could not revoke the ACL on {path} (winerror {status})")
+        status = advapi.SetNamedSecurityInfoW(str(path), 1, 4, None, None, updated, None)
+        if status != 0:
+            raise SandboxError(f"could not write the ACL on {path} (winerror {status})")
+    finally:
+        if security.value:
+            kernel.LocalFree(security)
+        if updated.value:
+            kernel.LocalFree(updated)
+
+
+def _win_revoke_tree(lease: _WinLease, root: Path) -> None:
+    """Revoke one tree. ``icacls`` on ``C:\\hostedtoolcache`` does not return."""
+    deadline = time.monotonic() + 180
+    pending = [root]
+    while pending:
+        if time.monotonic() > deadline:
+            return
+        current = pending.pop()
+        try:
+            is_dir = current.is_dir()
+        except OSError:
+            continue
+        if is_dir and current != root:
+            name = current.name
+            if name == "__pycache__" or name.endswith(".dist-info") or name.endswith(".egg-info"):
+                continue
+        try:
+            _win_revoke_ace(lease, current)
+        except SandboxError:
+            if current == root:
+                raise
+        if not is_dir:
+            continue
+        try:
+            pending.extend(current.iterdir())
+        except OSError:
+            continue
+
+
 def _win_grant(lease: _WinLease, path: Path, rights: str, *, recurse: bool) -> None:
     if not path.exists():
         return
@@ -2185,30 +2308,22 @@ def _win_sweep_orphans() -> None:
 
 
 def _win_remove_aces(lease: _WinLease, paths, *, recurse: bool) -> None:
+    """Drop ACEs this grant added. Never calls ``icacls``.
+
+    ``icacls`` without ``/T`` on ``C:\\hostedtoolcache`` still does not
+    return. A failed grant used to spend 45 seconds there and every test
+    then reported that timeout instead of the grant error.
+    """
     if lease is None or not lease.sid_text:
         return
     for path in paths:
         if not path or not Path(path).exists():
             continue
-        command = [
-            _icacls(),
-            str(path),
-            "/remove:g",
-            f"*{lease.sid_text}",
-            "/remove:d",
-            f"*{lease.sid_text}",
-            "/C",
-            "/Q",
-        ]
-        if recurse:
-            command.append("/T")
-        try:
-            _icacls_run(command)
-        except SandboxError:
-            # A path that disappeared is already gone. A real ACL failure still
-            # has to surface: the next command raises if the ACE is still there
-            # only when icacls itself fails. Keep the first failure.
-            raise
+        target = Path(path)
+        if recurse and target.is_dir():
+            _win_revoke_tree(lease, target)
+        else:
+            _win_revoke_ace(lease, target)
 
 
 def _win_reject_overlap(grants, denied) -> None:
