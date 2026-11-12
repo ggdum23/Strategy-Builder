@@ -4,8 +4,9 @@ The worker is the same book process as a pack run: spawn, argv
 ``['backtester-design']``, an empty working directory, and the environment
 allowlist. The sidecar, the date map, and the dividend file stay in the
 parent. The designer child receives cash per pack share (the file amount
-times the price factor sealed at build). The operator child receives the
-file amount times its billing scale. ``share_scale`` is passed the same way
+times the price factor authenticated by the operator MAC). The operator
+child receives the file amount times its billing scale. ``share_scale`` is
+passed the same way
 a single pack run passes it. Desk dividends are remapped here before the
 child starts.
 
@@ -744,7 +745,7 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod,
         if bool(secret["anonymized"]) != loaded.anonymized:
             raise ValueError("sidecar anonymized flag does not match the pack")
         anonymized = bool(secret["anonymized"])
-        price_factor = require_build_price_factor(loaded.manifest, secret["price_factor"])
+        price_factor = require_build_price_factor(secret)
         share_scale = float(secret["share_scale"])
         symbol = str(secret["symbol"])
         child_dividends = runner_mod._pack_dividends(

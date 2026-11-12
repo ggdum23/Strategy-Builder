@@ -113,7 +113,7 @@ These are the readings that were not fixed by a single sentence in the spec.
     real dollars per real share. The parent remaps the date through the sidecar
     date map to the pack session id (`S#####`). The operator child receives the
     amount multiplied by `share_scale`. The designer child receives the amount
-    multiplied by the price factor sealed when the pack was built, not by
+    multiplied by the price factor whose operator HMAC matches, not by
     `share_scale`. A date that is not in the pack is an error.
 
 17. **Bar order.** If this is the first live bar, reset the book flat to the

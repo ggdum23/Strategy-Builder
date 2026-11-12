@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,7 +20,6 @@ from backtester.pack import (
     build_pack,
     load_pack,
     load_sidecar,
-    price_factor_seal,
     require_build_price_factor,
 )
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
@@ -99,12 +99,10 @@ def test_chunk_defaults_and_anonymized_scrub(tmp_path):
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["asset_name"] == "RANDOM"
     assert manifest["anonymized"] is True
-    assert manifest["price_seal"] == price_factor_seal(1.7)
+    assert "price_seal" not in manifest
     assert "price_factor" not in (pack / "manifest.json").read_text(encoding="utf-8")
-    assert require_build_price_factor(manifest, 1.7) == 1.7
-    with pytest.raises(ValueError, match="sealed"):
-        require_build_price_factor(manifest, 1.8)
     secret = load_sidecar(sidecar)
+    assert require_build_price_factor(secret) == 1.7
     assert secret["symbol"] == "NIK"
     assert secret["price_factor"] == 1.7
     assert secret["volume_factor"] == 0.42
@@ -120,6 +118,128 @@ def test_chunk_defaults_and_anonymized_scrub(tmp_path):
     assert "2024-" not in text
     assert "price_factor" not in text
     assert sidecar.resolve().parent != pack.resolve()
+
+
+def _pack_views(pack: Path) -> list[bytes]:
+    views = []
+    for path in pack.rglob("*"):
+        if not path.is_file():
+            continue
+        raw = path.read_bytes()
+        views.append(raw)
+        if path.name.endswith(".gz"):
+            views.append(gzip.decompress(raw))
+    return views
+
+
+def test_pack_has_no_unkeyed_digest_of_the_price_factor(tmp_path):
+    src, registry = _series(tmp_path, 2)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    forms = {
+        "1.7",
+        "1.70",
+        "1.700",
+        "1.7000",
+        "1.70000",
+        json.dumps(1.7),
+        json.dumps("1.7"),
+        format(1.7, ".16g"),
+        format(1.7, ".17g"),
+        repr(1.7),
+        str(1.7),
+        f"{1.7:.1f}",
+        f"{1.7:.2f}",
+        f"{1.7:.3f}",
+        f"{1.7:.4f}",
+        f"{1.7:.8f}",
+        f"{1.7:.17g}",
+    }
+    side = json.loads((tmp_path / "side.json").read_text(encoding="utf-8"))
+    assert side["factor_mac"] != hashlib.sha256(b"1.7").hexdigest()
+    assert side["factor_mac"] != hashlib.md5(b"1.7").hexdigest()
+    views = _pack_views(pack)
+    assert views
+    for form in forms:
+        for algo in (hashlib.sha256, hashlib.md5):
+            digest = algo(form.encode("utf-8")).hexdigest()
+            for view in views:
+                assert digest.encode("ascii") not in view
+    for view in views:
+        text = view.decode("utf-8", errors="ignore")
+        assert "price_seal" not in text
+        assert "factor_key" not in text
+        assert "factor_mac" not in text
+
+
+def test_manifest_or_sidecar_tamper_is_refused(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    manifest_path = pack / "manifest.json"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    original_sidecar = sidecar.read_text(encoding="utf-8")
+    manifest = json.loads(original_manifest)
+    manifest["price_seal"] = hashlib.sha256(b"1.7").hexdigest()
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown"):
+        load_pack(pack)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+    manifest = json.loads(original_manifest)
+    manifest["pack_id"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="pack_id"):
+        load_pack(pack)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+    load_pack(pack)
+
+    forged = json.loads(original_sidecar)
+    forged["price_factor"] = 2.5
+    forged["share_scale"] = 2.5
+    sidecar.write_text(json.dumps(forged, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="factor_mac"):
+        load_sidecar(sidecar)
+
+    forged = json.loads(original_sidecar)
+    forged["factor_mac"] = hashlib.sha256(b"1.7").hexdigest()
+    sidecar.write_text(json.dumps(forged, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="factor_mac"):
+        load_sidecar(sidecar)
+
+    forged = json.loads(original_sidecar)
+    forged["factor_key"] = "ab" * 32
+    sidecar.write_text(json.dumps(forged, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="factor_mac"):
+        load_sidecar(sidecar)
+
+    stripped = json.loads(original_sidecar)
+    del stripped["factor_key"]
+    del stripped["factor_mac"]
+    sidecar.write_text(json.dumps(stripped, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="rebuild the pack"):
+        load_sidecar(sidecar)
+
+    named_pack = tmp_path / "named"
+    named_side = tmp_path / "named.json"
+    build_pack(
+        src, "NIK", named_pack, named_side,
+        anonymize=False, registry_path=registry, profile="arena",
+    )
+    legacy = json.loads(named_side.read_text(encoding="utf-8"))
+    del legacy["factor_key"]
+    del legacy["factor_mac"]
+    named_side.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
+    loaded = load_sidecar(named_side)
+    assert require_build_price_factor(loaded) == 1.0
 
 
 def test_a_session_is_not_split_and_a_failed_build_keeps_an_old_sidecar(tmp_path):

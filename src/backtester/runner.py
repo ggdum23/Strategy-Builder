@@ -1757,13 +1757,14 @@ def run_pack(
     The operator child is billed on real share counts (``share_scale``).
     An anonymized pack also runs a designer child: flat fee, canonical
     equity, no scale factor. Dividend cash per pack share for that child is
-    the file amount times the price factor sealed at build, never
-    ``share_scale``. The operator child still receives amounts times
-    ``share_scale``. Neither child receives the sidecar document, the date
-    map, the ticker, the volume factor, or the note.
+    the file amount times the price factor authenticated by the operator
+    MAC, never ``share_scale``. The operator child still receives amounts
+    times ``share_scale``. Neither child receives the sidecar document, the
+    date map, the ticker, the volume factor, the factor key, or the note.
 
     ``allow_scale_mismatch`` is the test override that bills a scale other
-    than the sealed price factor. The invoice then records both factors.
+    than that price factor. The invoice then records both factors. The MAC
+    is still checked.
     """
     from .pack import load_pack, load_sidecar, require_build_price_factor
 
@@ -1776,7 +1777,7 @@ def run_pack(
     if bool(secret["anonymized"]) != loaded.anonymized:
         raise ValueError("sidecar anonymized flag does not match the pack")
     anonymized = bool(secret["anonymized"])
-    price_factor = require_build_price_factor(loaded.manifest, secret["price_factor"])
+    price_factor = require_build_price_factor(secret)
     share_scale = float(secret["share_scale"])
     symbol = str(secret["symbol"])
     series_kind = str(loaded.manifest["price_basis"])
@@ -1909,7 +1910,7 @@ def walk_pack(
     if bool(secret["anonymized"]) != loaded.anonymized:
         raise ValueError("sidecar anonymized flag does not match the pack")
     anonymized = bool(secret["anonymized"])
-    price_factor = require_build_price_factor(loaded.manifest, secret["price_factor"])
+    price_factor = require_build_price_factor(secret)
     share_scale = float(secret["share_scale"])
     symbol = str(secret["symbol"])
     series_kind = str(loaded.manifest["price_basis"])

@@ -438,8 +438,9 @@ def test_sidecar_ticker_does_not_change_designer_bytes(tmp_path):
 def test_edited_price_factor_is_rejected(tmp_path):
     src, registry = _write_series(tmp_path, days=1)
     pack, sidecar = _build(tmp_path, src, registry, symbol="NIK", price_factor=1.7)
-    _rewrite(sidecar, allow_scale_mismatch=True, price_factor=3.3, share_scale=3.3)
-    with pytest.raises(ValueError, match="sealed"):
+    with pytest.raises(ValueError, match="factor_mac"):
+        _rewrite(sidecar, allow_scale_mismatch=True, price_factor=3.3, share_scale=3.3)
+    with pytest.raises(ValueError, match="factor_mac"):
         run_pack(BuyThenSell, pack, sidecar, "desk", tmp_path / "out", with_benchmarks=False)
 
 
