@@ -1511,3 +1511,74 @@ def test_ntfs_alternate_stream_is_refused(tmp_path):
     with pytest.raises(ValueError, match="alternate data stream"):
         copy_anonymized_pack(pack, tmp_path / "copied")
     assert not (tmp_path / "copied").exists()
+
+
+class _CountSignal:
+    """Long only when the trade count clears 1.2. Both profiles use this class."""
+
+    def __init__(self):
+        self.counts = []
+
+    def on_bar(self, bar, _account):
+        count = float(bar["count"])
+        self.counts.append(count)
+        if count >= 1.2:
+            return 1.0
+        return 0.0
+
+
+def _count_cells(pack: Path) -> list[str]:
+    cells = []
+    for path in sorted(pack.glob("bars_part_*.csv.gz")):
+        text = gzip.decompress(path.read_bytes()).decode("ascii")
+        cells.extend(row["count"] for row in csv.DictReader(io.StringIO(text)))
+    return cells
+
+
+def test_fractional_count_signal_matches_on_arena_and_desk(tmp_path):
+    src, registry = _series(tmp_path, 4)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42, chunk_sessions=2,
+    )
+    assert _count_cells(pack) == ["1.26"] * 8
+    seen = {}
+    fills = {}
+    designer_fills = {}
+    for profile in ("arena", "desk"):
+        out = tmp_path / profile
+        payload = run_pack(
+            _CountSignal, pack, sidecar, profile, out, with_benchmarks=False,
+        )
+        seen[profile] = list(payload["strategy_observer"].counts)
+        fills[profile] = payload["n_fills"]
+        designer = json.loads((out / "designer" / "metrics.json").read_text(encoding="utf-8"))
+        designer_fills[profile] = designer["n_fills"]
+    assert seen["arena"] == pytest.approx([1.26] * 8)
+    assert seen["desk"] == seen["arena"]
+    assert fills == {"arena": 1, "desk": 1}
+    assert designer_fills == {"arena": 1, "desk": 1}
+
+    named = tmp_path / "named"
+    named_side = tmp_path / "named.json"
+    build_pack(
+        src, "NIK", named, named_side,
+        anonymize=False, registry_path=registry, profile="arena",
+        chunk_sessions=2,
+    )
+    assert _count_cells(named) == ["3"] * 8
+    named_seen = {}
+    named_fills = {}
+    for profile in ("arena", "desk"):
+        payload = run_pack(
+            _CountSignal, named, named_side, profile, tmp_path / f"named-{profile}",
+            with_benchmarks=False,
+        )
+        named_seen[profile] = list(payload["strategy_observer"].counts)
+        named_fills[profile] = payload["n_fills"]
+    assert named_seen["arena"] == [3.0] * 8
+    assert named_seen["desk"] == named_seen["arena"]
+    assert named_fills == {"arena": 1, "desk": 1}

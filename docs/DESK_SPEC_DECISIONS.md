@@ -18,8 +18,10 @@ These are the readings that were not fixed by a single sentence in the spec.
 
 2. **Bar keys.** The strategy sees exactly `session`, `time`, `phase`, `open`,
    `high`, `low`, `close`, `volume`, `wap`, `count`, `filled`, `new_session`.
-   `minute` stays internal. `new_session` is recomputed from the session id, so a
-   flag on the input cannot move a financing or dividend charge. Named local
+   `minute` stays internal. `count` is the trade count as a real number. A
+   fractional scaled count is not truncated. `new_session` is recomputed from
+   the session id, so a flag on the input cannot move a financing or dividend
+   charge. Named local
    data uses the calendar date (`YYYY-MM-DD`) as the session id. A caller may
    pass `S00001` instead. Arena's integer `day` is not shown to a Desk strategy.
 

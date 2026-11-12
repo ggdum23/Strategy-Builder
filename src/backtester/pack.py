@@ -15,8 +15,9 @@ refused, named or anonymized. Verification accepts only this version.
 Session ids use ASCII digits. An anonymized pack is a schema: regular
 files with the builder's names, a typed manifest, and a typed CSV cell
 for every column. There is no free-text column and no format scan of
-prices. Trade count is rescaled by the same volume factor as volume,
-and the daily count is the sum of those bar counts.
+prices. Trade count is rescaled by the same volume factor as volume.
+When the day has a regular session the daily count is the sum of those
+scaled regular-session bars; otherwise it is the sum of every scaled bar.
 """
 
 from __future__ import annotations
