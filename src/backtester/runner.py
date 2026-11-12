@@ -151,6 +151,39 @@ def _pack_dividends(dividends, *, anonymized: bool, share_scale: float, date_map
     return scaled
 
 
+def _designer_dividends(dividends, date_map, price_factor: float):
+    """Cash per pack share is the file amount times the build-time price factor.
+
+    The child receives the restated map. This is not ``share_scale``.
+    """
+    from .designer_run import session_dividends
+
+    if not dividends:
+        return session_dividends(dividends, date_map)
+    restated = {str(key): float(amount) * float(price_factor) for key, amount in dividends.items()}
+    return session_dividends(restated, date_map)
+
+
+def _record_scale_override(books, *, price_factor: float, share_scale: float) -> None:
+    """Name both factors when the billing scale is not the build-time price factor.
+
+    Equal factors keep the invoice label the operator files already use.
+    """
+    if float(price_factor) == float(share_scale):
+        return
+    note = (
+        f"share_scale={share_scale} differs from the build-time price factor {price_factor}. "
+        "Per-share fees are not real share counts."
+    )
+    for _result, metrics in books.values():
+        basis = metrics.get("cost_basis")
+        if not isinstance(basis, dict):
+            continue
+        basis["price_factor"] = float(price_factor)
+        basis["per_share_fees"] = "billing_override"
+        basis["note"] = note
+
+
 def _summary(profile: str, metrics: dict) -> dict:
     keys = _DESK_KEYS if profile == "desk" else _ARENA_KEYS
     return {key: metrics.get(key) for key in keys}
@@ -842,15 +875,21 @@ def _books_worker(queue, job):
         strategy_cls = _load_strategy(job["strategy"])
         frame = job["frame"]
         profile = job["profile"]
+        audience = job.get("audience") or "operator"
         kwargs = job["kwargs"]
         job.clear()
-        books = run_books(
-            strategy_cls,
-            frame,
-            profile,
-            share_factor=kwargs.pop("share_factor"),
-            **kwargs,
-        )
+        if audience == "designer":
+            from .designer_run import run_books as designer_books
+
+            books = designer_books(strategy_cls, frame, profile, **kwargs)
+        else:
+            books = run_books(
+                strategy_cls,
+                frame,
+                profile,
+                share_factor=kwargs.pop("share_factor"),
+                **kwargs,
+            )
         _note_child(books, inherited_argv, inherited_cwd)
         queue.put(("ok", _picklable_books(books)))
     except BaseException:
@@ -1154,6 +1193,7 @@ def _isolated_books(
         raise ValueError("strategy is missing")
     else:
         spec = _strategy_spec(strategy_cls)
+    audience = kwargs.pop("audience", "operator")
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     gate = {"started": ctx.Event(), "release": ctx.Event()}
@@ -1161,6 +1201,7 @@ def _isolated_books(
         "strategy": spec,
         "frame": _standalone_frame(frame),
         "profile": profile,
+        "audience": audience,
         "kwargs": _plain_kwargs(kwargs),
         "gate": gate,
     }
@@ -1203,6 +1244,10 @@ def _isolated_books(
             raise failure
         if proc.exitcode not in (0, None):
             raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n")
+        if audience == "designer":
+            from .designer_run import accept_books
+
+            return accept_books(profile, _standalone_frame(frame), message[1], kwargs)
         return _accept_child_books(profile, _standalone_frame(frame), message[1], kwargs)
     finally:
         # Success, a strategy exception, and a parent-side failure all come
@@ -1282,12 +1327,16 @@ def write_books(
     *,
     extra: dict | None = None,
     anonymized: bool = False,
+    designer_books=None,
 ) -> dict:
     """Write the strategy curves at the top of ``out_dir`` and benchmarks underneath.
 
     An anonymized run also writes ``designer/``. That tree is the copy a
     strategy designer may see. It has no ticker, no calendar date, and no
-    scale factor. The files next to it are the operator copy and may have those.
+    scale factor. When ``designer_books`` is given, that tree is those books
+    (flat fee, canonical equity). The files next to it are the operator copy
+    and may have the real ticker and the real fees. Those operator files are
+    written from ``books`` either way.
     """
     if anonymized:
         from .report import require_anonymizable_symbol
@@ -1312,7 +1361,26 @@ def write_books(
         payload["run"] = extra
     write_json(out / "metrics.json", payload)
     if anonymized:
-        publish_designer(out, profile, frame, books, payload, symbol=symbol)
+        published = designer_books if designer_books is not None else books
+        designer_payload = payload
+        if designer_books is not None:
+            designer_metrics = designer_books["strategy"][1]
+            designer_payload = dict(designer_metrics)
+            designer_payload["profile"] = profile
+            designer_payload["symbol"] = symbol
+            designer_payload["bar_minutes"] = bar_minutes
+            designer_benchmarks = {}
+            for label, (_result, metrics) in designer_books.items():
+                if label == "strategy":
+                    continue
+                designer_benchmarks[label] = _summary(profile, metrics)
+            designer_payload["benchmarks"] = designer_benchmarks
+            if extra:
+                designer_payload["run"] = extra
+            from .report import write_cost_comparison
+
+            write_cost_comparison(out / "cost_comparison.json", profile, books, designer_books)
+        publish_designer(out, profile, frame, published, designer_payload, symbol=symbol)
     return payload
 
 
@@ -1472,6 +1540,7 @@ def walk_forward(
     design_fraction: float | None = None,
     warmup_days: int = 0,
     share_factor: float = 1.0,
+    allow_scale: bool = False,
     borrow_rate_annual: float | None = None,
     financing_rate_annual: float | None = None,
     fee_mult: float = 1.0,
@@ -1484,6 +1553,7 @@ def walk_forward(
     series_kind: str = "raw",
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
+    anonymized: bool = False,
 ):
     """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
 
@@ -1508,9 +1578,10 @@ def walk_forward(
 
     The books written here are operator books. They keep the original ticker.
     There is no designer tree, so a symbol that is reserved for anonymized
-    reports is allowed.
+    reports is allowed. ``anonymized`` stamps those operator books. Named
+    walks leave it false.
     """
-    if share_factor != 1.0:
+    if share_factor != 1.0 and not allow_scale:
         raise ValueError(
             f"share_factor {share_factor} is not 1.0. Raw runs use 1.0. "
             "0.9 is not a kit constant."
@@ -1563,6 +1634,7 @@ def walk_forward(
         series_kind=series_kind,
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
+        anonymized=anonymized,
     )
     notes = [str(note) for note in (inspection_notes or ())]
     previous_dumpable = _set_dumpable(False)
@@ -1678,25 +1750,34 @@ def run_pack(
     price_basis: str = "raw",
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
+    allow_scale_mismatch: bool = False,
 ):
     """Run a pack. The sidecar stays in this process.
 
-    An anonymized pack's share_scale is the price factor k. The child engine
-    receives that number so per-share fees use real share counts. It does not
-    receive the sidecar document, the date map, the ticker, the volume factor,
-    or the operator note. Dividend amounts are scaled and re-keyed here first.
+    The operator child is billed on real share counts (``share_scale``).
+    An anonymized pack also runs a designer child: flat fee, canonical
+    equity, no scale factor. Dividend cash per pack share for that child is
+    the file amount times the price factor authenticated by the operator
+    MAC, never ``share_scale``. The operator child still receives amounts
+    times ``share_scale``. Neither child receives the sidecar document, the
+    date map, the ticker, the volume factor, the factor key, or the note.
+
+    ``allow_scale_mismatch`` is the test override that bills a scale other
+    than that price factor. The invoice then records both factors. The MAC
+    is still checked.
     """
-    from .pack import load_pack, load_sidecar
+    from .pack import load_pack, load_sidecar, require_build_price_factor
 
     if _report_inside_pack(pack_dir, out_dir):
         raise ValueError("the report must not live inside the pack directory")
     loaded = load_pack(pack_dir)
-    secret = load_sidecar(sidecar_path)
+    secret = load_sidecar(sidecar_path, allow_scale_mismatch=allow_scale_mismatch)
     if secret["pack_id"] != loaded.pack_id:
         raise ValueError("sidecar does not match this pack")
     if bool(secret["anonymized"]) != loaded.anonymized:
         raise ValueError("sidecar anonymized flag does not match the pack")
     anonymized = bool(secret["anonymized"])
+    price_factor = require_build_price_factor(secret)
     share_scale = float(secret["share_scale"])
     symbol = str(secret["symbol"])
     series_kind = str(loaded.manifest["price_basis"])
@@ -1709,11 +1790,13 @@ def run_pack(
         from .report import require_anonymizable_symbol
 
         require_anonymizable_symbol(symbol)
+    date_map = secret["date_map"]
+    designer_dividends = _designer_dividends(dividends, date_map, price_factor) if anonymized else None
     child_dividends = _pack_dividends(
         dividends,
         anonymized=anonymized,
         share_scale=share_scale,
-        date_map=secret["date_map"],
+        date_map=date_map,
     )
     if borrow_rate_annual is None and secret["borrow_rate_source"] == "explicit":
         borrow_rate_annual = float(secret["borrow_rate_annual"])
@@ -1721,6 +1804,28 @@ def run_pack(
     # copied into the child job. Drop the document before the spawn.
     del secret
     gc.collect()
+    designer_books = None
+    if anonymized:
+        from .designer_run import spawn_kwargs
+
+        designer_books = _isolated_books(
+            strategy_cls,
+            loaded.frame,
+            profile,
+            audience="designer",
+            **spawn_kwargs(
+                borrow_rate_annual=borrow_rate_annual,
+                financing_rate_annual=financing_rate_annual,
+                fee_mult=fee_mult,
+                dividends=designer_dividends,
+                warmup_sessions=warmup_sessions,
+                with_benchmarks=with_benchmarks,
+                price_basis=basis,
+                series_kind=series_kind,
+                cash_rate_annual=cash_rate_annual,
+                withholding_rate=withholding_rate,
+            ),
+        )
     books = _isolated_books(
         strategy_cls,
         loaded.frame,
@@ -1740,6 +1845,7 @@ def run_pack(
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
     )
+    _record_scale_override(books, price_factor=price_factor, share_scale=share_scale)
     payload = write_books(
         out_dir,
         get_profile(profile).name,
@@ -1748,6 +1854,7 @@ def run_pack(
         loaded.frame,
         books,
         anonymized=anonymized,
+        designer_books=designer_books,
         extra={
             "warnings": [],
             "pack_id": loaded.pack_id,
@@ -1759,6 +1866,184 @@ def run_pack(
     if observer is not None:
         payload["strategy_observer"] = observer
     return payload
+
+
+def walk_pack(
+    strategy_cls,
+    pack_dir,
+    sidecar_path,
+    profile: str,
+    out_dir,
+    *,
+    design_end_day: int | None = None,
+    design_end_date: str | None = None,
+    design_fraction: float | None = None,
+    warmup_days: int = 0,
+    borrow_rate_annual: float | None = None,
+    financing_rate_annual: float | None = None,
+    fee_mult: float = 1.0,
+    dividends: dict | None = None,
+    initial_equity: float = 1_000_000.0,
+    with_benchmarks: bool = True,
+    price_basis: str = "raw",
+    cash_rate_annual: float | None = None,
+    withholding_rate: float | None = None,
+):
+    """Walk-forward a pack.
+
+    Operator design and locked books use the real fee schedule and
+    ``share_scale``. An anonymized pack publishes the design window under
+    ``designer/`` on the flat fee and the canonical equity. The locked
+    window stays an operator book. ``cost_comparison.json`` shows both
+    windows on both cost models.
+    """
+    from .designer_run import spawn_kwargs
+    from .pack import load_pack, load_sidecar, require_build_price_factor
+    from .report import publish_designer, write_cost_comparison
+
+    if _report_inside_pack(pack_dir, out_dir):
+        raise ValueError("the report must not live inside the pack directory")
+    loaded = load_pack(pack_dir)
+    secret = load_sidecar(sidecar_path)
+    if secret["pack_id"] != loaded.pack_id:
+        raise ValueError("sidecar does not match this pack")
+    if bool(secret["anonymized"]) != loaded.anonymized:
+        raise ValueError("sidecar anonymized flag does not match the pack")
+    anonymized = bool(secret["anonymized"])
+    price_factor = require_build_price_factor(secret)
+    share_scale = float(secret["share_scale"])
+    symbol = str(secret["symbol"])
+    series_kind = str(loaded.manifest["price_basis"])
+    basis = normalize_price_basis(price_basis)
+    if series_kind == "total_return" and basis != "total_return":
+        raise ValueError(
+            f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
+        )
+    if anonymized:
+        from .report import require_anonymizable_symbol
+
+        require_anonymizable_symbol(symbol)
+    date_map = secret["date_map"]
+    designer_dividends = _designer_dividends(dividends, date_map, price_factor) if anonymized else None
+    child_dividends = _pack_dividends(
+        dividends,
+        anonymized=anonymized,
+        share_scale=share_scale,
+        date_map=date_map,
+    )
+    if borrow_rate_annual is None and secret["borrow_rate_source"] == "explicit":
+        borrow_rate_annual = float(secret["borrow_rate_annual"])
+    del secret
+    gc.collect()
+    summary, rebuilt, design_books, locked_books = walk_forward(
+        strategy_cls,
+        loaded.frame,
+        profile,
+        out_dir,
+        symbol=symbol,
+        bar_minutes=loaded.bar_minutes,
+        design_end_day=design_end_day,
+        design_end_date=design_end_date,
+        design_fraction=design_fraction,
+        warmup_days=warmup_days,
+        share_factor=share_scale,
+        allow_scale=True,
+        borrow_rate_annual=borrow_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        fee_mult=fee_mult,
+        dividends=child_dividends,
+        initial_equity=initial_equity,
+        with_benchmarks=with_benchmarks,
+        price_basis=basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        withholding_rate=withholding_rate,
+        anonymized=anonymized,
+    )
+    if not anonymized:
+        return summary
+    name = get_profile(profile).name
+    accounting = _bound_accounting(
+        name,
+        price_basis=basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        withholding_rate=withholding_rate,
+        dividends=designer_dividends,
+    )
+    design_kwargs = spawn_kwargs(
+        borrow_rate_annual=borrow_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        fee_mult=fee_mult,
+        dividends=_dividends_for_frame(rebuilt.design, designer_dividends),
+        with_benchmarks=with_benchmarks,
+        price_basis=basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        withholding_rate=withholding_rate,
+        accounting=accounting,
+        max_day=int(rebuilt.design["day"].max()),
+    )
+    design_designer = _isolated_books(
+        strategy_cls,
+        rebuilt.design,
+        profile,
+        audience="designer",
+        **design_kwargs,
+    )
+    designer_metrics = design_designer["strategy"][1]
+    designer_payload = dict(designer_metrics)
+    designer_payload["profile"] = name
+    designer_payload["symbol"] = symbol
+    designer_payload["bar_minutes"] = loaded.bar_minutes
+    designer_payload["benchmarks"] = {
+        label: _summary(name, metrics)
+        for label, (_result, metrics) in design_designer.items()
+        if label != "strategy"
+    }
+    designer_payload["run"] = {
+        "warnings": [],
+        "pack_id": loaded.pack_id,
+        "anonymized": True,
+        "window": "design",
+    }
+    publish_designer(out_dir, name, rebuilt.design, design_designer, designer_payload, symbol=symbol)
+    locked_kwargs = spawn_kwargs(
+        borrow_rate_annual=borrow_rate_annual,
+        financing_rate_annual=financing_rate_annual,
+        fee_mult=fee_mult,
+        dividends=_dividends_for_frame(rebuilt.locked_with_warmup, designer_dividends),
+        with_benchmarks=with_benchmarks,
+        price_basis=basis,
+        series_kind=series_kind,
+        cash_rate_annual=cash_rate_annual,
+        withholding_rate=withholding_rate,
+        accounting=accounting,
+        max_day=int(rebuilt.locked["day"].max()),
+    )
+    if name == "arena":
+        locked_kwargs["reset_day"] = summary["locked_start_day"] if summary["warmup_sessions"] else None
+    elif name == "desk":
+        locked_kwargs["warmup_sessions"] = summary["warmup_sessions"]
+    locked_designer = _isolated_books(
+        strategy_cls,
+        rebuilt.locked_with_warmup,
+        profile,
+        audience="designer",
+        **locked_kwargs,
+    )
+    write_cost_comparison(
+        Path(out_dir) / "cost_comparison.json",
+        name,
+        design_books,
+        design_designer,
+        windows={
+            "design": (design_books, design_designer),
+            "locked": (locked_books, locked_designer),
+        },
+    )
+    return summary
 
 
 def run_parallel(*args, **kwargs):
