@@ -963,7 +963,13 @@ def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_sec
     pipe = _Pipe(box)
     pipe.set_memory_cap(memory_cap)
     try:
-        ready = pipe.hello(min(60.0, float(call_timeout)))
+        # AppContainer startup is not the strategy clock. On Windows the
+        # ready line is allowed WINDOWS_JAIL_STARTUP_S; each bar still uses
+        # call_timeout. Linux keeps the shorter of 60s and the call timeout.
+        from .sandbox import WINDOWS_JAIL_STARTUP_S
+
+        startup = float(WINDOWS_JAIL_STARTUP_S) if os.name == "nt" else min(60.0, float(call_timeout))
+        ready = pipe.hello(startup)
         remote = _Remote(pipe, profile, box, call_timeout=float(call_timeout))
         remote.arm(ready)
         yield remote

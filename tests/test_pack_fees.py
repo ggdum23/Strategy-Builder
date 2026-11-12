@@ -19,6 +19,7 @@ from backtester.data import load_named
 from backtester.pack import assert_anonymized_pack_clean, build_pack, load_pack
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 from backtester.runner import execute, run_named, run_pack
+from windows_open import windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 QQQ = ROOT / "assets" / "sample" / "QQQ" / "filled"
@@ -380,6 +381,7 @@ def test_an_unknown_dividend_date_is_an_error(tmp_path):
         )
 
 
+@windows_jails(4)
 def test_child_runner_frames_do_not_keep_the_scale(tmp_path):
     from backtester.strategy_loader import load_strategy_class
 
@@ -488,6 +490,7 @@ def _tiny_series(tmp_path):
     return path.parent, registry
 
 
+@windows_jails(4)
 def test_explicit_borrow_overrides_the_run_profile(tmp_path):
     src, _registry = _tiny_series(tmp_path)
     loaded = load_named(src, "NIK")

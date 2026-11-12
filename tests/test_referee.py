@@ -590,6 +590,45 @@ def _probe_bubblewrap_and_landlock(path, monkeypatch, **kwargs) -> None:
     assert probe(path, **settings) == 0.0
 
 
+def test_x32_syscall_numbers_are_killed(tmp_path):
+    """Bit 0x40000000 is the x32 ABI. It must not fall through to ALLOW."""
+    if sys.platform != "linux":
+        pytest.skip("the x32 bit is a Linux seccomp number")
+    import os
+
+    if os.uname().machine.lower() not in {"x86_64", "amd64"}:
+        pytest.skip("x32 numbers are an x86_64 seccomp concern")
+    code = (
+        "import ctypes, os, sys\n"
+        "from backtester.sandbox import _filter_bytes, _install_filter\n"
+        "_install_filter(_filter_bytes(deny=(), allow_threads=True))\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "libc.syscall.restype = ctypes.c_long\n"
+        "if libc.syscall(39) <= 0:\n"
+        "    sys.stderr.write('getpid failed\\n')\n"
+        "    os._exit(2)\n"
+        "sys.stdout.write('alive\\n')\n"
+        "sys.stdout.flush()\n"
+        "libc.syscall(0x40000000)\n"
+        "os._exit(0)\n"
+    )
+    env = os.environ.copy()
+    src = str(ROOT / "src")
+    env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.stdout == "alive\n", (completed.returncode, completed.stdout, completed.stderr)
+    assert completed.returncode != 0
+    assert "getpid failed" not in completed.stderr
+
+
 def test_io_uring_setup_is_denied_on_both_backends(monkeypatch):
     if sys.platform != "linux":
         pytest.skip("io_uring is the Linux seccomp gap")

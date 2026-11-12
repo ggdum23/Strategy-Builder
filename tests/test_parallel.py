@@ -18,7 +18,7 @@ import pandas as pd
 import pytest
 from pathlib import PureWindowsPath
 
-from windows_open import OWNER_PC, windows_jails
+from windows_open import OWNER_PC, runner_timeout, windows_jails, windows_limit
 
 from backtester.parallel import (
     CancelToken,
@@ -191,6 +191,7 @@ def test_bad_batch_settings_do_not_spawn(tmp_path, monkeypatch):
         )
 
 
+@windows_jails(4)
 def test_workers_do_not_change_the_leaderboard_or_the_metrics(tmp_path):
     strategies = [
         _strategy(tmp_path / "s", "flat", FLAT),
@@ -205,7 +206,7 @@ def test_workers_do_not_change_the_leaderboard_or_the_metrics(tmp_path):
             tmp_path / name,
             profile="arena",
             workers=workers,
-            timeout_s=60,
+            timeout_s=runner_timeout(2, 60),
         )
 
     serial = once(1, "serial")
@@ -236,6 +237,7 @@ def test_workers_do_not_change_the_leaderboard_or_the_metrics(tmp_path):
         assert written[key] == live[key]
 
 
+@windows_jails(1)
 def test_desk_financing_matches_the_in_process_book(tmp_path):
     from backtester.runner import execute
     from backtester.strategy_loader import load_strategy_class
@@ -247,7 +249,7 @@ def test_desk_financing_matches_the_in_process_book(tmp_path):
         tmp_path / "out",
         profile="desk",
         workers=1,
-        timeout_s=60,
+        timeout_s=runner_timeout(1, 60),
     )
     assert result.failures == 0
     _engine_result, metrics = execute(load_strategy_class(strategy.path)(), _frame(), "desk")
@@ -258,6 +260,7 @@ def test_desk_financing_matches_the_in_process_book(tmp_path):
     assert "buy_and_hold_1x" in written["benchmarks"]
 
 
+@windows_jails(5)
 def test_a_crash_a_hang_signal_and_bad_syntax_stay_inside_one_row(tmp_path):
     good = _strategy(tmp_path / "s", "good", FLAT)
     _strategy(tmp_path / "s", "boom", "class Strategy:\n    def on_bar(self, bar, state):\n        raise RuntimeError('boom-isolated')\n")
@@ -275,7 +278,7 @@ def test_a_crash_a_hang_signal_and_bad_syntax_stay_inside_one_row(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=2,
-        timeout_s=30,
+        timeout_s=runner_timeout(5, 30),
         with_benchmarks=False,
     )
     by_id = {item.strategy_id: item for item in result.results}
@@ -315,7 +318,7 @@ def test_a_hang_times_out_without_stopping_the_other_strategy(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=2,
-        timeout_s=6,
+        timeout_s=runner_timeout(2, 6, deadline=True),
         with_benchmarks=False,
     )
     elapsed = time.monotonic() - started
@@ -326,6 +329,7 @@ def test_a_hang_times_out_without_stopping_the_other_strategy(tmp_path):
     assert elapsed < 45
 
 
+@windows_jails(2)
 def test_a_memory_hog_is_one_row(tmp_path):
     from backtester.limits import current_rss
 
@@ -352,7 +356,7 @@ def test_a_memory_hog_is_one_row(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=2,
-        timeout_s=45,
+        timeout_s=runner_timeout(2, 45),
         memory_bytes=cap,
         with_benchmarks=False,
     )
@@ -363,6 +367,7 @@ def test_a_memory_hog_is_one_row(tmp_path):
     assert by_id["good"].status == "ok", detail
 
 
+@windows_jails(2)
 def test_cancel_stops_the_batch(tmp_path):
     source = "import time\nclass Strategy:\n    def on_bar(self, bar, state):\n        time.sleep(60)\n        return None\n"
     _strategy(tmp_path / "s", "one", source)
@@ -380,12 +385,12 @@ def test_cancel_stops_the_batch(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(2, 60),
         with_benchmarks=False,
         on_progress=on_progress,
         cancel=token,
     )
-    assert time.monotonic() - started < 45
+    assert time.monotonic() - started < windows_limit(45, 2)
     assert result.cancelled is True
     assert result.failures == len(result.results)
     assert all(item.status != "ok" for item in result.results)
@@ -437,6 +442,7 @@ def _named_series(directory: Path, symbol: str) -> Path:
     return directory
 
 
+@windows_jails(4)
 def test_anonymized_pack_keeps_the_sidecar_in_the_parent(tmp_path, monkeypatch):
     from backtester.data import load_named
     from backtester.pack import build_pack
@@ -526,7 +532,7 @@ def test_anonymized_pack_keeps_the_sidecar_in_the_parent(tmp_path, monkeypatch):
             tmp_path / "out",
             profile="desk",
             workers=2,
-            timeout_s=60,
+            timeout_s=runner_timeout(4, 60),
             dividends={"2024-01-02": 2.0},
         )
     finally:
@@ -745,6 +751,7 @@ def _assert_grandchild_gone(marker: Path, label: str) -> None:
         _reap(worker)
 
 
+@windows_jails(4)
 def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
     """A long-lived child of the strategy dies on timeout, cancel, and the RSS kill.
 
@@ -763,7 +770,7 @@ def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
             tmp_path / "timeout-out",
             profile="arena",
             workers=1,
-            timeout_s=3,
+            timeout_s=runner_timeout(1, 3, deadline=True),
             with_benchmarks=False,
         )
         assert time.monotonic() - started < 20
@@ -790,7 +797,7 @@ def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
             tmp_path / "cancel-out",
             profile="arena",
             workers=1,
-            timeout_s=25,
+            timeout_s=runner_timeout(1, 25, deadline=True),
             with_benchmarks=False,
             cancel=token,
         )
@@ -824,7 +831,7 @@ def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
             tmp_path / "memory-out",
             profile="arena",
             workers=2,
-            timeout_s=40,
+            timeout_s=runner_timeout(2, 40),
             memory_bytes=cap,
             with_benchmarks=False,
         )
@@ -838,6 +845,7 @@ def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
         _assert_grandchild_gone(memory_marker, "memory")
 
 
+@windows_jails(1)
 def test_strategy_cannot_read_operator_metrics_through_original_dir_or_sys_path(tmp_path):
     import multiprocessing.process as mp_process
 
@@ -894,7 +902,7 @@ def test_strategy_cannot_read_operator_metrics_through_original_dir_or_sys_path(
             tmp_path / "out",
             profile="arena",
             workers=1,
-            timeout_s=30,
+            timeout_s=runner_timeout(1, 30),
             with_benchmarks=False,
         )
     finally:
@@ -910,6 +918,7 @@ def test_strategy_cannot_read_operator_metrics_through_original_dir_or_sys_path(
     assert seen["orig"] is None or Path(seen["orig"]).resolve() != operator.resolve()
 
 
+@windows_jails(1)
 def test_a_large_print_is_not_a_timeout(tmp_path, monkeypatch):
     source = (
         "import time\n"
@@ -946,10 +955,10 @@ def test_a_large_print_is_not_a_timeout(tmp_path, monkeypatch):
         tmp_path / "out",
         profile="arena",
         workers=1,
-        timeout_s=20,
+        timeout_s=runner_timeout(1, 20),
         with_benchmarks=False,
     )
-    assert time.monotonic() - started < 20
+    assert time.monotonic() - started < windows_limit(20, 1)
     assert result.results[0].status == "ok", (result.results[0].status, result.results[0].error)
     assert 0 < captured["size"] < 1_000_000
 
@@ -1052,6 +1061,7 @@ def _pack_for_ticker_two(tmp_path: Path, name: str, price_factor: float):
     return pack, sidecar, built
 
 
+@windows_jails(2)
 def test_designer_error_hides_the_operator_traceback(tmp_path):
     pack, sidecar, _built = _anon_pack(tmp_path, "NIK")
     source = (
@@ -1066,7 +1076,7 @@ def test_designer_error_hides_the_operator_traceback(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=1,
-        timeout_s=30,
+        timeout_s=runner_timeout(2, 30),
         with_benchmarks=False,
     )
     assert result.results[0].status == "error"
@@ -1091,6 +1101,7 @@ def test_designer_error_hides_the_operator_traceback(tmp_path):
     assert "boom-isolated" not in blob
 
 
+@windows_jails(2)
 def test_ticker_scrub_ignores_case(tmp_path):
     pack, sidecar, _built = _anon_pack(tmp_path, "ZZZX")
     result = run_parallel(
@@ -1099,7 +1110,7 @@ def test_ticker_scrub_ignores_case(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=1,
-        timeout_s=30,
+        timeout_s=runner_timeout(2, 30),
         with_benchmarks=False,
     )
     assert result.failures == 0, [(item.status, item.error) for item in result.results]
@@ -1121,6 +1132,7 @@ def test_ticker_scrub_ignores_case(tmp_path):
     assert "ZZZX" in operator[0].read_text(encoding="utf-8")
 
 
+@windows_jails(1)
 def test_parent_rejects_metrics_the_child_rewrote(tmp_path):
     source = (
         "import backtester.engine_arena as arena\n"
@@ -1140,7 +1152,7 @@ def test_parent_rejects_metrics_the_child_rewrote(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=1,
-        timeout_s=30,
+        timeout_s=runner_timeout(1, 30),
     )
     assert result.results[0].total_return != 123.0
     for path in (tmp_path / "out").rglob("metrics.json"):
@@ -1149,6 +1161,7 @@ def test_parent_rejects_metrics_the_child_rewrote(tmp_path):
             assert payload["total_return"] != 123.0
 
 
+@windows_jails(1)
 def test_parent_rejects_a_benchmark_run_at_a_patched_financing_rate(tmp_path):
     source = (
         "import backtester.engine_desk as desk\n"
@@ -1163,7 +1176,7 @@ def test_parent_rejects_a_benchmark_run_at_a_patched_financing_rate(tmp_path):
         tmp_path / "out",
         profile="desk",
         workers=1,
-        timeout_s=30,
+        timeout_s=runner_timeout(1, 30),
     )
     from backtester.engine_desk import D
 
@@ -1198,7 +1211,7 @@ def test_cancel_after_the_gate_stops_the_worker(tmp_path):
             tmp_path / "out",
             profile="arena",
             workers=1,
-            timeout_s=25,
+            timeout_s=runner_timeout(1, 25, deadline=True),
             with_benchmarks=False,
             cancel=token,
         )
@@ -1209,6 +1222,7 @@ def test_cancel_after_the_gate_stops_the_worker(tmp_path):
     assert "cancelled" in (result.results[0].error or "")
 
 
+@windows_jails(2)
 def test_rss_poll_kills_without_a_memory_error(tmp_path):
     probe = subprocess.run(
         [
@@ -1246,7 +1260,7 @@ def test_rss_poll_kills_without_a_memory_error(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=2,
-        timeout_s=30,
+        timeout_s=runner_timeout(2, 30),
         memory_bytes=cap,
         with_benchmarks=False,
     )
@@ -1309,6 +1323,7 @@ def _run_orphan(tmp_path: Path, name: str, *, ignore_term: bool, action: str, ti
         _assert_grandchild_gone(marker, name)
 
 
+@windows_jails(5)
 def test_grandchildren_are_reaped_after_return_error_timeout_and_cancel(tmp_path):
     """A process the strategy starts dies on every exit, including a clean return.
 
@@ -1317,32 +1332,32 @@ def test_grandchildren_are_reaped_after_return_error_timeout_and_cancel(tmp_path
     proves the success and error paths signal the group at all.
     """
     returned, elapsed = _run_orphan(
-        tmp_path, "sleep-ok", ignore_term=False, action="return", timeout_s=30, cancel=False
+        tmp_path, "sleep-ok", ignore_term=False, action="return", timeout_s=runner_timeout(1, 30), cancel=False
     )
-    assert elapsed < 20
+    assert elapsed < windows_limit(20, 1)
     assert returned.results[0].status == "ok", (returned.results[0].status, returned.results[0].error)
 
     raised, elapsed = _run_orphan(
-        tmp_path, "sleep-err", ignore_term=False, action="raise", timeout_s=30, cancel=False
+        tmp_path, "sleep-err", ignore_term=False, action="raise", timeout_s=runner_timeout(1, 30), cancel=False
     )
-    assert elapsed < 20
+    assert elapsed < windows_limit(20, 1)
     assert raised.results[0].status == "error"
     assert "grandchild-left-behind" in (raised.results[0].error or "")
 
     ignored, elapsed = _run_orphan(
-        tmp_path, "ign-ok", ignore_term=True, action="return", timeout_s=30, cancel=False
+        tmp_path, "ign-ok", ignore_term=True, action="return", timeout_s=runner_timeout(1, 30), cancel=False
     )
-    assert elapsed < 20
+    assert elapsed < windows_limit(20, 1)
     assert ignored.results[0].status == "ok", (ignored.results[0].status, ignored.results[0].error)
 
     timed, elapsed = _run_orphan(
-        tmp_path, "ign-timeout", ignore_term=True, action="sleep", timeout_s=6, cancel=False
+        tmp_path, "ign-timeout", ignore_term=True, action="sleep", timeout_s=runner_timeout(1, 6, deadline=True), cancel=False
     )
     assert elapsed < 20
     assert timed.results[0].status == "timeout"
 
     cancelled, elapsed = _run_orphan(
-        tmp_path, "ign-cancel", ignore_term=True, action="sleep", timeout_s=25, cancel=True
+        tmp_path, "ign-cancel", ignore_term=True, action="sleep", timeout_s=runner_timeout(1, 25, deadline=True), cancel=True
     )
     assert elapsed < 12, [(item.status, item.error) for item in cancelled.results]
     assert cancelled.results[0].status == "cancelled"
@@ -1366,6 +1381,7 @@ def test_job_directories_keep_case_variants_apart(tmp_path):
     assert paths[("flat", "pack")] == tmp_path / "jobs" / "flat" / "pack-2"
 
 
+@windows_jails(4)
 def test_designer_leaderboard_keeps_distinct_ids_for_ticker_case_variants(tmp_path):
     from backtester.report import read_leaderboard
 
@@ -1379,7 +1395,7 @@ def test_designer_leaderboard_keeps_distinct_ids_for_ticker_case_variants(tmp_pa
         tmp_path / "out",
         profile="arena",
         workers=2,
-        timeout_s=30,
+        timeout_s=runner_timeout(4, 30),
         with_benchmarks=False,
     )
     assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
@@ -1401,6 +1417,7 @@ def test_designer_leaderboard_keeps_distinct_ids_for_ticker_case_variants(tmp_pa
     assert_designer_clean(designer, symbol="ZZZX")
 
 
+@windows_jails(1)
 def test_child_cannot_read_a_report_through_pythonpath(tmp_path):
     secret = tmp_path / "via-pythonpath"
     secret.mkdir()
@@ -1451,7 +1468,7 @@ def test_child_cannot_read_a_report_through_pythonpath(tmp_path):
             tmp_path / "out",
             profile="arena",
             workers=1,
-            timeout_s=30,
+            timeout_s=runner_timeout(1, 30),
             with_benchmarks=False,
         )
     finally:
@@ -1471,6 +1488,7 @@ def test_child_cannot_read_a_report_through_pythonpath(tmp_path):
     assert all(os.path.normcase(os.path.abspath(entry)) != os.path.normcase(str(secret.resolve())) for entry in seen["path"] if entry)
 
 
+@windows_jails(1)
 def test_a_missing_windows_job_fails_the_run(tmp_path, monkeypatch):
     monkeypatch.setattr("backtester.limits.arm_worker_job", lambda *_args, **_kwargs: None)
     result = run_parallel(
@@ -1479,7 +1497,7 @@ def test_a_missing_windows_job_fails_the_run(tmp_path, monkeypatch):
         tmp_path / "out",
         profile="arena",
         workers=1,
-        timeout_s=30,
+        timeout_s=runner_timeout(1, 30),
         with_benchmarks=False,
     )
     if os.name == "nt":
@@ -1516,7 +1534,7 @@ def test_schema_token_tickers_publish_and_register(tmp_path):
             out,
             profile="arena",
             workers=1,
-            timeout_s=60,
+            timeout_s=runner_timeout(2, 60, deadline=True),
             index_path=index,
         )
         assert result.failures == 0, (symbol, [(item.status, item.error) for item in result.results])
@@ -1533,6 +1551,7 @@ def test_schema_token_tickers_publish_and_register(tmp_path):
         assert info["jobs"][0]["symbol"] == symbol
 
 
+@windows_jails(4)
 def test_mixed_zzzx_and_cost_batch_registers_both(tmp_path):
     from backtester.report import read_leaderboard
 
@@ -1549,7 +1568,7 @@ def test_mixed_zzzx_and_cost_batch_registers_both(tmp_path):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(4, 60),
         index_path=index,
     )
     assert result.failures == 0, [(item.source_id, item.status, item.error) for item in result.results]
@@ -1596,6 +1615,7 @@ def _plant_v_json(src, dst, *args, **kwargs):
     (Path(dst) / "V.json").write_text("{}\n", encoding="utf-8")
 
 
+@windows_jails(4)
 def test_a_ticker_in_a_value_fails_only_that_row(tmp_path, monkeypatch):
     monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_ticker_file)
     pack, sidecar, _built = _anon_pack(tmp_path, "COST", name="cost")
@@ -1610,7 +1630,7 @@ def test_a_ticker_in_a_value_fails_only_that_row(tmp_path, monkeypatch):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(4, 60),
         with_benchmarks=False,
         index_path=index,
     )
@@ -1713,6 +1733,7 @@ def _designer_text(designer: Path) -> str:
 
 
 @pytest.mark.parametrize("symbol", _REQUIRED_SYMBOLS + ("SS", "FI", "AS", "ET"))
+@windows_jails(4)
 def test_each_required_symbol_publishes_an_embedded_id(tmp_path, symbol):
     from backtester.report import read_leaderboard, ticker_token_spans
 
@@ -1729,7 +1750,7 @@ def test_each_required_symbol_publishes_an_embedded_id(tmp_path, symbol):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(4, 60),
         with_benchmarks=False,
         index_path=index,
     )
@@ -1750,6 +1771,7 @@ def test_each_required_symbol_publishes_an_embedded_id(tmp_path, symbol):
     ("symbol", "strategy_id"),
     [("SS", "my_ß_v2"), ("FI", "my_ﬁ_v2")],
 )
+@windows_jails(2)
 def test_casefold_embedded_ids_publish(tmp_path, symbol, strategy_id):
     from backtester.report import read_leaderboard
 
@@ -1762,7 +1784,7 @@ def test_casefold_embedded_ids_publish(tmp_path, symbol, strategy_id):
         out,
         profile="arena",
         workers=1,
-        timeout_s=60,
+        timeout_s=runner_timeout(2, 60),
         with_benchmarks=False,
         index_path=index,
     )
@@ -1799,7 +1821,7 @@ def test_one_embedded_id_does_not_fail_the_mixed_batch(tmp_path):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(8, 60),
         with_benchmarks=False,
         index_path=index,
     )
@@ -1825,6 +1847,7 @@ def test_one_embedded_id_does_not_fail_the_mixed_batch(tmp_path):
     assert_designer_clean(designer, symbol="ZZZX")
 
 
+@windows_jails(4)
 def test_an_id_carrying_both_batch_tickers_is_scrubbed(tmp_path):
     """One row's symbol is not enough: COST and ZZZX are both in the id."""
     from backtester.report import read_leaderboard
@@ -1841,7 +1864,7 @@ def test_an_id_carrying_both_batch_tickers_is_scrubbed(tmp_path):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(4, 60),
         with_benchmarks=False,
     )
     assert result.failures == 0, [(item.source_id, item.status, item.error) for item in result.results]
@@ -1873,7 +1896,7 @@ def test_colliding_tickers_keep_distinct_designer_ids(tmp_path):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(8, 60),
         with_benchmarks=False,
     )
     assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
@@ -1890,6 +1913,7 @@ def test_colliding_tickers_keep_distinct_designer_ids(tmp_path):
     assert (out / "jobs" / "ZZZX").is_dir()
 
 
+@windows_jails(4)
 def test_a_file_named_v_json_fails_only_that_job(tmp_path, monkeypatch):
     monkeypatch.setattr("backtester.parallel.shutil.copytree", _plant_v_json)
     pack, sidecar, _built = _anon_pack(tmp_path, "V", name="v", price_factor=1.2)
@@ -1904,7 +1928,7 @@ def test_a_file_named_v_json_fails_only_that_job(tmp_path, monkeypatch):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(4, 60),
         with_benchmarks=False,
         index_path=index,
     )
@@ -2002,6 +2026,7 @@ def test_designer_components_are_casefold_unique_and_screened():
     assert ticker_token_spans(renamed, "asset") == []
 
 
+@windows_jails(4)
 def test_case_variant_designer_dirs_stay_distinct(tmp_path):
     from backtester.report import ticker_token_spans
 
@@ -2016,7 +2041,7 @@ def test_case_variant_designer_dirs_stay_distinct(tmp_path):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(4, 60),
         with_benchmarks=False,
     )
     assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
@@ -2050,7 +2075,7 @@ def test_numeric_ticker_suffix_is_not_published(tmp_path):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(8, 60),
         with_benchmarks=False,
     )
     assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
@@ -2098,7 +2123,7 @@ def test_a_forced_ticker_suffix_is_renamed_off_disk(tmp_path, monkeypatch):
         out,
         profile="arena",
         workers=2,
-        timeout_s=60,
+        timeout_s=runner_timeout(8, 60),
         with_benchmarks=False,
     )
     assert state["poisoned"]
@@ -2151,6 +2176,7 @@ def _assert_designer_names(designer: Path, symbols) -> None:
 
 
 @pytest.mark.parametrize("symbol", _REQUIRED_SYMBOLS + _PASSING_EXTRA_SYMBOLS)
+@windows_jails(4)
 def test_every_symbol_publishes_a_clean_book(tmp_path, symbol):
     """A symbol that passes the guard publishes under canonical names as RANDOM.
 
@@ -2178,7 +2204,7 @@ def test_every_symbol_publishes_a_clean_book(tmp_path, symbol):
         out,
         profile=profile,
         workers=2,
-        timeout_s=90,
+        timeout_s=runner_timeout(4, 90),
         with_benchmarks=benchmarks,
         index_path=tmp_path / "runs.json",
     )
@@ -2232,12 +2258,13 @@ def test_a_reserved_symbol_rejects_the_batch_before_output(tmp_path):
             out,
             profile="arena",
             workers=1,
-            timeout_s=30,
+            timeout_s=runner_timeout(1, 30),
             with_benchmarks=False,
         )
     assert not out.exists()
 
 
+@windows_jails(1)
 def test_setsid_cannot_move_a_grandchild_out_of_the_worker_group(tmp_path):
     """The worker filter still denies setsid, and a jailed strategy cannot spawn.
 
@@ -2293,7 +2320,7 @@ def test_setsid_cannot_move_a_grandchild_out_of_the_worker_group(tmp_path):
         tmp_path / "out",
         profile="arena",
         workers=1,
-        timeout_s=30,
+        timeout_s=runner_timeout(1, 30),
         with_benchmarks=False,
     )
     assert result.results[0].status == "error", (result.results[0].status, result.results[0].error)

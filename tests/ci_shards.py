@@ -1,8 +1,11 @@
 """Split the Windows suite into jobs that finish inside the 25-minute cap.
 
 The fast files share a shard. The walk-forward file and the accounting file
-each have their own, because a single walk is the slow call. Parallel tests
-are packed so the sum of their Windows timeouts stays at or under 12 minutes,
+each have their own, because a single walk is the slow call. A test in a
+file shard whose Windows budget is above 60 seconds is lifted into a
+``jail-`` shard and deselected from the file run, so the 60-second cap does
+not cover a multi-jail test. Parallel tests and those lifted tests are
+packed so the sum of their Windows timeouts stays at or under 12 minutes,
 which is well under the 25-minute job cap. A test marked ``windows_jails(n)``
 is budgeted at 90 seconds per jail. Every other test is budgeted at 60.
 ``tests/test_jailed_examples.py`` stays in the jailed-examples job.
@@ -91,24 +94,15 @@ def collect() -> list[tuple[str, int]]:
     return found
 
 
-def assign(items: list[tuple[str, int]]) -> dict[str, list[str]]:
-    """Each collected test in exactly one shard. Unknown files land in ``rest``."""
-    shards: dict[str, list[str]] = {name: [] for name in FILE_SHARDS}
-    parallel: list[tuple[str, int]] = []
-    rest: list[str] = []
-    for nodeid, seconds in items:
-        path = nodeid.split("::", 1)[0].replace("\\", "/")
-        if path == "tests/test_parallel.py":
-            parallel.append((nodeid, seconds))
-        elif path in _FILE_TO_SHARD:
-            shards[_FILE_TO_SHARD[path]].append(nodeid)
-        else:
-            rest.append(nodeid)
-    # A test budgeted at the whole 12 minutes cannot share a shard. Pull
-    # those out first so a 60-second test is not left sitting alone between
-    # them. The rest pack in collection order.
-    heavy = [(nodeid, seconds) for nodeid, seconds in parallel if seconds + DEFAULT_TEST_S > SHARD_BUDGET_S]
-    light = [(nodeid, seconds) for nodeid, seconds in parallel if seconds + DEFAULT_TEST_S <= SHARD_BUDGET_S]
+def _pack(pairs: list[tuple[str, int]], prefix: str) -> dict[str, list[str]]:
+    """Pack tests so each shard stays within the 12-minute budget.
+
+    A test that cannot share a shard is pulled out first. Otherwise a
+    60-second test is left sitting alone between two long ones.
+    """
+    heavy = [(nodeid, seconds) for nodeid, seconds in pairs if seconds + DEFAULT_TEST_S > SHARD_BUDGET_S]
+    light = [(nodeid, seconds) for nodeid, seconds in pairs if seconds + DEFAULT_TEST_S <= SHARD_BUDGET_S]
+    shards: dict[str, list[str]] = {}
     bucket: list[str] = []
     used = 0
     number = 1
@@ -117,7 +111,7 @@ def assign(items: list[tuple[str, int]]) -> dict[str, list[str]]:
         nonlocal bucket, used, number
         if not bucket:
             return
-        shards[f"parallel-{number}"] = bucket
+        shards[f"{prefix}-{number}"] = bucket
         number += 1
         bucket = []
         used = 0
@@ -129,8 +123,32 @@ def assign(items: list[tuple[str, int]]) -> dict[str, list[str]]:
         used += seconds
     flush()
     for nodeid, _seconds in heavy:
-        shards[f"parallel-{number}"] = [nodeid]
+        shards[f"{prefix}-{number}"] = [nodeid]
         number += 1
+    return shards
+
+
+def assign(items: list[tuple[str, int]]) -> dict[str, list[str]]:
+    """Each collected test in exactly one shard. Unknown files land in ``rest``."""
+    shards: dict[str, list[str]] = {name: [] for name in FILE_SHARDS}
+    parallel: list[tuple[str, int]] = []
+    # A multi-jail test does not belong in a file shard whose other tests
+    # are budgeted at 60 seconds. It is packed on its own.
+    lifted: list[tuple[str, int]] = []
+    rest: list[str] = []
+    for nodeid, seconds in items:
+        path = nodeid.split("::", 1)[0].replace("\\", "/")
+        if path == "tests/test_parallel.py":
+            parallel.append((nodeid, seconds))
+        elif path in _FILE_TO_SHARD:
+            if seconds > DEFAULT_TEST_S:
+                lifted.append((nodeid, seconds))
+            else:
+                shards[_FILE_TO_SHARD[path]].append(nodeid)
+        else:
+            rest.append(nodeid)
+    shards.update(_pack(parallel, "parallel"))
+    shards.update(_pack(lifted, "jail"))
     if rest:
         shards["rest"] = rest
     return {name: nodes for name, nodes in shards.items() if nodes}
@@ -145,7 +163,7 @@ def problems(items: list[tuple[str, int]], shards: dict[str, list[str]]) -> list
         errors.append(f"unassigned tests: {sample}")
     seen: dict[str, str] = {}
     for name, nodes in shards.items():
-        if name.startswith("parallel-"):
+        if name.startswith("parallel-") or name.startswith("jail-"):
             if len(nodes) > PARALLEL_CHUNK:
                 errors.append(f"{name} has {len(nodes)} tests")
             cost = sum(budgets.get(nodeid, DEFAULT_TEST_S) for nodeid in nodes)
@@ -170,7 +188,20 @@ def _targets(name: str, nodeids: list[str]) -> list[str]:
     return nodeids
 
 
-def _pytest(targets: list[str]) -> int:
+def _deselect(name: str, items: list[tuple[str, int]]) -> list[str]:
+    """Node ids pulled out of a file shard. The file path would run them again."""
+    if name not in FILE_SHARDS:
+        return []
+    files = set(FILE_SHARDS[name])
+    chosen = []
+    for nodeid, seconds in items:
+        path = nodeid.split("::", 1)[0].replace("\\", "/")
+        if seconds > DEFAULT_TEST_S and path in files:
+            chosen.append(nodeid)
+    return chosen
+
+
+def _pytest(targets: list[str], deselect: list[str] | None = None) -> int:
     command = [
         sys.executable,
         "-m",
@@ -180,6 +211,8 @@ def _pytest(targets: list[str]) -> int:
         "--timeout-method=thread",
         *targets,
     ]
+    for nodeid in deselect or ():
+        command.append(f"--deselect={nodeid}")
     return subprocess.call(command, cwd=ROOT)
 
 
@@ -206,7 +239,7 @@ def main(argv: list[str]) -> int:
             print(f"{name} {len(nodes)}")
         return 0
     if len(argv) == 3 and argv[1] == "run":
-        _items, shards, found = _load()
+        items, shards, found = _load()
         if found:
             print("\n".join(found), file=sys.stderr)
             return 2
@@ -214,7 +247,7 @@ def main(argv: list[str]) -> int:
         if not chosen:
             print(f"unknown shard {argv[2]}", file=sys.stderr)
             return 2
-        return _pytest(_targets(argv[2], chosen))
+        return _pytest(_targets(argv[2], chosen), _deselect(argv[2], items))
     print("usage: ci_shards.py plan|check|run <shard>", file=sys.stderr)
     return 2
 

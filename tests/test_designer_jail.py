@@ -19,7 +19,7 @@ from backtester.parallel import FrameMarket, StrategyRef, run_parallel
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 from backtester.runner import walk_forward
 from backtester.strategy_loader import load_strategy_class
-from windows_open import OWNER_PC
+from windows_open import OWNER_PC, runner_timeout
 
 ROOT = Path(__file__).resolve().parents[1]
 SELFTEST = ROOT / "examples" / "selftest"
@@ -137,7 +137,7 @@ def _parallel(tmp_path: Path, strategy_path: Path, name: str):
         tmp_path / name,
         profile="arena",
         workers=1,
-        timeout_s=60,
+        timeout_s=runner_timeout(1, 60, deadline=True),
         with_benchmarks=False,
     )
     assert result.results[0].status == "ok", (result.results[0].status, result.results[0].error)

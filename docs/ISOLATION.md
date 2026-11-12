@@ -301,7 +301,10 @@ x86_64 still refuses the launch instead of using a partial table. `clone` is
 allowed only when `CLONE_THREAD` is set. `clone3` returns ENOSYS. Classic BPF
 cannot read its flag pointer, so the whole call is refused and glibc creates
 threads with `clone` instead. A process cannot use `clone3` to skip the
-`CLONE_THREAD` check. `RLIMIT_NPROC` is 64 inside the user namespace. The
+`CLONE_THREAD` check. A syscall number with bit `0x40000000` set is an x32
+number. Those numbers do not match the native denylist, so the filter kills
+the process before the native compare. The action is `SECCOMP_RET_KILL`, the
+same action as a foreign architecture. `RLIMIT_NPROC` is 64 inside the user namespace. The
 child environment sets `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, and
 `MKL_NUM_THREADS` to 1.
 
@@ -347,7 +350,10 @@ Windows is an xpass. Windows CI runs one shard per group of files, on
 Python 3.11, 3.12, and 3.13. Each shard stops at 25 minutes. The default
 per-test cap is 60 seconds (`pytest-timeout`). A test that starts several
 AppContainer jails is marked `windows_jails(n)` and, on Windows only, gets
-90 seconds per jail. Linux keeps the suite default. A parallel shard holds
+90 seconds per jail. The same helper raises that test's worker `timeout_s`
+on Windows, because the worker clock includes AppContainer startup. A test
+that measures a kill or a cancel keeps its short deadline. Linux keeps the
+suite default and the caller's `timeout_s`. A parallel shard holds
 at most 12 tests, and the sum of those Windows budgets stays at or under
 12 minutes, so a shard ends in a pass or a fail instead of being cancelled.
 The thread timer raises in that test instead of calling `os._exit`, so one
@@ -436,12 +442,23 @@ the whole suite in one job per Python version.
 
 On the GitHub-hosted Windows runners a jail is silent for about 16–20
 seconds (`walk-forward wait` climbs to that, `pipe_bytes=0`, the child
-alive) and then the call returns. A test that starts eight jails — two
-strategies, two anonymized packs, and both the designer child and the
-operator child — does not fit in 60 seconds. Those four tests are not
-`xfail`. They have to pass. Their Windows budget is 90 seconds times the
-eight launches, and each one sits in its own shard so that budget stays
-inside the 12-minute pack.
+alive) and then the call returns. The referee's ready-wait on Windows is
+90 seconds and is not the per-bar call timeout. Linux still waits the
+shorter of 60 seconds and the call timeout for that first line. A test
+that starts several jails does not fit in 60 seconds. Those tests are not
+`xfail`. They have to pass. `windows_jails(n)` and `runner_timeout` give
+each one 90 seconds times its jail count, on the pytest timer and on the
+worker timer. A test whose budget is above 60 seconds is packed on its own
+shard group so that budget stays inside the 12-minute pack.
+
+The per-launch ancestor ACL update is serialized with `CreateProcessW`
+under the profile lock. Two workers rewriting the same DACL could drop the
+traverse ACE. AppContainer then reports `CreateProcessW` winerror 2
+(`ERROR_FILE_NOT_FOUND`) even though the interpreter exists, because the
+new token cannot resolve its current directory. The lock covers the grant
+and the spawn, including `ResumeThread`. It does not cover the 16–20
+second boot. The failure still names the executable path, whether that
+file exists, and whether the work directory exists. It is not retried.
 
 This is an owner-PC item, not a CI waiver. Time one jail and the
 private-directory grant, and compare it with the 16–20 second GitHub

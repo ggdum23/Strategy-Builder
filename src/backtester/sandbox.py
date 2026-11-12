@@ -35,6 +35,12 @@ class SandboxError(RuntimeError):
     """The jail could not be applied. The strategy was not started."""
 
 
+# GitHub-hosted AppContainer startup is about 16–20 seconds before the
+# child writes a ready line. The Windows hello wait is this long so that
+# cost is not the strategy's call timeout. Tests use the same number.
+WINDOWS_JAIL_STARTUP_S = 90
+
+
 # seccomp / BPF
 _BPF_LD = 0x00
 _BPF_W = 0x00
@@ -60,6 +66,10 @@ _PR_SET_NO_NEW_PRIVS = 38
 _PR_SET_SECCOMP = 22
 _SECCOMP_MODE_FILTER = 2
 _CLONE_THREAD = 0x00010000
+# x32 reuses the x86_64 audit architecture and sets this bit on the number.
+# A denylist of native numbers does not match those calls, so they would
+# fall through to ALLOW. The filter kills them.
+_X32_SYSCALL_BIT = 0x40000000
 
 # x86_64 syscall numbers. Other machines fail closed rather than guess.
 # aarch64 uses the generic table for io_uring_setup, io_uring_enter, and
@@ -164,6 +174,12 @@ def _filter_bytes(*, deny: tuple[str, ...], allow_threads: bool) -> bytes:
     program = [
         _insn(_LD_W_ABS, 0, 0, 4),
         _insn(_JMP_JEQ, 1, 0, arch),
+        _insn(_RET_K, 0, 0, _SECCOMP_RET_KILL),
+        _insn(_LD_W_ABS, 0, 0, 0),
+        # Kill x32 numbers before the native compare. AND clears the
+        # accumulator, so the native number is loaded again afterwards.
+        _insn(_ALU_AND, 0, 0, _X32_SYSCALL_BIT),
+        _insn(_JMP_JEQ, 0, 1, _X32_SYSCALL_BIT),
         _insn(_RET_K, 0, 0, _SECCOMP_RET_KILL),
         _insn(_LD_W_ABS, 0, 0, 0),
     ]
@@ -1085,8 +1101,25 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
             # recursive deny of the repository walks the tree inside the
             # strategy timeout. The private directory is the only grant
             # that changes per launch, and it is a handful of files.
-            extra_grants = _win_grant_work(lease, work)
-            popen = _win_spawn(work, lease, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+            # Ancestor DACLs are shared. Two workers updating them at once
+            # can drop the traverse ACE, and CreateProcessW then fails with
+            # ERROR_FILE_NOT_FOUND (winerror 2) because the new token cannot
+            # resolve its current directory. The profile lock makes that
+            # update and the spawn one sequence.
+            def _grant_and_spawn():
+                nonlocal extra_grants, popen
+                try:
+                    extra_grants = _win_grant_work(lease, work)
+                    popen = _win_spawn(work, lease, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+                except Exception:
+                    # Drop the ACEs before the next waiter starts. A drop
+                    # after the lock is released can remove the traverse ACE
+                    # that waiter just inherited.
+                    _win_drop_launch_aces(lease, [], [], extra_grants)
+                    extra_grants = []
+                    raise
+
+            _with_profile_lock(_grant_and_spawn)
         except Exception:
             _win_drop_launch_aces(lease, [], [], extra_grants)
             raise
@@ -2118,7 +2151,12 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
             ctypes.byref(created),
         )
         if not ok:
-            raise _win_fail("CreateProcessW failed")
+            code = ctypes.get_last_error()
+            executable = Path(sys.executable)
+            raise SandboxError(
+                "CreateProcessW failed (winerror %s); executable %s exists=%s cwd=%s cwd_exists=%s"
+                % (code, executable, executable.is_file(), work, work.is_dir())
+            )
         process = created.hProcess
         thread = created.hThread
         _win_require_container(lease, process)
