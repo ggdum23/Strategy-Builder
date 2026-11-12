@@ -10,7 +10,10 @@ where that number is stored. It also holds a random key and an HMAC over a
 versioned binding of pack_id, the anonymized flag, the date map, k,
 share_scale, and the borrow rate. A null borrow rate stays JSON null. The
 pack files do not contain the factor, the key, or any digest of the factor.
-The runner checks the MAC before it uses k. Session ids use ASCII digits.
+The runner checks the MAC before it uses k. A sidecar without that MAC is
+refused, named or anonymized. Verification accepts only this version.
+Session ids use ASCII digits. The anonymized-pack leak scan folds other
+decimal digits before it looks for a date or a year.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ import re
 import secrets
 import shutil
 import struct
+import unicodedata
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,14 +96,13 @@ _MANIFEST_KEYS = {
     "price_basis",
 }
 _CHUNK_KEYS = {"file", "first_day", "last_day", "sessions"}
-# ASCII digits only. Unicode ``\d`` treats fullwidth ０-９ as digits, so a
-# session id like ``2024-03-０１`` would pass as a calendar date and take the
-# legacy no-MAC named path.
+# ASCII digits only. These accept a session id or a date_map value. The leak
+# scan folds compatibility and other decimal digits before it uses them.
 _DATE_RE = re.compile(r"\b(?:19|20)[0-9]{2}-[0-9]{2}-[0-9]{2}\b")
 _ANON_SESSION_RE = re.compile(r"^S[0-9]{5}$")
 _FACTOR_MAC_VERSION = 2
 _BORROW_SOURCES = {"profile_default", "explicit", "unregistered"}
-_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+_YEAR_RE = re.compile(r"(?:19|20)[0-9]{2}")
 _BANNED_TEXT = (
     "price_factor",
     "volume_factor",
@@ -246,26 +249,18 @@ def _hex32(text, label: str) -> bytes:
     return bytes.fromhex(text)
 
 
-def _factors_are_one(document: dict) -> bool:
-    try:
-        return all(float(document[name]) == 1.0 for name in ("price_factor", "volume_factor", "share_scale"))
-    except (KeyError, TypeError, ValueError):
-        return False
-
-
 def _verify_factor_mac(document: dict) -> None:
     """Refuse a sidecar whose pack binding was not authenticated at build.
 
-    An anonymized sidecar with no MAC is refused. A named sidecar from before
-    this MAC still loads when every factor is 1. ``load_pack`` is what limits
-    that legacy path to session ids that are calendar dates: an ``S#####`` id
-    cannot be loaded with ``anonymized`` false.
+    Every pack sidecar needs the version-2 MAC. A missing tag fails closed
+    for a named pack and for an anonymized pack. A version-1 tag does not
+    match this message, so that pack has to be rebuilt. ``load_sidecar`` is
+    the gate for ``run_pack``, ``walk_pack``, and ``_prepare_pack``. A raw
+    local run never loads a sidecar.
     """
     present = _FACTOR_MAC_KEYS & set(document)
     if not present:
-        if document.get("anonymized") is True or not _factors_are_one(document):
-            _fail("factor_mac", "anonymized pack has no operator factor MAC; rebuild the pack")
-        return
+        _fail("factor_mac", "sidecar has no operator factor MAC; rebuild the pack")
     if present != _FACTOR_MAC_KEYS:
         _fail("factor_mac", "the operator factor MAC is incomplete")
     key = _hex32(document.get("factor_key"), "factor_key")
@@ -284,7 +279,8 @@ def require_build_price_factor(sidecar: dict) -> float:
     Call this in the operator process before restating designer dividends
     and before comparing ``share_scale`` to this factor. The MAC binds
     ``pack_id``, the anonymized flag, the date map, this factor,
-    ``share_scale``, and the borrow rate (null stays null).
+    ``share_scale``, and the borrow rate (null stays null). Only version 2
+    verifies. A missing tag or a version-1 tag is refused.
     """
     if not isinstance(sidecar, dict):
         raise ValueError("sidecar is not an object")
@@ -531,6 +527,38 @@ def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
     return payloads
 
 
+def _fold_decimal_digits(text: str) -> tuple[str, list[bool]]:
+    """NFKC, then map remaining decimal digits to ASCII.
+
+    Fullwidth and superscript digits become ASCII under NFKC. Arabic-Indic
+    and Devanagari digits do not, so those still go through ``digit()``.
+    The second list says whether each output character came from an ASCII
+    source character. A year made of ASCII digits is not, by itself, a leak.
+    """
+    folded: list[str] = []
+    ascii_source: list[bool] = []
+    for char in text:
+        pieces = unicodedata.normalize("NFKC", char)
+        for piece in pieces:
+            if unicodedata.category(piece) == "Nd":
+                folded.append(str(unicodedata.digit(piece)))
+            else:
+                folded.append(piece)
+            ascii_source.append(char.isascii())
+    return "".join(folded), ascii_source
+
+
+def _leaks_calendar(text: str) -> bool:
+    """True when folded text is an ISO date, or a year written with non-ASCII digits."""
+    folded, ascii_source = _fold_decimal_digits(text)
+    if _DATE_RE.search(folded):
+        return True
+    for match in _YEAR_RE.finditer(folded):
+        if not all(ascii_source[match.start():match.end()]):
+            return True
+    return False
+
+
 def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
     """Refuse a designer tree that still carries identity or a scale factor."""
     root = Path(pack_dir)
@@ -541,7 +569,8 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
         raise ValueError("pack directory is empty")
     for path in files:
         name = path.name
-        if _YEAR_RE.search(name) or _token_present(symbol, name):
+        folded_name, _ascii_source = _fold_decimal_digits(name)
+        if _YEAR_RE.search(folded_name) or _token_present(symbol, name):
             raise ValueError(f"{name} leaks identity in the file name")
         raw = path.read_bytes()
         if path.suffix == ".gz":
@@ -560,7 +589,7 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
         for key in _BANNED_TEXT:
             if key in text:
                 raise ValueError(f"{name} contains {key}")
-        if _DATE_RE.search(text):
+        if _leaks_calendar(text):
             raise ValueError(f"{name} contains a calendar date")
         if path.stat().st_size >= MAX_FILE_BYTES:
             raise ValueError(f"{name} is {path.stat().st_size} bytes, which is not under {MAX_FILE_BYTES}")
@@ -868,7 +897,8 @@ def _validate_manifest(document: dict) -> None:
     for chunk in document["chunks"]:
         if set(chunk) != _CHUNK_KEYS:
             raise ValueError(f"chunk record {chunk!r} does not match the schema")
-        if _YEAR_RE.search(chunk["file"]) or chunk["file"] != Path(chunk["file"]).name:
+        folded_name, _ascii_source = _fold_decimal_digits(chunk["file"])
+        if _YEAR_RE.search(folded_name) or chunk["file"] != Path(chunk["file"]).name:
             raise ValueError(f"chunk file name {chunk['file']!r} is not allowed")
         if chunk["sessions"] < 1 or chunk["last_day"] < chunk["first_day"]:
             raise ValueError(f"chunk {chunk['file']} has an empty day range")
