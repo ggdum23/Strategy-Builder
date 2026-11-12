@@ -15,6 +15,7 @@ from backtester.data import load_named
 from backtester.pack import (
     CHUNK_SESSIONS,
     MAX_FILE_BYTES,
+    _factor_mac_message,
     _gzip_csv,
     _pack_id,
     _read_csv_gz,
@@ -335,6 +336,54 @@ def test_calendar_session_id_requires_a_named_pack(tmp_path):
         load_pack(pack)
 
 
+def test_fullwidth_digit_session_id_is_refused_for_both_flags(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    wide = "2024-03-\uff10\uff11"
+
+    def _wide(frame):
+        frame["session_id"] = wide
+
+    _retouch(pack, _wide)
+    with pytest.raises(ValueError, match="not an anonymized session id"):
+        load_pack(pack)
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    manifest["anonymized"] = False
+    manifest["asset_name"] = "NIK"
+    _write_json(pack / "manifest.json", manifest)
+    with pytest.raises(ValueError, match="not a calendar date"):
+        load_pack(pack)
+
+
+def test_tampered_borrow_rate_is_refused(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    secret = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert require_build_price_factor(secret) == pytest.approx(1.7)
+    assert secret["borrow_rate_annual"] != 0.5
+    null_borrow = dict(secret)
+    null_borrow["borrow_rate_annual"] = None
+    assert b'"borrow_rate_annual":null' in _factor_mac_message(null_borrow)
+    secret["borrow_rate_source"] = "explicit"
+    secret["borrow_rate_annual"] = 0.5
+    _write_json(sidecar, secret)
+    with pytest.raises(ValueError, match="factor_mac"):
+        load_sidecar(sidecar)
+    with pytest.raises(ValueError, match="factor_mac"):
+        run_pack(_Quiet, pack, sidecar, "arena", tmp_path / "out", with_benchmarks=False)
+
+
 def test_mac_binds_pack_id_date_map_and_share_scale(tmp_path):
     src, registry = _series(tmp_path, 2)
     pack = tmp_path / "pack"
@@ -525,6 +574,51 @@ def test_pack_cli_does_not_print_the_scale_factor(tmp_path, capsys):
     assert "cost basis" in report
     assert "share_scale=0.25" in report
     assert "desk" in report
+
+
+def test_dividend_file_sha256_is_recorded_only_on_the_operator_manifest(tmp_path):
+    src, registry = _series(tmp_path, 2)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    secret = json.loads(sidecar.read_text(encoding="utf-8"))
+    day = secret["date_map"][max(secret["date_map"], key=int)]
+    dividends = tmp_path / "dividends.csv"
+    dividends.write_bytes(f"session,amount\n{day},1.25\n".encode())
+    expected = hashlib.sha256(dividends.read_bytes()).hexdigest()
+    hold = Path(__file__).resolve().parents[1] / "examples" / "desk" / "buy_and_hold.py"
+    out = tmp_path / "run"
+    code = main(
+        [
+            "run", "--profile", "desk", "--strategy", str(hold),
+            "--pack", str(pack), "--sidecar", str(sidecar),
+            "--out", str(out), "--dividends", str(dividends),
+        ]
+    )
+    assert code == 0
+    document = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert document["dividend_file_sha256"] == expected
+    designer = out / "designer"
+    assert designer.is_dir()
+    for path in designer.rglob("*"):
+        if path.is_file():
+            assert path.name != "run.json"
+            assert expected.encode() not in path.read_bytes()
+    bare = tmp_path / "bare"
+    code = main(
+        [
+            "run", "--profile", "desk", "--strategy", str(hold),
+            "--pack", str(pack), "--sidecar", str(sidecar),
+            "--out", str(bare),
+        ]
+    )
+    assert code == 0
+    bare_doc = json.loads((bare / "run.json").read_text(encoding="utf-8"))
+    assert "dividend_file_sha256" not in bare_doc
 
 
 def test_total_return_is_recorded_by_refusing_the_pack(tmp_path):

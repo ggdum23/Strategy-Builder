@@ -7,9 +7,10 @@ year. A chunk is about 250 trading sessions and each file stays under 25 MB.
 
 Prices multiplied by k are paired with share_scale = k. The sidecar file is
 where that number is stored. It also holds a random key and an HMAC over a
-versioned binding of pack_id, the anonymized flag, the date map, k, and
-share_scale. The pack files do not contain the factor, the key, or any
-digest of the factor. The runner checks the MAC before it uses k.
+versioned binding of pack_id, the anonymized flag, the date map, k,
+share_scale, and the borrow rate. A null borrow rate stays JSON null. The
+pack files do not contain the factor, the key, or any digest of the factor.
+The runner checks the MAC before it uses k. Session ids use ASCII digits.
 """
 
 from __future__ import annotations
@@ -91,9 +92,13 @@ _MANIFEST_KEYS = {
     "price_basis",
 }
 _CHUNK_KEYS = {"file", "first_day", "last_day", "sessions"}
-_DATE_RE = re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b")
-_ANON_SESSION_RE = re.compile(r"^S\d{5}$")
-_FACTOR_MAC_VERSION = 1
+# ASCII digits only. Unicode ``\d`` treats fullwidth ０-９ as digits, so a
+# session id like ``2024-03-０１`` would pass as a calendar date and take the
+# legacy no-MAC named path.
+_DATE_RE = re.compile(r"\b(?:19|20)[0-9]{2}-[0-9]{2}-[0-9]{2}\b")
+_ANON_SESSION_RE = re.compile(r"^S[0-9]{5}$")
+_FACTOR_MAC_VERSION = 2
+_BORROW_SOURCES = {"profile_default", "explicit", "unregistered"}
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 _BANNED_TEXT = (
     "price_factor",
@@ -175,12 +180,26 @@ def canonical_price_factor(price_factor: float) -> str:
     return json.dumps(value, allow_nan=False)
 
 
+def _canonical_borrow_rate(value):
+    """``None`` stays JSON null. Any other rate is a finite non-negative float."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("borrow rate must be a non-negative number or null")
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError("borrow rate must be a non-negative number or null")
+    return number
+
+
 def _factor_mac_message(document: dict) -> bytes:
     """Versioned canonical JSON bound to this pack, not only to k.
 
-    The dividend schedule is not a pack or sidecar field. It is an operator
-    input supplied when the pack is run, so it is not part of this message.
-    ``date_map`` is what places those amounts on session ids, and it is bound.
+    Version 2 also binds ``borrow_rate_source`` and ``borrow_rate_annual``.
+    A null borrow rate stays JSON null. The dividend file is not a pack or
+    sidecar field. It is an operator input supplied when the pack is run, so
+    it is not part of this message. ``date_map`` is what places those amounts
+    on session ids, and it is bound.
     """
     if not isinstance(document.get("anonymized"), bool):
         raise ValueError("anonymized flag must be true or false")
@@ -196,6 +215,9 @@ def _factor_mac_message(document: dict) -> bytes:
         if not isinstance(key, str) or not isinstance(value, str):
             raise ValueError("date_map keys and values must be strings")
         canonical_map[key] = value
+    source = document.get("borrow_rate_source")
+    if source not in _BORROW_SOURCES:
+        raise ValueError("borrow_rate_source is not a known source")
     payload = {
         "v": _FACTOR_MAC_VERSION,
         "pack_id": pack_id,
@@ -203,6 +225,8 @@ def _factor_mac_message(document: dict) -> bytes:
         "date_map": canonical_map,
         "price_factor": canonical_price_factor(document["price_factor"]),
         "share_scale": canonical_price_factor(document["share_scale"]),
+        "borrow_rate_source": source,
+        "borrow_rate_annual": _canonical_borrow_rate(document.get("borrow_rate_annual")),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
@@ -259,8 +283,8 @@ def require_build_price_factor(sidecar: dict) -> float:
 
     Call this in the operator process before restating designer dividends
     and before comparing ``share_scale`` to this factor. The MAC binds
-    ``pack_id``, the anonymized flag, the date map, this factor, and
-    ``share_scale``.
+    ``pack_id``, the anonymized flag, the date map, this factor,
+    ``share_scale``, and the borrow rate (null stays null).
     """
     if not isinstance(sidecar, dict):
         raise ValueError("sidecar is not an object")
@@ -298,9 +322,19 @@ def validate_sidecar(document: dict, *, allow_scale_mismatch: bool = False) -> N
             _fail("date_map", "keys and values must be strings")
         if _DATE_RE.fullmatch(value) is None:
             _fail("date_map", f"{value!r} is not a calendar date")
-    # The MAC binds pack_id, the flag, the date map, k, and share_scale.
-    # Check it before the share_scale comparison below, and again from
-    # require_build_price_factor before dividend restatement.
+    if document["borrow_rate_source"] not in _BORROW_SOURCES:
+        _fail("borrow_rate_source", "unknown source")
+    borrow = document["borrow_rate_annual"]
+    if borrow is not None and (
+        isinstance(borrow, bool)
+        or not isinstance(borrow, (int, float))
+        or not math.isfinite(float(borrow))
+        or float(borrow) < 0.0
+    ):
+        _fail("borrow_rate_annual", "expected a non-negative number or null")
+    # The MAC binds pack_id, the flag, the date map, k, share_scale, and the
+    # borrow rate. Check it before the share_scale comparison below, and again
+    # from require_build_price_factor before dividend restatement.
     require_build_price_factor(document)
     if document["anonymized"]:
         # The builder writes share_scale equal to the price factor authenticated
@@ -318,11 +352,6 @@ def validate_sidecar(document: dict, *, allow_scale_mismatch: bool = False) -> N
             _fail("share_scale", "a named pack is unscaled, so every factor is 1")
     if document.get("price_basis") not in {"raw", "total_return"}:
         _fail("price_basis", "expected raw or total_return")
-    if document["borrow_rate_source"] not in {"profile_default", "explicit", "unregistered"}:
-        _fail("borrow_rate_source", "unknown source")
-    borrow = document["borrow_rate_annual"]
-    if borrow is not None and (isinstance(borrow, bool) or not isinstance(borrow, (int, float)) or float(borrow) < 0.0):
-        _fail("borrow_rate_annual", "expected a non-negative number or null")
     profile = document["registered_profile"]
     if profile is not None and profile not in {"arena", "desk"}:
         _fail("registered_profile", "expected arena, desk, or null")
