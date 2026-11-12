@@ -12,8 +12,12 @@ share_scale, and the borrow rate. A null borrow rate stays JSON null. The
 pack files do not contain the factor, the key, or any digest of the factor.
 The runner checks the MAC before it uses k. A sidecar without that MAC is
 refused, named or anonymized. Verification accepts only this version.
-Session ids use ASCII digits. The anonymized-pack leak scan folds other
-decimal digits before it looks for a date or a year.
+Session ids use ASCII digits. An anonymized pack is a schema: regular
+files with the builder's names, a typed manifest, and a typed CSV cell
+for every column. There is no free-text column and no format scan of
+prices. Trade count is rescaled by the same volume factor as volume.
+When the day has a regular session the daily count is the sum of those
+scaled regular-session bars; otherwise it is the sum of every scaled bar.
 """
 
 from __future__ import annotations
@@ -25,11 +29,12 @@ import hmac
 import io
 import json
 import math
+import os
 import re
 import secrets
 import shutil
+import stat
 import struct
-import unicodedata
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,13 +101,41 @@ _MANIFEST_KEYS = {
     "price_basis",
 }
 _CHUNK_KEYS = {"file", "first_day", "last_day", "sessions"}
-# ASCII digits only. These accept a session id or a date_map value. The leak
-# scan folds compatibility and other decimal digits before it uses them.
+# ASCII digits only. Session ids and date_map values. The leak scan uses
+# its own pattern and does not fold Unicode.
 _DATE_RE = re.compile(r"\b(?:19|20)[0-9]{2}-[0-9]{2}-[0-9]{2}\b")
-_ANON_SESSION_RE = re.compile(r"^S[0-9]{5}$")
+# Named packs use day 0. Every later ordinal is digits with no leading zero.
+_DATE_MAP_KEY_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+_BARS_NAME_RE = re.compile(r"^bars_part_([0-9]+)\.csv\.gz$")
+_DAILY_NAME = "daily_rth.csv.gz"
+_MANIFEST_NAME = "manifest.json"
 _FACTOR_MAC_VERSION = 2
 _BORROW_SOURCES = {"profile_default", "explicit", "unregistered"}
-_YEAR_RE = re.compile(r"(?:19|20)[0-9]{2}")
+_PRINTABLE_ASCII = frozenset(b"\t\n\r" + bytes(range(0x20, 0x7F)))
+_YEAR = r"(?:19|20)[0-9]{2}"
+_MONTH = r"(?:0?[1-9]|1[0-2])"
+_DAY = r"(?:0?[1-9]|[12][0-9]|3[01])"
+_MONTH2 = r"(?:0[1-9]|1[0-2])"
+_DAY2 = r"(?:0[1-9]|[12][0-9]|3[01])"
+_SEP = r"[-/._ ]"
+# Digit lookarounds, not \\b. Used only to word the error when a cell has
+# already failed its column grammar. Session ids are not scanned: the gate
+# requires the builder's exact ``S{day:05d}`` and the day sequence 1..n.
+_LEAK_DATE_RE = re.compile(
+    rf"(?<![0-9])(?:{_YEAR}{_SEP}{_MONTH}{_SEP}{_DAY}|{_DAY}{_SEP}{_MONTH}{_SEP}{_YEAR}|{_YEAR}{_MONTH2}{_DAY2})(?![0-9])"
+)
+_ALT_STREAM = "pack file has an alternate data stream"
+_STREAM_UNREADABLE = "pack file streams could not be read"
+_DEFAULT_STREAM = "::$DATA"
+_PACK_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_INT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+_PHASES = frozenset({"pre", "rth", "post"})
+_PRICE_COLUMNS = frozenset({"open", "high", "low", "close", "volume", "wap"})
+_FLAG_COLUMNS = frozenset({"filled", "short_session", "partial"})
+_MAX_ORDINAL = 1_000_000_000
+_MAX_MINUTE = 24 * 60 - 1
+_MAX_BAR_MINUTES = 24 * 60
+_NOT_REGULAR = "pack directory entry is not a regular pack file"
 _BANNED_TEXT = (
     "price_factor",
     "volume_factor",
@@ -316,6 +349,8 @@ def validate_sidecar(document: dict, *, allow_scale_mismatch: bool = False) -> N
     for key, value in date_map.items():
         if not isinstance(key, str) or not isinstance(value, str):
             _fail("date_map", "keys and values must be strings")
+        if _DATE_MAP_KEY_RE.fullmatch(key) is None:
+            _fail("date_map", f"key {key!r} is not a canonical ordinal")
         if _DATE_RE.fullmatch(value) is None:
             _fail("date_map", f"{value!r} is not a calendar date")
     if document["borrow_rate_source"] not in _BORROW_SOURCES:
@@ -365,10 +400,20 @@ def _pack_id(files: list[tuple[str, bytes]]) -> str:
     return digest.hexdigest()
 
 
+def _emitted_count(value) -> float:
+    """The count decimal ``to_csv`` will write, parsed back.
+
+    Anonymized counts are ``source * volume_factor``. Named counts are the
+    source integers. Both spellings are ``format(value, '.17g')``.
+    """
+    return float(format(float(value), ".17g"))
+
+
 def _gzip_csv(frame: pd.DataFrame) -> bytes:
     ordered = frame.loc[:, list(PACK_COLUMNS)].copy()
-    for name in ("day", "weekday", "minute", "count", "filled", "short_session", "bar_minutes", "partial"):
+    for name in ("day", "weekday", "minute", "filled", "short_session", "bar_minutes", "partial"):
         ordered[name] = ordered[name].astype(int)
+    ordered["count"] = [_emitted_count(value) for value in ordered["count"].tolist()]
     text = ordered.to_csv(index=False, float_format="%.17g")
     buffer = io.BytesIO()
     with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0, filename="") as handle:
@@ -527,72 +572,480 @@ def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
     return payloads
 
 
-def _fold_decimal_digits(text: str) -> tuple[str, list[bool]]:
-    """NFKC, then map remaining decimal digits to ASCII.
+def _canonical_bars_name(name: str) -> bool:
+    """``bars_part_001`` … ``bars_part_999``, then ``bars_part_1000`` with no extra zero.
 
-    Fullwidth and superscript digits become ASCII under NFKC. Arabic-Indic
-    and Devanagari digits do not, so those still go through ``digit()``.
-    The second list says whether each output character came from an ASCII
-    source character. A year made of ASCII digits is not, by itself, a leak.
+    ``:03d`` is the builder's spelling. ``bars_part_1`` and ``bars_part_01000``
+    are a different spelling of the same part, so they are refused. Case
+    variants are refused.
     """
-    folded: list[str] = []
-    ascii_source: list[bool] = []
-    for char in text:
-        pieces = unicodedata.normalize("NFKC", char)
-        for piece in pieces:
-            if unicodedata.category(piece) == "Nd":
-                folded.append(str(unicodedata.digit(piece)))
-            else:
-                folded.append(piece)
-            ascii_source.append(char.isascii())
-    return "".join(folded), ascii_source
+    match = _BARS_NAME_RE.fullmatch(name)
+    if match is None:
+        return False
+    digits = match.group(1)
+    number = int(digits)
+    return 1 <= number <= _MAX_ORDINAL and digits == f"{number:03d}"
 
 
-def _leaks_calendar(text: str) -> bool:
-    """True when folded text is an ISO date, or a year written with non-ASCII digits."""
-    folded, ascii_source = _fold_decimal_digits(text)
-    if _DATE_RE.search(folded):
-        return True
-    for match in _YEAR_RE.finditer(folded):
-        if not all(ascii_source[match.start():match.end()]):
-            return True
-    return False
+def _canonical_anonymized_name(name: str) -> bool:
+    """Builder file names only. Anything else is refused, not scanned."""
+    return name in {_MANIFEST_NAME, _DAILY_NAME} or _canonical_bars_name(name)
+
+
+def _entry_is_regular_pack_file(mode: int, name: str) -> bool:
+    """lstat mode plus the builder's name. Symlinks and devices are not regular."""
+    return stat.S_ISREG(mode) and _canonical_anonymized_name(name)
+
+
+def _printable_ascii(blob: bytes) -> bool:
+    return blob.translate(None, bytes(_PRINTABLE_ASCII)) == b""
+
+
+def _session_ordinal(cell: str) -> int | None:
+    """The builder's ``S{n:05d}``. Longer ordinals stay unpadded past five digits."""
+    if len(cell) < 6 or len(cell) > 16 or cell[0] != "S":
+        return None
+    digits = cell[1:]
+    if not digits.isascii() or not digits.isdigit():
+        return None
+    number = int(digits)
+    if number < 1 or number > _MAX_ORDINAL or digits != f"{number:05d}":
+        return None
+    return number
+
+
+def _canonical_int(cell: str, low: int, high: int) -> int | None:
+    if len(cell) > 18 or _INT_RE.fullmatch(cell) is None:
+        return None
+    value = int(cell)
+    if value < low or value > high:
+        return None
+    return value
+
+
+def _canonical_decimal(cell: str) -> bool:
+    """The spelling ``format(value, '.17g')`` produces. That is what ``to_csv`` writes."""
+    if not cell or len(cell) > 64 or cell[0] == "+":
+        return False
+    try:
+        value = float(cell)
+    except ValueError:
+        return False
+    return math.isfinite(value) and cell == format(value, ".17g")
+
+
+def _canonical_count(cell: str) -> bool:
+    """A non-negative count decimal. The same spelling as a scaled volume."""
+    if not _canonical_decimal(cell):
+        return False
+    return float(cell) >= 0.0
+
+
+def _fail_cell(name: str, column: str, cell: str) -> None:
+    """A cell that is not its column. A date-shaped leftover still says so."""
+    if _LEAK_DATE_RE.search(cell):
+        raise ValueError(f"{name} contains a calendar date")
+    raise ValueError(f"{column} cell is not the builder form")
+
+
+def _manifest_int(value, low: int, high: int, label: str) -> int:
+    if isinstance(value, bool) or type(value) is not int or not low <= value <= high:
+        raise ValueError(f"{label} is not an ordinal")
+    return value
+
+
+def _manifest_bar_minutes(value) -> int:
+    if isinstance(value, bool) or type(value) is not int or not 1 <= value <= _MAX_BAR_MINUTES:
+        raise ValueError("bar_minutes is not an allowed bar size")
+    return value
+
+
+def _validate_anonymized_manifest(document: dict) -> None:
+    """Decoded manifest. Keys, types, and grammars. No date-format scan."""
+    if not isinstance(document, dict):
+        raise ValueError("pack manifest is not an object")
+    extra = sorted(set(document) - _MANIFEST_KEYS)
+    missing = sorted(_MANIFEST_KEYS - set(document))
+    if extra or missing:
+        raise ValueError(f"pack manifest fields are wrong (missing {missing}, unknown {extra})")
+    if isinstance(document["schema_version"], bool) or document["schema_version"] != SCHEMA_VERSION:
+        raise ValueError(f"pack schema_version {document['schema_version']!r} is not supported")
+    if document.get("price_basis") not in {"raw", "total_return"}:
+        raise ValueError("pack price_basis must be raw or total_return")
+    if document["anonymized"] is not True:
+        raise ValueError("pack anonymized flag is not true or false")
+    if document["asset_name"] != TICKER_STAND_IN:
+        raise ValueError(f"an anonymized pack must call the asset {TICKER_STAND_IN}")
+    pack_id = document["pack_id"]
+    if not isinstance(pack_id, str) or _PACK_ID_RE.fullmatch(pack_id) is None:
+        raise ValueError("pack_id is not 64 lowercase hex digits")
+    _manifest_bar_minutes(document["bar_minutes"])
+    if document["columns"] != list(PACK_COLUMNS):
+        raise ValueError("pack columns do not match the schema")
+    chunks = document["chunks"]
+    if not isinstance(chunks, list) or not chunks:
+        raise ValueError("pack has no chunks")
+    names = []
+    previous = None
+    for chunk in chunks:
+        if not isinstance(chunk, dict) or set(chunk) != _CHUNK_KEYS:
+            raise ValueError("chunk record does not match the schema")
+        chunk_name = chunk["file"]
+        if (
+            not isinstance(chunk_name, str)
+            or chunk_name != Path(chunk_name).name
+            or not _canonical_bars_name(chunk_name)
+        ):
+            raise ValueError("chunk file name is not allowed")
+        first = _manifest_int(chunk["first_day"], 1, _MAX_ORDINAL, "first_day")
+        last = _manifest_int(chunk["last_day"], 1, _MAX_ORDINAL, "last_day")
+        sessions = _manifest_int(chunk["sessions"], 1, _MAX_ORDINAL, "sessions")
+        if last < first or sessions > (last - first + 1):
+            raise ValueError(f"chunk {chunk_name} has an empty day range")
+        if previous is not None and first <= previous:
+            raise ValueError("pack chunks overlap or are out of order")
+        previous = last
+        names.append(chunk_name)
+    if len(names) != len(set(names)):
+        raise ValueError("chunk file names repeat")
+    if document["daily_file"] != _DAILY_NAME:
+        raise ValueError("daily file name is not allowed")
+    total = sum(chunk["sessions"] for chunk in chunks)
+    counted = _manifest_int(document["n_sessions"], 1, _MAX_ORDINAL, "n_sessions")
+    if counted != total:
+        raise ValueError("n_sessions is not the chunk session count")
+
+
+def _clock_text(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def _csv_days(
+    name: str,
+    text: str,
+    *,
+    symbol: str | None,
+    bar_minutes: int,
+    single_row: bool = False,
+) -> tuple[list[int], dict[int, float], dict[int, float]]:
+    """Typed rows.
+
+    Returns the day ordinals in appearance order, the sum of every count
+    cell for each day, and the daily count the builder writes: the regular
+    session when the day has one, otherwise every bar. ``single_row`` is
+    the daily file. Days inside the file are contiguous. ``session_id`` is
+    exactly ``S{day:05d}``.
+    """
+    try:
+        rows = list(csv.reader(io.StringIO(text)))
+    except csv.Error as exc:
+        raise ValueError(f"{name} CSV header is not the pack schema") from exc
+    if not rows or rows[0] != list(PACK_COLUMNS):
+        raise ValueError(f"{name} CSV header is not the pack schema")
+    index = {column: position for position, column in enumerate(PACK_COLUMNS)}
+    days: list[int] = []
+    counts: dict[int, float] = {}
+    session_counts: dict[int, float] = {}
+    saw_rth: set[int] = set()
+    previous: int | None = None
+    for row in rows[1:]:
+        if symbol and any(_token_present(symbol, cell) for cell in row):
+            raise ValueError(f"{name} contains the ticker")
+        if len(row) != len(PACK_COLUMNS):
+            raise ValueError(f"{name} CSV row does not match the pack header")
+        day = _canonical_int(row[index["day"]], 1, _MAX_ORDINAL)
+        if day is None:
+            _fail_cell(name, "day", row[index["day"]])
+        if _canonical_int(row[index["weekday"]], 0, 6) is None:
+            _fail_cell(name, "weekday", row[index["weekday"]])
+        minute = _canonical_int(row[index["minute"]], 0, _MAX_MINUTE)
+        if minute is None:
+            _fail_cell(name, "minute", row[index["minute"]])
+        if row[index["time"]] != _clock_text(minute):
+            _fail_cell(name, "time", row[index["time"]])
+        if row[index["session"]] not in _PHASES:
+            _fail_cell(name, "session", row[index["session"]])
+        if row[index["session_id"]] != f"S{day:05d}":
+            _fail_cell(name, "session_id", row[index["session_id"]])
+        for column in _PRICE_COLUMNS:
+            if not _canonical_decimal(row[index[column]]):
+                _fail_cell(name, column, row[index[column]])
+        count_cell = row[index["count"]]
+        if not _canonical_count(count_cell):
+            _fail_cell(name, "count", count_cell)
+        for column in _FLAG_COLUMNS:
+            if _canonical_int(row[index[column]], 0, 1) is None:
+                _fail_cell(name, column, row[index[column]])
+        if _canonical_int(row[index["bar_minutes"]], bar_minutes, bar_minutes) is None:
+            _fail_cell(name, "bar_minutes", row[index["bar_minutes"]])
+        if previous is None or day == previous + 1:
+            days.append(day)
+        elif day == previous:
+            if single_row:
+                raise ValueError(f"{name} repeats a session")
+        else:
+            raise ValueError(f"{name} sessions are not sequential")
+        previous = day
+        value = float(count_cell)
+        counts[day] = counts.get(day, 0.0) + value
+        if row[index["session"]] == "rth":
+            saw_rth.add(day)
+            session_counts[day] = session_counts.get(day, 0.0) + value
+    if not days:
+        raise ValueError(f"{name} CSV row does not match the pack header")
+    # The daily row sums the regular session when the day has one, else every bar.
+    for day in days:
+        if day not in saw_rth:
+            session_counts[day] = counts[day]
+    return days, counts, session_counts
+
+
+def _reject_banned(name: str, text: str) -> None:
+    for key in _BANNED_TEXT:
+        if key in text:
+            raise ValueError(f"{name} contains {key}")
+
+
+def _stream_names(path: Path) -> list[str]:
+    """NTFS stream names on ``path``. Empty on platforms without them.
+
+    Callers that refuse a pack must not put these names in the error.
+    """
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class _StreamData(ctypes.Structure):
+        _fields_ = (
+            ("StreamSize", ctypes.c_longlong),
+            ("cStreamName", ctypes.c_wchar * 296),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    find_first = kernel32.FindFirstStreamW
+    find_first.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(_StreamData), wintypes.DWORD]
+    find_first.restype = wintypes.HANDLE
+    find_next = kernel32.FindNextStreamW
+    find_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_StreamData)]
+    find_next.restype = wintypes.BOOL
+    find_close = kernel32.FindClose
+    find_close.argtypes = [wintypes.HANDLE]
+    find_close.restype = wintypes.BOOL
+    data = _StreamData()
+    handle = find_first(os.fspath(path), 0, ctypes.byref(data), 0)
+    if handle is None or int(handle) in {0, -1, 2**32 - 1, 2**64 - 1}:
+        raise OSError(_STREAM_UNREADABLE)
+    names = []
+    try:
+        while True:
+            names.append(data.cStreamName.replace("\x00", ""))
+            data = _StreamData()
+            if not find_next(handle, ctypes.byref(data)):
+                error = ctypes.get_last_error()
+                if error in {18, 38}:
+                    return names
+                raise OSError(_STREAM_UNREADABLE)
+    finally:
+        find_close(handle)
+
+
+def _has_nondefault_stream(path: Path) -> bool:
+    """True when ``path`` has an NTFS stream other than ``::$DATA``."""
+    return any(name.casefold() != _DEFAULT_STREAM.casefold() for name in _stream_names(path))
+
+
+def _reject_alternate_streams(path: Path) -> None:
+    """Refuse an NTFS alternate stream. The error does not name it."""
+    try:
+        extra = _has_nondefault_stream(path)
+    except OSError:
+        raise ValueError(_STREAM_UNREADABLE) from None
+    if extra:
+        raise ValueError(_ALT_STREAM)
+
+
+def _anonymized_directory(root: Path) -> list[str]:
+    """scandir plus lstat. No link is followed. The error names nothing."""
+    try:
+        info = os.lstat(root)
+    except OSError:
+        raise ValueError("pack directory is missing") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(_NOT_REGULAR)
+    names = []
+    try:
+        scan = os.scandir(root)
+    except OSError:
+        raise ValueError("pack directory is missing") from None
+    with scan:
+        for entry in scan:
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError:
+                raise ValueError(_NOT_REGULAR) from None
+            if not _entry_is_regular_pack_file(mode, entry.name):
+                raise ValueError(_NOT_REGULAR)
+            names.append(entry.name)
+    if not names:
+        raise ValueError("pack directory is empty")
+    return names
+
+
+def _read_regular(root: Path, name: str) -> bytes:
+    path = root / name
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise ValueError(_NOT_REGULAR) from None
+    if not _entry_is_regular_pack_file(info.st_mode, name):
+        raise ValueError(_NOT_REGULAR)
+    _reject_alternate_streams(path)
+    if info.st_size >= MAX_FILE_BYTES:
+        raise ValueError(f"{name} is not under {MAX_FILE_BYTES} bytes")
+    flags = os.O_RDONLY
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags | nofollow)
+    except OSError:
+        raise ValueError(_NOT_REGULAR) from None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            blob = handle.read()
+    except OSError:
+        raise ValueError(_NOT_REGULAR) from None
+    if len(blob) >= MAX_FILE_BYTES:
+        raise ValueError(f"{name} is not under {MAX_FILE_BYTES} bytes")
+    return blob
+
+
+def _anonymized_text(name: str, raw: bytes) -> str:
+    """Printable ASCII text. Gzip is checked after inflation, not as a container."""
+    if name.endswith(".gz"):
+        blob = b"".join(_anonymized_gzip_payloads(name, raw))
+    else:
+        blob = raw
+    if not _printable_ascii(blob):
+        raise ValueError(f"{name} is not printable ASCII")
+    return blob.decode("ascii")
+
+
+def _anonymized_pack_gate(root: Path, *, symbol: str | None = None) -> dict:
+    """One schema verdict for the audit and for ``load_pack``.
+
+    Directory entries, the manifest, and every CSV cell. A scaled price,
+    volume, or trade count may equal a date-shaped integer. That is a
+    number, not a calendar field. ``session_id`` is the day ordinal, and
+    ``pack_id`` is the hash of the chunk and daily bytes.
+    """
+    names = _anonymized_directory(root)
+    if _MANIFEST_NAME not in names:
+        raise ValueError("pack manifest is missing")
+    raw_manifest = _read_regular(root, _MANIFEST_NAME)
+    if not _printable_ascii(raw_manifest):
+        raise ValueError(f"{_MANIFEST_NAME} is not printable ASCII")
+    text = raw_manifest.decode("ascii")
+    if "\\u" in text or "\\U" in text:
+        raise ValueError("pack manifest contains a unicode escape")
+    if "\\" in text:
+        raise ValueError("pack manifest contains an escape")
+    try:
+        document = json.loads(text, object_pairs_hook=_json_pairs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"pack manifest is not JSON: {exc}") from exc
+    _validate_anonymized_manifest(document)
+    expected = {_MANIFEST_NAME, _DAILY_NAME, *(chunk["file"] for chunk in document["chunks"])}
+    if set(names) != expected:
+        raise ValueError("pack files are not the manifest set")
+    bar_minutes = document["bar_minutes"]
+    seen: list[int] = []
+    bar_counts: dict[int, float] = {}
+    hashed: list[tuple[str, bytes]] = []
+    next_day = 1
+    for chunk in document["chunks"]:
+        name = chunk["file"]
+        blob = _read_regular(root, name)
+        hashed.append((name, blob))
+        payload = _anonymized_text(name, blob)
+        days, _totals, sums = _csv_days(name, payload, symbol=symbol, bar_minutes=bar_minutes)
+        if days[0] != chunk["first_day"] or days[-1] != chunk["last_day"] or len(days) != chunk["sessions"]:
+            raise ValueError(f"{name} does not match its manifest day range")
+        if days[0] != next_day:
+            raise ValueError(f"{name} sessions are not sequential")
+        next_day = days[-1] + 1
+        seen.extend(days)
+        bar_counts.update(sums)
+        _reject_banned(name, payload)
+        if symbol and _text_has_ticker(name, payload, symbol):
+            raise ValueError(f"{name} contains the ticker")
+    if seen != list(range(1, len(seen) + 1)) or document["n_sessions"] != len(seen):
+        raise ValueError("pack sessions are not sequential")
+    daily_blob = _read_regular(root, _DAILY_NAME)
+    hashed.append((_DAILY_NAME, daily_blob))
+    daily = _anonymized_text(_DAILY_NAME, daily_blob)
+    daily_days, daily_counts, _session_counts = _csv_days(
+        _DAILY_NAME, daily, symbol=symbol, bar_minutes=bar_minutes, single_row=True
+    )
+    if daily_days != seen:
+        raise ValueError(f"{_DAILY_NAME} does not match its manifest day range")
+    for day, total in daily_counts.items():
+        if format(total, ".17g") != format(bar_counts[day], ".17g"):
+            raise ValueError("count is not the session trade count")
+    _reject_banned(_DAILY_NAME, daily)
+    if symbol and _text_has_ticker(_DAILY_NAME, daily, symbol):
+        raise ValueError(f"{_DAILY_NAME} contains the ticker")
+    _reject_banned(_MANIFEST_NAME, text)
+    if symbol and _text_has_ticker(_MANIFEST_NAME, text, symbol):
+        raise ValueError(f"{_MANIFEST_NAME} contains the ticker")
+    if symbol:
+        for name in names:
+            if _token_present(symbol, name):
+                raise ValueError(f"{name} leaks identity in the file name")
+    if _pack_id(hashed) != document["pack_id"]:
+        raise ValueError("pack files do not match the manifest pack_id")
+    return document
 
 
 def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
     """Refuse a designer tree that still carries identity or a scale factor."""
-    root = Path(pack_dir)
     if not symbol:
         raise ValueError("symbol is empty")
-    files = [path for path in root.rglob("*") if path.is_file()]
-    if not files:
-        raise ValueError("pack directory is empty")
-    for path in files:
-        name = path.name
-        folded_name, _ascii_source = _fold_decimal_digits(name)
-        if _YEAR_RE.search(folded_name) or _token_present(symbol, name):
-            raise ValueError(f"{name} leaks identity in the file name")
-        raw = path.read_bytes()
-        if path.suffix == ".gz":
+    _anonymized_pack_gate(Path(pack_dir), symbol=symbol)
+
+
+def copy_anonymized_pack(source, destination) -> None:
+    """Write a new pack directory from each file's default data stream.
+
+    The designer child is given the bar frame, not this directory. A file
+    handoff uses this copy. The bytes are the ones ``open`` reads, and the
+    destination files are created empty and then written, so an NTFS
+    alternate stream on the source does not ride along. A non-default
+    stream is refused before the copy.
+    """
+    src = Path(source)
+    dest = Path(destination)
+    if dest.exists() and any(dest.iterdir()):
+        raise ValueError("pack copy destination is not empty")
+    names = _anonymized_directory(src)
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        for name in sorted(names):
+            blob = _read_regular(src, name)
+            target = dest / name
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
             try:
-                parts = [payload.decode("utf-8") for payload in _anonymized_gzip_payloads(name, raw)]
-            except UnicodeDecodeError as exc:
-                raise ValueError(f"{name} is not text; refusing to ship it") from exc
-            text = "".join(parts)
-        else:
+                fd = os.open(target, flags | nofollow, 0o644)
+            except OSError:
+                raise ValueError(_NOT_REGULAR) from None
             try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError(f"{name} is not text; refusing to ship it") from exc
-        if _text_has_ticker(name, text, symbol):
-            raise ValueError(f"{name} contains the ticker")
-        for key in _BANNED_TEXT:
-            if key in text:
-                raise ValueError(f"{name} contains {key}")
-        if _leaks_calendar(text):
-            raise ValueError(f"{name} contains a calendar date")
-        if path.stat().st_size >= MAX_FILE_BYTES:
-            raise ValueError(f"{name} is {path.stat().st_size} bytes, which is not under {MAX_FILE_BYTES}")
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(blob)
+            except OSError:
+                raise ValueError(_NOT_REGULAR) from None
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
 
 
 def _designer_frame(frame: pd.DataFrame, *, anonymize: bool, price_factor: float, volume_factor: float):
@@ -620,7 +1073,10 @@ def _designer_frame(frame: pd.DataFrame, *, anonymize: bool, price_factor: float
             "close": frame["close"].astype(float).to_numpy() * price_factor,
             "volume": frame["volume"].astype(float).to_numpy() * volume_factor,
             "wap": frame["wap"].astype(float).to_numpy() * price_factor,
-            "count": frame["count"].astype(int).to_numpy(),
+            "count": [
+                _emitted_count((float(value) * volume_factor) if anonymize else value)
+                for value in frame["count"].tolist()
+            ],
             "filled": frame["filled"].astype(int).to_numpy(),
             "short_session": frame["short_session"].astype(int).to_numpy(),
             "bar_minutes": frame["bar_minutes"].astype(int).to_numpy(),
@@ -640,6 +1096,9 @@ def _daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
             wap = float((source["wap"] * source["volume"]).sum()) / volume
         else:
             wap = float(source["close"].iloc[-1])
+        count = 0.0
+        for value in source["count"].tolist():
+            count += float(value)
         rows.append(
             {
                 "day": int(day),
@@ -654,7 +1113,7 @@ def _daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
                 "close": float(source["close"].iloc[-1]),
                 "volume": volume,
                 "wap": wap,
-                "count": int(source["count"].sum()),
+                "count": count,
                 "filled": int(source["filled"].max()),
                 "short_session": int(source["short_session"].iloc[0]),
                 "bar_minutes": int(source["bar_minutes"].iloc[0]),
@@ -785,7 +1244,7 @@ def build_pack(
         daily_blob = _gzip_csv(_daily_frame(frame))
         if len(daily_blob) >= max_bytes:
             raise ValueError(f"daily file is {len(daily_blob)} bytes, which is not under {max_bytes}")
-        daily_name = "daily_rth.csv.gz"
+        daily_name = _DAILY_NAME
         (destination / daily_name).write_bytes(daily_blob)
         hashed = [(item["file"], item["bytes"]) for item in chunks]
         hashed.append((daily_name, daily_blob))
@@ -810,7 +1269,7 @@ def build_pack(
             "n_sessions": int(frame["day"].nunique()),
             "price_basis": loaded.inspection.price_adjustment,
         }
-        (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        (destination / _MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         if anonymize:
             assert_anonymized_pack_clean(destination, symbol=symbol)
         factor_key = secrets.token_bytes(32)
@@ -897,14 +1356,21 @@ def _validate_manifest(document: dict) -> None:
     for chunk in document["chunks"]:
         if set(chunk) != _CHUNK_KEYS:
             raise ValueError(f"chunk record {chunk!r} does not match the schema")
-        folded_name, _ascii_source = _fold_decimal_digits(chunk["file"])
-        if _YEAR_RE.search(folded_name) or chunk["file"] != Path(chunk["file"]).name:
-            raise ValueError(f"chunk file name {chunk['file']!r} is not allowed")
+        chunk_name = chunk["file"]
+        if not isinstance(chunk_name, str) or chunk_name != Path(chunk_name).name:
+            raise ValueError(f"chunk file name {chunk_name!r} is not allowed")
+        if document["anonymized"] and not _canonical_bars_name(chunk_name):
+            raise ValueError("chunk file name is not allowed")
         if chunk["sessions"] < 1 or chunk["last_day"] < chunk["first_day"]:
             raise ValueError(f"chunk {chunk['file']} has an empty day range")
         if previous is not None and chunk["first_day"] <= previous:
             raise ValueError("pack chunks overlap or are out of order")
         previous = chunk["last_day"]
+    daily_name = document.get("daily_file")
+    if not isinstance(daily_name, str) or daily_name != Path(daily_name).name:
+        raise ValueError(f"daily file name {daily_name!r} is not allowed")
+    if document["anonymized"] and daily_name != _DAILY_NAME:
+        raise ValueError(f"daily file name {daily_name!r} is not allowed")
 
 
 def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
@@ -921,9 +1387,10 @@ def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
 def _require_anonymized_flag(manifest: dict, session_ids: list[str]) -> None:
     """Tie structural anonymization markers to the manifest flag.
 
-    ``S#####`` session ids and the stand-in asset name are anonymized packs.
-    A named pack's session ids are calendar dates, and that is the only shape
-    allowed to load without an operator MAC.
+    The builder's ``S{n:05d}`` session ids and the stand-in asset name
+    require ``anonymized`` true. A named pack's session ids are ASCII
+    calendar dates. Anything else is refused. The operator MAC is checked
+    on the sidecar, not here.
     """
     anonymized = manifest["anonymized"] is True
     if not anonymized and manifest.get("asset_name") == TICKER_STAND_IN:
@@ -932,7 +1399,7 @@ def _require_anonymized_flag(manifest: dict, session_ids: list[str]) -> None:
             "so the manifest anonymized flag must be true"
         )
     for value in session_ids:
-        if _ANON_SESSION_RE.fullmatch(value):
+        if _session_ordinal(value) is not None:
             if not anonymized:
                 raise ValueError(
                     f"pack session id {value} is an anonymized marker, "
@@ -953,22 +1420,42 @@ def _require_anonymized_flag(manifest: dict, session_ids: list[str]) -> None:
         )
 
 
-def load_pack(pack_dir) -> LoadedPack:
-    """Read a pack. This does not open a sidecar."""
+def load_pack(pack_dir, *, symbol: str | None = None) -> LoadedPack:
+    """Read a pack. This does not open a sidecar.
+
+    ``symbol``, when the caller knows it, runs the same ticker check as
+    the audit. Typed cells cannot hold a split ticker either way.
+    """
     root = Path(pack_dir)
-    manifest_path = root / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"pack manifest is missing: {manifest_path}")
+    manifest_path = root / _MANIFEST_NAME
+    if manifest_path.is_symlink():
+        raise ValueError(_NOT_REGULAR)
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"), object_pairs_hook=_json_pairs)
+        info = os.lstat(manifest_path)
+    except OSError:
+        raise FileNotFoundError(f"pack manifest is missing: {manifest_path}") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(_NOT_REGULAR)
+    try:
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"{_MANIFEST_NAME} is not printable ASCII") from None
+    try:
+        manifest = json.loads(manifest_text, object_pairs_hook=_json_pairs)
     except json.JSONDecodeError as exc:
         raise ValueError(f"pack manifest is not JSON: {exc}") from exc
-    _validate_manifest(manifest)
+    if isinstance(manifest, dict) and manifest.get("anonymized") is True:
+        manifest = _anonymized_pack_gate(root, symbol=symbol)
+    else:
+        _validate_manifest(manifest)
     frames = []
     hashed = []
     for chunk in manifest["chunks"]:
         path = root / chunk["file"]
-        blob = path.read_bytes()
+        if manifest["anonymized"]:
+            blob = _read_regular(root, chunk["file"])
+        else:
+            blob = path.read_bytes()
         if len(blob) >= MAX_FILE_BYTES:
             raise ValueError(f"{chunk['file']} is not under {MAX_FILE_BYTES} bytes")
         if manifest["anonymized"]:
@@ -980,7 +1467,10 @@ def load_pack(pack_dir) -> LoadedPack:
             raise ValueError(f"{chunk['file']} does not match its manifest day range")
         frames.append(frame)
     daily_path = root / manifest["daily_file"]
-    daily_blob = daily_path.read_bytes()
+    if manifest["anonymized"]:
+        daily_blob = _read_regular(root, manifest["daily_file"])
+    else:
+        daily_blob = daily_path.read_bytes()
     if manifest["anonymized"]:
         _reject_anonymized_gzip(manifest["daily_file"], daily_blob)
     hashed.append((manifest["daily_file"], daily_blob))

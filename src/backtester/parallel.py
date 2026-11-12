@@ -753,6 +753,10 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod,
         price_factor = require_build_price_factor(secret)
         share_scale = float(secret["share_scale"])
         symbol = str(secret["symbol"])
+        if anonymized:
+            from .pack import assert_anonymized_pack_clean
+
+            assert_anonymized_pack_clean(market.pack_dir, symbol=symbol)
         child_dividends = runner_mod._pack_dividends(
             dividends,
             anonymized=anonymized,

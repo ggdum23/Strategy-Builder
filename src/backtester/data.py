@@ -974,11 +974,21 @@ def _accumulate(bucket, row):
         raise ValueError("weekday changed inside a resampled session")
 
 
+def _desk_trade_count(value) -> float:
+    """Trade count for a Desk bar. The scaled pack value is not a whole number."""
+    count = float(value)
+    if not math.isfinite(count):
+        raise ValueError("desk bar count is not finite")
+    return count
+
+
 def frame_to_desk_bars(frame: pd.DataFrame) -> list[dict]:
     """Desk bars. ``session`` is the real date; ``phase`` is pre/rth/post.
 
     Column ``count`` is pulled by name. Iterating tuples would rename it,
-    because ``count`` clashes with a tuple method.
+    because ``count`` clashes with a tuple method. The trade count stays a
+    float: an anonymized pack multiplies it by ``volume_factor``, and
+    truncating that product would show Desk a different bar from Arena.
     """
     rows = []
     previous = None
@@ -1000,7 +1010,7 @@ def frame_to_desk_bars(frame: pd.DataFrame) -> list[dict]:
                 "close": float(columns["close"][i]),
                 "volume": float(columns["volume"][i]),
                 "wap": float(columns["wap"][i]),
-                "count": int(columns["count"][i]),
+                "count": _desk_trade_count(columns["count"][i]),
                 "filled": int(columns["filled"][i]),
                 "new_session": session_id != previous,
             }
