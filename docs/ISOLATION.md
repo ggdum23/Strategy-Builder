@@ -246,8 +246,10 @@ The backend name is `job+appcontainer`.
   token is not the user, so a directory that was not granted is not readable.
   A child whose token is not an AppContainer, or whose token has a
   capability, is not resumed. Loopback exemptions for this profile are
-  removed, and inbound and outbound firewall rules block the package SID
-  so a connect fails with access denied instead of hanging. A connect to a
+  removed. Inbound and outbound firewall rules block the package SID, and
+  a connect-layer filter blocks it too, including loopback. Windows otherwise
+  drops loopback in the receive layer and `connect` waits until it times out.
+  A connect to a
   listening loopback server and to an external
   address both fail with access denied (10013). `LOCALAPPDATA` is the host
   value. CreateProcess returns 203 when it is missing, so a missing value

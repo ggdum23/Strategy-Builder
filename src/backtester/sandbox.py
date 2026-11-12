@@ -1123,6 +1123,122 @@ def _with_profile_lock(action):
             pass
 
 
+_WFP_ENGINE = None
+
+
+def _win_wfp_block(lease: _WinLease) -> None:
+    """Block this package at the connect layer, including loopback.
+
+    Windows drops an AppContainer's loopback handshake in the receive layer,
+    so ``connect`` waits until it times out. A connect-layer block for the
+    package SID fails that call with access denied before the handshake.
+    The filter is dynamic and lives as long as this process holds the engine.
+    """
+    global _WFP_ENGINE
+    if _WFP_ENGINE is not None:
+        return
+
+    class Guid(ctypes.Structure):
+        _fields_ = (
+            ("Data1", ctypes.c_uint32),
+            ("Data2", ctypes.c_uint16),
+            ("Data3", ctypes.c_uint16),
+            ("Data4", ctypes.c_ubyte * 8),
+        )
+
+    class Value(ctypes.Structure):
+        _fields_ = (("type", ctypes.c_uint32), ("ptr", ctypes.c_void_p))
+
+    class Condition(ctypes.Structure):
+        _fields_ = (("fieldKey", Guid), ("matchType", ctypes.c_uint32), ("value", Value))
+
+    class Action(ctypes.Structure):
+        _fields_ = (("type", ctypes.c_uint32), ("filterType", Guid))
+
+    class Display(ctypes.Structure):
+        _fields_ = (("name", ctypes.c_wchar_p), ("description", ctypes.c_wchar_p))
+
+    class Blob(ctypes.Structure):
+        _fields_ = (("size", ctypes.c_uint32), ("data", ctypes.c_void_p))
+
+    class Filter(ctypes.Structure):
+        _fields_ = (
+            ("filterKey", Guid),
+            ("displayData", Display),
+            ("flags", ctypes.c_uint32),
+            ("providerKey", ctypes.c_void_p),
+            ("providerData", Blob),
+            ("layerKey", Guid),
+            ("subLayerKey", Guid),
+            ("weight", Value),
+            ("numFilterConditions", ctypes.c_uint32),
+            ("filterCondition", ctypes.POINTER(Condition)),
+            ("action", Action),
+            ("rawContext", ctypes.c_uint64),
+            ("reserved", ctypes.c_void_p),
+            ("filterId", ctypes.c_uint64),
+            ("effectiveWeight", Value),
+        )
+
+    def guid(data1, data2, data3, data4) -> Guid:
+        item = Guid()
+        item.Data1 = data1
+        item.Data2 = data2
+        item.Data3 = data3
+        for index, byte in enumerate(data4):
+            item.Data4[index] = byte
+        return item
+
+    fwpu = ctypes.WinDLL("fwpuclnt", use_last_error=True)
+    fwpu.FwpmEngineOpen0.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    fwpu.FwpmEngineOpen0.restype = ctypes.c_uint32
+    fwpu.FwpmFilterAdd0.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(Filter),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    fwpu.FwpmFilterAdd0.restype = ctypes.c_uint32
+    engine = ctypes.c_void_p()
+    # RPC_C_AUTHN_WINNT
+    status = fwpu.FwpmEngineOpen0(None, 10, None, None, ctypes.byref(engine))
+    if status != 0 or not engine.value:
+        raise SandboxError(f"the firewall engine did not open (winerror {status})")
+    # Highest weight. The value is a pointer, and it has to outlive the add.
+    weight = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
+    name = "strategybuilderjail block connect"
+    condition = Condition()
+    # FWPM_CONDITION_ALE_PACKAGE_ID
+    condition.fieldKey = guid(0x71BC78FA, 0xF17C, 0x4997, (0xA6, 0x02, 0x6A, 0xBB, 0x26, 0x1F, 0x35, 0x1C))
+    condition.matchType = 0  # FWP_MATCH_EQUAL
+    condition.value.type = 13  # FWP_SID
+    condition.value.ptr = lease.sid
+    filt = Filter()
+    filt.displayData.name = name
+    filt.displayData.description = name
+    # FWPM_LAYER_ALE_AUTH_CONNECT_V4
+    filt.layerKey = guid(0xC38D57D1, 0x05A7, 0x4C33, (0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82))
+    # FWPM_SUBLAYER_UNIVERSAL
+    filt.subLayerKey = guid(0xEEBECC03, 0xCED4, 0x4380, (0x81, 0x9A, 0x27, 0x34, 0x39, 0x7B, 0x2B, 0x74))
+    filt.weight.type = 4  # FWP_UINT64
+    filt.weight.ptr = ctypes.cast(ctypes.byref(weight), ctypes.c_void_p)
+    filt.numFilterConditions = 1
+    filt.filterCondition = ctypes.pointer(condition)
+    filt.action.type = 0x1001  # FWP_ACTION_BLOCK
+    added = ctypes.c_uint64()
+    status = fwpu.FwpmFilterAdd0(engine, ctypes.byref(filt), None, ctypes.byref(added))
+    if status != 0:
+        raise SandboxError(f"the connect-layer block was not added (winerror {status})")
+    # Keep the engine open. Closing it removes this dynamic filter.
+    _WFP_ENGINE = (engine, fwpu, weight, condition, filt, name)
+
+
 def _win_block_network(sid_text: str) -> None:
     """Block every inbound and outbound connection for this package SID.
 
@@ -1324,6 +1440,9 @@ def _win_lease_open(lease: _WinLease) -> None:
         )
 
     try:
+        # Every process that launches a jail holds this filter. A scrubbed
+        # worker is a new process, so the grant marker cannot stand in for it.
+        _win_wfp_block(lease)
         _with_profile_lock(ensure_grants)
     except Exception:
         advapi.FreeSid(sid)
