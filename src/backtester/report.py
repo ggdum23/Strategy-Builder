@@ -25,6 +25,7 @@ import pandas as pd
 
 from .accounting import EXACT_RESERVED, LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
 from .calendar_text import contains_calendar_date
+from .costs_designer import flat_bps, is_cost_label, label as cost_label
 from .designer_allow import canonical_png, designer_csv_cell, project_designer, redacted_key_allowed
 from .designer_ids import is_report_filename, strategy_id_problem
 
@@ -44,6 +45,9 @@ _BANNED_DESIGNER_KEYS = frozenset(
         "inspection",
         "sidecar",
         "sidecar_path",
+        "factor_key",
+        "factor_mac",
+        "borrow_rate_source",
     }
 )
 _BANNED_DESIGNER_TEXT = (
@@ -56,6 +60,9 @@ _BANNED_DESIGNER_TEXT = (
     "source_root",
     "source_glob",
     "sidecar",
+    "factor_key",
+    "factor_mac",
+    "borrow_rate_source",
 )
 # Free-text values and names use the underscore-aware ticker pattern.
 # Schema keys and CSV headers do not. Status, bool, and numeric columns keep
@@ -148,7 +155,7 @@ DESIGNER_LEADERBOARD_COLUMNS = tuple(
     column
     for column in OPERATOR_LEADERBOARD_COLUMNS
     if column != "symbol" and redacted_key_allowed(column)
-)
+) + ("cost_model",)
 
 # What ``load_report`` returns. The desktop window reads this shape.
 REPORT_CONTRACT = "strategy-builder.report.v1"
@@ -443,6 +450,8 @@ def _float_token(text: str) -> bool:
 
 def _exempt_designer_value(key: str, text: str) -> bool:
     """Tokens this report writes, and only in the columns that emit them."""
+    if key == "cost_model" and is_cost_label(text):
+        return True
     folded = text.strip().casefold()
     if key == "status" and folded in _STATUS_TOKENS:
         return True
@@ -1094,19 +1103,123 @@ def _audit_publication(root: Path, *, symbol: str, scale: float | None) -> None:
             raise RuntimeError(f"{path.name} contains {reason}")
 
 
-def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str) -> Path:
+_COMPARE_FIELDS = (
+    "initial_equity",
+    "final_equity",
+    "total_return",
+    "cagr",
+    "sharpe",
+    "max_drawdown",
+    "n_fills",
+    "fees_total",
+    "slippage_cost",
+    "borrow_cost",
+    "financing_cost",
+    "cash_interest",
+    "dividends_net",
+)
+
+
+def _fee_drag_bps(fees, equity):
+    """``fees / equity * 10000``, half-up to 0.1 bp. Missing equity is null."""
+    from decimal import Decimal, ROUND_HALF_UP
+
+    if isinstance(fees, bool) or isinstance(equity, bool):
+        return None
+    if not isinstance(fees, (int, float)) or not isinstance(equity, (int, float)):
+        return None
+    if not math.isfinite(fees) or not math.isfinite(equity) or equity == 0.0:
+        return None
+    dragged = (Decimal(str(fees)) / Decimal(str(equity))) * Decimal(10000)
+    return float(dragged.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def _comparison_side(metrics: dict) -> dict:
+    side = {}
+    for key in _COMPARE_FIELDS:
+        if key in metrics:
+            side[key] = metrics.get(key)
+    side["fee_drag_bps"] = _fee_drag_bps(metrics.get("fees_total"), metrics.get("initial_equity"))
+    return side
+
+
+def _comparison_difference(real: dict, designer: dict) -> dict:
+    difference = {}
+    for key in ("total_return", "fees_total", "fee_drag_bps", "sharpe", "cagr", "max_drawdown"):
+        left = real.get(key)
+        right = designer.get(key)
+        if isinstance(left, bool) or isinstance(right, bool):
+            continue
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            continue
+        if not math.isfinite(left) or not math.isfinite(right):
+            continue
+        difference[key] = right - left
+    return difference
+
+
+def _comparison_books(real_books, designer_books) -> dict:
+    names = list(real_books)
+    for name in designer_books:
+        if name not in names:
+            names.append(name)
+    compared = {}
+    for name in names:
+        if name not in real_books or name not in designer_books:
+            continue
+        real = _comparison_side(real_books[name][1])
+        designer = _comparison_side(designer_books[name][1])
+        compared[name] = {
+            "real_fees": real,
+            "designer_cost": designer,
+            "difference": _comparison_difference(real, designer),
+        }
+    return compared
+
+
+def write_cost_comparison(path, profile: str, real_books, designer_books, *, windows=None) -> None:
+    """Operator side-by-side of the real schedule and the designer flat fee.
+
+    ``difference`` is designer minus real. This file is not part of ``designer/``.
+    """
+    document = {
+        "profile": get_profile_name(profile),
+        "label": cost_label(profile),
+        "flat_fee_bps": flat_bps(profile),
+    }
+    if windows is not None:
+        document["windows"] = {
+            name: {"books": _comparison_books(real, designer)}
+            for name, (real, designer) in windows.items()
+        }
+    else:
+        document["books"] = _comparison_books(real_books, designer_books)
+    write_json(Path(path), document)
+
+
+def get_profile_name(profile: str) -> str:
+    return str(profile).strip().lower()
+
+
+def publish_designer(
+    out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str, scale: float | None = None
+) -> Path:
     """Write the designer-facing copy under ``out_dir/designer``.
 
-    Metrics, fills, trades, liquidation, and benchmarks keep the shared
-    allow-list, and a string is kept only when that key's schema allows it.
-    The tree is then scanned with the operator scale. A hit deletes
-    ``designer/`` and raises, so a dirty tree is not left to open. The
-    operator files next to this tree are not rewritten.
+    ``books`` are the designer books. Cost drag is that book's fees over its
+    equity. ``scale`` is the operator invoice scale used only to scan the
+    tree; it is not written into ``designer/``. When the caller omits it, a
+    scale still sitting on the wrapper is used. Metrics, fills, trades,
+    liquidation, and benchmarks keep the shared allow-list, and a string is
+    kept only when that key's schema allows it. A hit deletes ``designer/``
+    and raises, so a dirty tree is not left to open. The operator files next
+    to this tree are not rewritten.
     """
     root = Path(out_dir) / "designer"
     if root.exists():
         shutil.rmtree(root)
-    scale = _operator_scale(wrapper)
+    if scale is None:
+        scale = _operator_scale(wrapper)
     if scale is None:
         scale = 1.0
     try:
@@ -1361,6 +1474,21 @@ def _coerce_row(row: dict) -> dict:
     return {str(key): _coerce_cell(value) for key, value in row.items()}
 
 
+def _operator_comparison(directory: Path):
+    path = Path(directory) / "cost_comparison.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _with_comparison(view: dict, directory: Path, audience: str) -> dict:
+    if audience == "operator":
+        comparison = _operator_comparison(directory)
+        if comparison is not None:
+            view["cost_comparison"] = comparison
+    return view
+
+
 def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
     """Structured view of one run. ``designer`` never includes the operator secrets.
 
@@ -1384,22 +1512,39 @@ def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
     designer_root = directory / "designer"
     root = designer_root if audience == "designer" and designer_root.is_dir() else directory
     if kind == "walkforward":
+        if audience == "designer":
+            metrics_path = designer_root / "metrics.json"
+            if not metrics_path.is_file():
+                raise FileNotFoundError(f"no designer metrics for this walk-forward in {directory}")
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            return {
+                "contract": REPORT_CONTRACT,
+                "audience": audience,
+                "kind": "walkforward",
+                "id": info.get("id"),
+                "profile": info.get("profile") or metrics.get("profile"),
+                "metrics": metrics,
+                "cancelled": False,
+                "directory_name": "designer",
+            }
         summary_path = directory / "walkforward.json"
         if not summary_path.is_file():
             raise FileNotFoundError(f"no walkforward.json in {directory}")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        if audience == "designer":
-            summary = redact_metrics(summary, symbol=symbol or str(summary.get("symbol") or ""))
-        return {
-            "contract": REPORT_CONTRACT,
-            "audience": audience,
-            "kind": "walkforward",
-            "id": info.get("id"),
-            "profile": info.get("profile") or summary.get("profile"),
-            "summary": summary,
-            "cancelled": False,
-            "directory_name": directory.name if audience == "operator" else "designer",
-        }
+        return _with_comparison(
+            {
+                "contract": REPORT_CONTRACT,
+                "audience": audience,
+                "kind": "walkforward",
+                "id": info.get("id"),
+                "profile": info.get("profile") or summary.get("profile"),
+                "summary": summary,
+                "cancelled": False,
+                "directory_name": directory.name if audience == "operator" else "designer",
+            },
+            directory,
+            audience,
+        )
     if kind == "parallel":
         if audience == "designer" and designer_root.is_dir():
             board = designer_root / "leaderboard.csv"
@@ -1408,28 +1553,36 @@ def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
         rows = read_leaderboard(board) if board.is_file() else []
         if audience == "designer" and root is directory:
             rows = [_redact_row(row, symbol) for row in rows]
-        return {
-            "contract": REPORT_CONTRACT,
-            "audience": audience,
-            "kind": "parallel",
-            "id": info.get("id"),
-            "profile": info.get("profile"),
-            "rows": [_coerce_row(row) for row in rows],
-            "cancelled": bool(info.get("cancelled")),
-            "directory_name": root.name,
-        }
+        return _with_comparison(
+            {
+                "contract": REPORT_CONTRACT,
+                "audience": audience,
+                "kind": "parallel",
+                "id": info.get("id"),
+                "profile": info.get("profile"),
+                "rows": [_coerce_row(row) for row in rows],
+                "cancelled": bool(info.get("cancelled")),
+                "directory_name": root.name,
+            },
+            directory,
+            audience,
+        )
     metrics_path = root / "metrics.json"
     if not metrics_path.is_file():
         raise FileNotFoundError(f"no metrics.json in {directory}")
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
     if audience == "designer" and root is directory:
         metrics = redact_metrics(metrics, symbol=symbol or str(metrics.get("symbol") or ""))
-    return {
-        "contract": REPORT_CONTRACT,
-        "audience": audience,
-        "kind": "book",
-        "id": info.get("id") or metrics.get("run_id"),
-        "profile": metrics.get("profile") or info.get("profile"),
-        "metrics": metrics,
-        "directory_name": root.name,
-    }
+    return _with_comparison(
+        {
+            "contract": REPORT_CONTRACT,
+            "audience": audience,
+            "kind": "book",
+            "id": info.get("id") or metrics.get("run_id"),
+            "profile": metrics.get("profile") or info.get("profile"),
+            "metrics": metrics,
+            "directory_name": root.name,
+        },
+        directory,
+        audience,
+    )

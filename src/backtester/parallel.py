@@ -2,9 +2,13 @@
 
 The worker is the same book process as a pack run: spawn, argv
 ``['backtester-design']``, an empty working directory, and the environment
-allowlist. The sidecar, the date map, and the unscaled dividend amounts stay
-in the parent. ``share_scale`` is passed the same way a single pack run passes
-it. Desk dividends are remapped here before the child starts.
+allowlist. The sidecar, the date map, and the dividend file stay in the
+parent. The designer child receives cash per pack share (the file amount
+times the price factor authenticated by the operator MAC). The operator
+child receives the file amount times its billing scale. ``share_scale`` is
+passed the same way
+a single pack run passes it. Desk dividends are remapped here before the
+child starts.
 
 Results do not depend on how many workers ran or which job finished first.
 A strategy that crashes, hangs, or exceeds the resident-set cap is one failed
@@ -13,7 +17,9 @@ not finished. It is safe to call from another thread. ``on_progress`` runs on
 the thread that called ``run_parallel``.
 
 The leaderboard sorts by excess total return against the 1x book. An anonymized
-job also lands in ``designer/``, which is the tree to hand a strategy designer.
+job also lands in ``designer/``, priced with the flat designer fee and the
+canonical equity. That child is not given the billing scale. The operator
+copy of the same job still is.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from .designer_ids import strategy_id_has_calendar
 from .profiles import get_profile
 from . import report as report_mod
 from .report import (
+    DESIGNER_LEADERBOARD_COLUMNS,
     OPERATOR_LEADERBOARD_COLUMNS,
     _designer_value_error,
     assert_designer_clean,
@@ -155,6 +162,7 @@ class _Prepared:
     pack_id: str | None
     inspection: dict | None
     series_kind: str = "raw"
+    designer_dividends: dict | None = None
 
 
 class _Stop:
@@ -372,6 +380,32 @@ def run_parallel(
             return _job_result(ref, source_id, "error", directory, None, market[1], timeout_s)
         emit(ref.strategy_id, source_id, "started", "")
         try:
+            designer_books = None
+            if market.anonymized:
+                from .designer_run import spawn_kwargs
+
+                designer_books = runner_mod._isolated_books(
+                    None,
+                    frame,
+                    name,
+                    timeout=timeout_s,
+                    memory_bytes=memory_bytes,
+                    stop=stop,
+                    strategy_path=ref.path,
+                    audience="designer",
+                    **spawn_kwargs(
+                        borrow_rate_annual=market.borrow_rate_annual,
+                        financing_rate_annual=financing_rate_annual,
+                        fee_mult=fee_mult,
+                        dividends=market.designer_dividends,
+                        warmup_sessions=warmup_sessions,
+                        with_benchmarks=with_benchmarks,
+                        price_basis=basis,
+                        series_kind=market.series_kind,
+                        cash_rate_annual=cash_rate_annual,
+                        withholding_rate=withholding_rate,
+                    ),
+                )
             books = runner_mod._isolated_books(
                 None,
                 frame,
@@ -413,6 +447,8 @@ def run_parallel(
                 frame,
                 books,
                 anonymized=market.anonymized,
+                designer_books=designer_books,
+                scale=market.share_factor,
                 extra=extra,
             )
             emit(ref.strategy_id, source_id, "ok", "")
@@ -702,7 +738,7 @@ def _prepare_one(market, dividends, borrow_rate_annual, runner_mod, *, price_bas
 
 
 def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod, *, price_basis) -> _Prepared:
-    from .pack import load_pack, load_sidecar
+    from .pack import load_pack, load_sidecar, require_build_price_factor
 
     loaded = load_pack(market.pack_dir)
     secret = load_sidecar(market.sidecar_path)
@@ -712,6 +748,7 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod,
         if bool(secret["anonymized"]) != loaded.anonymized:
             raise ValueError("sidecar anonymized flag does not match the pack")
         anonymized = bool(secret["anonymized"])
+        price_factor = require_build_price_factor(secret)
         share_scale = float(secret["share_scale"])
         symbol = str(secret["symbol"])
         child_dividends = runner_mod._pack_dividends(
@@ -720,6 +757,11 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod,
             share_scale=share_scale,
             date_map=secret["date_map"],
         )
+        designer_dividends = None
+        if anonymized:
+            designer_dividends = runner_mod._designer_dividends(
+                dividends, secret["date_map"], price_factor
+            )
         borrow = borrow_rate_annual
         if borrow is None and secret["borrow_rate_source"] == "explicit":
             borrow = float(secret["borrow_rate_annual"])
@@ -750,6 +792,7 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod,
         pack_id=pack_id,
         inspection=None,
         series_kind=series_kind,
+        designer_dividends=designer_dividends,
     )
 
 
@@ -1194,6 +1237,38 @@ def _write_clean_designer_error(dest, folder: str, source_name: str, profile: st
         raise
 
 
+def _overlay_designer_metrics(copied: dict, dest: Path) -> None:
+    """Replace leaderboard figures with the designer-cost book."""
+    path = Path(dest) / "metrics.json"
+    if not path.is_file():
+        return
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(metrics, dict):
+        return
+    for column in DESIGNER_LEADERBOARD_COLUMNS:
+        if column in {"rank", "strategy_id", "source_id", "status", "error", "timeout_s", "profile"}:
+            continue
+        value = metrics.get(column)
+        if isinstance(value, (dict, list)):
+            continue
+        if column in metrics:
+            # Strict JSON stores a non-finite calmar as null. The engine's only
+            # non-finite calmar is +inf (no drawdown). Put that back so the
+            # designer board still prints ``inf``.
+            if column == "calmar" and value is None:
+                value = float("inf")
+            copied[column] = value
+    benches = metrics.get("benchmarks") or {}
+    if isinstance(benches, dict):
+        held = benches.get("buy_and_hold_1x") or {}
+        if isinstance(held, dict) and held.get("total_return") is not None and copied.get("total_return") is not None:
+            copied["bh_total_return"] = held["total_return"]
+            copied["excess_total_return"] = copied["total_return"] - held["total_return"]
+        levered = benches.get("long_2x") or {}
+        if isinstance(levered, dict) and levered.get("total_return") is not None:
+            copied["long_2x_total_return"] = levered["total_return"]
+
+
 def _bundle_designer(out, ranked_rows, assignments, results) -> None:
     """One directory a designer can be handed. Named jobs stay out of it.
 
@@ -1361,6 +1436,8 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             # different token; a repair pass renames the directory to match.
             copied["strategy_id"] = folder
             copied["source_id"] = source_name
+            if row["status"] == "ok":
+                _overlay_designer_metrics(copied, designer / folder / source_name)
             if row["status"] != "ok":
                 copied["status"] = "error"
                 copied["error"] = scrub_symbols(
@@ -1382,6 +1459,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                     if isinstance(value, str) and _cell_violation({column: value}, unique_symbols):
                         copied[column] = _screened_sentence(unique_symbols)
             cleaned.append(copied)
+        cleaned.sort(key=_rank_key)
         for index, copied in enumerate(cleaned, start=1):
             copied["rank"] = index
         return cleaned

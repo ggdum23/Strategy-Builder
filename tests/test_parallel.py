@@ -508,13 +508,26 @@ def test_anonymized_pack_keeps_the_sidecar_in_the_parent(tmp_path, monkeypatch):
     finally:
         os.environ.pop("BT_CANARY", None)
     assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
-    assert len(recorded) == 2
-    for item in recorded:
+    operators = [item for item in recorded if "share_factor" in item["kwargs"]]
+    designers = [item for item in recorded if item["kwargs"].get("audience") == "designer"]
+    assert len(operators) == 2
+    assert len(designers) == 2
+    for item in operators:
         kwargs = item["kwargs"]
         assert kwargs["share_factor"] == 1.5
         assert kwargs["anonymized"] is True
         assert kwargs["dividends"] == {"S00001": 2.0 * 1.5}
         for banned in ("date_map", "symbol", "volume_factor", "operator_note", "sidecar"):
+            assert banned not in kwargs
+        assert symbol not in item["csv"]
+        assert "2024-01-02" not in item["csv"]
+    for item in designers:
+        kwargs = item["kwargs"]
+        assert "share_factor" not in kwargs
+        assert "share_scale" not in kwargs
+        assert "initial_equity" not in kwargs
+        assert kwargs["dividends"] == {"S00001": 2.0 * 1.5}
+        for banned in ("date_map", "symbol", "volume_factor", "operator_note", "sidecar", "anonymized"):
             assert banned not in kwargs
         assert symbol not in item["csv"]
         assert "2024-01-02" not in item["csv"]

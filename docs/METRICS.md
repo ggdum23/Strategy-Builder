@@ -192,14 +192,28 @@ the Desk 2x book's total return and is empty for Arena.
 
 ## What a designer may see
 
-An anonymized run writes two trees. The operator files keep the original ticker and
-`cost_basis.share_scale`. The `designer/` tree replaces the ticker with `RANDOM`, drops calendar
-dates, and the scale fields (`symbol`, `share_factor`, `share_scale`,
+An anonymized run writes two trees. The operator files keep the original ticker,
+the real fee schedule, and `cost_basis.share_scale`. The `designer/` tree is a
+separate run. It replaces the ticker with `RANDOM`, drops calendar dates, and
+drops the scale fields (`symbol`, `share_factor`, `share_scale`,
 `price_factor`, `volume_factor`, `date_map`, `cost_basis`, the sidecar, and
-the source paths). ISO dates are blanked. A parallel batch puts the designer
-leaderboard and each anonymized job under one `designer/` directory. Hand
-over that directory. Named runs are the operator's own data and are not
-rewritten into that tree.
+the source paths). ISO dates are blanked. Fills on that run use the flat
+designer fee in `docs/COSTS_DESIGNER.md`. Equity starts at the canonical
+$1,000,000 index, not the operator account. The metrics carry
+`cost_model` = `designer cost model: 0.8 bp flat` and `flat_fee_bps`. A
+parallel batch puts the designer leaderboard and each anonymized job under
+one `designer/` directory. That leaderboard is ranked on the designer-cost
+excess. Hand over that directory. Named runs are the operator's own data and
+are not rewritten into that tree.
+
+`cost_comparison.json` sits beside the operator report, not under `designer/`.
+It shows the real-fee result, the designer-cost result, and the difference
+(designer minus real) for the strategy and the benchmarks. The difference
+omits `final_equity`; each side still has it in its own unit, and
+`total_return` is the comparable gap. Walk-forward splits that file into a
+design window and a locked window. The locked window is not published under
+`designer/`. A designer audience of that walk reads `designer/metrics.json`
+only and does not include the operator design or locked statistics.
 
 The equity chart is session index against equity. The title drawn on the
 axes is `equity`. It has no ticker and no date axis. PNG bytes are not part
@@ -210,7 +224,7 @@ not read pixel bytes. A `pack_` source id whose tail is hex is rewritten to
 an opaque id on this tree. The operator copy keeps the original id.
 
 A string on an allow-listed key has to match that key: a phase, a session
-label, a clock time, an accounting enum, or a safe id (`strategy_id`,
+label, a clock time, an accounting enum, the designer cost label, or a safe id (`strategy_id`,
 `source_id`, `name`). Free text is omitted. A designer-visible strategy id matches the allow-list grammar: a leading
 letter, then ASCII letters, digits, underscore, or hyphen, with no four-digit
 run and no month or calendar token. A decimal is not an id. An id that
@@ -223,12 +237,13 @@ is judged as written, so a scale inside it fails both gates.
 
 The designer tree is an allow-list. Share counts, prices, notionals,
 per-component fees, the dollar `fees_total`, and accounting dollars are not
-in it. Fees are a cost drag in basis points of equity, rounded half-up to
-0.1 bp. Exact equity stays. A public per-share fee schedule plus that equity
-still lets a determined designer infer the share count. That residual is
-accepted and is described in `docs/PACK.md`. Redaction removes the factor
-fields. It does not promise that the numeric factor is absent from the
-equity path.
+in it. Fees are a cost drag in basis points of the designer book's equity,
+`fees_total / initial_equity * 10000`, rounded half-up to 0.1 bp. Exact
+equity stays, on the canonical index. The designer run charges the flat fee
+and is not given `share_scale`. Redaction removes `price_factor`,
+`factor_key`, `factor_mac`, and `borrow_rate_source`. It does not promise
+that a scaled price grid is unrecognizable. That grid leak is the native-tick
+residual in `docs/PACK.md`.
 
 ## Accounting switches
 

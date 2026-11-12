@@ -158,7 +158,17 @@ class PacksPage(QWidget):
         self.host.start_task(work, self.show_build, self._failed)
 
     def show_build(self, payload: dict) -> None:
-        forbidden = {"price_factor", "volume_factor", "date_map", "share_scale", "operator_note", "symbol"}
+        forbidden = {
+            "price_factor",
+            "volume_factor",
+            "date_map",
+            "share_scale",
+            "operator_note",
+            "symbol",
+            "factor_key",
+            "factor_mac",
+            "borrow_rate_source",
+        }
         leaked = forbidden & set(payload)
         clear_layout(self.banners)
         if leaked:

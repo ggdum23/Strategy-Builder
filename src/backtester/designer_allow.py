@@ -95,6 +95,8 @@ REDACTED_KEYS = frozenset(
         "start_day",
         "end_day",
         "cost_drag_bps",
+        "cost_model",
+        "flat_fee_bps",
         "period_returns",
         "monthly",
         "yearly",
@@ -375,6 +377,10 @@ def accept_string(key: str, text: str):
     """
     if text == "":
         return ""
+    if key == "cost_model":
+        from .costs_designer import is_cost_label
+
+        return text if is_cost_label(text) else None
     if key in _BOOL_KEYS and text in _BOOL_TEXT:
         return text
     if key in _FREE_TEXT_KEYS:
@@ -399,7 +405,9 @@ def accept_string(key: str, text: str):
     return None
 
 
-_STRING_SCHEMA_KEYS = _FREE_TEXT_KEYS | frozenset(_ENUM_VALUES) | _ID_KEYS | _TIME_KEYS | _SESSION_KEYS
+_STRING_SCHEMA_KEYS = (
+    _FREE_TEXT_KEYS | frozenset(_ENUM_VALUES) | _ID_KEYS | _TIME_KEYS | _SESSION_KEYS | frozenset({"cost_model"})
+)
 
 
 def _numeric_text(text: str) -> bool:

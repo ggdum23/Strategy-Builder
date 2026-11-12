@@ -70,6 +70,9 @@ WITHHELD_KEYS = frozenset(
         "price_factor",
         "volume_factor",
         "operator_note",
+        "factor_key",
+        "factor_mac",
+        "borrow_rate_source",
     }
 )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import secrets
 import signal
 import sys
@@ -107,7 +108,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--sidecar", default=None, help="Operator sidecar for that pack. Never ship this file.")
 
     walk = sub.add_parser("walkforward", help="Design window, then a locked tail")
-    _add_data_args(walk, require_out=True)
+    _add_data_args(walk, require_out=True, require_src=False)
+    walk.add_argument("--pack", default=None, help="Chunked pack directory")
+    walk.add_argument("--sidecar", default=None, help="Operator sidecar for that pack. Never ship this file.")
     walk.add_argument("--design-end-day", type=int, default=None)
     walk.add_argument("--design-end-date", default=None)
     walk.add_argument("--design-fraction", type=float, default=None)
@@ -270,6 +273,7 @@ def _cmd_run(args) -> int:
             withholding_rate=args.withholding,
         )
         _print_headline(args.profile, payload)
+        _print_cost_comparison(args.out)
         print(f"wrote {args.out}")
         _remember(
             args.out,
@@ -339,8 +343,35 @@ def _walk_inputs(args):
     }
 
 
+def _print_cost_comparison(out_dir) -> None:
+    path = Path(out_dir) / "cost_comparison.json"
+    if not path.is_file():
+        return
+    document = json.loads(path.read_text(encoding="utf-8"))
+    print(document.get("label") or "designer cost model")
+
+    def _line(name, block):
+        real = (block.get("real_fees") or {}).get("total_return")
+        designer = (block.get("designer_cost") or {}).get("total_return")
+        gap = (block.get("difference") or {}).get("total_return")
+        if real is None or designer is None or gap is None:
+            return
+        print(f"  {name}: real_fees total_return={real:.6f} designer_cost total_return={designer:.6f} difference={gap:.6f}")
+
+    books = document.get("books")
+    if isinstance(books, dict):
+        for name, block in books.items():
+            _line(name, block)
+    windows = document.get("windows")
+    if isinstance(windows, dict):
+        for window, body in windows.items():
+            print(f"window {window}")
+            for name, block in (body.get("books") or {}).items():
+                _line(f"{window}.{name}", block)
+
+
 def _cmd_walk(args) -> int:
-    from .runner import walk_forward
+    from .runner import walk_forward, walk_pack
 
     if args.warmup_sessions:
         raise ValueError(
@@ -348,6 +379,53 @@ def _cmd_walk(args) -> int:
             "--warmup-sessions belongs to `run`."
         )
     strategy_cls = load_strategy_class(args.strategy)
+    if args.pack or args.sidecar:
+        if args.share_factor is not None:
+            raise ValueError("a pack walk-forward does not take --share-factor. The sidecar holds the scale.")
+        if not args.pack or not args.sidecar:
+            raise ValueError("a pack walk-forward needs both --pack and --sidecar")
+        if args.src or args.ticker:
+            raise ValueError("a pack walk-forward does not take --src or --ticker. The sidecar holds those.")
+        if args.bar_minutes != 1:
+            raise ValueError("bar size is fixed when the pack is built. Build another pack to change it.")
+        summary = walk_pack(
+            strategy_cls,
+            args.pack,
+            args.sidecar,
+            args.profile,
+            args.out,
+            design_end_day=args.design_end_day,
+            design_end_date=args.design_end_date,
+            design_fraction=args.design_fraction,
+            warmup_days=args.warmup_days,
+            borrow_rate_annual=args.borrow_rate,
+            financing_rate_annual=args.financing_rate,
+            fee_mult=args.fee_mult,
+            dividends=_dividends(args.dividends),
+            initial_equity=args.initial_equity,
+            price_basis=args.price_basis,
+            cash_rate_annual=args.cash_rate,
+            withholding_rate=args.withholding,
+        )
+        print(
+            f"[{args.profile}] design through {summary['design_end_date']} "
+            f"({summary['design_sessions']} sessions), locked from {summary['locked_start_date']} "
+            f"({summary['locked_sessions']} sessions), warmup_sessions={summary['warmup_sessions']} "
+            f"rule={summary['warmup_rule']}"
+        )
+        _print_cost_comparison(args.out)
+        print(f"wrote {args.out}")
+        _remember(
+            args.out,
+            kind="walkforward",
+            profile=args.profile,
+            symbol=summary.get("symbol"),
+            anonymized=(Path(args.out) / "cost_comparison.json").is_file(),
+            accounting=summary.get("accounting"),
+        )
+        return 0
+    if not args.src or not args.ticker:
+        raise ValueError("a named walk-forward needs --src and --ticker")
     pack = _walk_inputs(args)
     summary, _slices, _design, _locked = walk_forward(
         strategy_cls,
@@ -626,6 +704,12 @@ def _cmd_report(args) -> int:
             print("cancelled")
         return 0
     if view["kind"] == "walkforward":
+        if args.audience == "designer":
+            metrics = view["metrics"]
+            for key in ("total_return", "fees_total", "cost_model"):
+                if key in metrics and metrics[key] is not None:
+                    print(f"{key}={metrics[key]}")
+            return 0
         summary = view["summary"]
         for key in ("design_end_date", "locked_start_date", "design_sessions", "locked_sessions", "warmup_rule"):
             if key in summary and not (args.audience == "designer" and key.endswith("_date")):
@@ -634,6 +718,8 @@ def _cmd_report(args) -> int:
             block = summary.get(label) or {}
             if block.get("total_return") is not None:
                 print(f"{label} total_return={block['total_return']}")
+        if args.audience == "operator" and view.get("cost_comparison"):
+            print(view["cost_comparison"].get("label") or "designer cost model")
         return 0
     metrics = view["metrics"]
     for key in (
@@ -655,6 +741,8 @@ def _cmd_report(args) -> int:
             print(f"{label} total_return={block['total_return']}")
     if args.audience == "operator" and metrics.get("symbol"):
         print(f"symbol={metrics['symbol']}")
+    if args.audience == "operator" and view.get("cost_comparison"):
+        print(view["cost_comparison"].get("label") or "designer cost model")
     return 0
 
 

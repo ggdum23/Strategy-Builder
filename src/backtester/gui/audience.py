@@ -33,9 +33,18 @@ from ..designer_allow import (
 )
 from ..designer_ids import fold, id_has_calendar
 
-_SECRET_TOKENS = ("share_scale", "share_factor", "price_factor", "volume_factor", "date_map")
+_SECRET_TOKENS = (
+    "share_scale",
+    "share_factor",
+    "price_factor",
+    "volume_factor",
+    "date_map",
+    "factor_key",
+    "factor_mac",
+    "borrow_rate_source",
+)
 _SECRET_WORDS = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:share_scale|share_factor|price_factor|volume_factor|date_map)(?![A-Za-z0-9_])"
+    r"(?i)(?<![A-Za-z0-9_])(?:share_scale|share_factor|price_factor|volume_factor|date_map|factor_key|factor_mac|borrow_rate_source)(?![A-Za-z0-9_])"
 )
 # A path may contain spaces and commas (``Strategy Builder, Inc\QQQ\data.csv``).
 # ``\\?\UNC\``, ``\\?\``, and the slash forms ``//?/UNC/`` and ``//?/`` are paths.
@@ -148,6 +157,9 @@ DESIGNER_DROP_KEYS = frozenset(
         "inspection",
         "sidecar",
         "sidecar_path",
+        "factor_key",
+        "factor_mac",
+        "borrow_rate_source",
         "last_price",
         "raw_price",
     }
@@ -1181,6 +1193,15 @@ def _free_has_scale(text: str, scale: float | None) -> bool:
     return _contains_scale(text, scale)
 
 
+def _published_cost_label(key, value) -> bool:
+    """The flat-fee sentence is a published constant, not the invoice scale."""
+    if str(key or "") != "cost_model" or not isinstance(value, str):
+        return False
+    from ..costs_designer import is_cost_label
+
+    return is_cost_label(value)
+
+
 def _publication_has_scale(text: str, scale: float | None) -> bool:
     if _scale_number(scale) is None:
         return False
@@ -1203,6 +1224,8 @@ def _json_has_scale(value, scale: float | None, key: str | None = None) -> bool:
     if isinstance(value, list):
         return any(_json_has_scale(item, scale, key) for item in value)
     if isinstance(value, str):
+        if _published_cost_label(key, value):
+            return False
         return _free_has_scale(value, scale)
     if isinstance(value, bool) or value is None:
         return False
@@ -1328,6 +1351,8 @@ def _csv_has_scale(rows: list[list[str]], scale: float | None) -> bool:
         for index, cell in enumerate(row):
             key = keys[index] if index < len(keys) else ""
             if key and redacted_key_allowed(key) and key not in _ID_COLUMNS and _listed_number(cell):
+                continue
+            if _published_cost_label(key, cell):
                 continue
             if _free_has_scale(cell, scale):
                 return True
