@@ -23,6 +23,7 @@ from backtester.sandbox import (
     rewrite_pyvenv_home,
     runtime_relpath_is_copied,
     should_write_ace,
+    copy_parent_candidates,
     stage_unreachable_runtimes,
     translate_staged_path,
 )
@@ -302,6 +303,84 @@ def test_the_staged_interpreter_keeps_the_child_files_only(tmp_path):
         rewritten.split("=", 1)[1].strip().splitlines()[0],
         r"C:\ProgramData\Strategy Builder\jail\runtime",
     )
+
+
+def test_programdata_is_the_copy_parent_when_its_chain_is_open():
+    version = r"C:\hostedtoolcache\windows\Python\3.12"
+    found = copy_parent_candidates(ENV, [version + r"\x64"], _open(version))
+    assert acl_same(found[0], r"C:\ProgramData")
+    assert any(acl_same(item, r"C:\hostedtoolcache\windows\Python") for item in found)
+    assert not any(acl_same(item, version) for item in found)
+    assert not any(_is_volume(item) for item in found)
+
+
+def test_a_closed_programdata_uses_the_nearest_open_ancestor():
+    version = r"C:\hostedtoolcache\windows\Python\3.12"
+    closed = (version, r"C:\ProgramData", r"C:\Users\Public")
+
+    def accessible(path: str) -> bool:
+        return not any(acl_same(path, item) for item in closed)
+
+    environ = dict(ENV)
+    environ["PUBLIC"] = r"C:\Users\Public"
+    found = copy_parent_candidates(environ, [version + r"\x64"], accessible)
+    assert acl_same(found[0], r"C:\hostedtoolcache\windows\Python")
+    assert not any(acl_same(item, r"C:\ProgramData") for item in found)
+    assert not any(acl_same(item, r"C:\Users\Public") for item in found)
+    assert not any(acl_same(item, version) for item in found)
+    assert not any(_is_volume(item) for item in found)
+
+
+def test_the_actions_temp_directory_is_not_the_copy_parent():
+    blocked = r"D:\a\_temp"
+    closed = (blocked, r"C:\ProgramData", r"C:\Users\Public", r"C:\Program Files", r"C:\Program Files (x86)")
+
+    def accessible(path: str) -> bool:
+        return not any(acl_same(path, item) for item in closed)
+
+    environ = dict(ENV)
+    environ["PUBLIC"] = r"C:\Users\Public"
+    found = copy_parent_candidates(environ, [blocked + r"\Strategy Builder\_internal"], accessible)
+    assert acl_same(found[0], r"D:\a")
+    assert not any(acl_same(item, blocked) for item in found)
+    assert not any(_is_volume(item) for item in found)
+
+
+def test_windows_is_not_a_copy_parent():
+    environ = {
+        "SystemRoot": r"C:\Windows",
+        "WINDIR": r"C:\Windows",
+        "SystemDrive": "C:",
+        "USERPROFILE": r"C:\Users\runner",
+    }
+    found = copy_parent_candidates(
+        environ,
+        [r"C:\Windows\Temp\py"],
+        _open(r"C:\Windows\Temp"),
+    )
+    assert found == []
+
+
+def test_a_frozen_bundle_copy_keeps_nested_directories(tmp_path):
+    bundle = tmp_path / "app"
+    internal = bundle / "_internal" / "numpy"
+    internal.mkdir(parents=True)
+    (internal / "__init__.py").write_text("numpy", encoding="utf-8")
+    (bundle / "backtester.exe").write_bytes(b"exe")
+    (bundle / "app.pth").write_text("x", encoding="utf-8")
+    stage = tmp_path / "runtime"
+    _copy_runtime_tree(bundle, stage, [], full=True)
+    assert (stage / "backtester.exe").read_bytes() == b"exe"
+    assert (stage / "_internal" / "numpy" / "__init__.py").is_file()
+    assert not (stage / "app.pth").exists()
+    assert runtime_relpath_is_copied(("_internal", "numpy"), is_dir=True, package_prefixes=(), full=True)
+    assert not runtime_relpath_is_copied(("_internal",), is_dir=True, package_prefixes=())
+
+
+def _is_volume(path: str) -> bool:
+    from backtester.sandbox import _is_volume_acl_path
+
+    return _is_volume_acl_path(path)
 
 
 def test_the_child_command_uses_the_staged_interpreter(monkeypatch):

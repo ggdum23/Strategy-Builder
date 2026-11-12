@@ -634,22 +634,70 @@ def _private_dir() -> str:
     return tempfile.mkdtemp(prefix="bt-referee-", dir=str(parent))
 
 
+def _chain_accessible(path, accessible) -> bool:
+    """True when ``path`` and every ancestor already pass ``accessible``.
+
+    This does not write an ACL. The volume root is included in the check.
+    """
+    if not accessible(path):
+        return False
+    return all(accessible(higher) for higher in acl_ancestor_paths(path))
+
+
+def copy_parent_candidates(environ, roots, accessible) -> list[str]:
+    """Directories an app-owned runtime copy may be created under.
+
+    ProgramData and Public come first, when that directory and every
+    ancestor already let the container through. Otherwise each blocked
+    runtime contributes its traversable ancestors, nearest first. The
+    blocked directory, the volume root, and anything inside Windows or
+    System32 are not candidates. Program Files is last, and only as a
+    parent: the directory itself is not a grant target.
+    """
+    found: list[str] = []
+    _exact, trees = protected_acl_layout(environ)
+
+    def add(raw) -> None:
+        if raw is None or raw == "" or _is_volume_acl_path(raw):
+            return
+        if any(acl_same(raw, tree) or _acl_inside(raw, tree) for tree in trees):
+            return
+        if any(acl_same(raw, item) for item in found):
+            return
+        if not _chain_accessible(raw, accessible):
+            return
+        found.append(str(raw))
+
+    for key in ("ProgramData", "PUBLIC"):
+        add(environ.get(key, ""))
+    for root in roots:
+        if not root:
+            continue
+        blocked = first_blocked_ancestor(str(root), [], accessible)
+        if blocked is None:
+            continue
+        for parent in acl_ancestor_paths(blocked):
+            add(parent)
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        add(environ.get(key, ""))
+    return found
+
+
 def _owned_work_parent() -> Path | None:
     """An app-created folder whose parents already allow package traverse.
 
-    The DACL of ProgramData, Public, the user profile, and the drive root
-    is not modified. If none of those parents already let All Application
-    Packages through, the caller falls back to the user temp and the launch
-    refuses to rewrite those ancestors.
+    The DACL of the parent is not modified. ProgramData and Public are
+    tried first. When those do not already let All Application Packages
+    through, the copy is created under the nearest ancestor of the blocked
+    interpreter that does. The volume root, Windows, and System32 are
+    never used. Only the directories this function creates are later granted.
     """
     if sys.platform != "win32":
         return None
-    for key in ("ProgramData", "PUBLIC"):
-        raw = os.environ.get(key)
-        if not raw:
-            continue
+    roots = [str(path) for path in _interpreter_candidates()]
+    for raw in copy_parent_candidates(os.environ, roots, _ancestor_accessible):
+        parent = Path(raw)
         try:
-            parent = Path(raw)
             if not parent.is_dir():
                 continue
             if not _chain_has_package_traverse(parent):
@@ -2267,12 +2315,14 @@ def rewrite_pyvenv_home(text: str, translate) -> str:
     return "".join(lines)
 
 
-def runtime_relpath_is_copied(parts, *, is_dir: bool, package_prefixes) -> bool:
+def runtime_relpath_is_copied(parts, *, is_dir: bool, package_prefixes, full: bool = False) -> bool:
     """Files the child interpreter opens, not the whole site-packages tree.
 
     ``package_prefixes`` are casefolded relative paths of imported packages,
     such as ``Lib/site-packages/numpy``. A ``._pth`` file is left behind so
-    the copy does not redirect the child at the original prefix.
+    the copy does not redirect the child at the original prefix. ``full``
+    keeps a frozen bundle's layout, including directories other than Lib
+    and DLLs, and still drops caches and path files.
     """
     folded = tuple(part.casefold() for part in parts)
     if any(
@@ -2284,6 +2334,8 @@ def runtime_relpath_is_copied(parts, *, is_dir: bool, package_prefixes) -> bool:
         return False
     if folded and (folded[-1].endswith("._pth") or folded[-1].endswith(".pth")):
         return False
+    if full:
+        return True
     if not folded:
         return True
     # The CPython regression suite is not opened by the child. Copying it
@@ -2341,9 +2393,13 @@ def _remember_runtime_stamp() -> None:
 
 
 def _runtime_copy_ready(dest: Path, src: Path) -> bool:
-    exe_name = "python.exe" if os.name == "nt" else "python"
-    if not (dest / exe_name).is_file() or not (dest / "Lib" / "os.py").is_file():
-        return False
+    if getattr(sys, "frozen", False):
+        if not (dest / Path(sys.executable).name).is_file():
+            return False
+    else:
+        exe_name = "python.exe" if os.name == "nt" else "python"
+        if not (dest / exe_name).is_file() or not (dest / "Lib" / "os.py").is_file():
+            return False
     for item in _load_runtime_stamp():
         if not isinstance(item, dict):
             continue
@@ -2390,7 +2446,7 @@ def _package_prefixes(src: Path, package_dirs) -> tuple:
     return tuple(found)
 
 
-def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set) -> None:
+def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set, *, full: bool) -> None:
     try:
         entries = list(src.iterdir())
     except OSError as exc:
@@ -2401,7 +2457,9 @@ def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set) -> Non
             is_dir = entry.is_dir()
         except OSError:
             continue
-        if not runtime_relpath_is_copied(relative, is_dir=is_dir, package_prefixes=prefixes):
+        if not runtime_relpath_is_copied(
+            relative, is_dir=is_dir, package_prefixes=prefixes, full=full
+        ):
             continue
         try:
             resolved = entry.resolve()
@@ -2413,7 +2471,7 @@ def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set) -> Non
         target = dest / entry.name
         if is_dir:
             target.mkdir(exist_ok=True)
-            _copy_runtime_into(entry, target, relative, prefixes, seen)
+            _copy_runtime_into(entry, target, relative, prefixes, seen, full=full)
             continue
         if target.exists():
             continue
@@ -2425,10 +2483,11 @@ def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set) -> Non
             ) from exc
 
 
-def _copy_runtime_tree(src: Path, dest: Path, package_dirs) -> None:
+def _copy_runtime_tree(src: Path, dest: Path, package_dirs, *, full: bool = False) -> None:
     """Copy the interpreter files the child opens. The source tree is not granted."""
     dest.mkdir(parents=True, exist_ok=True)
-    _copy_runtime_into(src, dest, (), _package_prefixes(src, package_dirs), set())
+    prefixes = () if full else _package_prefixes(src, package_dirs)
+    _copy_runtime_into(src, dest, (), prefixes, set(), full=full)
 
 
 def _prepare_runtime_grant_roots() -> list[Path]:
@@ -2453,6 +2512,14 @@ def _prepare_runtime_grant_roots() -> list[Path]:
         stage_root=stage_root,
     )
     _RUNTIME_COPIES = [(source, dest) for source, dest in copies]
+    # The copy sits under directories this process just created. Those
+    # directories do not inherit the ancestor's traverse ACE, so the
+    # container cannot reach the copy unless they are granted too.
+    # The ancestor itself is not in this list.
+    if copies:
+        for directory in _CREATED_APP_DIRS:
+            if not any(acl_same(directory, path) for path in grant):
+                grant.append(str(directory))
     return [Path(path) for path in grant]
 
 
@@ -2492,7 +2559,7 @@ def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:
             _win_grant(lease, target, "(OI)(CI)(RX)", recurse=False)
             granted.append((target, False))
         note_phase(f"runtime-copy-start {target.name}")
-        _copy_runtime_tree(src, target, packages)
+        _copy_runtime_tree(src, target, packages, full=bool(getattr(sys, "frozen", False)))
         _rewrite_staged_pyvenv(target)
         note_phase(f"runtime-copy-done {target.name}")
         if sys.platform == "win32":
