@@ -10,7 +10,8 @@ Rules and the interpretations they required are in docs/DESK_SPEC_DECISIONS.md.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from types import SimpleNamespace
 
 from . import costs_desk as D
 from .accounting import dividend_cash, idle_base, require_annual_rate, require_withholding_rate, session_accrual
@@ -577,11 +578,54 @@ def _session_index(rows):
     return ordinals, last_rth, last_index
 
 
+def _without_share_factor(cfg: DeskConfig):
+    """A config object that does not carry share_factor.
+
+    Deleting the dataclass attribute falls back to the class default, which
+    is still 1.0. The cost-model path has to use an object that has no such
+    attribute, so a strategy walking frames cannot see that default.
+    """
+    values = {
+        field.name: getattr(cfg, field.name)
+        for field in fields(cfg)
+        if field.name != "share_factor"
+    }
+    return SimpleNamespace(**values)
+
+
+def _reported_config(cfg) -> dict:
+    """Operator config keeps share_factor. The cost-model path does not."""
+    reported = {
+        "borrow_rate_annual": cfg.borrow_rate_annual,
+        "financing_rate_annual": cfg.financing_rate_annual,
+        "cash_rate_annual": cfg.cash_rate_annual,
+        "withholding_rate": cfg.withholding_rate,
+        "fee_mult": cfg.fee_mult,
+        "slippage_bps": cfg.slippage_bps,
+        "max_abs_target": cfg.max_abs_target,
+        "margin_call_leverage": cfg.margin_call_leverage,
+        "margin_call_target": cfg.margin_call_target,
+        "liquidation_hwm_fraction": cfg.liquidation_hwm_fraction,
+        "live_start_ordinal": cfg.live_start_ordinal,
+        "sessions_per_year": cfg.sessions_per_year,
+        "sessions_per_month": cfg.sessions_per_month,
+    }
+    if cfg.cost_model is None:
+        return {"share_factor": cfg.share_factor, **reported}
+    return reported
+
+
 def run(strategy, bars, config=None):
     """Simulate `strategy` on desk rules. `bars` is a frame or a sequence of mappings."""
     cfg = config if config is not None else DeskConfig()
     if not isinstance(cfg, DeskConfig):
         raise TypeError("config must be a DeskConfig")
+    if cfg.cost_model is not None:
+        # Designer fills do not use share_factor. Replace the config before
+        # on_bar so the default 1.0 is not an attribute a strategy can see.
+        # The operator path, cost_model None, still binds it.
+        cfg = _without_share_factor(cfg)
+        config = cfg
     rows = normalize_bars(bars)
     ordinals, last_rth, last_index = _session_index(rows)
     book = _Book(cfg)
@@ -697,22 +741,7 @@ def run(strategy, bars, config=None):
             "frac_short": book.n_short / book.n_exp if book.n_exp else 0.0,
             "n_bars": book.n_exp,
         },
-        "config": {
-            "share_factor": cfg.share_factor,
-            "borrow_rate_annual": cfg.borrow_rate_annual,
-            "financing_rate_annual": cfg.financing_rate_annual,
-            "cash_rate_annual": cfg.cash_rate_annual,
-            "withholding_rate": cfg.withholding_rate,
-            "fee_mult": cfg.fee_mult,
-            "slippage_bps": cfg.slippage_bps,
-            "max_abs_target": cfg.max_abs_target,
-            "margin_call_leverage": cfg.margin_call_leverage,
-            "margin_call_target": cfg.margin_call_target,
-            "liquidation_hwm_fraction": cfg.liquidation_hwm_fraction,
-            "live_start_ordinal": cfg.live_start_ordinal,
-            "sessions_per_year": cfg.sessions_per_year,
-            "sessions_per_month": cfg.sessions_per_month,
-        },
+        "config": _reported_config(cfg),
     }
 
 
@@ -811,7 +840,7 @@ def metrics(res):
             per[label] = [prev_end, None]
         per[label][1] = equity[i]
         prev_end = equity[i]
-    return {
+    payload = {
         "sessions": n,
         "years": round(years, 3),
         "first_session": daily[0]["session"],
@@ -865,16 +894,18 @@ def metrics(res):
         "avg_abs_exposure_close": sum(abs(x) for x in exposure) / n,
         "frac_sessions_long_at_close": sum(1 for x in exposure if x > 0.0) / n,
         "frac_sessions_short_at_close": sum(1 for x in exposure if x < 0.0) / n,
-        "share_factor": res["config"]["share_factor"],
-        "borrow_rate_annual": res["config"]["borrow_rate_annual"],
-        "financing_rate_annual": res["config"]["financing_rate_annual"],
-        "cash_rate_annual": float(res["config"].get("cash_rate_annual", 0.0)),
-        "withholding_rate": float(res["config"].get("withholding_rate", 0.0)),
-        "fee_mult": res["config"]["fee_mult"],
-        "period_returns": {
-            label: _session_return(per[label][1], per[label][0]) for label in per
-        },
     }
+    if "share_factor" in res["config"]:
+        payload["share_factor"] = res["config"]["share_factor"]
+    payload["borrow_rate_annual"] = res["config"]["borrow_rate_annual"]
+    payload["financing_rate_annual"] = res["config"]["financing_rate_annual"]
+    payload["cash_rate_annual"] = float(res["config"].get("cash_rate_annual", 0.0))
+    payload["withholding_rate"] = float(res["config"].get("withholding_rate", 0.0))
+    payload["fee_mult"] = res["config"]["fee_mult"]
+    payload["period_returns"] = {
+        label: _session_return(per[label][1], per[label][0]) for label in per
+    }
+    return payload
 
 
 class BuyAndHold:

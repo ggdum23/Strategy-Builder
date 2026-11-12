@@ -68,8 +68,9 @@ per-share fees on real share counts. It does not receive the sidecar
 document, the date map, the ticker, the volume factor, the operator note, or
 the sidecar path. The runner frames that are only forwarding the number do not
 keep a local named `share_scale` or `share_factor` while `on_bar` runs. The
-engine frame does: Arena's `run` parameter and Desk's `DeskConfig.share_factor`
-are how the invoice is computed, and a strategy can see them in that process.
+operator engine frame does: Arena's `run` parameter and Desk's
+`DeskConfig.share_factor` are how the invoice is computed, and a strategy can
+see them in that process.
 Post-fee cash on the operator book can still be read against the public
 per-share schedule. That book is not the designer tree.
 
@@ -78,7 +79,9 @@ The designer child is a second process. It is not given `share_scale`,
 `docs/COSTS_DESIGNER.md`. Equity starts at the canonical index. Dividend
 cash per pack share is the file amount times the price factor whose
 operator HMAC matches, never `share_scale`. When that child runs Arena, the engine unbinds
-`share_scale` before the bar loop, so the default 1.0 is not a local.
+`share_scale` before the bar loop, so the default 1.0 is not a local. When it
+runs Desk, the engine drops `share_factor` from the config before `on_bar` and
+leaves it out of the result config.
 The exact-equity plus per-share-schedule residual is closed for that process
 and for everything written under `designer/`: there is no per-share term, the
 flat constant is not derived from the ticker or the pack, and the equity unit

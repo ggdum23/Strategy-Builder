@@ -114,7 +114,9 @@ These are the readings that were not fixed by a single sentence in the spec.
     date map to the pack session id (`S#####`). The operator child receives the
     amount multiplied by `share_scale`. The designer child receives the amount
     multiplied by the price factor whose operator HMAC matches, not by
-    `share_scale`. A date that is not in the pack is an error.
+    `share_scale`. That MAC also binds the pack id, the anonymized flag, and
+    the date map. A date that is not in the pack is an error. On the designer
+    cost-model path the engine drops `share_factor` before `on_bar`.
 
 17. **Bar order.** If this is the first live bar, reset the book flat to the
     starting equity. Then, if not disqualified: boundary charges, then an RTH

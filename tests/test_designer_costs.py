@@ -31,7 +31,7 @@ from backtester.costs_designer import (
 from backtester.data import load_named, slice_walkforward
 from backtester.designer_run import execute as designer_execute
 from backtester.engine_desk import BuyAndHold, DeskConfig
-from backtester.pack import build_pack, load_pack, load_sidecar
+from backtester.pack import build_pack, factor_mac, load_pack, load_sidecar
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 from backtester.report import assert_designer_clean, load_report
 from backtester.runner import execute, run_named, run_pack, walk_forward, walk_pack
@@ -237,7 +237,7 @@ def test_desk_margin_and_liquidation_use_the_flat_fee():
     assert margin["margin_calls_filled"] == 1
     margin_fill = next(row for row in margin["fills"] if row["kind"] == "margin")
     assert margin_fill["fees"] == _fee(margin_fill["shares_delta"], margin_fill["fill_price"])
-    assert margin["config"]["share_factor"] == 1.0
+    assert "share_factor" not in margin["config"]
 
     shares = int(equity0 / open_px)
     fill = model.slipped_price(open_px, shares)
@@ -317,9 +317,13 @@ def _build(tmp_path, src, registry, *, symbol="NIK", price_factor=1.7, volume_fa
     return pack, sidecar
 
 
-def _rewrite(sidecar, *, allow_scale_mismatch=False, **changes):
+def _rewrite(sidecar, *, allow_scale_mismatch=False, resign=False, **changes):
     document = json.loads(Path(sidecar).read_text(encoding="utf-8"))
     document.update(changes)
+    if resign:
+        # The operator holds the key, so an intentional billing-scale edit can
+        # be signed again. A tamper that does not resign is refused.
+        document["factor_mac"] = factor_mac(bytes.fromhex(document["factor_key"]), document)
     Path(sidecar).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     return load_sidecar(sidecar, allow_scale_mismatch=allow_scale_mismatch)
 
@@ -349,7 +353,7 @@ def test_designer_tree_is_identical_across_share_scales(tmp_path, profile):
     trees = []
     operator_fees = []
     for scale in SCALES:
-        _rewrite(sidecar, allow_scale_mismatch=True, share_scale=scale)
+        _rewrite(sidecar, allow_scale_mismatch=True, resign=True, share_scale=scale)
         out = tmp_path / f"{profile}-{scale}"
         payload = run_pack(
             BuyThenSell,
@@ -447,8 +451,10 @@ def test_edited_price_factor_is_rejected(tmp_path):
 def test_anonymized_sidecar_rejects_a_share_scale_other_than_the_price_factor(tmp_path):
     src, registry = _write_series(tmp_path, days=1)
     _pack, sidecar = _build(tmp_path, src, registry, symbol="NIK", price_factor=1.7)
-    with pytest.raises(ValueError, match="build-time price factor"):
+    with pytest.raises(ValueError, match="factor_mac"):
         _rewrite(sidecar, share_scale=0.25)
+    with pytest.raises(ValueError, match="must equal the build-time price factor"):
+        _rewrite(sidecar, resign=True, share_scale=0.25)
 
 
 def test_designer_dividend_is_real_div_times_build_price_factor(tmp_path):
@@ -459,7 +465,7 @@ def test_designer_dividend_is_real_div_times_build_price_factor(tmp_path):
     trees = []
     per_share = []
     for scale in SCALES:
-        _rewrite(sidecar, allow_scale_mismatch=True, share_scale=scale)
+        _rewrite(sidecar, allow_scale_mismatch=True, resign=True, share_scale=scale)
         out = tmp_path / f"div-{scale}"
         run_pack(
             BuyAndHold,
@@ -508,6 +514,36 @@ def test_cost_model_path_does_not_bind_share_scale():
     seen.clear()
     engine_arena.run(Probe(), make_bars(days=1), share_scale=1.7)
     assert any(seen)
+
+
+def test_cost_model_path_drops_share_factor():
+    seen = []
+
+    class Probe:
+        def on_bar(self, _row, _account):
+            frame = sys._getframe()
+            while frame is not None:
+                code = frame.f_code
+                if code.co_name == "run" and code.co_filename.endswith("engine_desk.py"):
+                    cfg = frame.f_locals.get("cfg")
+                    seen.append(getattr(cfg, "share_factor", "missing"))
+                frame = frame.f_back
+            return None
+
+    bars = [
+        _desk_bar("S1", "09:30", 100.0),
+        _desk_bar("S1", "15:59", 100.0),
+    ]
+    designer = engine_desk.run(Probe(), bars, DeskConfig(cost_model=DesignerCostModel(0.8), share_factor=7.777))
+    assert seen
+    assert seen == ["missing"] * len(seen)
+    assert "share_factor" not in designer["config"]
+    assert "share_factor" not in engine_desk.metrics(designer)
+    seen.clear()
+    operator = engine_desk.run(Probe(), bars, DeskConfig(share_factor=1.7))
+    assert 1.7 in seen
+    assert operator["config"]["share_factor"] == 1.7
+    assert engine_desk.metrics(operator)["share_factor"] == 1.7
 
 
 def test_named_run_stays_on_the_real_schedule(tmp_path):
