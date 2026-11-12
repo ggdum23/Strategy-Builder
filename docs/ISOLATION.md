@@ -120,9 +120,9 @@ receive it.
 ## Parallel runner
 
 `backtester parallel` scores each strategy in a new spawned process. An
-anonymized job spawns the designer worker first (flat fee, canonical equity,
-no billing scale, dividend cash per pack share restated by the MAC-checked
-price factor) and the operator worker second. The operator worker receives
+anonymized job spawns the designer worker (flat fee, canonical equity, no
+billing scale, dividend cash per pack share restated by the MAC-checked
+price factor) and the operator worker together. The operator worker receives
 `share_scale`. A named job spawns once. The strategy file runs in the jail
 inside that worker and is not given the sidecar, `factor_key`, `factor_mac`,
 or the scale. Desk dividends are remapped in the parent before the worker
