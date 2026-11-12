@@ -318,8 +318,9 @@ These are the Windows-only cases left for a live check on the owner PC.
 Linux runs the same assertions and does not take the `xfail`. The mark is
 `xfail(strict=False, reason="verify live on owner Windows PC")`. A pass on
 Windows is an xpass. The Windows CI job stops at 25 minutes, and each test
-stops at 60 seconds (`pytest-timeout`, thread method), so a hang cannot
-hold the job for hours.
+stops at 60 seconds (`pytest-timeout`). The thread timer raises in that
+test instead of calling `os._exit`, so one slow test does not discard the
+rest of the run. A hang cannot hold the job for hours.
 
 H3, network. AppContainer drops loopback in the receive layer, so `connect`
 to a listening loopback server waits until the socket times out unless a
@@ -329,7 +330,8 @@ probe still requires access denied (`EPERM`, `EACCES`, or `10013`) on both
 the listener and `1.1.1.1:443`. A refused or timed-out connect is not a
 block. The installer smoke on `642f31f` (run 43125742983) saw that access
 error from the frozen app. The unit probe has not been observed after that
-filter, because the child died in import first (see H7).
+filter. On `aa90226` the matrix still stopped at the first 60s pipe wait
+(see H5), so this unit probe has not been reached on a finished Windows run.
 
 - `tests/test_referee.py::test_selftest_probes_are_blocked[net.py-0.0]`
 - `tests/test_designer_jail.py::test_absolute_read_arm_memory_and_network_stay_in_the_jail`
@@ -343,8 +345,14 @@ Grants are once per machine now, and traverse uses the ACL API instead of
 bound while that grant ran inside the call. The parallel leg of the
 designer-jail test hit 60s. The reserved benchmark publish uses a 90s
 worker budget. The fast strategy in the hang test also came back as a
-timeout when startup was slower than its 6s budget. None of these have
-been re-measured on a finished Windows run since the grant change.
+timeout when startup was slower than its 6s budget. On `aa90226` (push
+run 43129181253) the matrix did not finish. Python 3.12 stopped in
+`tests/test_accounting.py::test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date`
+while `_take_result` waited on the worker pipe. Python 3.13 reached the
+designer-jail test below, at the pack-arm launch, and the thread timer
+then exited the process, so the `xfail` was not recorded. That accounting
+test is not marked: 3.13 got past it, and a real failure there should stay
+visible. The timer now fails only the slow test.
 
 - `tests/test_referee.py::test_sleep_and_lookahead_are_disqualified_within_eight_seconds`
 - `tests/test_designer_jail.py::test_absolute_read_arm_memory_and_network_stay_in_the_jail`
@@ -355,10 +363,11 @@ H7, numpy on Windows, not marked. On `844626d` the child aborted with
 `OSError: [WinError 87] The parameter is incorrect: 'pydeps\00\numpy.libs'`
 because `add_dll_directory` was given the junction. `20359e2` does not link
 `*.libs` into the slot and calls `add_dll_directory` on the real directory.
-That has not been observed on Windows. The jailed D05, D06, D09, and D11
-examples stay strict on both runners. Ubuntu already matches those examples
-jailed against in-process, including numpy, with `/etc/ld.so.cache` bound
-and the parent's import order on `sys.path`.
+On `aa90226` the Windows jailed-examples job in push run 43129181253 passed
+all 40 (D01–D20, arena and desk), including the numpy strategies. Those
+examples stay strict on both runners. Ubuntu matches them jailed against
+in-process, with `/etc/ld.so.cache` bound and the parent's import order on
+`sys.path`.
 
 ### What the child is not given
 
