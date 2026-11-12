@@ -6,8 +6,10 @@ only to the sidecar. Designer-facing file names carry neither a ticker nor a
 year. A chunk is about 250 trading sessions and each file stays under 25 MB.
 
 Prices multiplied by k are paired with share_scale = k. The sidecar file is
-where that number is stored. The runner reads it and passes it to the child
-engine so per-share fees use real share counts. The pack files do not contain it.
+where that number is stored. It also holds a random key and an HMAC over a
+versioned binding of pack_id, the anonymized flag, the date map, k, and
+share_scale. The pack files do not contain the factor, the key, or any
+digest of the factor. The runner checks the MAC before it uses k.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import csv
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -74,6 +77,7 @@ _SIDECAR_KEYS = {
     "operator_note",
     "price_basis",
 }
+_FACTOR_MAC_KEYS = {"factor_key", "factor_mac"}
 _MANIFEST_KEYS = {
     "schema_version",
     "anonymized",
@@ -88,6 +92,8 @@ _MANIFEST_KEYS = {
 }
 _CHUNK_KEYS = {"file", "first_day", "last_day", "sessions"}
 _DATE_RE = re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b")
+_ANON_SESSION_RE = re.compile(r"^S\d{5}$")
+_FACTOR_MAC_VERSION = 1
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 _BANNED_TEXT = (
     "price_factor",
@@ -155,10 +161,122 @@ def _keys(value, expected: set[str], path: str) -> None:
         _fail(path, f"missing field {missing[0]!r}")
 
 
-def validate_sidecar(document: dict) -> None:
+def canonical_price_factor(price_factor: float) -> str:
+    """Shortest round-trip decimal of a scale factor.
+
+    ``1.7`` stays ``1.7``. The decimal is one field of the HMAC message. It
+    is not written into the pack.
+    """
+    if isinstance(price_factor, bool) or not isinstance(price_factor, (int, float)):
+        raise ValueError("price factor must be a positive finite number")
+    value = float(price_factor)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("price factor must be a positive finite number")
+    return json.dumps(value, allow_nan=False)
+
+
+def _factor_mac_message(document: dict) -> bytes:
+    """Versioned canonical JSON bound to this pack, not only to k.
+
+    The dividend schedule is not a pack or sidecar field. It is an operator
+    input supplied when the pack is run, so it is not part of this message.
+    ``date_map`` is what places those amounts on session ids, and it is bound.
+    """
+    if not isinstance(document.get("anonymized"), bool):
+        raise ValueError("anonymized flag must be true or false")
+    pack_id = document.get("pack_id")
+    if not isinstance(pack_id, str) or not pack_id:
+        raise ValueError("pack_id must be a non-empty string")
+    date_map = document.get("date_map")
+    if not isinstance(date_map, dict) or not date_map:
+        raise ValueError("date_map must map ordinals to calendar dates")
+    canonical_map = {}
+    for key in sorted(date_map):
+        value = date_map[key]
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("date_map keys and values must be strings")
+        canonical_map[key] = value
+    payload = {
+        "v": _FACTOR_MAC_VERSION,
+        "pack_id": pack_id,
+        "anonymized": document["anonymized"],
+        "date_map": canonical_map,
+        "price_factor": canonical_price_factor(document["price_factor"]),
+        "share_scale": canonical_price_factor(document["share_scale"]),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def factor_mac(key: bytes, document: dict) -> str:
+    """HMAC-SHA256 of the canonical pack binding. ``key`` is 32 raw bytes."""
+    if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+        raise ValueError("factor key must be 32 bytes")
+    if not isinstance(document, dict):
+        raise ValueError("factor MAC document must be an object")
+    return hmac.new(bytes(key), _factor_mac_message(document), hashlib.sha256).hexdigest()
+
+
+def _hex32(text, label: str) -> bytes:
+    if not isinstance(text, str) or len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        _fail(label, "expected 32 bytes of lowercase hex")
+    return bytes.fromhex(text)
+
+
+def _factors_are_one(document: dict) -> bool:
+    try:
+        return all(float(document[name]) == 1.0 for name in ("price_factor", "volume_factor", "share_scale"))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _verify_factor_mac(document: dict) -> None:
+    """Refuse a sidecar whose pack binding was not authenticated at build.
+
+    An anonymized sidecar with no MAC is refused. A named sidecar from before
+    this MAC still loads when every factor is 1. ``load_pack`` is what limits
+    that legacy path to session ids that are calendar dates: an ``S#####`` id
+    cannot be loaded with ``anonymized`` false.
+    """
+    present = _FACTOR_MAC_KEYS & set(document)
+    if not present:
+        if document.get("anonymized") is True or not _factors_are_one(document):
+            _fail("factor_mac", "anonymized pack has no operator factor MAC; rebuild the pack")
+        return
+    if present != _FACTOR_MAC_KEYS:
+        _fail("factor_mac", "the operator factor MAC is incomplete")
+    key = _hex32(document.get("factor_key"), "factor_key")
+    _hex32(document.get("factor_mac"), "factor_mac")
+    try:
+        expected = factor_mac(key, document)
+    except ValueError:
+        _fail("factor_mac", "does not match the build-time price factor")
+    if not hmac.compare_digest(document["factor_mac"], expected):
+        _fail("factor_mac", "does not match the build-time price factor")
+
+
+def require_build_price_factor(sidecar: dict) -> float:
+    """The price factor whose MAC matches the operator key.
+
+    Call this in the operator process before restating designer dividends
+    and before comparing ``share_scale`` to this factor. The MAC binds
+    ``pack_id``, the anonymized flag, the date map, this factor, and
+    ``share_scale``.
+    """
+    if not isinstance(sidecar, dict):
+        raise ValueError("sidecar is not an object")
+    _verify_factor_mac(sidecar)
+    return float(sidecar["price_factor"])
+
+
+def validate_sidecar(document: dict, *, allow_scale_mismatch: bool = False) -> None:
     if not isinstance(document, dict):
         _fail("", "the file is not an object")
-    _keys(document, _SIDECAR_KEYS, "")
+    extra = sorted(set(document) - _SIDECAR_KEYS - _FACTOR_MAC_KEYS)
+    missing = sorted(_SIDECAR_KEYS - set(document))
+    if extra:
+        _fail("", f"unknown field {extra[0]!r}")
+    if missing:
+        _fail("", f"missing field {missing[0]!r}")
     if document["schema_version"] != SCHEMA_VERSION:
         _fail("schema_version", f"{document['schema_version']!r} is not supported")
     if not isinstance(document["anonymized"], bool):
@@ -172,14 +290,6 @@ def validate_sidecar(document: dict) -> None:
         value = document[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0.0:
             _fail(name, "expected a positive finite number")
-    if document["anonymized"]:
-        if float(document["share_scale"]) != float(document["price_factor"]):
-            _fail("share_scale", "must equal price_factor (prices x k means share_scale = k)")
-        if float(document["price_factor"]) == 1.0 or float(document["volume_factor"]) == 1.0:
-            _fail("price_factor", "an anonymized pack must actually rescale prices and volume")
-    else:
-        if float(document["share_scale"]) != 1.0 or float(document["price_factor"]) != 1.0 or float(document["volume_factor"]) != 1.0:
-            _fail("share_scale", "a named pack is unscaled, so every factor is 1")
     date_map = document["date_map"]
     if not isinstance(date_map, dict) or not date_map:
         _fail("date_map", "expected ordinal to calendar date")
@@ -188,6 +298,24 @@ def validate_sidecar(document: dict) -> None:
             _fail("date_map", "keys and values must be strings")
         if _DATE_RE.fullmatch(value) is None:
             _fail("date_map", f"{value!r} is not a calendar date")
+    # The MAC binds pack_id, the flag, the date map, k, and share_scale.
+    # Check it before the share_scale comparison below, and again from
+    # require_build_price_factor before dividend restatement.
+    require_build_price_factor(document)
+    if document["anonymized"]:
+        # The builder writes share_scale equal to the price factor authenticated
+        # by the operator MAC. A later sidecar may not bill a different scale
+        # and still say the invoice used real share counts.
+        # allow_scale_mismatch is the test override that keeps one pack's
+        # designer tree comparable across billing scales. The caller records
+        # both factors in that case. The MAC is still checked.
+        if float(document["price_factor"]) == 1.0 or float(document["volume_factor"]) == 1.0:
+            _fail("price_factor", "an anonymized pack must actually rescale prices and volume")
+        if not allow_scale_mismatch and float(document["share_scale"]) != float(document["price_factor"]):
+            _fail("share_scale", "must equal the build-time price factor")
+    else:
+        if float(document["share_scale"]) != 1.0 or float(document["price_factor"]) != 1.0 or float(document["volume_factor"]) != 1.0:
+            _fail("share_scale", "a named pack is unscaled, so every factor is 1")
     if document.get("price_basis") not in {"raw", "total_return"}:
         _fail("price_basis", "expected raw or total_return")
     if document["borrow_rate_source"] not in {"profile_default", "explicit", "unregistered"}:
@@ -627,6 +755,7 @@ def build_pack(
         (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         if anonymize:
             assert_anonymized_pack_clean(destination, symbol=symbol)
+        factor_key = secrets.token_bytes(32)
         sidecar_document = {
             "schema_version": SCHEMA_VERSION,
             "pack_id": pack_id,
@@ -644,7 +773,9 @@ def build_pack(
             "bar_minutes": int(bar_minutes),
             "operator_note": operator_note,
             "price_basis": loaded.inspection.price_adjustment,
+            "factor_key": factor_key.hex(),
         }
+        sidecar_document["factor_mac"] = factor_mac(factor_key, sidecar_document)
         validate_sidecar(sidecar_document)
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(json.dumps(sidecar_document, indent=2) + "\n", encoding="utf-8")
@@ -675,13 +806,13 @@ def _json_pairs(pairs):
     return document
 
 
-def load_sidecar(path) -> dict:
+def load_sidecar(path, *, allow_scale_mismatch: bool = False) -> dict:
     file = Path(path)
     try:
         document = json.loads(file.read_text(encoding="utf-8"), object_pairs_hook=_json_pairs)
     except json.JSONDecodeError as exc:
         raise ValueError(f"sidecar {file} is not JSON: {exc}") from exc
-    validate_sidecar(document)
+    validate_sidecar(document, allow_scale_mismatch=allow_scale_mismatch)
     return document
 
 
@@ -728,6 +859,41 @@ def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
     _anonymized_gzip_payloads(name, blob)
 
 
+def _require_anonymized_flag(manifest: dict, session_ids: list[str]) -> None:
+    """Tie structural anonymization markers to the manifest flag.
+
+    ``S#####`` session ids and the stand-in asset name are anonymized packs.
+    A named pack's session ids are calendar dates, and that is the only shape
+    allowed to load without an operator MAC.
+    """
+    anonymized = manifest["anonymized"] is True
+    if not anonymized and manifest.get("asset_name") == TICKER_STAND_IN:
+        raise ValueError(
+            f"pack asset name {TICKER_STAND_IN} is an anonymized marker, "
+            "so the manifest anonymized flag must be true"
+        )
+    for value in session_ids:
+        if _ANON_SESSION_RE.fullmatch(value):
+            if not anonymized:
+                raise ValueError(
+                    f"pack session id {value} is an anonymized marker, "
+                    "so the manifest anonymized flag must be true"
+                )
+            continue
+        if _DATE_RE.fullmatch(value):
+            if anonymized:
+                raise ValueError(
+                    f"pack session id {value} is a calendar date, "
+                    "so the manifest anonymized flag must be false"
+                )
+            continue
+        if anonymized:
+            raise ValueError(f"pack session id {value} is not an anonymized session id")
+        raise ValueError(
+            f"pack session id {value} is not a calendar date, so a named pack cannot use it"
+        )
+
+
 def load_pack(pack_dir) -> LoadedPack:
     """Read a pack. This does not open a sidecar."""
     root = Path(pack_dir)
@@ -762,6 +928,12 @@ def load_pack(pack_dir) -> LoadedPack:
     pack_id = _pack_id(hashed)
     if pack_id != manifest["pack_id"]:
         raise ValueError("pack files do not match the manifest pack_id")
+    daily = _read_csv_gz(daily_path)
+    session_ids = [str(value) for frame in frames for value in frame["session_id"].tolist()]
+    session_ids.extend(str(value) for value in daily["session_id"].tolist())
+    # Before any runner reads share_scale. An S##### id cannot be relabeled
+    # as a named pack to skip the operator MAC.
+    _require_anonymized_flag(manifest, session_ids)
     frame = pd.concat(frames, ignore_index=True)
     frame["date"] = frame["session_id"].astype(str)
     return LoadedPack(

@@ -60,35 +60,42 @@ The design child also receives the strategy (the class, or the strategy file
 path when the class was loaded from a file) and the run kwargs. It does not
 receive the data directory, the CLI argv, or the locked frame.
 
-An anonymized pack run uses the same channels. `run_pack` reads the sidecar in
-the operator process, then drops that document before the spawn. The sidecar
-file is where the scale factors, the date map, and the ticker are stored. The
-worker that runs the engine receives `share_scale` (the price factor k) so
-per-share fees use real share counts. It does not receive the sidecar
-document, the date map, the ticker, the volume factor, the operator note, or
-the sidecar path.
+An anonymized pack run uses the same channels twice. `run_pack` reads the
+sidecar in the operator process, checks the operator HMAC, then drops that
+document before either spawn. The sidecar stores the scale factors, the date
+map, the ticker, `factor_key`, and `factor_mac`.
 
-A strategy file does not run in that worker, and the operator process does
+The operator worker receives `share_scale` so per-share fees use real share
+counts. It does not receive the sidecar document, `factor_key`, `factor_mac`,
+the date map, the ticker, the volume factor, or the operator note. The
+designer worker is a second process. It is not given `share_scale`,
+`share_factor`, `factor_key`, `factor_mac`, or the operator account size.
+Fills use the flat fee in `docs/COSTS_DESIGNER.md`. Equity starts at the
+canonical index. Dividend cash per pack share is the file amount times the
+price factor whose HMAC matched, never `share_scale`. When that worker runs
+Arena, the engine unbinds `share_scale` before the bar loop. When it runs
+Desk, the engine drops `share_factor` from the config before `on_bar`.
+
+A strategy file does not run in either worker, and the operator process does
 not import it. `run`, `run --pack`, `walkforward`, `parallel`, and `referee`
 pass the path through. The worker launches the same jail as `backtester
-referee` and learns the class name, extended-hours flag, and day-end hook
-from the pipe. The pipe is not given the scale, the accounting record, or
-the dividend map. The strategy process has no engine frame, so it cannot see
-`share_scale` or `share_factor`. An in-memory class passed to the library
-still runs beside the engine. That is how a test observes the window's
-ex-dates. `--unsafe-in-process` is the only escape, it prints a warning, and
-it refuses a pack. Benchmarks are official code and stay in the worker. The
-designer per-call timeout defaults to 10 seconds, the same as the referee,
-and `--call-timeout` changes it.
+referee`. The pipe is not given the sidecar, `factor_key`, `factor_mac`, the
+scale, the accounting record, or the dividend map. The strategy process has
+no engine frame. An in-memory class passed to the library still runs beside
+the engine. `--unsafe-in-process` prints a warning and refuses a pack.
+Benchmarks stay in the worker. The designer per-call timeout defaults to 10
+seconds, the same as the referee, and `--call-timeout` changes it.
 
-Post-fee cash is still in the account the engine sends. A designer who knows
-the public fee schedule can infer k from that cash. The name and the factor
-are not in the strategy process.
+Post-fee cash on the operator book can still be read against the public
+per-share schedule. That book is not the designer tree. The designer book
+has no per-share term, and the flat constant is not derived from the ticker
+or the pack.
 
-The same pack leaks that `docs/PACK.md` lists apply here: weekday plus
-early-close shape, a crash-shaped path, native tick times `price_factor`, the
-billing scale above, and bar `count`, which is not volume-scaled and is an
-identity cue. `count` stays the source trade count.
+The same pack leaks that `docs/PACK.md` lists apply to the bars themselves:
+weekday plus early-close shape, a crash-shaped path, native tick times
+`price_factor`, and bar `count`, which is not volume-scaled and is an
+identity cue. `count` stays the source trade count. The billing-scale residual
+does not apply to the designer child.
 
 Heap, environment, argv, and cwd are the in-scope checks. A hardcoded absolute
 path can still open a file. That is the Phase 4 jail.
@@ -99,9 +106,11 @@ below fail in the strategy process:
 - `/proc/<ppid>/cmdline`
 - `/proc/<ppid>/environ`
 - `/proc/<ppid>/cwd`, and the Windows handle equivalents
-- `share_scale` on an engine frame. The worker bills. The strategy is not
-  sent the scale. Post-fee cash in the account can still be lined up with the
-  public fee schedule. See `docs/PACK.md`.
+- `share_scale` on the operator worker's engine frame. The parent passes it
+  so the real invoice uses real share counts. The designer worker does not
+  receive it. The jailed strategy receives neither the scale, the sidecar,
+  `factor_key`, nor `factor_mac`. See `docs/PACK.md` and
+  `docs/COSTS_DESIGNER.md`.
 
 `walk_forward` deletes the frame it was given. The command line passes that
 frame as the argument and does not keep another name for it. A caller that
@@ -110,13 +119,14 @@ receive it.
 
 ## Parallel runner
 
-`backtester parallel` scores each strategy in a new spawned process. The worker
-uses argv `['backtester-design']`, an empty working directory, and the
-environment allowlist. The parent keeps the sidecar, the date map, and the
-unscaled dividend amounts. `share_scale` is passed to the worker the same way
-`run_pack` passes it, and the worker runs the engine. The strategy file runs
-in the jail and is not given the scale. Desk dividends are remapped in the
-parent before the worker starts. The worker receives only that remapped slice.
+`backtester parallel` scores each strategy in a new spawned process. An
+anonymized job spawns the designer worker first (flat fee, canonical equity,
+no billing scale, dividend cash per pack share restated by the MAC-checked
+price factor) and the operator worker second. The operator worker receives
+`share_scale`. A named job spawns once. The strategy file runs in the jail
+inside that worker and is not given the sidecar, `factor_key`, `factor_mac`,
+or the scale. Desk dividends are remapped in the parent before the worker
+starts.
 
 Spawn copies the parent environment at `Process.start`. A launch lock holds
 the argv, cwd, and environment scrub so two jobs cannot snapshot a cleared

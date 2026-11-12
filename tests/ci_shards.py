@@ -42,6 +42,7 @@ FILE_SHARDS = {
         "tests/test_accounting.py",
         "tests/test_designer_jail.py",
     ),
+    "designer": ("tests/test_designer_costs.py",),
     "walkforward": ("tests/test_walkforward.py",),
     "referee": (
         "tests/test_referee.py",

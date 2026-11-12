@@ -5,10 +5,16 @@ process that is handed one bar, then the decision for that bar, and only then
 the next bar. A read that gets ahead of the parent blocks until the per-call
 timeout and the run is disqualified.
 
-Fills, fees, and equity are the engine's. Arena and Desk are not mixed:
-Arena rescales to the starting equity and keeps exposure; Desk stays flat
-until the account is live. Calendar months and the share scale are applied
-here. Neither is sent to the child.
+A named sample uses the official fee schedule. Arena rescales to the starting
+equity and keeps exposure. Desk stays flat until the account is live.
+Calendar months are applied here.
+
+A pack replay is a designer surface. Fills go through ``DesignerCostModel``
+(0.8 bp flat, no per-share fee) and the canonical designer equity. The parent
+checks the sidecar MAC before it reads the price factor or ``share_scale``,
+then drops the sidecar. The jailed strategy is not given the sidecar,
+``factor_key``, ``factor_mac``, ``share_scale``, or ``share_factor``. The
+operator invoice stays on ``run_pack``, which keeps the real schedule.
 """
 
 from __future__ import annotations
@@ -45,6 +51,9 @@ _HIDDEN_KEYS = frozenset(
         "sidecar_path",
         "price_factor",
         "volume_factor",
+        "factor_key",
+        "factor_mac",
+        "operator_note",
     }
 )
 _JAIL_MARKERS = ("bwrap:", "landlock", "seccomp", "no-new-privs", "parent-death", "jail metadata")
@@ -281,7 +290,7 @@ def run_referee(
     if not isinstance(cpu_seconds, int) or isinstance(cpu_seconds, bool) or cpu_seconds <= 0:
         raise ValueError("cpu cap must be a positive number of seconds")
     name = get_profile(profile).name
-    hidden_frame, scale, symbol, anonymized, hidden_minutes, hidden_dividends, deny, explicit_borrow = _load_side(
+    hidden_frame, scale, symbol, anonymized, hidden_minutes, hidden_dividends, deny, explicit_borrow, designer = _load_side(
         hidden,
         ticker=ticker,
         sidecar=sidecar,
@@ -292,7 +301,7 @@ def run_referee(
     )
     train_frame = None
     if train:
-        train_frame, _train_scale, _train_symbol, _train_anon, _train_minutes, _ignored, train_deny, _train_borrow = _load_side(
+        train_frame, _train_scale, _train_symbol, _train_anon, _train_minutes, _ignored, train_deny, _train_borrow, _train_designer = _load_side(
             train,
             ticker=ticker,
             sidecar=train_sidecar,
@@ -313,14 +322,16 @@ def run_referee(
         raise ValueError("the report must not live inside the hidden sample")
     deny.append(out_dir)
     common = dict(
-        share_scale=scale,
         borrow_rate=borrow_rate,
         financing_rate=financing_rate,
         fee_mult=fee_mult,
         dividends=hidden_dividends,
         initial_equity=initial_equity,
         anonymized=anonymized,
+        designer=designer,
     )
+    if not designer:
+        common["share_scale"] = scale
     guarantees = describe_isolation()
     backend = guarantees.get("backend")
     try:
@@ -545,6 +556,24 @@ def _public_frame(frame):
     return frame.drop(columns=drop)
 
 
+def _designer_score(strategy, prepared: Prepared, *, borrow_rate, financing_rate, fee_mult, dividends):
+    """Flat fee. This function does not read ``share_scale`` or ``share_factor``."""
+    from .designer_run import execute as designer_execute
+
+    name = prepared.profile
+    kwargs = {
+        "borrow_rate_annual": borrow_rate,
+        "financing_rate_annual": financing_rate,
+        "fee_mult": fee_mult,
+        "dividends": dividends,
+    }
+    if name == "arena":
+        kwargs["reset_day"] = prepared.reset_day
+    elif name == "desk":
+        kwargs["warmup_sessions"] = prepared.live_start
+    return designer_execute(strategy, prepared.frame, name, **kwargs)
+
+
 def _score(
     strategy,
     prepared: Prepared,
@@ -556,9 +585,19 @@ def _score(
     dividends=None,
     initial_equity: float = 1_000_000.0,
     anonymized: bool = False,
+    designer: bool = False,
 ):
     from .runner import _cost_basis
 
+    if designer:
+        return _designer_score(
+            strategy,
+            prepared,
+            borrow_rate=borrow_rate,
+            financing_rate=financing_rate,
+            fee_mult=fee_mult,
+            dividends=dividends,
+        )
     if not math.isfinite(float(share_scale)) or float(share_scale) <= 0.0:
         raise ValueError("share scale must be a positive finite number")
     if not math.isfinite(float(initial_equity)) or float(initial_equity) <= 0.0:
@@ -674,6 +713,11 @@ class _Pipe:
         self._protocol = ""
         self._awaiting = True
         self._closed = False
+        # The parent's resident-set cap, when this worker was given one.
+        # A decision that is still allocating near that cap is not a timeout:
+        # the parent poll is what classifies it as memory.
+        self._memory_cap = None
+        self._rss_mark = None
         self._stdout_thread = threading.Thread(target=self._read_fd, args=(box.stdout_fd, False), daemon=True)
         self._stderr_thread = threading.Thread(target=self._read_fd, args=(box.stderr_fd, True), daemon=True)
         self._stdout_thread.start()
@@ -717,10 +761,17 @@ class _Pipe:
             self._raise_if_jail(detail)
             raise Disqualified("crash", detail) from exc
 
+    def set_memory_cap(self, memory_bytes: int | None) -> None:
+        """Remember the parent resident-set cap. It is not sent to the jail."""
+        if memory_bytes is None:
+            self._memory_cap = None
+            return
+        self._memory_cap = int(memory_bytes)
+
     def _read_line(self, timeout: float) -> bytes:
         deadline = time.monotonic() + timeout
-        with self._cv:
-            while True:
+        while True:
+            with self._cv:
                 if self._protocol:
                     raise Disqualified("protocol", self._protocol)
                 newline = self._buf.find(b"\n")
@@ -737,12 +788,40 @@ class _Pipe:
                     self._raise_if_jail(detail)
                     raise Disqualified("crash", detail or "strategy process closed the pipe")
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._cv.wait(remaining)
+                if remaining > 0:
+                    self._cv.wait(remaining)
+                    continue
+            if self._allocation_still_under_cap():
+                deadline = time.monotonic() + timeout
+                continue
+            break
         self.box.terminate()
         detail = self.stderr_text()
         raise Disqualified("timeout", detail)
+
+    def _allocation_still_under_cap(self) -> bool:
+        """True when this call is still growing and has not crossed the cap.
+
+        A sleep holds a flat resident set and times out on the original
+        budget. A bomb that is already near the cap, but not over it, gets
+        another budget so the parent poll can report the memory stop. Crossing
+        the cap here raises that stop directly.
+        """
+        cap = self._memory_cap
+        if cap is None:
+            return False
+        from .limits import process_tree_rss_bytes
+
+        rss = process_tree_rss_bytes(os.getpid())
+        if rss is None:
+            return False
+        if rss > cap:
+            self.box.terminate()
+            raise RuntimeError(f"walk-forward worker exceeded memory limit ({rss} > {cap})")
+        previous = self._rss_mark
+        self._rss_mark = rss
+        grown = previous is None or rss >= previous + 32 * 1024 * 1024
+        return bool(grown and rss * 2 >= cap)
 
     def _raise_if_jail(self, detail: str) -> None:
         lowered = detail.lower()
@@ -867,7 +946,7 @@ class _Remote:
 
 
 @contextmanager
-def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_seconds, call_timeout):
+def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_seconds, call_timeout, memory_cap=None):
     """Run a strategy file in the referee jail. The caller keeps the engine.
 
     ``on_bar`` sends one bar and reads one decision. The dividend map, the
@@ -882,6 +961,7 @@ def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_sec
         capture_stdio=True,
     )
     pipe = _Pipe(box)
+    pipe.set_memory_cap(memory_cap)
     try:
         ready = pipe.hello(min(60.0, float(call_timeout)))
         remote = _Remote(pipe, profile, box, call_timeout=float(call_timeout))
@@ -918,7 +998,7 @@ def _load_side(
             raise ValueError(
                 "--share-factor is refused on a pack run. The sidecar holds the scale."
             )
-        from .pack import load_pack, load_sidecar
+        from .pack import load_pack, load_sidecar, require_build_price_factor
 
         loaded = load_pack(source)
         secret = load_sidecar(sidecar)
@@ -927,6 +1007,7 @@ def _load_side(
                 raise ValueError("sidecar does not match this pack")
             if bool(secret["anonymized"]) != loaded.anonymized:
                 raise ValueError("sidecar anonymized flag does not match the pack")
+            price_factor = require_build_price_factor(secret)
             scale = float(secret["share_scale"])
             symbol = str(secret["symbol"])
             anonymized = bool(secret["anonymized"])
@@ -950,18 +1031,22 @@ def _load_side(
             calendar.append(date_map[key])
         frame["_calendar"] = calendar
         if dividends_path is not None:
-            from .runner import _pack_dividends
+            from .runner import _designer_dividends, _pack_dividends
 
-            dividends = _pack_dividends(
-                load_dividends(dividends_path),
-                anonymized=anonymized,
-                share_scale=scale,
-                date_map=date_map,
-            )
+            loaded_dividends = load_dividends(dividends_path)
+            if anonymized:
+                dividends = _designer_dividends(loaded_dividends, date_map, price_factor)
+            else:
+                dividends = _pack_dividends(
+                    loaded_dividends,
+                    anonymized=False,
+                    share_scale=1.0,
+                    date_map=date_map,
+                )
         else:
             dividends = None
         deny.append(Path(sidecar).resolve().parent)
-        return frame, scale, symbol, anonymized, int(loaded.bar_minutes), dividends, deny, sidecar_borrow
+        return frame, scale, symbol, anonymized, int(loaded.bar_minutes), dividends, deny, sidecar_borrow, True
     if sidecar:
         raise ValueError("named data does not take --sidecar")
     if share_factor not in (None, 1.0):
@@ -980,7 +1065,7 @@ def _load_side(
     frame = loaded.frame.copy()
     frame["_calendar"] = frame["date"].map(lambda value: str(value))
     dividends = load_dividends(dividends_path) if dividends_path else None
-    return frame, 1.0, str(ticker), False, int(bar_minutes), dividends, deny, None
+    return frame, 1.0, str(ticker), False, int(bar_minutes), dividends, deny, None, False
 
 
 def _inside(sample, out_dir: Path) -> bool:
