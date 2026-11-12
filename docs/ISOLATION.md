@@ -258,24 +258,28 @@ The backend name is `job+appcontainer`.
   runner lives under `C:\hostedtoolcache`. That write is refused.
   Ancestors this app does not own are not rewritten. Traverse and read
   of a system interpreter and of system DLLs use the All Application
-  Packages ACE already on those directories. The GitHub toolcache version
+  Packages ACE already on those directories.   The GitHub toolcache version
   directory has no such ACE. The files the child opens are copied under
   `Strategy Builder\jail\runtime` beneath the first parent whose own
-  directory and every ancestor already have that traverse ACE. The order
-  is ProgramData, then Public, then the nearest such ancestor of the
-  blocked directory, and Program Files only when nothing earlier works.
-  The blocked directory, the volume root, Windows, and System32 are never
-  that parent. A missing explicit ACE on the volume root does not reject
-  a parent that already has one, and the volume root is not granted.
-  Only the directories this app creates are granted. On the
-  GitHub runner ProgramData and Public do not have the ACE, so a toolcache
-  interpreter is copied under the toolcache Python directory when that
-  directory already lets the container through, and a bundle installed
-  under `D:\a\_temp` is copied under `D:\a` on the same condition. An
-  unfinished copy is deleted and replaced. A finished copy is reused. The
-  stamp is `%LOCALAPPDATA%\strategybuilderjail-runtime.json`, outside the
-  tree the child can read. If no such parent exists, the launch fails and
-  names the directory. An allow ACE that is
+  directory and every non-volume ancestor already have that traverse ACE.
+  The order is ProgramData, then Public, then the nearest such ancestor
+  of the blocked directory, and Program Files only when nothing earlier
+  works. The blocked directory, the volume root, Windows, and System32
+  are never that parent. A missing explicit ACE on the volume root does
+  not reject a parent that already has one, and the volume root is not
+  granted. The check is a read of the DACL. An inherit-only ACE does not
+  count. The first matching allow wins. Only the directories this app
+  creates (`Strategy Builder` and `jail`, then `runtime`) are granted.
+  The parent is not. An unfinished copy is deleted and replaced. A
+  finished copy is reused. The stamp is
+  `%LOCALAPPDATA%\strategybuilderjail-runtime.json`, outside the tree the
+  child can read. When no parent already lets the container through, the
+  copy is `{AppContainer folder}\runtime`. That folder is the path
+  `GetAppContainerFolderPath` returns for this profile. Its ancestors,
+  including the user-profile root, are not granted. The folder itself is
+  granted only when this process created it, and only if its parent
+  already existed. If that folder cannot be used, the launch fails and
+  names the blocked directory. An allow ACE that is
   already present is not written again. A failed grant drops the ACEs
   it added on app-owned paths and does not call `icacls`. Later launches
   see a marker and do not walk that tree again. Each launch grants the

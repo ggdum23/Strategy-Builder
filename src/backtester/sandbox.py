@@ -723,12 +723,8 @@ def _owned_work_parent() -> Path | None:
 
 
 def _chain_has_package_traverse(path: Path) -> bool:
-    if not _existing_package_access(path, read=False, traverse=True):
-        return False
-    for ancestor in acl_ancestor_paths(str(path)):
-        if not _existing_package_access(ancestor, read=False, traverse=True):
-            return False
-    return True
+    """Read-only. The volume root is not required to show an explicit ACE."""
+    return _chain_accessible(path, _ancestor_accessible)
 
 
 def _deny_roots(paths) -> list[Path]:
@@ -1757,16 +1753,19 @@ def _win_lease_open(lease: _WinLease) -> None:
     lease.kernel = kernel
 
     def ensure_grants():
-        roots = _prepare_runtime_grant_roots()
+        container = _container_runtime_parent(lease)
+        roots = _prepare_runtime_grant_roots(container)
         lease.acl_allow = _dedupe_acl(
             [str(path) for path in roots] + [str(path) for path in _CREATED_APP_DIRS]
         )
         # Read-only. A missing package ACE fails the grant before any write,
         # including on the marker fast path. An interpreter the container
-        # cannot walk to is copied under an app-owned directory. Its
-        # ancestors are not edited.
+        # cannot walk to is copied into the container's own folder. The
+        # user profile and the toolcache are not edited.
         _require_unowned_runtime_access(roots)
         for root in roots:
+            if _trusted_runtime_root(root):
+                continue
             _require_existing_ancestor_traverse(root, lease.acl_allow)
         made: list[tuple[Path, bool]] = []
         try:
@@ -2201,6 +2200,10 @@ def _acl_same_prefix(path: Path) -> bool:
 # The dest is an app-owned copy. The source's ancestors are not edited.
 _RUNTIME_COPIES: list[tuple[str, str]] = []
 _RUNTIME_COPY_VERSION = "1"
+# Set when the copy parent is the AppContainer folder. Ancestors of that
+# folder are not granted and are not required to show a package ACE.
+_CONTAINER_FOLDER_NOTE = ""
+_TRUSTED_STAGE_ROOTS: list[str] = []
 
 
 def _child_executable() -> str:
@@ -2231,7 +2234,7 @@ def first_blocked_ancestor(path, allow, accessible) -> str | None:
     return None
 
 
-def stage_unreachable_runtimes(roots, *, allow, accessible, stage_root):
+def stage_unreachable_runtimes(roots, *, allow, accessible, stage_root, trust_stage: bool = False):
     """Grant roots after an unreachable interpreter is replaced by a copy.
 
     ``copies`` is ``(source, dest)``. A reachable root stays. An unreachable
@@ -2260,7 +2263,7 @@ def stage_unreachable_runtimes(roots, *, allow, accessible, stage_root):
             f"({traverse_trace(blocked[0][0], accessible)}); "
             "this process will not rewrite a directory it does not own"
         )
-    stage_blocked = first_blocked_ancestor(str(stage_root), allow, accessible)
+    stage_blocked = None if trust_stage else first_blocked_ancestor(str(stage_root), allow, accessible)
     if stage_blocked is not None:
         raise SandboxError(
             f"the AppContainer cannot traverse {stage_blocked}; "
@@ -2516,9 +2519,102 @@ def _copy_runtime_tree(src: Path, dest: Path, package_dirs, *, full: bool = Fals
     _copy_runtime_into(src, dest, (), prefixes, set(), full=full)
 
 
-def _prepare_runtime_grant_roots() -> list[Path]:
-    """Owned grant roots. An unreachable interpreter is replaced by its copy."""
-    global _RUNTIME_COPIES
+def _copy_dest(path) -> bool:
+    for _source, dest in _RUNTIME_COPIES:
+        if acl_same(path, dest) or _acl_inside(path, dest):
+            return True
+    return False
+
+
+def _trusted_runtime_root(path) -> bool:
+    """A copy dest, or the container folder that holds it. Ancestors are not."""
+    if _copy_dest(path):
+        return True
+    return any(acl_same(path, root) or _acl_inside(path, root) for root in _TRUSTED_STAGE_ROOTS)
+
+
+def _container_runtime_parent(lease) -> Path | None:
+    """Path from ``GetAppContainerFolderPath``. This does not create or grant it.
+
+    The directory is this profile's own folder. ProgramData, Public, the
+    toolcache, and the user-profile root are not this path, and none of
+    them is granted here.
+    """
+    global _CONTAINER_FOLDER_NOTE
+    userenv = lease.userenv
+    get_path = getattr(userenv, "GetAppContainerFolderPath", None)
+    if get_path is None:
+        _CONTAINER_FOLDER_NOTE = "GetAppContainerFolderPath is missing"
+        return None
+    get_path.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
+    get_path.restype = ctypes.c_long
+    out = ctypes.c_void_p()
+    hr = int(get_path(lease.sid_text, ctypes.byref(out)))
+    text = ""
+    if out.value:
+        try:
+            text = str(ctypes.wstring_at(out.value))
+        finally:
+            ole = ctypes.WinDLL("ole32")
+            ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+            ole.CoTaskMemFree.restype = None
+            ole.CoTaskMemFree(out)
+    if hr != 0 or not text:
+        _CONTAINER_FOLDER_NOTE = f"GetAppContainerFolderPath hresult {hr & 0xFFFFFFFF:08x}"
+        return None
+    return Path(text)
+
+
+def _accept_container_parent(folder: Path) -> Path | None:
+    """Use the container folder only when its parent already exists.
+
+    Missing ancestors are not created, so this cannot mkdir a user-profile
+    root or a volume. The folder is granted later only when this call
+    created it.
+    """
+    global _CONTAINER_FOLDER_NOTE
+    if not folder.parent.is_dir():
+        _CONTAINER_FOLDER_NOTE = f"container folder parent is missing: {folder}"
+        return None
+    runtime = folder / "runtime"
+    if not _can_be_allow_root(folder, os.environ) or not _can_be_allow_root(runtime, os.environ):
+        _CONTAINER_FOLDER_NOTE = f"container folder is not an allow root: {folder}"
+        return None
+    created = not folder.is_dir()
+    try:
+        folder.mkdir(exist_ok=True)
+    except OSError as exc:
+        _CONTAINER_FOLDER_NOTE = f"could not create the container folder: {exc}"
+        return None
+    if created and not any(acl_same(folder, existing) for existing in _CREATED_APP_DIRS):
+        _CREATED_APP_DIRS.append(folder)
+    _CONTAINER_FOLDER_NOTE = str(folder)
+    return folder
+
+
+def _copy_failure_note() -> str:
+    parts = []
+    if _CONTAINER_FOLDER_NOTE:
+        parts.append(_CONTAINER_FOLDER_NOTE)
+    if sys.platform == "win32":
+        for key in ("ProgramData", "PUBLIC", "ProgramFiles"):
+            raw = os.environ.get(key, "")
+            if not raw:
+                continue
+            state = "open" if _chain_has_package_traverse(Path(raw)) else "closed"
+            parts.append(f"{raw}={state}")
+    return "; ".join(parts)
+
+
+def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path]:
+    """Owned grant roots. An unreachable interpreter is replaced by its copy.
+
+    ProgramData, Public, a traversable ancestor, and Program Files are
+    tried first. The AppContainer folder is used only when none of those
+    already let the container through. Its ancestors are not granted.
+    """
+    global _RUNTIME_COPIES, _TRUSTED_STAGE_ROOTS
+    _TRUSTED_STAGE_ROOTS = []
     roots = [str(path) for path in _windows_grant_roots()]
     if sys.platform != "win32":
         _RUNTIME_COPIES = []
@@ -2526,17 +2622,30 @@ def _prepare_runtime_grant_roots() -> list[Path]:
     allow = _dedupe_acl(roots + [str(path) for path in _CREATED_APP_DIRS])
     blocked = any(first_blocked_ancestor(root, allow, _ancestor_accessible) for root in roots)
     stage_root = None
+    trust = False
     if blocked:
         parent = _owned_work_parent()
+        if parent is None and container_dir is not None:
+            parent = _accept_container_parent(container_dir)
+            trust = parent is not None
         if parent is not None:
-            stage_root = str((parent / "runtime").resolve())
+            stage_root = str((Path(parent) / "runtime").resolve())
+            if trust:
+                _TRUSTED_STAGE_ROOTS = [str(Path(parent)), stage_root]
             allow = _dedupe_acl(allow + [str(path) for path in _CREATED_APP_DIRS] + [stage_root])
-    grant, copies = stage_unreachable_runtimes(
-        roots,
-        allow=allow,
-        accessible=_ancestor_accessible,
-        stage_root=stage_root,
-    )
+    try:
+        grant, copies = stage_unreachable_runtimes(
+            roots,
+            allow=allow,
+            accessible=_ancestor_accessible,
+            stage_root=stage_root,
+            trust_stage=trust,
+        )
+    except SandboxError as exc:
+        extra = _copy_failure_note()
+        if extra and extra not in str(exc):
+            raise SandboxError(f"{exc} ({extra})") from exc
+        raise
     _RUNTIME_COPIES = [(source, dest) for source, dest in copies]
     # The copy sits under directories this process just created. Those
     # directories do not inherit the ancestor's traverse ACE, so the
@@ -2954,6 +3063,41 @@ def _mask_allows(have: int, *, read: bool, traverse: bool) -> bool:
     return True
 
 
+def ace_grants_access(entries) -> bool:
+    """Whether ACL order already allows the requested bits.
+
+    ``entries`` is ``(ace_type, ace_flags, mask_matches)`` in file order.
+    An inherit-only ACE does not apply to this directory. The first ACE
+    whose mask covers the bits decides, so a later deny does not revoke
+    an earlier allow. Object allow is type 5 and object deny is type 6.
+    """
+    for ace_type, ace_flags, matches in entries:
+        if int(ace_flags) & 0x08:
+            continue
+        if not matches:
+            continue
+        if int(ace_type) in (1, 6):
+            return False
+        if int(ace_type) in (0, 5):
+            return True
+    return False
+
+
+def _ace_sid_offset(ace_type: int, ace_address: int) -> int | None:
+    """Byte offset of the SID. Object ACEs carry GUIDs before it."""
+    if ace_type in (0, 1):
+        return 8
+    if ace_type not in (5, 6):
+        return None
+    flags = int(ctypes.c_uint32.from_address(ace_address + 8).value)
+    offset = 12
+    if flags & 0x1:
+        offset += 16
+    if flags & 0x2:
+        offset += 16
+    return offset
+
+
 def _package_allow_sids(advapi) -> list:
     global _PACKAGE_SIDS
     if _PACKAGE_SIDS is not None:
@@ -3017,25 +3161,24 @@ def _existing_package_access(path, *, read: bool, traverse: bool, extra_sid=None
         if not sids:
             return False
         header = _ACL_HEADER.from_address(int(dacl.value))
-        allowed = False
+        entries = []
         for index in range(min(int(header.AceCount), 256)):
             ace = ctypes.c_void_p()
             if not advapi.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
                 continue
             info = _ACE_HEADER.from_address(int(ace.value))
             ace_type = int(info.AceType)
-            if ace_type not in (0, 1):
+            sid_offset = _ace_sid_offset(ace_type, int(ace.value))
+            if sid_offset is None:
                 continue
-            ace_sid = ctypes.c_void_p(int(ace.value) + 8)
+            ace_sid = ctypes.c_void_p(int(ace.value) + sid_offset)
             if not any(advapi.EqualSid(ace_sid, sid) for sid in sids):
                 continue
             have = int(ctypes.c_uint32.from_address(int(ace.value) + 4).value)
-            if not _mask_allows(have, read=read, traverse=traverse):
-                continue
-            if ace_type == 1:
-                return False
-            allowed = True
-        return allowed
+            entries.append(
+                (ace_type, int(info.AceFlags), _mask_allows(have, read=read, traverse=traverse))
+            )
+        return ace_grants_access(entries)
     finally:
         if security.value:
             kernel.LocalFree(security)

@@ -14,7 +14,9 @@ import pytest
 
 from backtester.sandbox import (
     SandboxError,
+    _chain_accessible,
     _copy_runtime_tree,
+    ace_grants_access,
     acl_ancestor_paths,
     acl_revoke_problem,
     acl_same,
@@ -400,6 +402,51 @@ def test_a_frozen_bundle_copy_keeps_nested_directories(tmp_path):
     assert not (stage / "app.pth").exists()
     assert runtime_relpath_is_copied(("_internal", "numpy"), is_dir=True, package_prefixes=(), full=True)
     assert not runtime_relpath_is_copied(("_internal",), is_dir=True, package_prefixes=())
+
+
+def test_a_closed_volume_root_does_not_fail_the_parent_chain():
+    assert _chain_accessible(r"C:\ProgramData", lambda path: not _is_volume(path))
+    assert not _chain_accessible(r"C:\ProgramData", lambda path: not acl_same(path, r"C:\ProgramData"))
+
+
+def test_a_trusted_container_folder_does_not_grant_its_ancestors():
+    stage = r"C:\Users\runner\AppData\Local\Packages\strategybuilderjail\runtime"
+    version = r"C:\hostedtoolcache\windows\Python\3.12"
+
+    def closed(_path: str) -> bool:
+        return False
+
+    grant, copies = stage_unreachable_runtimes(
+        [PREFIX],
+        allow=[stage],
+        accessible=closed,
+        stage_root=stage,
+        trust_stage=True,
+    )
+    assert len(copies) == 1
+    assert acl_same(copies[0][1], stage)
+    assert _same_set(grant, [stage])
+    for path in (r"C:\Users\runner", r"C:\Users\runner\AppData", version, r"C:\ProgramData", r"C:\\"):
+        assert not any(acl_same(item, path) for item in grant)
+        with pytest.raises(SandboxError, match="refusing to edit the ACL"):
+            refuse_acl_target(path, allow=grant, environ=ENV)
+    refuse_acl_target(stage, allow=grant, environ=ENV)
+    with pytest.raises(SandboxError, match="will not rewrite"):
+        stage_unreachable_runtimes(
+            [PREFIX],
+            allow=[stage],
+            accessible=closed,
+            stage_root=stage,
+        )
+
+
+def test_an_earlier_allow_wins_and_an_inherit_only_ace_does_not():
+    assert ace_grants_access([(0, 0, True), (1, 0, True)])
+    assert not ace_grants_access([(1, 0, True), (0, 0, True)])
+    assert not ace_grants_access([(0, 0x08, True)])
+    assert ace_grants_access([(0, 0x08, True), (5, 0, True)])
+    assert not ace_grants_access([(6, 0, True), (0, 0, True)])
+    assert not ace_grants_access([])
 
 
 def _is_volume(path: str) -> bool:
