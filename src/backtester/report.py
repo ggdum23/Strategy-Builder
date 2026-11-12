@@ -24,6 +24,7 @@ from pathlib import Path
 import pandas as pd
 
 from .accounting import EXACT_RESERVED, LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
+from .calendar_text import contains_calendar_date
 from .designer_allow import canonical_png, designer_csv_cell, project_designer, redacted_key_allowed
 
 _ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
@@ -793,7 +794,9 @@ def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
     for token in _BANNED_DESIGNER_TEXT:
         if token in text:
             return token
-    if _ISO_DATE.search(text):
+    from .gui.audience import normalize_surface
+
+    if contains_calendar_date(normalize_surface(text)):
         return "a calendar date"
     if not symbol:
         return None
@@ -826,7 +829,10 @@ def designer_component_problem(name: str, *, symbols=(), scale: float | None = N
 
     A strategy id is designer-supplied. A decimal in the id is not a price.
     The scale, a ticker, a calendar date, and a reserved token still fail.
-    The directory check and the publication audit both call this.
+    The date check is ``contains_calendar_date``, the same patterns as the
+    screen, including a bare year. ``day 2024`` stays. A slash is an unsafe
+    name before it is a date. The directory check and the publication audit
+    both call this.
     """
     if not isinstance(name, str) or name == "":
         return "an empty name"
@@ -836,11 +842,11 @@ def designer_component_problem(name: str, *, symbols=(), scale: float | None = N
     for token in _BANNED_DESIGNER_TEXT:
         if token in text:
             return token
-    if _ISO_DATE.search(text):
-        return "a calendar date"
     from .gui.audience import _GLUED_YEAR, _contains_scale, normalize_surface
 
     stored = normalize_surface(text)
+    if contains_calendar_date(stored):
+        return "a calendar date"
     if _GLUED_YEAR.search(stored):
         return "a calendar date"
     seen: set[str] = set()

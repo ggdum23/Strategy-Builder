@@ -8,7 +8,8 @@ the shared allow-list. There is no unredacted designer path.
 This module does not import the runner or ``report.py`` at load time. The
 ticker match is ``report.ticker_token_spans``, imported inside
 ``_ticker_spans``. The allow-list lives in ``designer_allow``, which
-``report.py`` imports as well.
+``report.py`` imports as well. Calendar dates are ``calendar_text``:
+one pattern list, shared with the publisher and the audit.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ import zlib
 from decimal import Decimal
 from pathlib import Path
 
+from ..calendar_text import MONTH as _MONTH
+from ..calendar_text import contains_calendar_date, strip_calendar_dates
 from ..designer_allow import (
     CLOCK_BODY,
     CLOCK_TEXT,
@@ -31,46 +34,6 @@ from ..designer_allow import (
     with_cost_drag,
 )
 
-_MONTH = (
-    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-)
-_ORDINAL = r"(?:st|nd|rd|th)"
-# Longer spellings first. A bare year is last so ``2024-01`` and ``2024-1-4`` stay one token.
-# A year glued to a decimal is a number. A bare year stays only when the whole
-# preceding word is "day" (``today 2024`` and ``holiday 2024`` still lose the year).
-_BARE_YEAR = re.compile(
-    r"(?<![A-Za-z0-9.])(?<!\bday )(?:19|20)\d{2}(?![A-Za-z0-9.])",
-    re.IGNORECASE,
-)
-_DATE_PATTERNS = (
-    # ISO, padded or not, with an optional time: 2024-01-04, 2024-1-4.
-    re.compile(
-        r"(?<!\d)(?:19|20)\d{2}-\d{1,2}-\d{1,2}(?!\d)"
-        r"(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?)?"
-    ),
-    re.compile(r"(?<!\d)(?:19|20)\d{2}[/.]\d{1,2}[/.]\d{1,2}(?!\d)"),
-    # Dotted, slashed, or dashed day-month-year: 01.04.2024, 04.01.2024, 1.4.2024.
-    re.compile(r"(?<!\d)\d{1,2}[./-]\d{1,2}[./-](?:19|20)\d{2}(?!\d)"),
-    re.compile(
-        rf"(?<!\d)\d{{1,2}}[\s.\-]+{_MONTH}(?![A-Za-z])\.?[\s,.\-]*(?:19|20)\d{{2}}(?!\d)",
-        re.IGNORECASE,
-    ),
-    # Month and day. A period alone separates them: Jan.4, 2024 and January.4 2024.
-    re.compile(
-        rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])(?:\.\s*|\s+)\d{{1,2}}{_ORDINAL}?"
-        rf"(?:(?:,\s*|\s+)(?:19|20)\d{{2}})(?!\d)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?<!\d)(?:19|20)\d{2}-\d{2}(?!\d)"),
-    re.compile(
-        rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])\.?[\s.\-]+(?:19|20)\d{{2}}(?!\d)",
-        re.IGNORECASE,
-    ),
-    _BARE_YEAR,
-)
-# The allow-list keeps a bare year. A day index or a price such as 2024.50 is not a date.
-_EXPORT_DATE_PATTERNS = tuple(pattern for pattern in _DATE_PATTERNS if pattern is not _BARE_YEAR)
 _SECRET_TOKENS = ("share_scale", "share_factor", "price_factor", "volume_factor", "date_map")
 _SECRET_WORDS = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:share_scale|share_factor|price_factor|volume_factor|date_map)(?![A-Za-z0-9_])"
@@ -304,9 +267,7 @@ def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = No
     does not match ``S00010``. The operator view never calls this. Ticker
     matching uses casefold, so ``ß`` and ``ﬁ`` count.
     """
-    text = value
-    for pattern in _DATE_PATTERNS:
-        text = pattern.sub("", text)
+    text = strip_calendar_dates(value)
     text = _SECRET_WORDS.sub("", text)
     text = _scrub_scale_number(text, scale)
     for symbol in _symbol_order(symbols):
@@ -1208,17 +1169,22 @@ def _structured_identifier_reason(kind: str, payload, scale: float | None) -> st
 
 
 def scan_publication(text: str, *, symbols: tuple[str, ...] = (), scale: float | None = None) -> str | None:
-    """None when ``text`` may be published. Otherwise ``the scale`` or ``a price``.
+    """None when ``text`` may be published. Otherwise a date, the scale, or a price.
 
-    The scale decision is the same token check as the screen. A price is a
-    decimal literal in free text whose absolute value is at least 1.
-    Allow-listed numeric cells are neither. A clock is neither. An exponent
-    inside a hex id is not a price. An identifier uses the same predicate as
-    the export check. The text is read as stored: a raw id is not rewritten
-    before this look. Tickers and dates are the other audit.
+    A calendar date is ``contains_calendar_date``, the same patterns as the
+    screen, including a bare year. ``day 2024`` stays. That check runs before
+    a price, so ``01.04.2024`` is a date. The scale decision is the same
+    token check as the screen. A price is a decimal literal in free text
+    whose absolute value is at least 1. Allow-listed numeric cells are
+    neither. A clock is neither. An exponent inside a hex id is not a price.
+    An identifier uses the same predicate as the export check. The text is
+    read as stored: a raw id is not rewritten before this look. Tickers are
+    the other audit.
     """
     del symbols
     normalized = normalize_surface(text)
+    if contains_calendar_date(normalized):
+        return "a date"
     structured = _structured_document(normalized)
     if structured is None:
         if _is_identifier(normalized):
@@ -1457,7 +1423,7 @@ def _preamble_reason(text: str, symbols: tuple[str, ...]) -> str | None:
     folded = text.casefold()
     if any(token in folded for token in _SECRET_TOKENS):
         return "a secret"
-    if any(pattern.search(text) for pattern in _EXPORT_DATE_PATTERNS):
+    if contains_calendar_date(text):
         return "a date"
     if _month_near_year(text):
         return "a date"
