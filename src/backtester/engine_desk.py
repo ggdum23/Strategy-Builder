@@ -125,6 +125,19 @@ def _time_of(row, minute):
     return f"{minute // 60:02d}:{minute % 60:02d}"
 
 
+def _trade_count(value, index: int) -> float:
+    """Trade count as a real number. A scaled pack count is not a whole number."""
+    if value is None or value == "":
+        value = 0.0
+    try:
+        count = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"bar {index} count is not a number") from exc
+    if not math.isfinite(count):
+        raise ValueError(f"bar {index} count is not finite")
+    return count
+
+
 def normalize_bars(bars):
     """Copy bars into plain dicts and reject a stream that cannot be simulated."""
     if hasattr(bars, "to_dict"):
@@ -159,7 +172,7 @@ def normalize_bars(bars):
             raise ValueError(f"bar {index} has negative volume")
         wap_raw = row.get("wap", close)
         wap = close if wap_raw is None else float(wap_raw)
-        count = int(row.get("count", 0) or 0)
+        count = _trade_count(row.get("count", 0.0), index)
         filled = int(row.get("filled", 0) or 0)
         if filled not in (0, 1):
             raise ValueError(f"bar {index} filled flag must be 0 or 1")

@@ -2243,9 +2243,11 @@ def run_pack(
             f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
         )
     if anonymized:
+        from .pack import assert_anonymized_pack_clean
         from .report import require_anonymizable_symbol
 
         require_anonymizable_symbol(symbol)
+        assert_anonymized_pack_clean(pack_dir, symbol=symbol)
     date_map = secret["date_map"]
     designer_dividends = _designer_dividends(dividends, date_map, price_factor) if anonymized else None
     child_dividends = _pack_dividends(
@@ -2383,9 +2385,11 @@ def walk_pack(
             f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
         )
     if anonymized:
+        from .pack import assert_anonymized_pack_clean
         from .report import require_anonymizable_symbol
 
         require_anonymizable_symbol(symbol)
+        assert_anonymized_pack_clean(pack_dir, symbol=symbol)
     date_map = secret["date_map"]
     designer_dividends = _designer_dividends(dividends, date_map, price_factor) if anonymized else None
     child_dividends = _pack_dividends(

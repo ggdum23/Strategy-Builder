@@ -92,9 +92,10 @@ has no per-share term, and the flat constant is not derived from the ticker
 or the pack.
 
 The same pack leaks that `docs/PACK.md` lists apply to the bars themselves:
-weekday plus early-close shape, a crash-shaped path, native tick times
-`price_factor`, and bar `count`, which is not volume-scaled and is an
-identity cue. `count` stays the source trade count. The billing-scale residual
+weekday plus early-close shape, a crash-shaped path, and native tick times
+`price_factor`. Bar `count` is multiplied by `volume_factor` before it
+reaches either child, and both profiles see that fraction. The pack directory is not copied into the child. The
+frame is the default-stream bytes. The billing-scale residual
 does not apply to the designer child.
 
 Heap, environment, argv, and cwd are the in-scope checks. A hardcoded absolute

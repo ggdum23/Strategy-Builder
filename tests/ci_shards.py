@@ -77,6 +77,7 @@ FILE_SHARDS = {
         "tests/gui/test_review6.py",
         "tests/gui/test_review7.py",
         "tests/gui/test_review9.py",
+        "tests/gui/test_scaled_count.py",
         "tests/gui/test_table.py",
         "tests/gui/test_window.py",
     ),

@@ -9,7 +9,7 @@ import pytest
 
 from backtester import costs as arena_costs
 from backtester import costs_desk as D
-from backtester.engine_desk import DeskConfig, metrics, run
+from backtester.engine_desk import DeskConfig, metrics, normalize_bars, run
 from backtester.profiles import get_profile
 
 
@@ -30,7 +30,7 @@ def bar(session, time, phase, price, **kw):
         "close": c,
         "volume": float(kw.get("volume", 1000)),
         "wap": float(kw.get("wap", c)),
-        "count": int(kw.get("count", 10)),
+        "count": float(kw.get("count", 10)),
         "filled": int(kw.get("filled", 0)),
         "new_session": kw.get("new_session", False),
     }
@@ -76,6 +76,44 @@ def test_fee_schedules_are_distinct_published_numbers():
     assert buy["sec"] == 0.0
     assert buy["taf"] == 0.0
     assert buy["pass_through"] == buy["commission"] * (0.000175 + 0.00056)
+
+
+def test_fractional_trade_count_is_not_truncated():
+    seen = []
+
+    def on_bar(row, _account):
+        seen.append(row["count"])
+        return 1.0 if float(row["count"]) >= 1.2 else 0.0
+
+    bars = [
+        bar("S00001", "09:30", "rth", 100, count=1.26),
+        bar("S00001", "09:31", "rth", 101, count=1.26),
+    ]
+    _strategy, result = go(on_bar, bars)
+    assert seen == pytest.approx([1.26, 1.26])
+    assert all(type(count) is float for count in seen)
+    assert result["n_fills"] == 1
+    flat = [
+        bar("S00001", "09:30", "rth", 100, count=0.42),
+        bar("S00001", "09:31", "rth", 101, count=0.42),
+    ]
+    held = []
+
+    def below(row, _account):
+        held.append(row["count"])
+        return 1.0 if float(row["count"]) >= 1.2 else 0.0
+
+    _strategy, quiet = go(below, flat)
+    assert held == pytest.approx([0.42, 0.42])
+    assert quiet["n_fills"] == 0
+    whole = [
+        bar("S00001", "09:30", "rth", 100, count=3),
+        bar("S00001", "09:31", "rth", 101, count=3),
+    ]
+    _strategy, named = go(lambda row, _account: 1.0 if float(row["count"]) >= 1.2 else 0.0, whole)
+    assert named["n_fills"] == 1
+    with pytest.raises(ValueError, match="not finite"):
+        normalize_bars([bar("S00001", "09:30", "rth", 100, count=float("nan"))])
 
 
 def test_fee_mult_applies_after_min_and_cap():

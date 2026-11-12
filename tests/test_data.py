@@ -248,6 +248,32 @@ def test_count_survives_the_desk_conversion():
     assert frame_to_desk_bars(frame)[0]["count"] == 7
 
 
+def test_fractional_count_survives_the_desk_conversion():
+    frame = pd.DataFrame(
+        [{
+            "date": "S00001",
+            "session": "rth",
+            "minute": 570,
+            "time": "09:30",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.26,
+            "wap": 1.0,
+            "count": 1.26,
+            "filled": 0,
+        }]
+    )
+    bar = frame_to_desk_bars(frame)[0]
+    assert type(bar["count"]) is float
+    assert bar["count"] == pytest.approx(1.26)
+    assert bar["volume"] == pytest.approx(1.26)
+    frame["count"] = float("nan")
+    with pytest.raises(ValueError, match="not finite"):
+        frame_to_desk_bars(frame)
+
+
 @windows_jails(3)
 def test_missing_month_is_named_and_a_gap_inside_a_file_is_kept(tmp_path, capsys):
     from backtester.__main__ import main
