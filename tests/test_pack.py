@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import gzip
 import hashlib
 import hmac
+import io
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -337,7 +339,7 @@ def test_calendar_session_id_requires_a_named_pack(tmp_path):
         frame.loc[frame["session_id"] == "S00001", "session_id"] = "2024-01-02"
 
     _retouch(pack, _date)
-    with pytest.raises(ValueError, match="anonymized flag must be false"):
+    with pytest.raises(ValueError, match="calendar date"):
         load_pack(pack)
 
 
@@ -355,7 +357,7 @@ def test_fullwidth_digit_session_id_is_refused_for_both_flags(tmp_path):
         frame["session_id"] = wide
 
     _retouch(pack, _wide)
-    with pytest.raises(ValueError, match="not an anonymized session id"):
+    with pytest.raises(ValueError, match="not printable ASCII"):
         load_pack(pack)
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
     manifest["anonymized"] = False
@@ -501,6 +503,23 @@ def test_version_1_mac_is_refused(tmp_path):
     assert not (out / "metrics.json").exists()
 
 
+def _bars_text(pack: Path) -> str:
+    return gzip.decompress((pack / "bars_part_001.csv.gz").read_bytes()).decode("utf-8")
+
+
+def _write_bars(pack: Path, payload: bytes) -> None:
+    (pack / "bars_part_001.csv.gz").write_bytes(_recompress(payload))
+
+
+def _with_cell(text: str, column: str, value: str) -> str:
+    rows = list(csv.reader(io.StringIO(text)))
+    index = rows[0].index(column)
+    rows[1][index] = value
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\n").writerows(rows)
+    return buffer.getvalue()
+
+
 def test_unicode_digit_dates_fail_the_anonymized_leak_scan(tmp_path):
     src, registry = _series(tmp_path, 1)
     pack = tmp_path / "pack"
@@ -510,6 +529,14 @@ def test_unicode_digit_dates_fail_the_anonymized_leak_scan(tmp_path):
         price_factor=1.7, volume_factor=0.42,
     )
     assert_anonymized_pack_clean(pack, symbol="NIK")
+    load_pack(pack)
+    original = (pack / "bars_part_001.csv.gz").read_bytes()
+    priced = _with_cell(_bars_text(pack), "open", "2024.50")
+    priced = _with_cell(priced, "volume", "20240102")
+    _write_bars(pack, priced.encode("utf-8"))
+    _rewrite_pack_id(pack)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    load_pack(pack)
     leaks = (
         "2024-03-\uff10\uff11",
         "2024-03-\u0660\u0661",
@@ -517,60 +544,117 @@ def test_unicode_digit_dates_fail_the_anonymized_leak_scan(tmp_path):
         "2024-03-\u2070\u00b9",
         "\uff12\uff10\uff12\uff14",
     )
-    note = pack / "note.txt"
     for leak in leaks:
-        note.write_text(leak + "\n", encoding="utf-8")
-        with pytest.raises(ValueError, match="calendar date"):
+        _write_bars(pack, gzip.decompress(original) + f"\n{leak}\n".encode("utf-8"))
+        with pytest.raises(ValueError, match="ASCII"):
             assert_anonymized_pack_clean(pack, symbol="NIK")
-    note.write_text("price 2024.50\n", encoding="utf-8")
-    assert_anonymized_pack_clean(pack, symbol="NIK")
-    note.unlink()
-    target = pack / "bars_part_001.csv.gz"
-    original = target.read_bytes()
-    payload = gzip.decompress(original) + "\n2024-03-\uff10\uff11\n".encode("utf-8")
-    target.write_bytes(_recompress(payload))
-    with pytest.raises(ValueError, match="calendar date"):
-        assert_anonymized_pack_clean(pack, symbol="NIK")
-    target.write_bytes(original)
+        with pytest.raises(ValueError, match="ASCII"):
+            load_pack(pack)
+    (pack / "bars_part_001.csv.gz").write_bytes(original)
+    _rewrite_pack_id(pack)
     assert_anonymized_pack_clean(pack, symbol="NIK")
 
 
-def test_format_characters_cannot_hide_a_date_from_the_leak_scan(tmp_path):
+def test_anonymized_pack_rejects_non_ascii_and_real_dates(tmp_path):
     src, registry = _series(tmp_path, 1)
     pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
     build_pack(
-        src, "NIK", pack, tmp_path / "side.json",
+        src, "NIK", pack, sidecar,
         anonymize=True, registry_path=registry, profile="arena",
         price_factor=1.7, volume_factor=0.42,
     )
     assert_anonymized_pack_clean(pack, symbol="NIK")
-    zwsp = "\u200b"
-    note = pack / "note.txt"
-    note.write_text("\uff12" + zwsp + "\uff10\uff12\uff14\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="calendar date"):
+    load_pack(pack)
+    original = (pack / "bars_part_001.csv.gz").read_bytes()
+    base = gzip.decompress(original)
+
+    def _payload(extra: bytes) -> None:
+        _write_bars(pack, base + b"\n" + extra + b"\n")
+
+    non_ascii = (
+        "2024\u180f-01-02",
+        "\uff12\u180f\uff10\uff12\uff14",
+        "2024\u2065-01-02",
+        "2024\U000E01F0-01-02",
+        "2024\u2212-01-02",
+        "2024\u2010-01-02",
+        "2024\u2009-01-02",
+        "2024\u0301-01-02",
+        "2024\u00a0-01-02",
+        "NI\u200bK",
+    )
+    for leak in non_ascii:
+        _payload(leak.encode("utf-8"))
+        with pytest.raises(ValueError, match="ASCII"):
+            assert_anonymized_pack_clean(pack, symbol="NIK")
+        with pytest.raises(ValueError, match="ASCII"):
+            load_pack(pack)
+    _payload(b"\x7f")
+    with pytest.raises(ValueError, match="ASCII"):
         assert_anonymized_pack_clean(pack, symbol="NIK")
-    note.write_text("2024" + zwsp + "-01-02\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="calendar date"):
-        assert_anonymized_pack_clean(pack, symbol="NIK")
-    for mark in ("\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad"):
-        note.write_text(f"2024{mark}-01-02\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="ASCII"):
+        load_pack(pack)
+    bars = base.decode("ascii")
+    for leak in (
+        "2024/01/02",
+        "2024/1/2",
+        "2024.01.02",
+        "2024 01 02",
+        "2024_01_02",
+        "02/01/2024",
+        "2/1/2024",
+        "x2024-01-02",
+        "2024-01-02_",
+        "20240102",
+    ):
+        _write_bars(pack, _with_cell(bars, "session", leak).encode("ascii"))
         with pytest.raises(ValueError, match="calendar date"):
             assert_anonymized_pack_clean(pack, symbol="NIK")
-    note.unlink()
-    hidden_name = f"bars_20{zwsp}24.csv.gz"
-    hidden = pack / hidden_name
+        with pytest.raises(ValueError, match="calendar date"):
+            load_pack(pack)
+    _write_bars(pack, _with_cell(bars, "open", "2024-01-02").encode("ascii"))
+    with pytest.raises(ValueError, match="calendar date"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    (pack / "bars_part_001.csv.gz").write_bytes(original)
+    manifest_path = pack / "manifest.json"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    manifest = json.loads(original_manifest)
+    manifest["chunks"][0]["first_day"] = 20240102
+    manifest["chunks"][0]["last_day"] = 20240102
+    _write_json(manifest_path, manifest)
+    with pytest.raises(ValueError, match="calendar date"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    with pytest.raises(ValueError, match="calendar date"):
+        load_pack(pack)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+    hidden = pack / "NI\u200bK"
     hidden.write_bytes(b"")
     with pytest.raises(ValueError, match="file name"):
         assert_anonymized_pack_clean(pack, symbol="NIK")
     hidden.unlink()
+    chunk = "bars_20\u180f24.csv.gz"
+    planted = pack / chunk
+    planted.write_bytes(b"")
+    with pytest.raises(ValueError, match="file name"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    planted.unlink()
     manifest_path = pack / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["chunks"][0]["file"] = hidden_name
+    manifest["chunks"][0]["file"] = chunk
     _write_json(manifest_path, manifest)
     with pytest.raises(ValueError, match="not allowed"):
         load_pack(pack)
-    assert _DATE_RE.fullmatch("2024" + zwsp + "-01-02") is None
+    secret = json.loads(sidecar.read_text(encoding="utf-8"))
+    dated = secret["date_map"]["1"]
+    for key in ("1\u200b", "\uff11", "01"):
+        edited = dict(secret)
+        edited["date_map"] = {key: dated}
+        _write_json(sidecar, edited)
+        with pytest.raises(ValueError, match="canonical ordinal"):
+            load_sidecar(sidecar)
     assert _DATE_RE.fullmatch("2024-01-02")
+    assert _DATE_RE.fullmatch("2024\u200b-01-02") is None
 
 
 def test_mac_binds_pack_id_date_map_and_share_scale(tmp_path):
@@ -973,7 +1057,8 @@ def test_pack_scan_does_not_treat_asset_substrings_as_tickers(tmp_path):
             anonymize=True, registry_path=registry, price_factor=0.5, volume_factor=0.4,
         )
         assert_anonymized_pack_clean(pack, symbol=symbol)
-        (pack / "note.txt").write_text(f"my_{symbol}_v2\n", encoding="utf-8")
+        bars = pack / "bars_part_001.csv.gz"
+        bars.write_bytes(_recompress(gzip.decompress(bars.read_bytes()) + f"my_{symbol}_v2\n".encode("utf-8")))
         with pytest.raises(ValueError, match="ticker"):
             assert_anonymized_pack_clean(pack, symbol=symbol)
 

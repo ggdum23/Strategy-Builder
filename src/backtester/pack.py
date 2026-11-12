@@ -12,8 +12,8 @@ share_scale, and the borrow rate. A null borrow rate stays JSON null. The
 pack files do not contain the factor, the key, or any digest of the factor.
 The runner checks the MAC before it uses k. A sidecar without that MAC is
 refused, named or anonymized. Verification accepts only this version.
-Session ids use ASCII digits. The anonymized-pack leak scan folds other
-decimal digits before it looks for a date or a year.
+Session ids use ASCII digits. An anonymized pack is printable ASCII
+under the builder's file names, and that text is scanned for calendar dates.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ import re
 import secrets
 import shutil
 import struct
-import unicodedata
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,13 +95,50 @@ _MANIFEST_KEYS = {
     "price_basis",
 }
 _CHUNK_KEYS = {"file", "first_day", "last_day", "sessions"}
-# ASCII digits only. These accept a session id or a date_map value. The leak
-# scan folds compatibility and other decimal digits before it uses them.
+# ASCII digits only. Session ids and date_map values. The leak scan uses
+# its own pattern and does not fold Unicode.
 _DATE_RE = re.compile(r"\b(?:19|20)[0-9]{2}-[0-9]{2}-[0-9]{2}\b")
+# Named packs use day 0. Every later ordinal is digits with no leading zero.
+_DATE_MAP_KEY_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _ANON_SESSION_RE = re.compile(r"^S[0-9]{5}$")
+_BARS_NAME_RE = re.compile(r"^bars_part_[0-9]{3}\.csv\.gz$")
+_DAILY_NAME = "daily_rth.csv.gz"
+_MANIFEST_NAME = "manifest.json"
 _FACTOR_MAC_VERSION = 2
 _BORROW_SOURCES = {"profile_default", "explicit", "unregistered"}
-_YEAR_RE = re.compile(r"(?:19|20)[0-9]{2}")
+_PRINTABLE_ASCII = frozenset(b"\t\n\r" + bytes(range(0x20, 0x7F)))
+_YEAR = r"(?:19|20)[0-9]{2}"
+_MONTH = r"(?:0?[1-9]|1[0-2])"
+_DAY = r"(?:0?[1-9]|[12][0-9]|3[01])"
+_MONTH2 = r"(?:0[1-9]|1[0-2])"
+_DAY2 = r"(?:0[1-9]|[12][0-9]|3[01])"
+_SEP = r"[-/._ ]"
+# Digit lookarounds, not \\b, so a letter or underscore beside the date does
+# not hide it. Numeric price and volume cells are masked before this runs.
+# Compact form is exactly YYYYMMDD. The separated forms also accept 2024/1/2.
+_LEAK_DATE_RE = re.compile(
+    rf"(?<![0-9])(?:{_YEAR}{_SEP}{_MONTH}{_SEP}{_DAY}|{_DAY}{_SEP}{_MONTH}{_SEP}{_YEAR}|{_YEAR}{_MONTH2}{_DAY2})(?![0-9])"
+)
+_NUMBER_CELL_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_NUMERIC_PACK_COLUMNS = frozenset(
+    {
+        "day",
+        "weekday",
+        "minute",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "wap",
+        "count",
+        "filled",
+        "short_session",
+        "bar_minutes",
+        "partial",
+    }
+)
 _BANNED_TEXT = (
     "price_factor",
     "volume_factor",
@@ -316,6 +352,8 @@ def validate_sidecar(document: dict, *, allow_scale_mismatch: bool = False) -> N
     for key, value in date_map.items():
         if not isinstance(key, str) or not isinstance(value, str):
             _fail("date_map", "keys and values must be strings")
+        if _DATE_MAP_KEY_RE.fullmatch(key) is None:
+            _fail("date_map", f"key {key!r} is not a canonical ordinal")
         if _DATE_RE.fullmatch(value) is None:
             _fail("date_map", f"{value!r} is not a calendar date")
     if document["borrow_rate_source"] not in _BORROW_SOURCES:
@@ -527,59 +565,80 @@ def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
     return payloads
 
 
-def _is_leak_ignorable(char: str) -> bool:
-    """Default-ignorable code points and format characters (category Cf).
-
-    Zero-width spaces, joiners, soft hyphens, and the byte-order mark are
-    invisible, so they must not split a year or a date before the regexes.
-    Session-id and date_map acceptance does not use this and stays ASCII.
-    """
-    if unicodedata.category(char) == "Cf":
-        return True
-    code = ord(char)
-    if 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF:
-        return True
-    if 0x180B <= code <= 0x180D or 0xFFF0 <= code <= 0xFFF8:
-        return True
-    return code in {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0}
+def _canonical_anonymized_name(name: str) -> bool:
+    """Builder file names only. Anything else is refused, not scanned."""
+    return name in {_MANIFEST_NAME, _DAILY_NAME} or _BARS_NAME_RE.fullmatch(name) is not None
 
 
-def _fold_decimal_digits(text: str) -> tuple[str, list[bool]]:
-    """Drop ignorables, NFKC, then map remaining decimal digits to ASCII.
+def _printable_ascii(blob: bytes) -> bool:
+    return blob.translate(None, bytes(_PRINTABLE_ASCII)) == b""
 
-    Fullwidth and superscript digits become ASCII under NFKC. Arabic-Indic
-    and Devanagari digits do not, so those still go through ``digit()``.
-    Format characters are removed before either step so ``2024\\u200b-01-02``
-    and ``bars_20\\u200b24`` still match the ASCII year and date regexes.
-    The second list says whether each output character came from an ASCII
-    source character. A year made of ASCII digits is not, by itself, a leak.
-    """
-    folded: list[str] = []
-    ascii_source: list[bool] = []
-    for char in text:
-        if _is_leak_ignorable(char):
-            continue
-        pieces = unicodedata.normalize("NFKC", char)
-        for piece in pieces:
-            if _is_leak_ignorable(piece):
-                continue
-            if unicodedata.category(piece) == "Nd":
-                folded.append(str(unicodedata.digit(piece)))
+
+def _mask_numeric_csv(text: str) -> str:
+    """Replace plain numbers in numeric columns so 2024.50 is not a date."""
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return text
+    numeric = {index for index, name in enumerate(rows[0]) if name in _NUMERIC_PACK_COLUMNS}
+    masked = [",".join(rows[0])]
+    for row in rows[1:]:
+        cells = []
+        for index, cell in enumerate(row):
+            if index in numeric and _NUMBER_CELL_RE.fullmatch(cell.strip()):
+                cells.append("0")
             else:
-                folded.append(piece)
-            ascii_source.append(char.isascii())
-    return "".join(folded), ascii_source
+                cells.append(cell)
+        masked.append(",".join(cells))
+    return "\n".join(masked)
 
 
-def _leaks_calendar(text: str) -> bool:
-    """True when folded text is an ISO date, or a year written with non-ASCII digits."""
-    folded, ascii_source = _fold_decimal_digits(text)
-    if _DATE_RE.search(folded):
-        return True
-    for match in _YEAR_RE.finditer(folded):
-        if not all(ascii_source[match.start():match.end()]):
-            return True
-    return False
+def _json_scan_text(text: str) -> str:
+    """Manifest text with a 64-hex pack id removed so the digest is not a date.
+
+    Numeric fields stay in the text. A ``first_day`` of 20240102 is a date.
+    """
+    return _HEX64_RE.sub("0", text)
+
+
+def _leaks_calendar(name: str, text: str) -> bool:
+    """Calendar dates on ASCII text. Numeric CSV cells are masked first."""
+    if name.endswith(".csv.gz") or name.endswith(".csv"):
+        scanned = _mask_numeric_csv(text)
+    elif name.endswith(".json"):
+        scanned = _json_scan_text(text)
+    else:
+        scanned = text
+    return _LEAK_DATE_RE.search(scanned) is not None
+
+
+def _anonymized_text(name: str, raw: bytes) -> str:
+    """Printable ASCII text. Gzip is checked after inflation, not as a container."""
+    if name.endswith(".gz"):
+        blob = b"".join(_anonymized_gzip_payloads(name, raw))
+    else:
+        blob = raw
+    if not _printable_ascii(blob):
+        raise ValueError(f"{name} is not printable ASCII")
+    return blob.decode("ascii")
+
+
+def _reject_anonymized_pack(root: Path) -> list[tuple[str, str]]:
+    """Names, ASCII bytes, and calendar dates. Shared by the audit and load_pack."""
+    files = [path for path in root.rglob("*") if path.is_file()]
+    if not files:
+        raise ValueError("pack directory is empty")
+    texts = []
+    for path in files:
+        name = path.name
+        if path.parent != root or not _canonical_anonymized_name(name):
+            raise ValueError(f"{name} is not a pack file name")
+        if path.stat().st_size >= MAX_FILE_BYTES:
+            raise ValueError(f"{name} is {path.stat().st_size} bytes, which is not under {MAX_FILE_BYTES}")
+        text = _anonymized_text(name, path.read_bytes())
+        if _leaks_calendar(name, text):
+            raise ValueError(f"{name} contains a calendar date")
+        texts.append((name, text))
+    return texts
 
 
 def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
@@ -587,35 +646,14 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
     root = Path(pack_dir)
     if not symbol:
         raise ValueError("symbol is empty")
-    files = [path for path in root.rglob("*") if path.is_file()]
-    if not files:
-        raise ValueError("pack directory is empty")
-    for path in files:
-        name = path.name
-        folded_name, _ascii_source = _fold_decimal_digits(name)
-        if _YEAR_RE.search(folded_name) or _token_present(symbol, name):
+    for name, text in _reject_anonymized_pack(root):
+        if _token_present(symbol, name):
             raise ValueError(f"{name} leaks identity in the file name")
-        raw = path.read_bytes()
-        if path.suffix == ".gz":
-            try:
-                parts = [payload.decode("utf-8") for payload in _anonymized_gzip_payloads(name, raw)]
-            except UnicodeDecodeError as exc:
-                raise ValueError(f"{name} is not text; refusing to ship it") from exc
-            text = "".join(parts)
-        else:
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError(f"{name} is not text; refusing to ship it") from exc
         if _text_has_ticker(name, text, symbol):
             raise ValueError(f"{name} contains the ticker")
         for key in _BANNED_TEXT:
             if key in text:
                 raise ValueError(f"{name} contains {key}")
-        if _leaks_calendar(text):
-            raise ValueError(f"{name} contains a calendar date")
-        if path.stat().st_size >= MAX_FILE_BYTES:
-            raise ValueError(f"{name} is {path.stat().st_size} bytes, which is not under {MAX_FILE_BYTES}")
 
 
 def _designer_frame(frame: pd.DataFrame, *, anonymize: bool, price_factor: float, volume_factor: float):
@@ -808,7 +846,7 @@ def build_pack(
         daily_blob = _gzip_csv(_daily_frame(frame))
         if len(daily_blob) >= max_bytes:
             raise ValueError(f"daily file is {len(daily_blob)} bytes, which is not under {max_bytes}")
-        daily_name = "daily_rth.csv.gz"
+        daily_name = _DAILY_NAME
         (destination / daily_name).write_bytes(daily_blob)
         hashed = [(item["file"], item["bytes"]) for item in chunks]
         hashed.append((daily_name, daily_blob))
@@ -833,7 +871,7 @@ def build_pack(
             "n_sessions": int(frame["day"].nunique()),
             "price_basis": loaded.inspection.price_adjustment,
         }
-        (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        (destination / _MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         if anonymize:
             assert_anonymized_pack_clean(destination, symbol=symbol)
         factor_key = secrets.token_bytes(32)
@@ -920,14 +958,21 @@ def _validate_manifest(document: dict) -> None:
     for chunk in document["chunks"]:
         if set(chunk) != _CHUNK_KEYS:
             raise ValueError(f"chunk record {chunk!r} does not match the schema")
-        folded_name, _ascii_source = _fold_decimal_digits(chunk["file"])
-        if _YEAR_RE.search(folded_name) or chunk["file"] != Path(chunk["file"]).name:
-            raise ValueError(f"chunk file name {chunk['file']!r} is not allowed")
+        chunk_name = chunk["file"]
+        if not isinstance(chunk_name, str) or chunk_name != Path(chunk_name).name:
+            raise ValueError(f"chunk file name {chunk_name!r} is not allowed")
+        if document["anonymized"] and _BARS_NAME_RE.fullmatch(chunk_name) is None:
+            raise ValueError(f"chunk file name {chunk_name!r} is not allowed")
         if chunk["sessions"] < 1 or chunk["last_day"] < chunk["first_day"]:
             raise ValueError(f"chunk {chunk['file']} has an empty day range")
         if previous is not None and chunk["first_day"] <= previous:
             raise ValueError("pack chunks overlap or are out of order")
         previous = chunk["last_day"]
+    daily_name = document.get("daily_file")
+    if not isinstance(daily_name, str) or daily_name != Path(daily_name).name:
+        raise ValueError(f"daily file name {daily_name!r} is not allowed")
+    if document["anonymized"] and daily_name != _DAILY_NAME:
+        raise ValueError(f"daily file name {daily_name!r} is not allowed")
 
 
 def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
@@ -988,6 +1033,8 @@ def load_pack(pack_dir) -> LoadedPack:
     except json.JSONDecodeError as exc:
         raise ValueError(f"pack manifest is not JSON: {exc}") from exc
     _validate_manifest(manifest)
+    if manifest["anonymized"]:
+        _reject_anonymized_pack(root)
     frames = []
     hashed = []
     for chunk in manifest["chunks"]:
