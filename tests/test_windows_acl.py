@@ -25,6 +25,7 @@ from backtester.sandbox import (
     rewrite_pyvenv_home,
     runtime_relpath_is_copied,
     should_write_ace,
+    container_mkdir_plan,
     copy_parent_candidates,
     stage_unreachable_runtimes,
     translate_staged_path,
@@ -533,6 +534,45 @@ def test_a_recorded_firewall_block_is_not_run_again_for_a_copy_refresh():
         {"firewall_blocked": True, "loopback_cleared": True, "sid": "S-1-15-2-2"},
         sid,
     )
+
+
+def test_a_missing_profile_folder_is_planned_under_existing_packages():
+    packages = r"C:\Users\runneradmin\AppData\Local\Packages"
+    profile = packages + r"\strategybuilderjail"
+    folder = profile + r"\AC"
+    existing = {packages}
+
+    def exists(path: str) -> bool:
+        return any(acl_same(path, item) for item in existing)
+
+    plan = container_mkdir_plan(folder, packages, exists)
+    assert plan is not None
+    assert [item.casefold() for item in plan] == [profile.casefold(), folder.casefold()]
+    assert not any(acl_same(item, packages) for item in plan)
+    assert not any(acl_same(item, r"C:\Users\runneradmin") for item in plan)
+    assert not any(_is_volume(item) for item in plan)
+    existing.add(profile)
+    parent_ready = container_mkdir_plan(folder, packages, exists)
+    assert parent_ready is not None and len(parent_ready) == 1
+    assert acl_same(parent_ready[0], folder)
+    existing.add(folder)
+    assert container_mkdir_plan(folder, packages, exists) == []
+
+
+def test_packages_and_paths_outside_it_are_not_created():
+    packages = r"C:\Users\runneradmin\AppData\Local\Packages"
+    folder = packages + r"\strategybuilderjail\AC"
+    assert container_mkdir_plan(folder, packages, lambda _path: False) is None
+    assert (
+        container_mkdir_plan(
+            r"C:\hostedtoolcache\windows\Python\runtime",
+            packages,
+            lambda _path: True,
+        )
+        is None
+    )
+    assert container_mkdir_plan(r"C:\Users\runneradmin", packages, lambda _path: True) is None
+    assert container_mkdir_plan(packages, packages, lambda _path: True) is None
 
 
 def test_the_firewall_command_does_not_format_the_rule_object():

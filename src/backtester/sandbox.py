@@ -2621,29 +2621,107 @@ def _container_runtime_parent(lease) -> Path | None:
     return Path(text)
 
 
-def _accept_container_parent(folder: Path) -> Path | None:
-    """Use the container folder only when its parent already exists.
+def container_mkdir_plan(folder, packages, exists) -> list[str] | None:
+    """Missing directories to create so ``folder`` exists under ``packages``.
 
-    Missing ancestors are not created, so this cannot mkdir a user-profile
-    root or a volume. The folder is granted later only when this call
-    created it.
+    ``packages`` must already exist. The plan lists only descendants that
+    do not, outermost first. ``packages`` itself, the user-profile root,
+    and the volume are never included. None means fail closed: the path
+    is not inside ``packages``, or reaching it would create ``packages``
+    or something above it.
+    """
+    if not folder or not packages:
+        return None
+    folder_text = str(folder)
+    packages_text = str(packages)
+    if not _acl_inside(folder_text, packages_text):
+        return None
+    packages_drive, packages_parts = _split_acl_path(packages_text)
+    packages_norm = _acl_join(packages_drive, packages_parts)
+    if not exists(packages_norm):
+        return None
+    missing: list[str] = []
+    current = folder_text
+    while not acl_same(current, packages_norm):
+        drive, parts = _split_acl_path(current)
+        if not parts:
+            return None
+        current_norm = _acl_join(drive, parts)
+        if exists(current_norm):
+            missing.reverse()
+            return missing
+        missing.append(current_norm)
+        parent = _acl_join(drive, parts[:-1])
+        if not parent or acl_same(parent, current_norm) or _is_volume_acl_path(parent):
+            return None
+        current = parent
+    missing.reverse()
+    return missing
+
+
+def _dir_exists(path) -> bool:
+    try:
+        return Path(path).is_dir()
+    except OSError:
+        return False
+
+
+def _accept_container_parent(folder: Path) -> Path | None:
+    """Use the AppContainer folder ``GetAppContainerFolderPath`` returned.
+
+    The usual path is ``%LOCALAPPDATA%\\Packages\\<profile>\\AC``. When
+    ``<profile>`` or ``AC`` is missing and ``Packages`` already exists,
+    only those missing descendants are created. ``Packages``, the
+    user-profile root, and the volume are not created and are not granted.
+    Only directories this call created are granted later. ``Packages``,
+    the user-profile root, and the volume are not. A directory that
+    already existed is left alone.
     """
     global _CONTAINER_FOLDER_NOTE
-    if not folder.parent.is_dir():
-        _CONTAINER_FOLDER_NOTE = f"container folder parent is missing: {folder}"
-        return None
     runtime = folder / "runtime"
     if not _can_be_allow_root(folder, os.environ) or not _can_be_allow_root(runtime, os.environ):
         _CONTAINER_FOLDER_NOTE = f"container folder is not an allow root: {folder}"
         return None
-    created = not folder.is_dir()
+    local = os.environ.get("LOCALAPPDATA") or ""
+    packages = str(Path(local) / "Packages") if local else ""
+    plan = container_mkdir_plan(folder, packages, _dir_exists) if packages else None
+    if plan is not None and any(not _can_be_allow_root(raw, os.environ) for raw in plan):
+        plan = None
+    if plan is None:
+        try:
+            parent_ready = folder.parent.is_dir()
+            folder_ready = folder.is_dir()
+        except OSError as exc:
+            _CONTAINER_FOLDER_NOTE = f"could not inspect the container folder: {exc}"
+            return None
+        if not parent_ready:
+            note = f"container folder parent is missing: {folder}"
+            if packages and _dir_exists(packages):
+                note += "; Packages exists"
+            elif packages:
+                note += "; Packages is absent"
+            _CONTAINER_FOLDER_NOTE = note
+            return None
+        plan = [] if folder_ready else [str(folder)]
+    created: list[Path] = []
     try:
-        folder.mkdir(exist_ok=True)
+        for raw in plan:
+            path = Path(raw)
+            if path.is_dir():
+                continue
+            path.mkdir(exist_ok=True)
+            created.append(path)
     except OSError as exc:
         _CONTAINER_FOLDER_NOTE = f"could not create the container folder: {exc}"
+        for path in reversed(created):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
         return None
-    if created and not any(acl_same(folder, existing) for existing in _CREATED_APP_DIRS):
-        _CREATED_APP_DIRS.append(folder)
+    for directory in created:
+        if not any(acl_same(directory, existing) for existing in _CREATED_APP_DIRS):
+            _CREATED_APP_DIRS.append(directory)
     _CONTAINER_FOLDER_NOTE = str(folder)
     return folder
 
@@ -2667,7 +2745,8 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
 
     ProgramData, Public, a traversable ancestor, and Program Files are
     tried first. The AppContainer folder is used only when none of those
-    already let the container through. Its ancestors are not granted.
+    already let the container through. Ancestors this process did not
+    create are not granted.
     """
     global _RUNTIME_COPIES, _TRUSTED_STAGE_ROOTS, _RUNTIME_PARENT
     _TRUSTED_STAGE_ROOTS = []
@@ -2689,7 +2768,13 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
             stage_root = str((Path(parent) / "runtime").resolve())
             _RUNTIME_PARENT = str(Path(parent))
             if trust:
-                _TRUSTED_STAGE_ROOTS = [str(Path(parent)), stage_root]
+                # The profile directory created under Packages is reachable
+                # for the same reason the container folder is: this process
+                # owns it. Its ancestors are not granted and are not required
+                # to show a package ACE.
+                trusted = [str(Path(parent)), stage_root]
+                trusted.extend(str(directory) for directory in _CREATED_APP_DIRS)
+                _TRUSTED_STAGE_ROOTS = _dedupe_acl(trusted)
             allow = _dedupe_acl(allow + [str(path) for path in _CREATED_APP_DIRS] + [stage_root])
     try:
         grant, copies = stage_unreachable_runtimes(

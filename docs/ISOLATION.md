@@ -275,12 +275,17 @@ The backend name is `job+appcontainer`.
   `%LOCALAPPDATA%\strategybuilderjail-runtime.json`, outside the tree the
   child can read.   When no parent already lets the container through, the
   copy is `{AppContainer folder}\runtime`. That folder is the path
-  `GetAppContainerFolderPath` returns for this profile. Its ancestors,
-  including the user-profile root, are not granted. The folder itself is
-  granted only when this process created it, and only if its parent
-  already existed. The private directory is created under that same
-  parent, not under the user Temp directory. If that folder cannot be
-  used, the launch fails and names the blocked directory. An allow ACE that is
+  `GetAppContainerFolderPath` returns for this profile, normally
+  `%LOCALAPPDATA%\Packages\<profile>\AC`. Its ancestors, including the
+  user-profile root and the Packages directory, are not granted. If
+  `<profile>` or `AC` is missing and `Packages` already exists, only
+  those missing descendants are created. `Packages`, the user-profile
+  root, and the volume are not created and are not granted. The
+  container folder and a profile directory this process created are
+  granted. A directory that already existed is not. The private
+  directory is created under that same parent, not under the user Temp
+  directory. If that folder cannot be used, the launch fails and names
+  the blocked directory. An allow ACE that is
   already present is not written again. A failed grant drops the ACEs
   it added on app-owned paths and does not call `icacls`. Later launches
   see a marker and do not walk that tree again. Each launch grants the
