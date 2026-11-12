@@ -265,7 +265,9 @@ The backend name is `job+appcontainer`.
   is ProgramData, then Public, then the nearest such ancestor of the
   blocked directory, and Program Files only when nothing earlier works.
   The blocked directory, the volume root, Windows, and System32 are never
-  that parent. Only the directories this app creates are granted. On the
+  that parent. A missing explicit ACE on the volume root does not reject
+  a parent that already has one, and the volume root is not granted.
+  Only the directories this app creates are granted. On the
   GitHub runner ProgramData and Public do not have the ACE, so a toolcache
   interpreter is copied under the toolcache Python directory when that
   directory already lets the container through, and a bundle installed

@@ -635,13 +635,18 @@ def _private_dir() -> str:
 
 
 def _chain_accessible(path, accessible) -> bool:
-    """True when ``path`` and every ancestor already pass ``accessible``.
+    """True when ``path`` and every non-root ancestor already pass ``accessible``.
 
-    This does not write an ACL. The volume root is included in the check.
+    This does not write an ACL. The volume root is not required to show an
+    explicit ACE and is never a grant target.
     """
-    if not accessible(path):
+    if _is_volume_acl_path(path) or not accessible(path):
         return False
-    return all(accessible(higher) for higher in acl_ancestor_paths(path))
+    return all(
+        accessible(higher)
+        for higher in acl_ancestor_paths(path)
+        if not _is_volume_acl_path(higher)
+    )
 
 
 def copy_parent_candidates(environ, roots, accessible) -> list[str]:
@@ -2211,9 +2216,13 @@ def first_blocked_ancestor(path, allow, accessible) -> str | None:
     """Nearest unowned ancestor ``accessible`` rejects, or None.
 
     Ancestors that are an allow root, or that sit inside one, are skipped.
-    This does not write an ACL.
+    The volume root is skipped too: it is never granted, and a missing
+    explicit ACE there is not a reason to refuse a copy whose other
+    ancestors already let the container through. This does not write an ACL.
     """
     for parent in acl_ancestor_paths(path):
+        if _is_volume_acl_path(parent):
+            continue
         if any(acl_same(parent, root) or _acl_inside(parent, root) for root in allow):
             continue
         if accessible(parent):
@@ -2247,7 +2256,8 @@ def stage_unreachable_runtimes(roots, *, allow, accessible, stage_root):
         return kept, []
     if not stage_root:
         raise SandboxError(
-            f"the AppContainer cannot traverse {blocked[0][1]}; "
+            f"the AppContainer cannot traverse {blocked[0][1]} "
+            f"({traverse_trace(blocked[0][0], accessible)}); "
             "this process will not rewrite a directory it does not own"
         )
     stage_blocked = first_blocked_ancestor(str(stage_root), allow, accessible)
@@ -2268,6 +2278,22 @@ def stage_unreachable_runtimes(roots, *, allow, accessible, stage_root):
     kept = _dedupe_acl(grant)
     kept.sort(key=_acl_parts)
     return kept, copies
+
+
+def traverse_trace(path, accessible) -> str:
+    """Short read-only note of which ancestors already allow traverse."""
+    notes = []
+    for item in acl_ancestor_paths(path):
+        if _is_volume_acl_path(item):
+            state = "volume"
+        elif accessible(item):
+            state = "open"
+        else:
+            state = "closed"
+        notes.append(f"{item}={state}")
+        if len(notes) >= 5:
+            break
+    return "; ".join(notes)
 
 
 def translate_staged_path(path, copies) -> str:

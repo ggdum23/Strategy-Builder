@@ -346,6 +346,31 @@ def test_the_actions_temp_directory_is_not_the_copy_parent():
     assert not any(_is_volume(item) for item in found)
 
 
+def test_a_closed_volume_root_does_not_block_the_copy():
+    version = r"C:\hostedtoolcache\windows\Python\3.12"
+    stage = version.rsplit("\\", 1)[0] + r"\Strategy Builder\jail\runtime"
+    closed = (version, r"C:\ProgramData", r"C:\Users\Public", r"C:\Program Files", r"C:\Program Files (x86)", r"C:\\")
+
+    def accessible(path: str) -> bool:
+        return not any(acl_same(path, item) for item in closed)
+
+    environ = dict(ENV)
+    environ["PUBLIC"] = r"C:\Users\Public"
+    found = copy_parent_candidates(environ, [version + r"\x64"], accessible)
+    assert acl_same(found[0], r"C:\hostedtoolcache\windows\Python")
+    assert not any(_is_volume(item) for item in found)
+    grant, copies = stage_unreachable_runtimes(
+        [version + r"\x64"],
+        allow=[version + r"\x64", stage],
+        accessible=accessible,
+        stage_root=stage,
+    )
+    assert len(copies) == 1
+    assert acl_same(copies[0][1], stage)
+    assert not any(_is_volume(item) for item in grant)
+    assert not any(acl_same(item, r"C:\hostedtoolcache\windows\Python") for item in grant)
+
+
 def test_windows_is_not_a_copy_parent():
     environ = {
         "SystemRoot": r"C:\Windows",
