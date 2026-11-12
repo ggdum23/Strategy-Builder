@@ -59,11 +59,19 @@ def test_decimal_strategy_id_is_not_a_price_and_the_batch_finishes(tmp_path):
         "qqq_momentum",
     }
     by_id = {job["strategy_id"]: job["status"] for job in jobs}
+
+    def _failed(strategy_id: str) -> str:
+        return "; ".join(
+            f"{item.status}: {item.error}"
+            for item in result.results
+            if item.strategy_id == strategy_id and item.status != "ok"
+        )
+
     assert by_id["vol_1.5"] == "error"
-    assert by_id["opening_drive"] == "ok"
-    assert by_id["mean_reversion"] == "ok"
-    assert by_id["ema12"] == "ok"
-    assert by_id["qqq_momentum"] == "ok"
+    assert by_id["opening_drive"] == "ok", _failed("opening_drive")
+    assert by_id["mean_reversion"] == "ok", _failed("mean_reversion")
+    assert by_id["ema12"] == "ok", _failed("ema12")
+    assert by_id["qqq_momentum"] == "ok", _failed("qqq_momentum")
     operator = read_leaderboard(out / "leaderboard.csv")
     designer_root = out / "designer"
     designer = read_leaderboard(designer_root / "leaderboard.csv")
