@@ -327,10 +327,13 @@ If landlock cannot be applied either, the launch is refused.
 These are the Windows-only cases left for a live check on the owner PC.
 Linux runs the same assertions and does not take the `xfail`. The mark is
 `xfail(strict=False, reason="verify live on owner Windows PC")`. A pass on
-Windows is an xpass. The Windows CI job stops at 25 minutes, and each test
-stops at 60 seconds (`pytest-timeout`). The thread timer raises in that
-test instead of calling `os._exit`, so one slow test does not discard the
-rest of the run. A hang cannot hold the job for hours.
+Windows is an xpass. Windows CI runs one shard per group of files, on
+Python 3.11, 3.12, and 3.13. Each shard stops at 25 minutes and each test
+stops at 60 seconds (`pytest-timeout`). A parallel shard holds at most 12
+tests, so a shard ends in a pass or a fail instead of being cancelled.
+The thread timer raises in that test instead of calling `os._exit`, so one
+slow test does not discard the rest of the run. A hang cannot hold the job
+for hours.
 
 H3, network. AppContainer drops loopback in the receive layer, so `connect`
 to a listening loopback server waits until the socket times out unless a
@@ -406,9 +409,9 @@ examples stay strict on both runners. Ubuntu matches them jailed against
 in-process, with `/etc/ld.so.cache` bound and the parent's import order on
 `sys.path`. The frozen installer smoke on `b9abba5` (run 43131711177) completed.
 
-A separate Windows job, `windows referee`, runs `tests/test_referee.py` and
-`tests/test_reserved.py` with a 60-second test cap and the same 25-minute
-job cap. The main matrix keeps its 25-minute cap.
+`tests/test_referee.py` and `tests/test_reserved.py` are one of those shards,
+with the same 60-second test cap and 25-minute job cap. Ubuntu still runs
+the whole suite in one job per Python version.
 
 ### Live Windows checklist
 
