@@ -170,20 +170,20 @@ def _extend_path() -> None:
         if entry not in sys.path:
             sys.path.insert(0, entry)
     if os.name == "nt" and hasattr(os, "add_dll_directory"):
-        # The absolute directory is the one the parent imported. A junction
-        # beside the package is not always where LoadLibrary looks.
+        # The real directory the parent imported. add_dll_directory rejects
+        # the junction in the slot (WinError 87) and wants this path.
         dlls = spec.get("dlls") if isinstance(spec, dict) else None
         for raw in dlls or []:
-            folder = Path(raw)
-            if folder.is_dir():
-                os.add_dll_directory(str(folder))
-        for entry in entries:
-            root = Path(entry)
-            if not root.is_dir():
+            try:
+                folder = Path(raw).resolve()
+            except OSError:
                 continue
-            for child in root.iterdir():
-                if child.is_dir() and child.name.endswith(".libs"):
-                    os.add_dll_directory(str(child))
+            if not folder.is_dir():
+                continue
+            try:
+                os.add_dll_directory(str(folder))
+            except OSError:
+                continue
 
 
 def _windows_token_facts() -> dict:

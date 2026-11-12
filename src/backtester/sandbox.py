@@ -693,8 +693,9 @@ def _stage_packages(work: Path) -> list[Path]:
 
     The slot holds one package. Its parent is what goes on ``sys.path``, so a
     scan of that path cannot see a sibling ``dist-info`` or ``.pth``. A
-    ``*.libs`` directory is placed in that same slot: on Windows the numpy
-    loader looks beside the package, not on ``sys.path``.
+    ``*.libs`` directory is not linked into the slot. On Windows the child
+    adds the real directory with ``os.add_dll_directory``; a junction there
+    makes that call fail.
     """
     packages = _runtime_package_dirs()
     stage = work / "pydeps"
@@ -706,9 +707,9 @@ def _stage_packages(work: Path) -> list[Path]:
     for path in packages:
         if path.name.endswith(".libs"):
             owner = path.parent / path.name[: -len(".libs")]
-            slot = slots.get(owner)
-            if slot is not None:
-                _link_into(path, slot / path.name)
+            if slots.get(owner) is not None:
+                # Not linked into the slot. os.add_dll_directory rejects that
+                # junction on Windows, and the loader raises before the import.
                 dlls.append(str(path))
                 continue
         slot = stage / f"{index:02d}"
