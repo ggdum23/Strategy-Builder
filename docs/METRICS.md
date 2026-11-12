@@ -192,22 +192,36 @@ the Desk 2x book's total return and is empty for Arena.
 
 ## What a designer may see
 
-An anonymized run writes two trees. The operator files keep the original ticker and
-`cost_basis.share_scale`. The `designer/` tree replaces the ticker with `RANDOM`, drops calendar
-dates, and the scale fields (`symbol`, `share_factor`, `share_scale`,
+An anonymized run writes two trees. The operator files keep the original ticker,
+the real fee schedule, and `cost_basis.share_scale`. The `designer/` tree is a
+separate run. It replaces the ticker with `RANDOM`, drops calendar dates, and
+drops the scale fields (`symbol`, `share_factor`, `share_scale`,
 `price_factor`, `volume_factor`, `date_map`, `cost_basis`, the sidecar, and
-the source paths). ISO dates are blanked. A parallel batch puts the designer
-leaderboard and each anonymized job under one `designer/` directory. Hand
-over that directory. Named runs are the operator's own data and are not
-rewritten into that tree.
+the source paths). ISO dates are blanked. Fills on that run use the flat
+designer fee in `docs/COSTS_DESIGNER.md`. Equity starts at the canonical
+$1,000,000 index, not the operator account. The metrics carry
+`cost_model` = `designer cost model: 0.8 bp flat` and `flat_fee_bps`. A
+parallel batch puts the designer leaderboard and each anonymized job under
+one `designer/` directory. That leaderboard is ranked on the designer-cost
+excess. Hand over that directory. Named runs are the operator's own data and
+are not rewritten into that tree.
+
+`cost_comparison.json` sits beside the operator report, not under `designer/`.
+It shows the real-fee result, the designer-cost result, and the difference
+(designer minus real) for the strategy and the benchmarks. Walk-forward splits
+that file into a design window and a locked window. The locked window is not
+published under `designer/`.
 
 The equity chart is session index against equity. The title is `equity`.
 It has no ticker and no date axis. PNG bytes are not part of the determinism
 contract. An encoder may stamp the file.
 
-Post-fee cash still determines `share_scale`. That residual is unchanged and
-is described in `docs/PACK.md`. Redaction removes the factor fields. It does
-not promise that the numeric factor is absent from a scaled price.
+The exact-equity plus per-share-schedule residual is closed for this tree.
+There is no per-share term, `share_scale` is not an input, the flat constant
+does not depend on the ticker or the pack, and the equity unit is the
+canonical index. Redaction still removes the factor fields. It does not
+promise that a scaled price grid is unrecognizable. That grid leak is the
+native-tick residual in `docs/PACK.md`, which is separate from the fee residual.
 
 ## Accounting switches
 

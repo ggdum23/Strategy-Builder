@@ -173,8 +173,9 @@ def validate_sidecar(document: dict) -> None:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0.0:
             _fail(name, "expected a positive finite number")
     if document["anonymized"]:
-        if float(document["share_scale"]) != float(document["price_factor"]):
-            _fail("share_scale", "must equal price_factor (prices x k means share_scale = k)")
+        # The builder writes share_scale equal to price_factor. The loader
+        # accepts any positive billing scale, including 1, so an operator
+        # invoice can be stated on its own. Designer runs do not read it.
         if float(document["price_factor"]) == 1.0 or float(document["volume_factor"]) == 1.0:
             _fail("price_factor", "an anonymized pack must actually rescale prices and volume")
     else:

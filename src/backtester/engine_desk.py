@@ -40,6 +40,9 @@ class DeskConfig:
     liquidation_hwm_fraction: float = 0.30
     live_start_ordinal: int = 0
     dividends: dict | None = None
+    # None uses costs_desk.fill_costs. A model prices the fill and this engine
+    # does not pass share_factor into that call.
+    cost_model: object | None = None
 
     def __post_init__(self):
         if self.initial_equity <= 0.0:
@@ -484,10 +487,14 @@ class _Book:
         delta = new_shares - self.shares
         if delta == 0:
             return
-        px = D.slipped_price(price, delta, self.cfg.slippage_bps, self.cfg.fee_mult)
         month = live_ordinal // self.cfg.sessions_per_month
         before = self.month_shares.get(month, 0.0)
-        fees = D.fill_costs(delta, px, before, self.cfg.share_factor, self.cfg.fee_mult)
+        if self.cfg.cost_model is None:
+            px = D.slipped_price(price, delta, self.cfg.slippage_bps, self.cfg.fee_mult)
+            fees = D.fill_costs(delta, px, before, self.cfg.share_factor, self.cfg.fee_mult)
+        else:
+            px = self.cfg.cost_model.slipped_price(price, delta)
+            fees = self.cfg.cost_model.fill_costs(delta, px, before)
         self.month_shares[month] = before + fees["tier_shares"]
         self.cash -= delta * px + fees["total"]
         for key in self.fees:

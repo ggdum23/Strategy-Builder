@@ -160,7 +160,7 @@ class _SessionCarry:
 def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month_of_day=None,
         taf_active_of_day=None, reset_day=None, period_label_of_day=None, record_fills=True,
         borrow_rate_annual=None, cash_rate_annual=0.0, financing_rate_annual=0.0,
-        withholding_rate=0.0, dividends=None):
+        withholding_rate=0.0, dividends=None, cost_model=None):
     """Run `strategy` over `bars` (DataFrame with BAR_FIELDS, all sessions, time-ordered).
 
     reset_day: if given, the account is rescaled to `initial_equity` (keeping exposure) at the
@@ -181,6 +181,9 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
       the strategy receives extended hours. Borrow stays on the last regular bar.
     dividends: None leaves the reference loop unchanged. A map of day -> amount
       is credited at that day's boundary, before the fill, on the shares in that snap.
+    cost_model: None uses costs.fill_costs and costs.slipped_price, including
+      share_scale. A model prices the fill itself and this loop does not read
+      share_scale for that fill. The default, None, is the operator schedule.
     """
     month_of_day = month_of_day or _local_month
     taf_active_of_day = taf_active_of_day or (lambda d: True)
@@ -314,9 +317,13 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 new_sh = int(tgt * eq_open / o)  # trunc toward zero
             delta = new_sh - shares
             if delta != 0:
-                px = C.slipped_price(o, delta)
                 mk = month_of_day(day)
-                fc = C.fill_costs(delta, px, month_vol.get(mk, 0.0), share_scale, taf_active_of_day(day))
+                if cost_model is None:
+                    px = C.slipped_price(o, delta)
+                    fc = C.fill_costs(delta, px, month_vol.get(mk, 0.0), share_scale, taf_active_of_day(day))
+                else:
+                    px = cost_model.slipped_price(o, delta)
+                    fc = cost_model.fill_costs(delta, px, month_vol.get(mk, 0.0))
                 month_vol[mk] = month_vol.get(mk, 0.0) + fc["tier_shares"]
                 cash -= delta * px + fc["total"]
                 for kk in fees_tot: fees_tot[kk] += fc[kk]
@@ -415,6 +422,8 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                          "frac_short": n_short / n_exp if n_exp else 0.0, "n_bars": n_exp},
         "wants_extended_hours": wants_ext, "period_label_of_day": period_label_of_day,
     }
+    if cost_model is not None:
+        out.pop("share_scale", None)
     if carry is not None:
         out["financing"] = carry.financing
         out["cash_interest"] = carry.cash_interest

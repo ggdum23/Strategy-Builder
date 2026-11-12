@@ -58,27 +58,37 @@ The design child also receives the strategy (the class, or the strategy file
 path when the class was loaded from a file) and the run kwargs. It does not
 receive the data directory, the CLI argv, or the locked frame.
 
-An anonymized pack run uses the same channels. `run_pack` reads the sidecar in
-the operator process, then drops that document before the spawn. The sidecar
-file is where the scale factors, the date map, and the ticker are stored. The
-child still receives `share_scale` (the price factor k) because the engine
-bills per-share fees on real share counts. It does not receive the sidecar
+An anonymized pack run uses the same channels twice. `run_pack` reads the
+sidecar in the operator process, then drops that document before either
+spawn. The sidecar file is where the scale factors, the date map, and the
+ticker are stored.
+
+The operator child still receives `share_scale` because that process bills
+per-share fees on real share counts. It does not receive the sidecar
 document, the date map, the ticker, the volume factor, the operator note, or
 the sidecar path. The runner frames that are only forwarding the number do not
 keep a local named `share_scale` or `share_factor` while `on_bar` runs. The
 engine frame does: Arena's `run` parameter and Desk's `DeskConfig.share_factor`
-are how the invoice is computed, and a strategy can see them.
+are how the invoice is computed, and a strategy can see them in that process.
+Post-fee cash on the operator book can still be read against the public
+per-share schedule. That book is not the designer tree.
 
-Post-fee cash determines k from the public fee schedule even if those names
-were hidden. That residual follows from the owner's choice to charge real
-per-share fees. Moving billing into the parent is a Phase 4 option. It would
-take the scale off the child engine frame. It would not remove the inference
-from post-fee cash.
+The designer child is a second process. It is not given `share_scale`,
+`share_factor`, or the operator account size. Fills use the flat fee in
+`docs/COSTS_DESIGNER.md`. Equity starts at the canonical index. Dividend
+amounts are remapped to session ids and are not multiplied by the scale.
+The exact-equity plus per-share-schedule residual is closed for that process
+and for everything written under `designer/`: there is no per-share term, the
+flat constant is not derived from the ticker or the pack, and the equity unit
+does not follow the real account or the real share count. A strategy that
+reads `share_scale` and then changes its orders will trade differently in the
+two processes. The designer artifact is the second one.
 
-The same pack leaks that `docs/PACK.md` lists apply here: weekday plus
-early-close shape, a crash-shaped path, native tick times `price_factor`, the
-billing scale above, and bar `count`, which is not volume-scaled and is an
-identity cue. `count` stays the source trade count.
+The same pack leaks that `docs/PACK.md` lists apply to the bars themselves:
+weekday plus early-close shape, a crash-shaped path, native tick times
+`price_factor`, and bar `count`, which is not volume-scaled and is an
+identity cue. `count` stays the source trade count. The billing-scale residual
+does not apply to the designer child.
 
 Heap, environment, argv, and cwd are the in-scope checks. A hardcoded absolute
 path can still open a file. That is the Phase 4 jail.
@@ -88,9 +98,9 @@ Phase 4 also still owns these reads, which this phase does not stop:
 - `/proc/<ppid>/cmdline`
 - `/proc/<ppid>/environ`
 - `/proc/<ppid>/cwd`, and the Windows handle equivalents
-- `share_scale` on the child engine frame. The parent passes it so per-share
-  fees use real share counts. Post-fee cash determines it as well. See
-  `docs/PACK.md`.
+- `share_scale` on the operator child's engine frame. The parent passes it so
+  the real invoice uses real share counts. The designer child does not receive
+  it. See `docs/PACK.md` and `docs/COSTS_DESIGNER.md`.
 
 `walk_forward` deletes the frame it was given. The command line passes that
 frame as the argument and does not keep another name for it. A caller that
@@ -102,9 +112,11 @@ receive it.
 `backtester parallel` scores each strategy in a new spawned process. The process
 is the same one a pack run uses: argv `['backtester-design']`, an empty working
 directory, and the environment allowlist. The parent keeps the sidecar, the
-date map, and the unscaled dividend amounts. `share_scale` is passed the same
-way `run_pack` passes it. Desk dividends are remapped in the parent before the
-child starts.
+date map, and the unscaled dividend amounts. An anonymized job spawns the
+designer child first (flat fee, canonical equity, no billing scale, dividend
+amounts remapped and not multiplied by the scale) and the operator child
+second. The operator child receives `share_scale` the same way `run_pack`
+passes it, and its dividends are scaled. A named job spawns once.
 
 Spawn copies the parent environment at `Process.start`. A launch lock holds
 the argv, cwd, and environment scrub so two jobs cannot snapshot a cleared
