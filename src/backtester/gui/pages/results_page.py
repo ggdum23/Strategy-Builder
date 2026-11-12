@@ -40,6 +40,7 @@ from ..audience import (
     refuse_oversized,
 )
 from ..backend import RunReport, chart_overlay, drawdown_line, exposure_line, load_run
+from ..jobs import failure_view
 from ..charts import ChartPanel
 from ..format import MISSING, format_number, is_missing
 from ..schema import (
@@ -305,8 +306,14 @@ class ResultsPage(QWidget):
             self.banners.addWidget(Banner(severity, text))
         missing = [self._designer_line(report, item) for item in self._visible_missing(report)]
         if missing:
-            notice = "Not in this report, so left blank: " + ", ".join(missing) + "."
-            self.banners.addWidget(Banner("info", self._designer_line(report, notice)))
+            # The period stays off the last name. The designer allow-list would
+            # otherwise read ``benchmarks.`` as one token and drop the field.
+            notice = "Not in this report, so left blank: " + ", ".join(missing)
+            if report.audience == "designer":
+                text = self._designer_line(report, notice)
+            else:
+                text = notice + "."
+            self.banners.addWidget(Banner("info", text))
         if report.kind == "walkforward":
             self.leg.blockSignals(True)
             self.leg.clear()
@@ -484,16 +491,30 @@ class ResultsPage(QWidget):
             self.cost_line.setText("")
             self.cost_line.setToolTip("")
 
+    def _failure_line(self, report: RunReport, text: str) -> tuple[str, str]:
+        """Visible sentence, and the operator text a tooltip may expand to.
+
+        Designer text stays the opaque sentence. A traceback is not copied
+        onto that tooltip.
+        """
+        shown, detail = failure_view(text)
+        if report.audience == "designer":
+            shown = self._designer_line(report, shown)
+            return shown, shown
+        return shown, detail
+
     def _show_failures(self, report: RunReport) -> None:
         for child in report.children:
             if child.get("state") == "ok":
                 continue
-            detail = str(child.get("error") or "").strip()
-            lines = [line.strip() for line in detail.splitlines() if line.strip()]
-            summary = lines[-1] if lines else child.get("state")
-            banner = Banner("error", self._designer_line(report, f"{child.get('name')}: {summary}"))
-            if detail:
-                banner.setToolTip(self._designer_line(report, detail))
+            raw = str(child.get("error") or "").strip()
+            shown, detail = self._failure_line(report, raw)
+            if not shown:
+                shown = str(child.get("state") or "error")
+                detail = ""
+            banner = Banner("error", self._designer_line(report, f"{child.get('name')}: {shown}"))
+            if detail and detail != banner.text():
+                banner.setToolTip(detail)
             self.banners.addWidget(banner)
 
     def _show_chart(self, visible: bool) -> None:
@@ -740,14 +761,17 @@ class ResultsPage(QWidget):
         for child in report.children:
             if not isinstance(child, dict):
                 continue
-            rows.append(
-                {
-                    "job": child.get("name"),
-                    "state": child.get("state"),
-                    "error": child.get("error"),
-                    "designer": self._job_designer_dir(report, child),
-                }
-            )
+            raw = child.get("error")
+            shown, detail = self._failure_line(report, raw if isinstance(raw, str) else "")
+            row = {
+                "job": child.get("name"),
+                "state": child.get("state"),
+                "error": shown or None,
+                "designer": self._job_designer_dir(report, child),
+            }
+            if report.audience != "designer" and detail and detail != shown:
+                row["error_detail"] = detail
+            rows.append(row)
         self.jobs.set_records(("job", "state", "error"), rows, {"job": "Job", "state": "State", "error": "Error"})
         self._fit_table(self.jobs, len(rows))
         self._show_section(self.jobs_title, self.jobs, bool(rows))
@@ -767,7 +791,17 @@ class ResultsPage(QWidget):
                 titles[column] = SPECS[column].label
             elif column in LEADERBOARD_LABELS:
                 titles[column] = LEADERBOARD_LABELS[column]
-        self.leaderboard.set_records(board.columns, list(board.rows), titles, kinds)
+        rows = []
+        for record in board.rows:
+            copied = dict(record)
+            raw = copied.get("error")
+            if isinstance(raw, str) and raw.strip():
+                shown, detail = self._failure_line(report, raw)
+                copied["error"] = shown
+                if report.audience != "designer" and detail and detail != shown:
+                    copied["error_detail"] = detail
+            rows.append(copied)
+        self.leaderboard.set_records(board.columns, rows, titles, kinds)
         self._fit_table(self.leaderboard, len(board.rows))
         self.leaderboard_title.setVisible(True)
         self.filter.setVisible(True)

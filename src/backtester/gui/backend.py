@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -709,13 +710,117 @@ def _error_by_job(directory: Path) -> dict[tuple[str, str], str]:
     return found
 
 
+def _record_keys(directory: Path) -> list[tuple[str, str]]:
+    """Job ids from ``run.json``, then any leaderboard row not already listed."""
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(strategy_id, source_id) -> None:
+        key = (str(strategy_id or ""), str(source_id or ""))
+        if key == ("", "") or key in seen:
+            return
+        seen.add(key)
+        keys.append(key)
+
+    info = directory / "run.json"
+    if info.is_file():
+        try:
+            document = _read_json(info)
+        except (OSError, json.JSONDecodeError):
+            document = None
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if isinstance(jobs, list):
+            for job in jobs:
+                if isinstance(job, dict):
+                    add(job.get("strategy_id"), job.get("source_id"))
+    board = directory / LEADERBOARD_FILE
+    if board.is_file():
+        try:
+            table = _load_table(board)
+        except (OSError, UnicodeError, csv.Error, ValueError):
+            table = None
+        if table is not None:
+            for row in table.rows:
+                add(row.get("strategy_id"), row.get("source_id"))
+    return keys
+
+
+_CASE_SUFFIX = re.compile(r"^(.+)-([1-9]\d*)$")
+
+
+def _reserved_folder_map(keys: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[str, str]]:
+    """On-disk folder names back to the ids ``_reserve_case_component`` reserved.
+
+    The engine sorts jobs by strategy id, then source id, and suffixes the
+    second case-colliding name (``momentum`` becomes ``momentum-2``).
+    """
+    from ..parallel import _reserve_case_component
+
+    mapping: dict[tuple[str, str], tuple[str, str]] = {}
+    strategy_names: dict[str, str] = {}
+    used_strategies: set[str] = set()
+    used_sources: dict[str, set[str]] = {}
+    for strategy_id, source_id in sorted(keys):
+        if strategy_id not in strategy_names:
+            strategy_names[strategy_id] = _reserve_case_component(strategy_id, used_strategies)
+        folder = strategy_names[strategy_id]
+        sources = used_sources.setdefault(folder, set())
+        source_name = _reserve_case_component(source_id, sources)
+        mapping[(folder, source_name)] = (strategy_id, source_id)
+    return mapping
+
+
+def _unsuffix_id(name: str, known: set[str]) -> str:
+    """``momentum-2`` is the reserved folder for recorded id ``momentum``.
+
+    A recorded id that is already ``momentum-2`` keeps that folder.
+    """
+    if name in known:
+        return name
+    match = _CASE_SUFFIX.fullmatch(name)
+    if match is None:
+        return name
+    base, number = match.group(1), int(match.group(2))
+    if number < 2 or base not in known:
+        return name
+    return base
+
+
+def _canonical_job(strategy_id: str, source_id: str, keys: list[tuple[str, str]], mapping: dict) -> tuple[str, str]:
+    found = mapping.get((strategy_id, source_id))
+    if found is not None:
+        return found
+    known = set(keys)
+    strategy_ids = {strategy for strategy, _source in keys}
+    canonical_strategy = _unsuffix_id(strategy_id, strategy_ids)
+    source_ids = {source for strategy, source in keys if strategy == canonical_strategy}
+    canonical_source = _unsuffix_id(source_id, source_ids)
+    candidate = (canonical_strategy, canonical_source)
+    if candidate in known:
+        return candidate
+    return strategy_id, source_id
+
+
+def _child_state(status: str | None, error: str | None, *, metrics: bool) -> tuple[str, str | None]:
+    if status and status.casefold() == "ok":
+        return "ok", None
+    if status:
+        return status, error
+    if error:
+        return "failed", error
+    if metrics:
+        return "ok", None
+    return "incomplete", None
+
+
 def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
     """Phase 3 tree: ``jobs/<id>/<source>/`` plus ``designer/`` and ``error.json``.
 
     The Jobs table takes its word from ``run.json`` and the leaderboard.
-    With no such word, ``error.json`` wins over ``metrics.json``. A metrics
-    file alone is ok. The error cell is ``error.json`` when it has text, then
-    a run or leaderboard message.
+    A case-suffixed folder uses the id the reserver started from. A recorded
+    row with no directory is still a row. With no recorded word, ``error.json``
+    wins over ``metrics.json``. A metrics file alone is ok. The error cell is
+    ``error.json`` when it has text, then a run or leaderboard message.
     """
     report = RunReport(directory=directory, kind="batch")
     jobs_root = directory / "jobs"
@@ -724,22 +829,22 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
         pairs = _nested_job_dirs(directory)
     recorded = _status_by_job(directory)
     noted = _error_by_job(directory)
+    keys = _record_keys(directory)
+    try:
+        mapping = _reserved_folder_map(keys)
+    except ValueError:
+        mapping = {}
+    represented: set[tuple[str, str]] = set()
     for strategy_id, source_id, job in pairs:
         metrics_path = job / METRICS_FILE
         error = _job_error(job)
-        status = recorded.get((strategy_id, source_id))
-        if status and status.casefold() == "ok":
-            state = "ok"
-        elif status:
-            state = status
-        elif error:
-            state = "failed"
-        elif metrics_path.is_file():
-            state = "ok"
-        else:
-            state = "incomplete"
+        canonical = _canonical_job(strategy_id, source_id, keys, mapping)
+        status = recorded.get(canonical)
         if not error:
-            error = noted.get((strategy_id, source_id))
+            error = noted.get(canonical)
+        state, shown = _child_state(status, error, metrics=metrics_path.is_file())
+        represented.add(canonical)
+        represented.add((strategy_id, source_id))
         report.children.append(
             {
                 "path": str(job),
@@ -747,7 +852,7 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
                 "strategy_id": strategy_id,
                 "source_id": source_id,
                 "state": state,
-                "error": None if state.casefold() == "ok" else error,
+                "error": shown,
             }
         )
     board_path = directory / LEADERBOARD_FILE
@@ -759,27 +864,25 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
     else:
         report.missing.append(LEADERBOARD_FILE)
         report.warnings.append("No jobs/ tree and no leaderboard.csv in this batch.")
-    info = directory / "run.json"
-    if info.is_file():
-        document = _read_json(info)
-        if isinstance(document, dict) and not report.children:
-            for job in document.get("jobs") or []:
-                if not isinstance(job, dict):
-                    continue
-                state = "ok" if job.get("status") == "ok" else str(job.get("status") or "failed")
-                note = _note_text(job.get("error"))
-                if note and note.casefold() == str(job.get("status") or "").casefold():
-                    note = None
-                report.children.append(
-                    {
-                        "path": "",
-                        "name": f"{job.get('strategy_id')}/{job.get('source_id')}",
-                        "strategy_id": job.get("strategy_id"),
-                        "source_id": job.get("source_id"),
-                        "state": state,
-                        "error": None if state == "ok" else note,
-                    }
-                )
+    for strategy_id, source_id in keys:
+        if (strategy_id, source_id) in represented:
+            continue
+        status = recorded.get((strategy_id, source_id))
+        note = noted.get((strategy_id, source_id))
+        if status is None and note is None:
+            state, shown = "failed", None
+        else:
+            state, shown = _child_state(status, note, metrics=False)
+        report.children.append(
+            {
+                "path": "",
+                "name": f"{strategy_id}/{source_id}",
+                "strategy_id": strategy_id,
+                "source_id": source_id,
+                "state": state,
+                "error": shown,
+            }
+        )
     config_path = directory / RUN_CONFIG_FILE
     if config_path.is_file():
         document = _read_json(config_path)

@@ -79,11 +79,17 @@ class JobFailure:
         )
 
 
+_TRACEBACK_MARK = "Traceback (most recent call last):"
+
+
 def failure_message(value) -> str:
     """The sentence a banner shows. A plain string is already that sentence."""
     if isinstance(value, JobFailure):
         if value.strategy:
             return failure_line(value.type_name, value.message)
+        if value.type_name == "SystemExit":
+            code = " ".join(value.message.split())
+            return f"SystemExit: {code}" if code else "SystemExit"
         text = value.message.strip()
         return text or "run failed"
     if isinstance(value, str):
@@ -97,6 +103,55 @@ def failure_detail(value) -> str:
     if isinstance(value, JobFailure):
         return value.traceback or value.message
     return str(value)
+
+
+def _first_content_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _outer_exception_text(text: str) -> str:
+    """The outermost exception block of a traceback, message lines included."""
+    block = text.rsplit(_TRACEBACK_MARK, 1)[-1]
+    start = None
+    lines = block.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if line[:1].isspace():
+            continue
+        if line.startswith("During handling of") or line.startswith("The above exception"):
+            continue
+        start = index
+        break
+    if start is None:
+        return ""
+    kept = []
+    for line in lines[start:]:
+        if line.startswith("During handling of") or line.startswith("The above exception"):
+            break
+        kept.append(line.rstrip())
+    return "\n".join(kept).strip()
+
+
+def failure_view(text: str) -> tuple[str, str]:
+    """The line a cell or banner shows, and the text kept for a tooltip.
+
+    A traceback shows the outermost exception's first line (``Type: message``).
+    The tooltip keeps the traceback. A plain multiline message shows its first
+    line and keeps the whole message for the tooltip.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return "", ""
+    if _TRACEBACK_MARK in raw:
+        sentence = _outer_exception_text(raw)
+        shown = _first_content_line(sentence) or _first_content_line(raw)
+        return shown, raw
+    return _first_content_line(raw), raw
 
 
 _PUBLIC_PACK_KEYS = (
