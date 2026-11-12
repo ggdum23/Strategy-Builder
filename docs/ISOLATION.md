@@ -248,19 +248,25 @@ The backend name is `job+appcontainer`.
 - The token is an AppContainer profile with zero capabilities, so it has no
   network capability. A socket call fails with access denied (10013).
 -   One AppContainer profile (`strategybuilderjail`) is created per machine.
-  The Win32 ACL API grants read/execute on the Python runtime once,
-  traverse-only on the directories between that tree and the volume root.
-  `C:\Windows` is traverse-only. Access denied there is skipped: All
-  Application Packages can already cross it, and writing the ACE returns
-  winerror 5. The volume root itself is not edited. An allow ACE that is
-  already present is not written again. A failed grant drops the ACEs it
-  added with the same API. `icacls` on `C:\hostedtoolcache` does not return,
-  so that cleanup does not call it. Later launches see a marker and do
-  not walk that tree again. Each launch grants the private temp directory
-  only. A tree walk that is still going after 180 seconds fails that grant.
-  The failure is a test error. It does not abort the pytest session. There
-  is no per-launch recursive deny: the container
-  token is not the user, so a directory that was not granted is not readable.
+  File ACLs are edited only for directories this app owns: the jail
+  working directory, an app-data directory it created, a virtualenv, a
+  frozen bundle, and the running interpreter when that directory is
+  outside Windows, System32, Program Files, the drive root, and the
+  user-profile root. The old grant list appended `SystemRoot`, so
+  `C:\Windows` was a target even though the interpreter on a GitHub
+  runner lives under `C:\hostedtoolcache`. That write is refused.
+  Ancestors this app does not own are not rewritten. Traverse and read
+  of a system interpreter and of system DLLs use the All Application
+  Packages ACE already on those directories. If an ancestor has no such
+  ACE, the launch fails and names the directory. An allow ACE that is
+  already present is not written again. A failed grant drops the ACEs
+  it added on app-owned paths and does not call `icacls`. Later launches
+  see a marker and do not walk that tree again. Each launch grants the
+  private directory only. A tree walk that is still going after 180
+  seconds fails that grant. The failure is a test error. It does not
+  abort the pytest session. There is no deny ACE on a directory this
+  app does not own: the container token is not the user, so a directory
+  that was not granted is not readable.
   A child whose token is not an AppContainer, or whose token has a
   capability, is not resumed. Loopback exemptions for this profile are
   removed. Inbound and outbound firewall rules block the package SID, and
@@ -274,8 +280,7 @@ The backend name is `job+appcontainer`.
   listening loopback server and to an external
   address both fail with access denied (10013). `LOCALAPPDATA` is the host
   value. CreateProcess returns 203 when it is missing, so a missing value
-  refuses the launch. That directory is denied without inheritance, once,
-  because the profile and the private temp live under it. The process
+  refuses the launch. Its DACL is not edited. The process
   environment is a sorted Unicode block. CreateProcess rejects an unsorted
   block. A frozen child is `StrategyBuilder.exe --sandbox-child` (or the
   console `backtester.exe`), not a system Python running a `.py` file.

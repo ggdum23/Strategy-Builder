@@ -1,10 +1,11 @@
 """OS jail for the referee child.
 
 Windows: a job object (kill on close, one active process, a memory cap, a CPU
-cap), an AppContainer with no network capability, and file ACL deny entries on
-the data, market, and repository directories. The private temp directory is
-the only writable location. If any of that cannot be applied, the launch
-raises and the strategy is not started.
+cap) and an AppContainer with no network capability. File ACLs are edited
+only on directories this app owns or creates. The private temp directory is
+the only writable location. A directory that was not granted is not readable,
+because the token is not the user. If any of that cannot be applied, the
+launch raises and the strategy is not started.
 
 Linux: bubblewrap when ``bwrap`` can start a throwaway namespace. Otherwise
 landlock plus a seccomp filter, rlimits, and ``PR_SET_PDEATHSIG``. The report
@@ -408,11 +409,14 @@ def _windows_guarantees() -> dict:
         ),
         "filesystem": (
             "The process token is an AppContainer, so the user SID does not grant file "
-            "access. The profile is granted read/execute on the runtime once, not on every "
-            "launch, and full control of the private temp directory. Data, market, and "
-            "repository trees are not granted. LOCALAPPDATA is the host value the profile "
-            "needs, and a non-inheriting deny on that directory is applied once. A child "
-            "that is not an AppContainer is not resumed."
+            "access. ACLs are edited only on directories this app owns: the private "
+            "temp directory, an app-data directory it created, and the interpreter "
+            "when that copy is outside Windows, Program Files, the drive root, and "
+            "the user-profile root. System directories are not edited. Ancestors "
+            "this app does not own are not rewritten; a missing traverse ACE fails "
+            "the launch. Data, market, and repository trees are not granted. "
+            "LOCALAPPDATA is the host value the profile needs, and its DACL is not "
+            "edited. A child that is not an AppContainer is not resumed."
         ),
         "process": (
             "job object with KILL_ON_JOB_CLOSE, active process limit 1, a commit-charge cap, "
@@ -609,10 +613,61 @@ def launch(
         raise
 
 
+# Directories this process created for the jail (app data, not the user profile).
+_CREATED_APP_DIRS: list[Path] = []
+
+
 def _private_dir() -> str:
     import tempfile
 
-    return tempfile.mkdtemp(prefix="bt-referee-")
+    parent = _owned_work_parent()
+    if parent is None:
+        return tempfile.mkdtemp(prefix="bt-referee-")
+    return tempfile.mkdtemp(prefix="bt-referee-", dir=str(parent))
+
+
+def _owned_work_parent() -> Path | None:
+    """An app-created folder whose parents already allow package traverse.
+
+    The DACL of ProgramData, Public, the user profile, and the drive root
+    is not modified. If none of those parents already let All Application
+    Packages through, the caller falls back to the user temp and the launch
+    refuses to rewrite those ancestors.
+    """
+    if sys.platform != "win32":
+        return None
+    for key in ("ProgramData", "PUBLIC"):
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        try:
+            parent = Path(raw)
+            if not parent.is_dir():
+                continue
+            if not _chain_has_package_traverse(parent):
+                continue
+            app = (parent / "Strategy Builder").resolve()
+            jail = (app / "jail").resolve()
+            if not _can_be_allow_root(app, os.environ) or not _can_be_allow_root(jail, os.environ):
+                continue
+            app.mkdir(exist_ok=True)
+            jail.mkdir(exist_ok=True)
+        except OSError:
+            continue
+        for directory in (app, jail):
+            if not any(acl_same(directory, existing) for existing in _CREATED_APP_DIRS):
+                _CREATED_APP_DIRS.append(directory)
+        return jail
+    return None
+
+
+def _chain_has_package_traverse(path: Path) -> bool:
+    if not _existing_package_access(path, read=False, traverse=True):
+        return False
+    for ancestor in acl_ancestor_paths(str(path)):
+        if not _existing_package_access(ancestor, read=False, traverse=True):
+            return False
+    return True
 
 
 def _deny_roots(paths) -> list[Path]:
@@ -1138,15 +1193,12 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
     try:
         try:
             _win_reject_overlap(lease.grant_paths, denied)
-            # The AppContainer token is the file boundary. A per-launch
-            # recursive deny of the repository walks the tree inside the
-            # strategy timeout. The private directory is the only grant
-            # that changes per launch, and it is a handful of files.
-            # Ancestor DACLs are shared. Two workers updating them at once
-            # can drop the traverse ACE, and CreateProcessW then fails with
-            # ERROR_FILE_NOT_FOUND (winerror 2) because the new token cannot
-            # resolve its current directory. The profile lock makes that
-            # update and the spawn one sequence.
+            # The AppContainer token is the file boundary. A directory that
+            # was not granted is not readable, so the repository is not
+            # given a deny ACE. The private directory is the only grant that
+            # changes per launch. Ancestors this app does not own are not
+            # rewritten; the launch fails if one of them lacks traverse.
+            # The profile lock still serializes the grant and the spawn.
             def _grant_and_spawn():
                 nonlocal extra_grants, popen
                 try:
@@ -1203,6 +1255,7 @@ class _WinLease:
         self.refs = 0
         self.grant_paths: list[tuple[Path, bool]] = []
         self.ancestor_grants: set[Path] = set()
+        self.acl_allow: list[str] = []
         self.userenv = None
         self.advapi = None
         self.kernel = None
@@ -1542,33 +1595,43 @@ def _clear_loopback(name: str, sid_text: str) -> None:
             continue
 
 
+_ACL_MARKER_VERSION = 2
+
+
 def _recorded_grants(sid_text: str):
     path = _grant_marker_path()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if payload.get("version") != _ACL_MARKER_VERSION:
+        return None
     if payload.get("sid") != sid_text:
         return None
+    expected = [os.path.normcase(str(item)) for item in _windows_grant_roots()]
     recorded_roots = [os.path.normcase(str(item)) for item in payload.get("roots") or []]
-    if recorded_roots != [os.path.normcase(str(path)) for path in _windows_grant_roots()]:
+    if recorded_roots != expected:
         return None
-    if not payload.get("local_denied"):
-        return None
+    allow = [str(item) for item in _windows_grant_roots()]
+    exact, trees = protected_acl_layout(os.environ)
     grants = []
     for item in payload.get("grants") or []:
         if not isinstance(item, list) or len(item) != 2:
             return None
-        grants.append((Path(item[0]), bool(item[1])))
+        target = Path(item[0])
+        if acl_write_problem(target, allow, exact, trees) is not None:
+            return None
+        grants.append((target, bool(item[1])))
     return grants
 
 
-def _write_grant_marker(sid_text: str, grants, *, local_denied: bool, loopback_cleared: bool) -> None:
+def _write_grant_marker(sid_text: str, grants, *, loopback_cleared: bool) -> None:
     payload = {
+        "version": _ACL_MARKER_VERSION,
         "sid": sid_text,
         "roots": [str(path) for path in _windows_grant_roots()],
         "grants": [[str(path), bool(recurse)] for path, recurse in grants],
-        "local_denied": bool(local_denied),
+        "local_denied": False,
         "loopback_cleared": bool(loopback_cleared),
         "firewall_blocked": True,
     }
@@ -1630,6 +1693,13 @@ def _win_lease_open(lease: _WinLease) -> None:
     lease.kernel = kernel
 
     def ensure_grants():
+        roots = _windows_grant_roots()
+        lease.acl_allow = [str(path) for path in roots]
+        # Read-only. A missing package ACE fails the grant before any write,
+        # including on the marker fast path.
+        _require_unowned_runtime_access(roots)
+        for root in roots:
+            _require_existing_ancestor_traverse(root, lease.acl_allow)
         recorded = _recorded_grants(sid_text)
         marker = {}
         try:
@@ -1650,33 +1720,13 @@ def _win_lease_open(lease: _WinLease) -> None:
         _win_block_network(sid_text)
         if recorded is not None:
             lease.grant_paths = recorded
-            _write_grant_marker(
-                sid_text, recorded, local_denied=True, loopback_cleared=True
-            )
+            _write_grant_marker(sid_text, recorded, loopback_cleared=True)
             return
         grants: list[tuple[Path, bool]] = []
         try:
-            for root in _windows_grant_roots():
-                if _same_dir(root, _system_root()):
-                    # C:\Windows already grants traverse to All Application
-                    # Packages. Writing an inheritable ACE there is access
-                    # denied (winerror 5), and the old icacls cleanup of the
-                    # Python prefix then hangs on C:\hostedtoolcache.
-                    _win_grant_protected(lease, root)
-                    grants.append((root, False))
-                    continue
+            for root in roots:
                 _win_grant(lease, root, "(OI)(CI)(RX)", recurse=True)
                 grants.append((root, True))
-                for parent in _ancestors(root):
-                    if parent == root or any(parent == earlier for earlier, _flag in grants):
-                        continue
-                    _win_grant(lease, parent, "(X)", recurse=False)
-                    grants.append((parent, False))
-            local = _local_app_data()
-            local_denied = False
-            if local is not None and local.exists() and not _is_volume_root(local):
-                _win_deny_shallow(lease, local)
-                local_denied = True
         except Exception:
             lease.grant_paths = grants
             try:
@@ -1686,9 +1736,7 @@ def _win_lease_open(lease: _WinLease) -> None:
                 pass
             raise
         lease.grant_paths = grants
-        _write_grant_marker(
-            sid_text, grants, local_denied=local_denied, loopback_cleared=True
-        )
+        _write_grant_marker(sid_text, grants, loopback_cleared=True)
 
     try:
         # Every process that launches a jail holds this filter. A scrubbed
@@ -1702,13 +1750,272 @@ def _win_lease_open(lease: _WinLease) -> None:
         raise
 
 
-def _same_dir(left: Path, right: Path | None) -> bool:
-    if right is None:
+def _split_acl_path(path) -> tuple[str, tuple[str, ...]]:
+    """Drive plus components. Backslashes are separators even on Linux tests."""
+    text = str(path).strip().replace("/", "\\")
+    if text.startswith("\\\\"):
+        body = text[2:]
+        while "\\\\" in body:
+            body = body.replace("\\\\", "\\")
+        parts = tuple(part for part in body.split("\\") if part and part != ".")
+        return "\\\\", parts
+    while "\\\\" in text:
+        text = text.replace("\\\\", "\\")
+    text = text.rstrip("\\")
+    if len(text) >= 2 and text[1] == ":":
+        drive = text[:2].upper()
+        rest = text[2:].lstrip("\\")
+        parts = tuple(part for part in rest.split("\\") if part and part != ".")
+        return drive, parts
+    parts = tuple(part for part in text.split("\\") if part and part != ".")
+    return "", parts
+
+
+def _acl_parts(path) -> tuple[str, tuple[str, ...]]:
+    drive, parts = _split_acl_path(path)
+    return drive, tuple(part.casefold() for part in parts)
+
+
+def acl_same(left, right) -> bool:
+    return _acl_parts(left) == _acl_parts(right)
+
+
+def _acl_inside(path, root) -> bool:
+    drive, parts = _acl_parts(path)
+    root_drive, root_parts = _acl_parts(root)
+    if drive != root_drive:
         return False
+    return len(parts) > len(root_parts) and parts[: len(root_parts)] == root_parts
+
+
+def _acl_join(drive: str, parts: tuple[str, ...]) -> str:
+    if not parts:
+        return f"{drive}\\" if drive and drive not in {"\\\\"} else drive
+    if drive == "\\\\":
+        return "\\\\" + "\\".join(parts)
+    if not drive:
+        return "\\".join(parts)
+    return drive + "\\" + "\\".join(parts)
+
+
+def acl_ancestor_paths(path) -> list[str]:
+    """Parents of ``path``, including the volume root. Does not include ``path``."""
+    drive, parts = _split_acl_path(path)
+    found = []
+    for length in range(len(parts) - 1, 0, -1):
+        found.append(_acl_join(drive, parts[:length]))
+    if drive and drive != "\\\\":
+        found.append(drive + "\\")
+    return found
+
+
+def _is_volume_acl_path(path) -> bool:
+    drive, parts = _acl_parts(path)
+    return bool(drive) and not parts
+
+
+def protected_acl_layout(environ) -> tuple[list[str], list[str]]:
+    """Exact directories that must never be edited, and trees that are off limits.
+
+    Program Files is exact: the directory itself is protected, and a frozen
+    bundle underneath can still be an allow root. The Windows directory and
+    System32 are trees: nothing inside them is an allow root.
+    """
+    exact: list[str] = []
+    trees: list[str] = []
+
+    def add_exact(raw) -> None:
+        if raw:
+            exact.append(str(raw))
+
+    system = environ.get("SystemRoot") or environ.get("WINDIR")
+    if system:
+        add_exact(system)
+        trees.append(str(system))
+        root = str(system).rstrip("\\/")
+        add_exact(root + "\\System32")
+        add_exact(root + "\\SysWOW64")
+        trees.append(root + "\\System32")
+        trees.append(root + "\\SysWOW64")
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        add_exact(environ.get(key, ""))
+    drive = environ.get("SystemDrive") or ""
+    letter = str(drive).rstrip("\\/")
+    if len(letter) >= 2 and letter[1] == ":":
+        add_exact(letter[:2] + "\\")
+    profile = environ.get("USERPROFILE")
+    if profile:
+        add_exact(profile)
+    return exact, trees
+
+
+def _inside_program_files(path, environ) -> bool:
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        root = environ.get(key) or ""
+        if root and (acl_same(path, root) or _acl_inside(path, root)):
+            return True
+    return False
+
+
+def _can_be_allow_root(path, environ) -> bool:
+    exact, trees = protected_acl_layout(environ)
+    if any(acl_same(path, banned) for banned in exact) or _is_volume_acl_path(path):
+        return False
+    if any(acl_same(path, tree) or _acl_inside(path, tree) for tree in trees):
+        return False
+    return True
+
+
+def runtime_root_is_app_owned(path, *, environ, venv: bool = False, frozen: bool = False, active: bool = False) -> bool:
+    """True when this process may edit the DACL of an interpreter directory.
+
+    ``C:\\Windows`` is not owned, including when a candidate equals
+    ``SystemRoot`` or sits inside it. An interpreter under Program Files is
+    not owned either: those directories already carry All Application
+    Packages. A virtualenv, a frozen bundle outside the Windows tree, and
+    the running interpreter when it lives somewhere else (the GitHub
+    toolcache, a user install, a venv) are the copies the old icacls grant
+    edited and that this process still may edit.
+    """
+    if not _can_be_allow_root(path, environ):
+        return False
+    if _inside_program_files(path, environ):
+        return bool(frozen)
+    return bool(venv or frozen or active)
+
+
+def acl_write_problem(path, allow_roots, exact, trees) -> str | None:
+    """None when ``path`` may be edited. Otherwise a short reason."""
+    if any(acl_same(path, banned) for banned in exact) or _is_volume_acl_path(path):
+        return "protected directory"
+    if any(acl_same(path, tree) or _acl_inside(path, tree) for tree in trees):
+        return "inside a system directory"
+    if not any(acl_same(path, root) or _acl_inside(path, root) for root in allow_roots):
+        return "outside the app-owned allow-list"
+    return None
+
+
+def acl_revoke_problem(path, *, environ) -> str | None:
+    """A cleanup write is still a write. System directories are never edited."""
+    exact, trees = protected_acl_layout(environ)
+    if any(acl_same(path, banned) for banned in exact) or _is_volume_acl_path(path):
+        return "protected directory"
+    if any(acl_same(path, tree) or _acl_inside(path, tree) for tree in trees):
+        return "inside a system directory"
+    return None
+
+
+def refuse_acl_target(path, *, allow, environ) -> None:
+    """Raise when a grant would edit a directory this app must not touch."""
+    exact, trees = protected_acl_layout(environ)
+    problem = acl_write_problem(path, allow, exact, trees)
+    if problem:
+        raise SandboxError(f"refusing to edit the ACL on {path}: {problem}")
+
+
+def should_write_ace(already_present: bool) -> bool:
+    """An allow ACE that already covers the mask is not written again."""
+    return not already_present
+
+
+def _dedupe_acl(paths) -> list[str]:
+    kept: list[str] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for raw in paths:
+        if raw is None or raw == "":
+            continue
+        key = _acl_parts(raw)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(str(raw))
+    return kept
+
+
+def _flagged(path, group) -> bool:
+    return any(acl_same(path, item) for item in group)
+
+
+def acl_allow_roots(
+    candidates,
+    *,
+    environ,
+    work=None,
+    active=(),
+    venv=(),
+    frozen=(),
+    app_data=(),
+) -> list[str]:
+    """App-owned grant roots from the historical icacls candidate list."""
+    allow: list[str] = []
+    for raw in candidates:
+        if not runtime_root_is_app_owned(
+            raw,
+            environ=environ,
+            venv=_flagged(raw, venv),
+            frozen=_flagged(raw, frozen),
+            active=_flagged(raw, active),
+        ):
+            continue
+        allow.append(str(raw))
+    for raw in list(app_data) + ([] if work is None else [work]):
+        if _can_be_allow_root(raw, environ):
+            allow.append(str(raw))
+    allow = _dedupe_acl(allow)
+    allow.sort(key=_acl_parts)
+    return allow
+
+
+def planned_acl_targets(
+    candidates,
+    *,
+    environ,
+    work=None,
+    active=(),
+    venv=(),
+    frozen=(),
+    app_data=(),
+) -> list[str]:
+    """Historical icacls targets (candidates and their ancestors) after the filter.
+
+    Ancestors are considered and then dropped. A protected directory that
+    was an explicit candidate, including ``SystemRoot``, is dropped too.
+    """
+    allow = acl_allow_roots(
+        candidates,
+        environ=environ,
+        work=work,
+        active=active,
+        venv=venv,
+        frozen=frozen,
+        app_data=app_data,
+    )
+    exact, trees = protected_acl_layout(environ)
+    proposed: list[str] = []
+    for raw in list(candidates) + list(app_data) + ([] if work is None else [work]):
+        if raw is None or raw == "":
+            continue
+        proposed.append(str(raw))
+        proposed.extend(acl_ancestor_paths(raw))
+    kept = []
+    for path in proposed:
+        if not any(acl_same(path, root) for root in allow):
+            continue
+        if acl_write_problem(path, allow, exact, trees) is not None:
+            continue
+        kept.append(path)
+    kept = _dedupe_acl(kept)
+    kept.sort(key=_acl_parts)
+    return kept
+
+
+def _is_volume_root(path: Path) -> bool:
+    """True for ``/`` or ``C:\\``. A volume root is never an ACL target."""
     try:
-        return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(Path(right).resolve()))
+        resolved = path.resolve()
     except OSError:
-        return os.path.normcase(str(left)) == os.path.normcase(str(right))
+        resolved = path
+    return resolved.parent == resolved
 
 
 def _system_root() -> Path | None:
@@ -1719,60 +2026,127 @@ def _system_root() -> Path | None:
     return path if path.is_dir() else None
 
 
-def _windows_grant_roots() -> list[Path]:
-    """Interpreter directories the AppContainer may read.
-
-    User-site from ``site.getusersitepackages`` is not included. It depends
-    on the process environment, so a scrubbed worker would miss the marker
-    and walk the Python tree with ``icacls /T`` on every launch. A package
-    that lives outside the prefix is added on its own.
-    """
-    roots: list[Path] = []
+def _interpreter_candidates() -> list[Path]:
     frozen_root = getattr(sys, "_MEIPASS", None)
-    candidates = [sys.base_prefix, sys.prefix, os.path.dirname(sys.executable), frozen_root]
-    system = _system_root()
-    if system is not None:
-        candidates.append(str(system))
-    for raw in candidates:
+    raws = [sys.base_prefix, sys.prefix, os.path.dirname(sys.executable), frozen_root]
+    found: list[Path] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for raw in raws:
         if not raw:
             continue
-        path = Path(raw).resolve()
-        if path.is_dir() and path not in roots:
-            roots.append(path)
+        path = Path(raw)
+        try:
+            path = path.resolve()
+        except OSError:
+            pass
+        try:
+            if not path.is_dir():
+                continue
+        except OSError:
+            continue
+        key = _acl_parts(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(path)
+    return found
+
+
+def _grant_candidates() -> list[str]:
+    """Historical icacls targets, before the app-owned filter.
+
+    ``SystemRoot`` (``C:\\Windows`` on a normal install) is appended here
+    as its own candidate. It is not produced by walking parents of the
+    interpreter. On a GitHub runner ``sys.base_prefix`` is under
+    ``C:\\hostedtoolcache``, and that walk never reaches ``C:\\Windows``.
+    The filter drops ``SystemRoot``, so the DACL write is not attempted.
+    """
+    found = [str(path) for path in _interpreter_candidates()]
+    system = _system_root()
+    if system is not None:
+        found.append(str(system))
+    seen = {_acl_parts(item) for item in found}
     for package in _runtime_package_dirs():
         directory = package if package.is_dir() else package.parent
-        if any(directory == root or root in directory.parents for root in roots):
+        key = _acl_parts(directory)
+        if key in seen:
             continue
-        if directory.is_dir() and directory not in roots:
-            roots.append(directory)
-    roots.sort(key=lambda path: os.path.normcase(str(path)))
-    return roots
+        try:
+            if not directory.is_dir():
+                continue
+        except OSError:
+            continue
+        seen.add(key)
+        found.append(str(directory))
+    return found
 
 
-def _is_volume_root(path: Path) -> bool:
-    """True for ``/`` or ``C:\\``. icacls on a volume root does not finish."""
-    try:
-        resolved = path.resolve()
-    except OSError:
-        resolved = path
-    return resolved.parent == resolved
+def _windows_grant_roots() -> list[Path]:
+    """Interpreter directories whose DACLs this process may edit.
 
-
-def _ancestors(path: Path) -> list[Path]:
-    """Parents of ``path``, stopping before the volume root.
-
-    The volume root already grants traverse to All Application Packages.
-    Editing its ACL with icacls does not finish on a CI runner.
+    User-site is not a root. It depends on the process environment, so a
+    scrubbed worker would miss the marker and walk the tree again. A
+    package directory inside an owned prefix is covered by that grant and
+    is not a separate target.
     """
-    nodes = []
-    current = path.resolve().parent
-    while not _is_volume_root(current):
-        nodes.append(current)
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-    return nodes
+    interpreters = _interpreter_candidates()
+    active = {str(path) for path in interpreters}
+    frozen_raw = getattr(sys, "_MEIPASS", None)
+    frozen = set()
+    if frozen_raw:
+        frozen.add(str(frozen_raw))
+    venv = set()
+    for path in interpreters:
+        prefix_differs = _acl_same_prefix(path)
+        if (path / "pyvenv.cfg").is_file() or prefix_differs:
+            venv.add(str(path))
+    kept = planned_acl_targets(
+        _grant_candidates(),
+        environ=os.environ,
+        active=active,
+        venv=venv,
+        frozen=frozen,
+    )
+    return [Path(path) for path in kept]
+
+
+def _acl_same_prefix(path: Path) -> bool:
+    if not sys.prefix or not sys.base_prefix:
+        return False
+    return acl_same(path, sys.prefix) and not acl_same(sys.prefix, sys.base_prefix)
+
+
+def _require_existing_ancestor_traverse(path, allow) -> None:
+    """Fail when an unowned ancestor has no package traverse ACE. Never writes."""
+    for parent in acl_ancestor_paths(str(path)):
+        if any(acl_same(parent, root) or _acl_inside(parent, root) for root in allow):
+            continue
+        if _existing_package_access(parent, read=False, traverse=True):
+            continue
+        raise SandboxError(
+            f"the AppContainer cannot traverse {parent}; this process will not rewrite a directory it does not own"
+        )
+
+
+def _require_unowned_runtime_access(owned: list[Path]) -> None:
+    """System interpreters stay readable only through ACEs Windows already has."""
+    paths = list(_interpreter_candidates())
+    for package in _runtime_package_dirs():
+        directory = package if package.is_dir() else package.parent
+        paths.append(directory)
+    for path in paths:
+        if any(acl_same(path, root) or _acl_inside(path, root) for root in owned):
+            continue
+        try:
+            if not path.exists():
+                continue
+        except OSError:
+            continue
+        if not _existing_package_access(path, read=True, traverse=True):
+            raise SandboxError(
+                f"the AppContainer cannot read {path}; this process will not rewrite a directory it does not own"
+            )
+        _require_existing_ancestor_traverse(path, owned)
 
 
 def _icacls() -> str:
@@ -1795,13 +2169,28 @@ def _icacls_run(args: list[str]) -> None:
         raise SandboxError(f"icacls failed ({proc.returncode}): {detail[-500:]}")
 
 
+def _lease_allow(lease: _WinLease) -> list[str]:
+    if lease.acl_allow:
+        return list(lease.acl_allow)
+    return [str(path) for path in _windows_grant_roots()]
+
+
+def _refuse_acl_write(lease: _WinLease, path: Path) -> None:
+    refuse_acl_target(path, allow=_lease_allow(lease), environ=os.environ)
+
+
 def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
     """Add a non-inherited traverse ACE without walking the directory.
 
-    ``icacls`` on ``C:\\hostedtoolcache\\windows`` does not return. The
-    AppContainer only needs to cross that directory to reach Python.
+    Only an app-owned directory is edited. An ancestor this app does not
+    own is never passed here. ``icacls`` on ``C:\\hostedtoolcache`` does
+    not return, so this uses the Win32 ACL API and skips a write when
+    traverse is already allowed.
     """
+    _refuse_acl_write(lease, path)
     if not path.exists():
+        return
+    if not should_write_ace(_traverse_already_allowed(lease, path)):
         return
     advapi = lease.advapi
     kernel = lease.kernel
@@ -1857,6 +2246,11 @@ def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
     status = advapi.GetNamedSecurityInfoW(str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security))
     if status != 0:
         raise SandboxError(f"could not read the ACL on {path} (winerror {status})")
+    if not dacl.value:
+        # A NULL DACL already allows traverse. Replacing it would drop that.
+        if security.value:
+            kernel.LocalFree(security)
+        return
     entry = ExplicitAccess()
     # FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
     entry.grfAccessPermissions = 0x20 | 0x80 | 0x100000
@@ -1983,7 +2377,8 @@ def _win_ace_present(lease: _WinLease, path: Path, mask: int, ace_type: int) -> 
 
 def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit: int) -> None:
     """Merge one ACE. ``mode`` 1 grants and 3 denies. An existing match is left."""
-    if _win_ace_present(lease, path, mask, 0 if mode == 1 else 1):
+    _refuse_acl_write(lease, path)
+    if not should_write_ace(_win_ace_present(lease, path, mask, 0 if mode == 1 else 1)):
         return
     advapi = lease.advapi
     kernel = lease.kernel
@@ -2045,16 +2440,139 @@ def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit:
             kernel.LocalFree(updated)
 
 
+# ALL APPLICATION PACKAGES, ALL RESTRICTED APPLICATION PACKAGES, Everyone.
+# BUILTIN\Users does not apply to an AppContainer token.
+_PACKAGE_SID_TEXTS = ("S-1-15-2-1", "S-1-15-2-2", "S-1-1-0")
+_PACKAGE_SIDS: list | None = None
+_FILE_READ_DATA = 0x1
+_FILE_TRAVERSE_BIT = 0x20
+_GENERIC_READ = 0x80000000
+_GENERIC_EXECUTE = 0x20000000
+_GENERIC_ALL = 0x10000000
+_FILE_ALL = 0x1F01FF
+
+
+def _mask_allows(have: int, *, read: bool, traverse: bool) -> bool:
+    if have & _GENERIC_ALL or (have & _FILE_ALL) == _FILE_ALL:
+        return True
+    if traverse and not (have & _FILE_TRAVERSE_BIT or have & _GENERIC_EXECUTE):
+        return False
+    if read and not (have & _FILE_READ_DATA or have & _GENERIC_READ):
+        return False
+    return True
+
+
+def _package_allow_sids(advapi) -> list:
+    global _PACKAGE_SIDS
+    if _PACKAGE_SIDS is not None:
+        return _PACKAGE_SIDS
+    advapi.ConvertStringSidToSidW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.ConvertStringSidToSidW.restype = ctypes.c_int
+    found = []
+    for text in _PACKAGE_SID_TEXTS:
+        sid = ctypes.c_void_p()
+        if advapi.ConvertStringSidToSidW(text, ctypes.byref(sid)) and sid.value:
+            found.append(sid)
+    _PACKAGE_SIDS = found
+    return found
+
+
+def _existing_package_access(path, *, read: bool, traverse: bool, extra_sid=None) -> bool:
+    """True when an existing ACE already lets an AppContainer through.
+
+    This only reads the DACL. A NULL DACL allows everyone. A missing ACE
+    is not a reason to write one on a directory this app does not own.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return False
+    advapi.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi.GetAce.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.GetAce.restype = ctypes.c_int
+    advapi.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    advapi.EqualSid.restype = ctypes.c_int
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    dacl = ctypes.c_void_p()
+    security = ctypes.c_void_p()
+    status = advapi.GetNamedSecurityInfoW(
+        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+    )
+    if status != 0 or not security.value:
+        if security.value:
+            kernel.LocalFree(security)
+        return False
+    try:
+        if not dacl.value:
+            return True
+        sids = list(_package_allow_sids(advapi))
+        if extra_sid is not None and getattr(extra_sid, "value", None):
+            sids.append(extra_sid)
+        if not sids:
+            return False
+        header = _ACL_HEADER.from_address(int(dacl.value))
+        allowed = False
+        for index in range(min(int(header.AceCount), 256)):
+            ace = ctypes.c_void_p()
+            if not advapi.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
+                continue
+            info = _ACE_HEADER.from_address(int(ace.value))
+            ace_type = int(info.AceType)
+            if ace_type not in (0, 1):
+                continue
+            ace_sid = ctypes.c_void_p(int(ace.value) + 8)
+            if not any(advapi.EqualSid(ace_sid, sid) for sid in sids):
+                continue
+            have = int(ctypes.c_uint32.from_address(int(ace.value) + 4).value)
+            if not _mask_allows(have, read=read, traverse=traverse):
+                continue
+            if ace_type == 1:
+                return False
+            allowed = True
+        return allowed
+    finally:
+        if security.value:
+            kernel.LocalFree(security)
+
+
+def _traverse_already_allowed(lease: _WinLease, path: Path) -> bool:
+    mask = _FILE_TRAVERSE_BIT | 0x80 | 0x100000
+    if _win_ace_present(lease, path, mask, 0):
+        return True
+    return _existing_package_access(path, read=False, traverse=True, extra_sid=lease.sid)
+
+
 def _grant_already_present(lease: _WinLease, root: Path, mask: int) -> bool:
-    """The tree was granted before the marker was written."""
-    if not root.is_dir():
-        return _win_ace_present(lease, root, mask, 0)
+    """The tree was granted before, or Windows already allows the package in."""
     probes = [root]
-    for relative in (Path("python.exe"), Path("Lib") / "os.py"):
-        candidate = root / relative
-        if candidate.is_file():
-            probes.append(candidate)
-    return all(_win_ace_present(lease, probe, mask, 0) for probe in probes)
+    if root.is_dir():
+        for relative in (Path("python.exe"), Path("Lib") / "os.py"):
+            candidate = root / relative
+            if candidate.is_file():
+                probes.append(candidate)
+    need_write = mask == _FULL_MASK
+    for probe in probes:
+        if _win_ace_present(lease, probe, mask, 0):
+            continue
+        if need_write or not _existing_package_access(
+            probe, read=True, traverse=True, extra_sid=lease.sid
+        ):
+            return False
+    return True
 
 
 def _win_grant_tree(lease: _WinLease, root: Path, mask: int, inherit: int) -> None:
@@ -2082,8 +2600,8 @@ def _win_grant_tree(lease: _WinLease, root: Path, mask: int, inherit: int) -> No
                 continue
         try:
             _win_change_ace(lease, current, mask, 1, inherit if is_dir else 0)
-        except SandboxError:
-            if current == root:
+        except SandboxError as exc:
+            if current == root or "refusing to edit the ACL" in str(exc):
                 raise
             continue
         seen += 1
@@ -2095,24 +2613,10 @@ def _win_grant_tree(lease: _WinLease, root: Path, mask: int, inherit: int) -> No
             continue
 
 
-def _win_grant_protected(lease: _WinLease, path: Path) -> None:
-    """Traverse-only grant. Access denied means the OS ACL already allows it.
-
-    ``SetNamedSecurityInfo`` on ``C:\\Windows`` returns winerror 5. The
-    directory grants traverse to All Application Packages, which is the
-    AppContainer. Failing the jail here made every test report the cleanup
-    timeout instead of the strategy result.
-    """
-    try:
-        _win_grant_traverse(lease, path)
-    except SandboxError as exc:
-        if "winerror 5" not in str(exc):
-            raise
-        note_phase(f"grant-skip-protected {path.name}")
-
-
 def _win_revoke_ace(lease: _WinLease, path: Path) -> None:
     """Drop this profile's ACEs from one file. Does not walk children."""
+    if acl_revoke_problem(path, environ=os.environ):
+        return
     if not path.exists():
         return
     advapi = lease.advapi
@@ -2172,6 +2676,8 @@ def _win_revoke_ace(lease: _WinLease, path: Path) -> None:
 
 def _win_revoke_tree(lease: _WinLease, root: Path) -> None:
     """Revoke one tree. ``icacls`` on ``C:\\hostedtoolcache`` does not return."""
+    if acl_revoke_problem(root, environ=os.environ):
+        return
     deadline = time.monotonic() + 180
     pending = [root]
     while pending:
@@ -2200,6 +2706,7 @@ def _win_revoke_tree(lease: _WinLease, root: Path) -> None:
 
 
 def _win_grant(lease: _WinLease, path: Path, rights: str, *, recurse: bool) -> None:
+    _refuse_acl_write(lease, path)
     if not path.exists():
         return
     if not recurse and rights == "(X)":
@@ -2223,17 +2730,18 @@ def _win_grant(lease: _WinLease, path: Path, rights: str, *, recurse: bool) -> N
 
 
 def _win_deny(lease: _WinLease, path: Path) -> None:
+    _refuse_acl_write(lease, path)
     command = [_icacls(), str(path), "/deny", f"*{lease.sid_text}:(OI)(CI)(F)", "/T", "/C", "/Q"]
     _icacls_run(command)
 
 
 def _win_deny_shallow(lease: _WinLease, path: Path) -> None:
-    """Deny reading the directory itself. Children keep the ACEs they have.
+    """Deny reading one app-owned directory. Children keep the ACEs they have.
 
-    ``icacls /deny`` on ``LOCALAPPDATA`` blocked while the profile lock file
-    in that directory was open. The deny is one non-inherited ACE, and it
-    is skipped when that ACE is already present.
+    The ACE is skipped when it is already present. A directory this app
+    does not own is not edited: the AppContainer cannot read it anyway.
     """
+    _refuse_acl_write(lease, path)
     if not path.exists():
         return
     if _win_ace_present(lease, path, _READ_MASK, 1):
@@ -2339,18 +2847,27 @@ def _win_reject_overlap(grants, denied) -> None:
 
 
 def _win_grant_work(lease: _WinLease, work: Path) -> list[tuple[Path, bool]]:
-    applied: list[tuple[Path, bool]] = []
-    _win_grant(lease, work, "(OI)(CI)(F)", recurse=True)
-    applied.append((work, True))
-    granted = {path for path, _recurse in lease.grant_paths}
-    granted.update(lease.ancestor_grants)
-    for parent in _ancestors(work):
-        if parent in granted:
+    """Grant the private directory. Ancestors this app did not create are read, not written."""
+    allow = [str(path) for path, _flag in lease.grant_paths]
+    allow.extend(str(path) for path in _CREATED_APP_DIRS)
+    allow.append(str(work))
+    lease.acl_allow = _dedupe_acl(allow)
+    _require_existing_ancestor_traverse(work, lease.acl_allow)
+    for parent in acl_ancestor_paths(str(work)):
+        if not any(acl_same(parent, root) for root in lease.acl_allow):
             continue
-        _win_grant(lease, parent, "(X)", recurse=False)
-        lease.ancestor_grants.add(parent)
-        granted.add(parent)
-    return applied
+        parent_path = Path(parent)
+        if any(acl_same(parent_path, earlier) for earlier in lease.ancestor_grants):
+            continue
+        try:
+            if not parent_path.exists():
+                continue
+        except OSError:
+            continue
+        _win_grant(lease, parent_path, "(X)", recurse=False)
+        lease.ancestor_grants.add(parent_path)
+    _win_grant(lease, work, "(OI)(CI)(F)", recurse=True)
+    return [(work, True)]
 
 
 def _win_apply_denies(lease: _WinLease, denied) -> list[Path]:
@@ -2360,6 +2877,10 @@ def _win_apply_denies(lease: _WinLease, denied) -> list[Path]:
             continue
         path = Path(banned)
         if not path.exists():
+            continue
+        try:
+            _refuse_acl_write(lease, path)
+        except SandboxError:
             continue
         try:
             _win_deny(lease, path)

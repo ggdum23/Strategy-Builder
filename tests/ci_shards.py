@@ -47,6 +47,7 @@ FILE_SHARDS = {
         "tests/test_paths.py",
         "tests/test_reports.py",
         "tests/test_registry.py",
+        "tests/test_windows_acl.py",
     ),
     "accounting": (
         "tests/test_accounting.py",
