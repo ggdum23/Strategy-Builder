@@ -56,7 +56,12 @@ def test_decimal_strategy_id_is_not_a_price_and_the_batch_finishes(tmp_path):
         "vol_1.5",
         "qqq_momentum",
     }
-    assert {job["status"] for job in jobs} == {"ok"}
+    by_id = {job["strategy_id"]: job["status"] for job in jobs}
+    assert by_id["vol_1.5"] == "error"
+    assert by_id["opening_drive"] == "ok"
+    assert by_id["mean_reversion"] == "ok"
+    assert by_id["ema12"] == "ok"
+    assert by_id["qqq_momentum"] == "ok"
     operator = read_leaderboard(out / "leaderboard.csv")
     designer_root = out / "designer"
     designer = read_leaderboard(designer_root / "leaderboard.csv")
@@ -64,28 +69,36 @@ def test_decimal_strategy_id_is_not_a_price_and_the_batch_finishes(tmp_path):
     assert {row["strategy_id"] for row in operator} == {job["strategy_id"] for job in jobs}
     folders = {path.name for path in designer_root.iterdir() if path.is_dir()}
     assert folders == {row["strategy_id"] for row in designer}
-    assert "vol_1.5" in folders
+    assert "vol_1.5" not in folders
     assert "qqq_momentum" not in folders
     assert "RANDOM_momentum" in folders
-    assert {row["strategy_id"] for row in designer} == {
-        "opening_drive",
-        "mean_reversion",
-        "ema12",
-        "vol_1.5",
-        "RANDOM_momentum",
-    }
+    shown = {row["strategy_id"]: row["status"] for row in designer}
+    assert shown["opening_drive"] == "ok"
+    assert shown["mean_reversion"] == "ok"
+    assert shown["ema12"] == "ok"
+    assert shown["RANDOM_momentum"] == "ok"
+    failed = [row for row in designer if row["status"] == "error"]
+    assert len(failed) == 1
+    assert failed[0]["strategy_id"] != "vol_1.5"
+    error_path = next((designer_root / failed[0]["strategy_id"]).rglob("error.json"))
+    error = json.loads(error_path.read_text(encoding="utf-8"))
+    assert error["error"] == "the strategy failed"
+    assert error["strategy_id"] == failed[0]["strategy_id"]
     for row in designer:
         book = designer_root / row["strategy_id"] / row["source_id"]
-        assert (book / "metrics.json").is_file()
-        assert row["status"] == "ok"
+        if row["status"] == "ok":
+            assert (book / "metrics.json").is_file()
+        else:
+            assert (book / "error.json").is_file()
     blob = "\n".join(
         path.read_text(encoding="utf-8")
         for path in designer_root.rglob("*")
         if path.is_file() and path.suffix.lower() != ".png"
     )
     assert "qqq_momentum" not in blob.casefold()
+    assert "vol_1.5" not in blob
     assert_designer_clean(designer_root, symbol="QQQ", scale=1.1)
-    assert result.failures == 0
+    assert result.failures == 1
 
 
 def test_scale_in_a_strategy_id_fails_one_job_and_the_batch_finishes(tmp_path):
@@ -158,11 +171,11 @@ def test_isolate_dirty_folders_does_not_abort_the_batch(tmp_path, monkeypatch):
 
 
 def test_path_predicate_skips_price_and_keeps_scale():
-    assert designer_component_problem("vol_1.5", symbols=("QQQ",), scale=2) is None
-    assert designer_component_problem("vol_1.5", symbols=("QQQ",), scale=1.1) is None
-    assert designer_component_problem("vol_1.5", symbols=("QQQ",), scale=1.5) == "the scale"
+    assert designer_component_problem("vol_1.5", symbols=("QQQ",), scale=2) == "an unsafe name"
+    assert designer_component_problem("vol_1.5", symbols=("QQQ",), scale=1.1) == "an unsafe name"
+    assert designer_component_problem("vol_1.5", symbols=("QQQ",), scale=1.5) == "an unsafe name"
     assert designer_component_problem("note25e2", scale=0.25) == "the scale"
-    assert designer_component_problem("2", symbols=("2",), scale=1.5) == "the ticker"
+    assert designer_component_problem("2", symbols=("2",), scale=1.5) == "an unsafe name"
     assert designer_component_problem("qqq_momentum", symbols=("QQQ",), scale=1.1) == "the ticker"
 
 
@@ -177,7 +190,7 @@ def test_unsigned_exponent_matches_when_the_value_is_the_scale():
     assert export_block_reason("note25e2", symbols=(), scale=0.25) == "the scale"
     assert scan_publication("pack_2e2abcdef0", scale=2) == "the scale"
     assert export_block_reason("pack_2e2abcdef0", symbols=(), scale=2) == "the scale"
-    assert scan_publication("4738e304", scale=2) is None
+    assert scan_publication("4738e304", scale=2) == "a date"
 
 
 def test_both_gates_agree_on_forty_thousand_pack_ids():

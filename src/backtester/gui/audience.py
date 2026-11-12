@@ -19,12 +19,10 @@ import io
 import json
 import math
 import re
-import unicodedata
 import zlib
 from decimal import Decimal
 from pathlib import Path
 
-from ..calendar_text import MONTH as _MONTH
 from ..calendar_text import contains_calendar_date, strip_calendar_dates
 from ..designer_allow import (
     CLOCK_BODY,
@@ -33,6 +31,7 @@ from ..designer_allow import (
     redacted_key_allowed,
     with_cost_drag,
 )
+from ..designer_ids import fold, id_has_calendar
 
 _SECRET_TOKENS = ("share_scale", "share_factor", "price_factor", "volume_factor", "date_map")
 _SECRET_WORDS = re.compile(
@@ -81,8 +80,6 @@ _MONTH_WORDS = frozenset(
     "jan january feb february mar march apr april may jun june jul july aug august "
     "sep sept september oct october nov november dec december".split()
 )
-_MONTH_WORD = re.compile(rf"(?<![A-Za-z]){_MONTH}(?![A-Za-z])", re.IGNORECASE)
-_NEAR_YEAR = re.compile(r"(?<![A-Za-z0-9.])(?:19|20)\d{2}(?![A-Za-z0-9.])")
 _FREE_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _SESSION_ID = re.compile(r"[Ss]\d+")
 _YEAR_TOKEN = re.compile(r"(?:19|20)\d{2}")
@@ -109,7 +106,6 @@ _SURFACE_TOKEN = re.compile(
     rf"|{_HYPHEN_WORD.pattern}"
     rf"|{_WORD_WITH_EXP}"
 )
-_GLUED_YEAR = re.compile(r"(?i)(?:[A-Za-z](?:19|20)\d{2}|(?:19|20)\d{2}[A-Za-z])")
 # Strategy and source ids are designer-supplied names. A decimal in one is not a price.
 _ID_COLUMNS = frozenset({"strategy_id", "source_id"})
 # One identifier, judged the same way by both gates. A signed exponent inside a
@@ -120,8 +116,6 @@ _IDENTIFIER = re.compile(
     r"|\d+[A-Za-z_][A-Za-z0-9_]*(?:[eE][+-](?:\d+(?:\.\d*)?|\.\d+))?[A-Za-z0-9_]*"
     r")\Z"
 )
-_MONTH_IN_TOKEN = re.compile(rf"(?i)(?<![A-Za-z]){_MONTH}(?![A-Za-z])")
-_YEAR_IN_TOKEN = re.compile(r"(?:19|20)\d{2}")
 # Designer surfaces say RANDOM where a ticker was. The operator view keeps the ticker.
 TICKER_STAND_IN = "RANDOM"
 # Whole-file reads stop at these caps so a huge report cannot exhaust memory.
@@ -180,23 +174,9 @@ SHARE_COLUMNS = frozenset({"shares", "shares_delta", "shares_after", "position_s
 
 # Unicode minus and dash characters that NFKC leaves unchanged, mapped to ASCII
 # before a numeric literal is read. Fullwidth digits fold under NFKC itself.
-_DASH_TO_HYPHEN = str.maketrans(
-    {
-        "\u2212": "-",
-        "\u2010": "-",
-        "\u2011": "-",
-        "\u2012": "-",
-        "\u2013": "-",
-        "\u2014": "-",
-        "\ufe63": "-",
-        "\uff0d": "-",
-    }
-)
-
-
 def normalize_surface(text: str) -> str:
     """NFKC, then unicode minus and dash characters become ASCII ``-``."""
-    return unicodedata.normalize("NFKC", str(text)).translate(_DASH_TO_HYPHEN)
+    return fold(text)
 
 
 def _hide_column(name: str, *, drop_prices: bool, allow_list: bool = False) -> bool:
@@ -258,16 +238,18 @@ def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = No
 
     ISO dates, unpadded ISO, slash dates, dotted DMY and MDY, month names,
     dotted abbreviations, a period with no space (``Jan.4, 2024``), ordinal
-    days, ``YYYY-MM`` keys, and a bare year all count. ``2024.50``, ``0.2024``,
-    and ``day 2024`` stay. ``today 2024`` does not. Session ids such as ``S01``
-    stay. A one-letter ticker is a ticker. A longer symbol that contains a
-    letter uses a letter boundary, so a digit does not glue and ``QQQ1`` is
-    shown as ``RANDOM1``. A one-character symbol, and a digits-only symbol,
-    uses an alphanumeric boundary, so ``V`` does not match ``v2`` and ``10``
-    does not match ``S00010``. The operator view never calls this. Ticker
-    matching uses casefold, so ``ß`` and ``ﬁ`` count.
+    days, ``YYYY-MM`` keys, compact eight-digit dates, two-digit-year month
+    dates, and a bare year all count. ``day 2024`` is a date. ``2024.50`` and
+    ``0.2024`` stay numbers. Session ids such as ``S01`` stay. Text is
+    NFKC-folded before that strip. A one-letter ticker is a ticker. A longer
+    symbol that contains a letter uses a letter boundary, so a digit does not
+    glue and ``QQQ1`` is shown as ``RANDOM1``. A one-character symbol, and a
+    digits-only symbol, uses an alphanumeric boundary, so ``V`` does not match
+    ``v2`` and ``10`` does not match ``S00010``. The operator view never calls
+    this. Ticker matching uses casefold, so ``ß`` and ``ﬁ`` count.
     """
-    text = strip_calendar_dates(value)
+    text = normalize_surface(value)
+    text = strip_calendar_dates(text)
     text = _SECRET_WORDS.sub("", text)
     text = _scrub_scale_number(text, scale)
     for symbol in _symbol_order(symbols):
@@ -318,16 +300,6 @@ def _contains_scale(text: str, scale: float | None) -> bool:
     if _scale_number(scale) is None:
         return False
     return any(_scale_in_token(match.group(0), scale) for match in _SURFACE_TOKEN.finditer(text))
-
-
-def _month_near_year(text: str) -> bool:
-    """A month word and a calendar year in the same short phrase."""
-    years = [match.start() for match in _NEAR_YEAR.finditer(text)]
-    if not years:
-        return False
-    return any(
-        any(abs(month.start() - year) <= 32 for year in years) for month in _MONTH_WORD.finditer(text)
-    )
 
 
 def _scrub_obj(
@@ -565,7 +537,9 @@ def _designer_session_label(label: str, index: int, symbols: tuple[str, ...], sc
     happens to equal the invoice scale.
     """
     raw = str(label).strip()
-    if re.fullmatch(r"\d+", raw) or _SESSION_ID.fullmatch(raw):
+    if _SESSION_ID.fullmatch(raw):
+        return raw
+    if re.fullmatch(r"\d+", raw) and not contains_calendar_date(raw):
         return raw
     cleaned = designer_surface_text(raw, symbols, scale=scale)
     if re.fullmatch(r"\d+", cleaned) or _SESSION_ID.fullmatch(cleaned):
@@ -710,26 +684,25 @@ def _scale_in_token(token: str, scale: float | None) -> bool:
 def _keep_surface_token(token: str, *, previous: str, scale: float | None) -> bool:
     """One decision for the screen filter and for ``export_allowed``.
 
-    A signed number stays whole. A hyphenated word stays whole. A month stem
-    plus a year, a year glued to letters, and the invoice scale do not.
-    ``2024.50`` and the pair ``day 2024`` stay.
+    A signed number stays whole. A hyphenated word stays whole. A calendar id
+    and the invoice scale do not. ``2024.50`` stays. A bare year does not,
+    including ``day 2024``.
     """
+    del previous
     if CLOCK_TEXT.fullmatch(token):
         return True
-    if _GLUED_YEAR.search(token):
-        return False
-    if _MONTH_IN_TOKEN.search(token) and _YEAR_IN_TOKEN.search(token):
+    if id_has_calendar(token):
         return False
     if _scale_in_token(token, scale):
         return False
     if token.casefold() in _MONTH_WORDS or token.split(".", 1)[0].casefold() in _MONTH_WORDS:
         return False
+    if _YEAR_TOKEN.fullmatch(token):
+        return False
     if _NUMBER_SURFACE.fullmatch(token):
         return True
     if _SESSION_ID.fullmatch(token):
         return True
-    if _YEAR_TOKEN.fullmatch(token):
-        return previous.casefold() == "day"
     if _HYPHEN_WORD.fullmatch(token):
         return not any(part.casefold() in _MONTH_WORDS for part in token.split("-"))
     if _FREE_WORD.fullmatch(token) or _DOTTED_WORD.fullmatch(token):
@@ -762,8 +735,8 @@ def _allow_listed_text(text: str, *, scale: float | None = None) -> str:
 
     A signed number, including ``$``, thousands commas, an exponent, and a
     trailing ``%``, is one token. ``pre-market`` stays hyphenated. A month name
-    is not a word we show. A four-digit year stays only when the previous word
-    is ``day``. This is the structural layer. The regexes have already run.
+    is not a word we show. A four-digit year is not shown, including after
+    ``day``. This is the structural layer. The regexes have already run.
     """
     pieces, _allowed = _surface_pieces(text, scale=scale)
     return " ".join(pieces)
@@ -1126,10 +1099,10 @@ def _is_identifier(text: str) -> bool:
 def _identifier_reason(text: str, scale: float | None) -> str | None:
     """Why one identifier cannot be published, or None. Both gates call this.
 
-    The scale still fails. A year glued into the token is a date. The token
-    is not a withheld word and it is not a price.
+    The scale still fails. A calendar id is a date. The token is not a
+    withheld word and it is not a price.
     """
-    if _GLUED_YEAR.search(text):
+    if contains_calendar_date(text):
         return "a date"
     if _contains_scale(text, scale):
         return "the scale"
@@ -1172,18 +1145,19 @@ def scan_publication(text: str, *, symbols: tuple[str, ...] = (), scale: float |
     """None when ``text`` may be published. Otherwise a date, the scale, or a price.
 
     A calendar date is ``contains_calendar_date``, the same patterns as the
-    screen, including a bare year. ``day 2024`` stays. That check runs before
-    a price, so ``01.04.2024`` is a date. The scale decision is the same
-    token check as the screen. A price is a decimal literal in free text
-    whose absolute value is at least 1. Allow-listed numeric cells are
-    neither. A clock is neither. An exponent inside a hex id is not a price.
-    An identifier uses the same predicate as the export check. The text is
-    read as stored: a raw id is not rewritten before this look. Tickers are
-    the other audit.
+    screen, including a bare year. ``day 2024`` is a date. That check runs
+    before a price, so ``01.04.2024`` is a date. Allow-listed numeric cells
+    are masked first, so an integer equal to a compact date is not a date.
+    The scale decision is the same token check as the screen. A price is a
+    decimal literal in free text whose absolute value is at least 1.
+    Allow-listed numeric cells are neither. A clock is neither. An exponent
+    inside a hex id is not a price. An identifier uses the same predicate as
+    the export check. The text is read as stored: a raw id is not rewritten
+    before this look. Tickers are the other audit.
     """
     del symbols
     normalized = normalize_surface(text)
-    if contains_calendar_date(normalized):
+    if contains_calendar_date(_mask_listed_numbers(normalized)):
         return "a date"
     structured = _structured_document(normalized)
     if structured is None:
@@ -1259,6 +1233,71 @@ def _header_parts(name: str) -> tuple[str, str]:
 def _listed_number(cell: str) -> bool:
     """A raw or formatted number sitting under an allow-listed column key."""
     return _numeric_cell(cell) or _formatted_number(cell)
+
+
+def _listed_metric_key(key: str | None) -> bool:
+    """An allow-listed numeric field. Ids and free-text keys stay visible to the date scan."""
+    if not key or key in _ID_COLUMNS or key in {"name", "message", "error"}:
+        return False
+    return redacted_key_allowed(key)
+
+
+def _mask_listed_numbers(text: str) -> str:
+    """Replace allow-listed numeric cells so a yyyymmdd integer is not a date.
+
+    The date scan is the only caller. Price and scale scans still see the
+    original text. A strategy id that is the digits stays.
+    """
+    structured = _structured_document(text)
+    if structured is None:
+        return text
+    kind, payload = structured
+    if kind == "json":
+        return json.dumps(_masked_json(payload), ensure_ascii=False, separators=(",", ":"))
+    return _masked_csv_text(payload)
+
+
+def _masked_json(value, key: str | None = None):
+    if isinstance(value, dict):
+        return {str(child): _masked_json(item, str(child)) for child, item in value.items()}
+    if isinstance(value, list):
+        return [_masked_json(item, key) for item in value]
+    if isinstance(value, bool) or value is None:
+        return value
+    if _listed_metric_key(key) and isinstance(value, (int, float)) and math.isfinite(value):
+        return 0
+    if isinstance(value, str) and _listed_metric_key(key) and _listed_number(value):
+        return "0"
+    return value
+
+
+def _masked_csv_text(rows: list[list[str]]) -> str:
+    header = [cell.strip() for cell in rows[0]]
+    masked = [list(row) for row in rows]
+    if header == ["key", "raw", "display"]:
+        for row in masked[1:]:
+            if not row:
+                continue
+            metric = row[0]
+            if metric in _ID_COLUMNS or not _listed_metric_key(metric):
+                continue
+            for index in range(1, len(row)):
+                if _listed_number(row[index]):
+                    row[index] = "0"
+    else:
+        keys: list[str] = []
+        for name in header:
+            key, _label = _header_parts(name)
+            keys.append(key)
+        for row in masked[1:]:
+            for index, cell in enumerate(row):
+                key = keys[index] if index < len(keys) else ""
+                if _listed_metric_key(key) and _listed_number(cell):
+                    row[index] = "0"
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerows(masked)
+    return buffer.getvalue()
 
 
 def _csv_has_scale(rows: list[list[str]], scale: float | None) -> bool:
@@ -1423,9 +1462,7 @@ def _preamble_reason(text: str, symbols: tuple[str, ...]) -> str | None:
     folded = text.casefold()
     if any(token in folded for token in _SECRET_TOKENS):
         return "a secret"
-    if contains_calendar_date(text):
-        return "a date"
-    if _month_near_year(text):
+    if contains_calendar_date(_mask_listed_numbers(text)):
         return "a date"
     if _consume_paths(text, "") != text:
         return "a path"
@@ -1465,7 +1502,7 @@ def _free_text_reason(
     _pieces, allowed = _surface_pieces(text, scale=scale)
     if allowed:
         return None
-    if _GLUED_YEAR.search(text):
+    if contains_calendar_date(text):
         return "a date"
     return "a withheld token"
 
@@ -1543,6 +1580,8 @@ def _json_reason(value, symbols: tuple[str, ...], scale: float | None, *, key: s
                 return reason
         return None
     if isinstance(value, str):
+        if _listed_metric_key(key) and _listed_number(value):
+            return None
         return _free_text_reason(value, symbols, scale, price=key not in _ID_COLUMNS)
     if isinstance(value, bool) or value is None:
         return None
@@ -1581,9 +1620,6 @@ def _csv_reason(rows: list[list[str]], symbols: tuple[str, ...], scale: float | 
                         return reason
                     continue
                 if listed and _listed_number(cell):
-                    reason = _preamble_reason(cell, symbols)
-                    if reason:
-                        return reason
                     continue
                 reason = _free_text_reason(cell, symbols, scale)
                 if reason:

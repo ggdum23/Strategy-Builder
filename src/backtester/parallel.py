@@ -33,6 +33,7 @@ from pathlib import Path
 
 from .accounting import normalize_price_basis, normalize_series_kind, require_annual_rate, require_withholding_rate, resolve_accounting
 from .designer_allow import designer_source_id
+from .designer_ids import strategy_id_has_calendar
 from .profiles import get_profile
 from . import report as report_mod
 from .report import (
@@ -1034,6 +1035,10 @@ def _designer_component(value: str, symbols, used: set, scales=None) -> str:
     if scales is None:
         scales = getattr(_COMPONENT_SCALES, "values", None)
     scale_list = tuple(scales) if scales else (None,)
+    # A calendar id fails before scrubbing can delete the date. The ticker
+    # rewrite still runs for an id that is only unsafe because of the symbol.
+    if strategy_id_has_calendar(str(value)):
+        raise ValueError("id is not designer-visible")
 
     def dirty(candidate: str) -> bool:
         return any(_name_dirty(candidate, symbol_list, scale) for scale in scale_list)
@@ -1243,12 +1248,16 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         strategy_id = row["strategy_id"]
         scales = scales_for.get(strategy_id) or (None,)
         if strategy_id not in folders:
-            scrubbed = scrub_symbols(str(strategy_id), symbol_list) if symbol_list else str(strategy_id)
-            problem = None
-            for scale in scales:
-                problem = report_mod.designer_component_problem(scrubbed, symbols=symbol_list, scale=scale)
-                if problem:
-                    break
+            original = str(strategy_id)
+            problem = "a calendar date" if strategy_id_has_calendar(original) else None
+            if problem is None:
+                scrubbed = scrub_symbols(original, symbol_list) if symbol_list else original
+                for scale in scales:
+                    problem = report_mod.designer_component_problem(
+                        scrubbed, symbols=symbol_list, scale=scale
+                    )
+                    if problem:
+                        break
             if problem:
                 folders[strategy_id] = _reject_folder(strategy_id, scales)
                 rejected.add(strategy_id)

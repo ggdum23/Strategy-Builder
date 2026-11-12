@@ -26,6 +26,7 @@ import pandas as pd
 from .accounting import EXACT_RESERVED, LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
 from .calendar_text import contains_calendar_date
 from .designer_allow import canonical_png, designer_csv_cell, project_designer, redacted_key_allowed
+from .designer_ids import is_report_filename, strategy_id_problem
 
 _ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
 _BANNED_DESIGNER_KEYS = frozenset(
@@ -653,12 +654,12 @@ def redact_metrics(payload, *, symbol: str = ""):
 
 
 def scrub_frame_dates(frame):
-    """Blank ISO dates. Session ids such as ``S00001`` stay."""
+    """Blank calendar dates. Session ids such as ``S00001`` stay."""
     if frame is None or "date" not in getattr(frame, "columns", ()):
         return frame
     out = frame.copy(deep=True)
     out["date"] = [
-        "" if _ISO_DATE.search(str(value)) else str(value) for value in out["date"].tolist()
+        "" if contains_calendar_date(str(value)) else str(value) for value in out["date"].tolist()
     ]
     return out
 
@@ -780,6 +781,22 @@ def scrub_designer_tree(
             path.write_text(updated, encoding="utf-8")
 
 
+def _listed_metric_number(key: str, text: str) -> bool:
+    """An allow-listed numeric cell. A yyyymmdd integer is not a date there."""
+    if not key or key in {"strategy_id", "source_id", "name", "message", "error"}:
+        return False
+    if not redacted_key_allowed(key):
+        return False
+    token = text.strip().replace(",", "").replace("$", "").replace("%", "")
+    if token.endswith(" bp"):
+        token = token[: -len(" bp")].strip()
+    try:
+        number = float(token)
+    except ValueError:
+        return False
+    return math.isfinite(number)
+
+
 def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
     """Why this value cannot be shown, or None when it is safe.
 
@@ -796,7 +813,7 @@ def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
             return token
     from .gui.audience import normalize_surface
 
-    if contains_calendar_date(normalize_surface(text)):
+    if not _listed_metric_number(key, text) and contains_calendar_date(normalize_surface(text)):
         return "a calendar date"
     if not symbol:
         return None
@@ -827,12 +844,10 @@ def _raise_designer_name(name: str, symbol: str) -> None:
 def designer_component_problem(name: str, *, symbols=(), scale: float | None = None) -> str | None:
     """Why a path component cannot be published, or None when it can.
 
-    A strategy id is designer-supplied. A decimal in the id is not a price.
-    The scale, a ticker, a calendar date, and a reserved token still fail.
-    The date check is ``contains_calendar_date``, the same patterns as the
-    screen, including a bare year. ``day 2024`` stays. A slash is an unsafe
-    name before it is a date. The directory check and the publication audit
-    both call this.
+    A strategy id is designer-supplied. The allow-list grammar decides a
+    single-token name before the ticker and the scale. A decimal is not an
+    id. ``day 2024`` is a date. A slash is an unsafe name before it is a
+    date. The directory check and the publication audit both call this.
     """
     if not isinstance(name, str) or name == "":
         return "an empty name"
@@ -842,13 +857,15 @@ def designer_component_problem(name: str, *, symbols=(), scale: float | None = N
     for token in _BANNED_DESIGNER_TEXT:
         if token in text:
             return token
-    from .gui.audience import _GLUED_YEAR, _contains_scale, normalize_surface
+    from .gui.audience import _contains_scale, normalize_surface
 
     stored = normalize_surface(text)
     if contains_calendar_date(stored):
         return "a calendar date"
-    if _GLUED_YEAR.search(stored):
-        return "a calendar date"
+    if not any(char.isspace() for char in stored) and not is_report_filename(stored):
+        grammar = strategy_id_problem(stored)
+        if grammar:
+            return grammar
     seen: set[str] = set()
     for symbol in symbols or ():
         if not symbol or symbol in seen:
@@ -876,7 +893,7 @@ def _raise_schema_label(filename: str, label: str) -> None:
     for token in _BANNED_DESIGNER_TEXT:
         if token in label:
             raise RuntimeError(f"{filename} contains {token}")
-    if _ISO_DATE.search(label):
+    if contains_calendar_date(label):
         raise RuntimeError(f"{filename} contains a calendar date")
 
 

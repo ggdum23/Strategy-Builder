@@ -44,7 +44,7 @@ def test_longer_tickers_use_a_letter_boundary_and_one_character_does_not():
     assert scrub_symbols("1QQQ", ["QQQ"]) == "1RANDOM"
     assert designer_component_problem("QQQ1", symbols=("QQQ",), scale=1.1) == "the ticker"
     assert designer_component_problem("RANDOM1", symbols=("QQQ",), scale=1.1) is None
-    assert designer_component_problem("1RANDOM", symbols=("QQQ",), scale=1.1) is None
+    assert designer_component_problem("1RANDOM", symbols=("QQQ",), scale=1.1) == "an unsafe name"
     assert designer_component_problem("v2", symbols=("V",), scale=1.1) is None
 
 
@@ -64,26 +64,42 @@ def test_glued_ticker_ids_publish_and_a_leftover_fails(tmp_path):
         timeout_s=60,
         with_benchmarks=False,
     )
-    assert result.failures == 0
+    assert result.failures == 1
     assert (out / "run.json").is_file()
     jobs = json.loads((out / "run.json").read_text(encoding="utf-8"))["jobs"]
-    assert {job["strategy_id"]: job["status"] for job in jobs} == {name: "ok" for name in names}
+    assert {job["strategy_id"]: job["status"] for job in jobs} == {
+        "QQQ1": "ok",
+        "QQQ2momentum": "ok",
+        "1QQQ": "error",
+    }
     designer = out / "designer"
     board = read_leaderboard(designer / "leaderboard.csv")
     operator = read_leaderboard(out / "leaderboard.csv")
-    assert {row["status"] for row in board} == {"ok"}
-    assert {row["status"] for row in operator} == {"ok"}
-    published = {row["strategy_id"] for row in board}
-    assert published == {"RANDOM1", "RANDOM2momentum", "1RANDOM"}
+    assert sorted(row["status"] for row in board) == sorted(row["status"] for row in operator)
+    assert sorted(row["status"] for row in board) == sorted(job["status"] for job in jobs)
+    published = {row["strategy_id"] for row in board if row["status"] == "ok"}
+    assert published == {"RANDOM1", "RANDOM2momentum"}
+    assert "1RANDOM" not in {row["strategy_id"] for row in board}
+    failed = [row for row in board if row["status"] == "error"]
+    assert len(failed) == 1
+    assert failed[0]["strategy_id"] not in names
+    errors = list((designer / failed[0]["strategy_id"]).rglob("error.json"))
+    assert errors
+    document = json.loads(errors[0].read_text(encoding="utf-8"))
+    assert document["error"] == "the strategy failed"
+    assert document["strategy_id"] == failed[0]["strategy_id"]
     for row in board:
-        assert (designer / row["strategy_id"] / row["source_id"] / "metrics.json").is_file()
+        if row["status"] == "ok":
+            assert (designer / row["strategy_id"] / row["source_id"] / "metrics.json").is_file()
     blob = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
         for path in designer.rglob("*")
         if path.is_file() and path.suffix.lower() != ".png"
     )
     assert "QQQ" not in blob
-    assert "RANDOM1" in blob and "RANDOM2momentum" in blob and "1RANDOM" in blob
+    assert "1QQQ" not in blob
+    assert "1RANDOM" not in blob
+    assert "RANDOM1" in blob and "RANDOM2momentum" in blob
     assert_designer_clean(designer, symbol="QQQ", scale=1.1)
     board_text = (designer / "leaderboard.csv").read_text(encoding="utf-8")
     assert export_allowed(board_text, symbols=("QQQ",), scale=1.1)
@@ -165,7 +181,7 @@ def test_raw_scale_ids_fail_both_gates_and_the_stored_id_does_not():
             assert export_allowed(stored, symbols=(), scale=other)
             assert scan_publication(stored, scale=other) is None
     assert _scale_in_token("pack_185e2abcdef", 2) is False
-    assert scan_publication("4738e304", scale=2) is None
+    assert scan_publication("4738e304", scale=2) == "a date"
 
 
 def test_signed_exponent_identifiers_agree():

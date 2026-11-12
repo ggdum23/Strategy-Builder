@@ -87,7 +87,7 @@ def test_glued_year_and_scale_tokens_fail_on_screen_and_in_export():
         assert glued not in shown
         assert "7.777" not in shown
         assert not export_allowed(glued, symbols=(), scale=7.777)
-    assert designer_surface_text("price 2024.50 day 2024", ()) == "price 2024.50 day 2024"
+    assert designer_surface_text("price 2024.50 day 2024", ()) == "price 2024.50 day"
     assert not export_allowed("price 2024.50 day 2024", symbols=(), scale=None)
     assert designer_surface_text("long_2x and 2.5", (), scale=2) == "long_2x and 2.5"
     assert not export_allowed("long_2x and 2.5", symbols=(), scale=2)

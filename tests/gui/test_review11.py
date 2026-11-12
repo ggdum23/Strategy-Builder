@@ -33,7 +33,7 @@ def _export_leaderboard(qtbot, tmp_path, monkeypatch):
     out = tmp_path / "out"
     run_parallel(
         [
-            _strategy(tmp_path / "strategies", "vol_1.5", LONG),
+            _strategy(tmp_path / "strategies", "mean_rev_3", LONG),
             _strategy(tmp_path / "strategies", "opening_drive", FLAT),
         ],
         [PackMarket(str(pack), str(sidecar))],
@@ -66,7 +66,7 @@ def _export_leaderboard(qtbot, tmp_path, monkeypatch):
         assert "sharpe" in keys
         assert "total_return" in keys
         assert "Sharpe" not in keys
-        assert "vol_1.5" in board
+        assert "mean_rev_3" in board
         status = window._status.currentMessage()
         assert "leaderboard_view.csv" in status
         assert status != "Nothing to export"

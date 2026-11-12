@@ -189,7 +189,7 @@ def test_forty_thousand_hex_ids_are_not_false_scales():
             assert scan_publication(stored, scale=scale) is None, (ident, stored, scale)
     for scale in (*_SCALES, 1e-7, 7.777):
         assert _literal_is_scale("4738e304", scale) is False
-        assert scan_publication("4738e304", scale=scale) is None
+        assert scan_publication("4738e304", scale=scale) == "a date"
     assert _literal_is_scale("2e2", 2) is True
     assert _literal_is_scale("7.777e3", 7.777) is True
     assert _scale_in_token("build2_7.777e3", 7.777) is True

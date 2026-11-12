@@ -14,6 +14,7 @@ from backtester.report import _designer_value_error, assert_designer_clean, desi
 from test_parallel import FLAT, _anon_pack, _strategy
 
 # Every spelling the publisher used to accept, plus the controls that stay.
+# ``day 2024`` is a date. A decimal year is still a number.
 DATES = (
     "04-Jan-2024",
     "2024-1-4",
@@ -26,11 +27,11 @@ DATES = (
     "Jan.4, 2024",
     "1.4.2024",
     "holiday 2024",
+    "day 2024",
+    "Day 2024",
 )
 KEPT = (
     "opening_drive",
-    "day 2024",
-    "Day 2024",
     "2024.50",
     "0.2024",
 )
@@ -57,8 +58,9 @@ def test_the_five_gates_use_one_date_predicate():
     assert not hasattr(audience, "_EXPORT_DATE_PATTERNS")
     assert calendar_text.DATE_PATTERNS[-1].search("today 2024")
     assert calendar_text.DATE_PATTERNS[-1].search("holiday 2024")
-    assert not calendar_text.DATE_PATTERNS[-1].search("day 2024")
-    assert not calendar_text.DATE_PATTERNS[-1].search("Day 2024")
+    assert calendar_text.DATE_PATTERNS[-1].search("day 2024")
+    assert calendar_text.DATE_PATTERNS[-1].search("Day 2024")
+    assert not hasattr(audience, "_GLUED_YEAR")
     assert not contains_calendar_date("2024.50")
     assert not contains_calendar_date("0.2024")
 

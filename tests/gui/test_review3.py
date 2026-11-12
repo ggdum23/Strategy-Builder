@@ -166,7 +166,7 @@ def test_dotted_unpadded_and_ordinal_dates_are_scrubbed_in_both_places():
         assert cleaned.strip(" ,.") == "", sample
         assert not export_allowed(sample, symbols=(), scale=None), sample
     kept = "price 2024.50 ratio 0.2024 day 2024"
-    assert scrub_text(kept, ()) == kept
+    assert scrub_text(kept, ()) == "price 2024.50 ratio 0.2024 day "
     assert not export_allowed(kept, symbols=(), scale=None)
     sentence = scrub_text("on 2024-1-4.", ())
     assert "2024" not in sentence
@@ -259,7 +259,7 @@ def test_casefold_tickers_match_on_screen_and_in_export():
     assert scrub_text(f"held {LIGATURE_FI} overnight", ("FI",)) == "held RANDOM overnight"
     assert scrub_text("held FI overnight", (LIGATURE_FI,)) == "held RANDOM overnight"
     assert scrub_text("maß", ("SS",)) == "maß"
-    assert scrub_text(f"{LIGATURE_FI}le", ("FI",)) == f"{LIGATURE_FI}le"
+    assert scrub_text(f"{LIGATURE_FI}le", ("FI",)) == "file"
     assert scrub_text("max_drawdown", ("MA",)) == "max_drawdown"
     assert scrub_text("QQQ1", ("QQQ",)) == "RANDOM1"
     assert scrub_text("held V overnight", ("V",)) == "held RANDOM overnight"

@@ -184,15 +184,15 @@ def test_period_is_enough_to_separate_month_and_day():
     assert scrub_text("price 2024.50", ()) == "price 2024.50"
 
 
-def test_bare_year_stays_only_after_the_word_day():
-    assert scrub_text("day 2024", ()) == "day 2024"
-    assert scrub_text("Day 2024", ()) == "Day 2024"
+def test_bare_year_is_a_date_including_after_day():
+    assert scrub_text("day 2024", ()) == "day "
+    assert scrub_text("Day 2024", ()) == "Day "
     assert "2024" not in scrub_text("today 2024", ())
-    assert "today" in scrub_text("today 2024", ())
+    assert "today" not in scrub_text("today 2024", ())
     assert "2024" not in scrub_text("holiday 2024", ())
-    assert "holiday" in scrub_text("holiday 2024", ())
+    assert "holiday" not in scrub_text("holiday 2024", ())
     kept = "price 2024.50 ratio 0.2024 day 2024"
-    assert scrub_text(kept, ()) == kept
+    assert scrub_text(kept, ()) == "price 2024.50 ratio 0.2024 day "
     assert not export_allowed(kept, symbols=(), scale=None)
 
 
@@ -260,7 +260,7 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
         shown = designer_surface_text(glued, (), scale=7.777)
         assert glued not in shown and "7.777" not in shown
         assert not export_allowed(glued, symbols=(), scale=7.777)
-    assert designer_surface_text("price 2024.50 day 2024", ()) == "price 2024.50 day 2024"
+    assert designer_surface_text("price 2024.50 day 2024", ()) == "price 2024.50 day"
     dates = _calendar_samples()
     paths = _path_samples()
     ordinary = "long_2x 2.5 2024.50 0.2024 day 2024 count 12"
@@ -272,7 +272,7 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
     for sample in ("today 2024", "holiday 2024"):
         shown = designer_surface_text(sample, (), scale=2)
         assert "2024" not in shown, sample
-        assert sample.split()[0] in shown
+        assert sample.split()[0] not in shown
     for sample in paths:
         shown = designer_surface_text(f"open {sample} please", ("QQQ",), scale=2)
         assert sample not in shown
@@ -280,7 +280,7 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
             assert needle not in shown, (sample, needle)
         assert not export_allowed(sample, symbols=(), scale=None), sample
     kept = designer_surface_text(ordinary, ("QQQ",), scale=2)
-    for piece in ("long_2x", "2.5", "2024.50", "0.2024", "day 2024", "12"):
+    for piece in ("long_2x", "2.5", "2024.50", "0.2024", "day", "12"):
         assert piece in kept, piece
     assert not export_allowed(ordinary, symbols=("QQQ",), scale=2)
     assert not export_allowed(f"held QQQ overnight {ordinary}", symbols=("QQQ",), scale=2)
