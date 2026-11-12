@@ -30,8 +30,11 @@ from backtester.pack import (
     _gzip_csv,
     _pack_id,
     _read_csv_gz,
+    _has_nondefault_stream,
+    _stream_names,
     assert_anonymized_pack_clean,
     build_pack,
+    copy_anonymized_pack,
     load_pack,
     load_sidecar,
     require_build_price_factor,
@@ -128,7 +131,7 @@ def test_chunk_defaults_and_anonymized_scrub(tmp_path):
     loaded = load_pack(pack)
     assert list(loaded.frame["date"].unique()) == ["S00001", "S00002", "S00003"]
     assert float(loaded.frame.iloc[0]["open"]) == pytest.approx(10.0 * 1.7)
-    assert int(loaded.frame.iloc[0]["count"]) == 3
+    assert float(loaded.frame.iloc[0]["count"]) == pytest.approx(3 * 0.42)
     assert "NIK" not in loaded.frame.to_csv(index=False)
     text = gzip.decompress((pack / "bars_part_001.csv.gz").read_bytes()).decode("utf-8")
     assert "2024-" not in text
@@ -259,6 +262,7 @@ def test_manifest_or_sidecar_tamper_is_refused(tmp_path):
     named = load_pack(named_pack)
     assert named.anonymized is False
     assert str(named.frame["session_id"].iloc[0]).startswith("2024-")
+    assert int(named.frame.iloc[0]["count"]) == 3
 
 
 class _Quiet:
@@ -1005,7 +1009,7 @@ def test_gzip_members_carry_no_name_comment_or_mtime(tmp_path):
     assert_anonymized_pack_clean(pack, symbol="NIK")
 
 
-def test_volume_is_scaled_and_trade_count_is_not(tmp_path):
+def test_volume_and_trade_count_are_scaled(tmp_path):
     src, registry = _series(tmp_path, 1)
     pack = tmp_path / "pack"
     build_pack(
@@ -1014,7 +1018,7 @@ def test_volume_is_scaled_and_trade_count_is_not(tmp_path):
     )
     loaded = load_pack(pack)
     assert float(loaded.frame.iloc[0]["volume"]) == pytest.approx(100 * 0.42)
-    assert int(loaded.frame.iloc[0]["count"]) == 3
+    assert float(loaded.frame.iloc[0]["count"]) == pytest.approx(3 * 0.42)
     assert float(loaded.frame.iloc[0]["open"]) == pytest.approx(10.0 * 1.7)
 
 
@@ -1288,10 +1292,11 @@ def test_anonymized_schema_gate_refuses_review_repros(tmp_path):
     masked = json.loads(original_manifest)
     masked["pack_id"] = digest
     _write_json(manifest_path, masked)
-    assert_anonymized_pack_clean(pack, symbol="NIK")
-    with pytest.raises(ValueError, match="pack_id") as caught:
-        load_pack(pack, symbol="NIK")
-    assert "calendar date" not in str(caught.value)
+    audit_message, load_message = both("pack_id")
+    assert digest not in audit_message
+    assert digest not in load_message
+    assert "calendar date" not in audit_message
+    assert "calendar date" not in load_message
     manifest_path.write_text(original_manifest, encoding="utf-8")
 
     duplicate = original_manifest.replace(
@@ -1329,3 +1334,180 @@ def test_anonymized_schema_gate_refuses_review_repros(tmp_path):
     wide.rename(bars)
     _rewrite_pack_id(pack)
     assert_anonymized_pack_clean(pack, symbol="NIK")
+
+
+def _pack_text(pack: Path) -> str:
+    parts = []
+    for path in sorted(pack.iterdir()):
+        blob = path.read_bytes()
+        parts.append(blob.decode("utf-8", "replace"))
+        if path.name.endswith(".gz"):
+            parts.append(gzip.decompress(blob).decode("utf-8"))
+    return "\n".join(parts)
+
+
+def _replace_column(text: str, column: str, values: list[str]) -> str:
+    rows = list(csv.reader(io.StringIO(text)))
+    index = rows[0].index(column)
+    if len(values) != len(rows) - 1:
+        raise AssertionError("column replacement does not cover every row")
+    for row, value in zip(rows[1:], values):
+        row[index] = value
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\n").writerows(rows)
+    return buffer.getvalue()
+
+
+def test_build_pack_scales_date_shaped_trade_counts(tmp_path):
+    """Source counts that are dates or an epoch do not reach the designer pack."""
+    leaks = [20240102, 20240103, 20240104, 946684800]
+    rows = []
+    day = datetime(2024, 1, 2)
+    made = 0
+    while made < len(leaks):
+        if day.weekday() < 5:
+            row = _row(day, 9 * 60 + 30, 10.0 + made)
+            row["count"] = leaks[made]
+            rows.append(row)
+            made += 1
+        day += timedelta(days=1)
+    path = tmp_path / "src" / "NIK_1min_filled_2024-01.csv.gz"
+    _write(path, rows)
+    loaded_src = load_named(path.parent, "NIK")
+    entry = entry_from_inspection(loaded_src.inspection, source_root=str(path.parent), profile="arena")
+    registry = tmp_path / "registry.json"
+    save_registry(registry, upsert_series({"schema_version": 1, "series": []}, entry))
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        path.parent, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    text = _pack_text(pack)
+    for leak in leaks:
+        assert str(leak) not in text
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    loaded = load_pack(pack, symbol="NIK")
+    assert list(loaded.frame["count"]) == pytest.approx([value * 0.42 for value in leaks])
+    run_pack(_Quiet, pack, sidecar, "arena", tmp_path / "out", with_benchmarks=False)
+    # A hand-written count may still be a date-shaped decimal. It is the same
+    # residual as volume: the builder did not copy the source integer, and the
+    # daily total has to be the sum of the bars.
+    bars = gzip.decompress((pack / "bars_part_001.csv.gz").read_bytes()).decode("utf-8")
+    daily = gzip.decompress((pack / "daily_rth.csv.gz").read_bytes()).decode("utf-8")
+    planted = "20240102"
+    bars = _replace_column(bars, "count", [planted] * (len(leaks)))
+    # One row per session in the daily file, and each session has one bar.
+    daily = _replace_column(daily, "count", [planted] * len(leaks))
+    (pack / "bars_part_001.csv.gz").write_bytes(_recompress(bars.encode("ascii")))
+    (pack / "daily_rth.csv.gz").write_bytes(_recompress(daily.encode("ascii")))
+    _rewrite_pack_id(pack)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    assert int(load_pack(pack, symbol="NIK").frame.iloc[0]["count"]) == int(planted)
+
+
+def test_session_id_is_the_ordinal_in_order(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    bars = pack / "bars_part_001.csv.gz"
+    base = gzip.decompress(bars.read_bytes()).decode("ascii")
+
+    def both(match):
+        with pytest.raises(ValueError, match=match) as audit:
+            assert_anonymized_pack_clean(pack, symbol="NIK")
+        with pytest.raises(ValueError, match=match) as loaded:
+            load_pack(pack, symbol="NIK")
+        return str(audit.value), str(loaded.value)
+
+    for leak in ("S202401021", "S120240102", "S2024001", "S240102", "S946684800"):
+        _write_bars(pack, _with_cell(base, "session_id", leak).encode("ascii"))
+        audit_message, load_message = both("session_id")
+        assert leak not in audit_message
+        assert leak not in load_message
+    rows = list(csv.reader(io.StringIO(base)))
+    planted_day = "240102"
+    planted_id = "S240102"
+    edited = _replace_column(base, "day", [planted_day] * (len(rows) - 1))
+    edited = _replace_column(edited, "session_id", [planted_id] * (len(rows) - 1))
+    _write_bars(pack, edited.encode("ascii"))
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["chunks"][0]["first_day"] = int(planted_day)
+    manifest["chunks"][0]["last_day"] = int(planted_day)
+    _write_json(manifest_path, manifest)
+    audit_message, load_message = both("sequential")
+    assert planted_id not in audit_message
+    assert planted_day not in load_message
+
+
+def test_daily_count_must_equal_the_bar_counts(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=1.7, volume_factor=0.42,
+    )
+    daily = pack / "daily_rth.csv.gz"
+    text = gzip.decompress(daily.read_bytes()).decode("utf-8")
+    daily.write_bytes(_recompress(_with_cell(text, "count", "5").encode("ascii")))
+    with pytest.raises(ValueError, match="session trade count"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    with pytest.raises(ValueError, match="session trade count"):
+        load_pack(pack, symbol="NIK")
+
+
+def test_copy_anonymized_pack_writes_default_stream_bytes(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=1.7, volume_factor=0.42,
+    )
+    dest = tmp_path / "copy"
+    copy_anonymized_pack(pack, dest)
+    copied = sorted(path.name for path in dest.iterdir())
+    assert copied == sorted(path.name for path in pack.iterdir())
+    for name in copied:
+        assert (dest / name).read_bytes() == (pack / name).read_bytes()
+    assert_anonymized_pack_clean(dest, symbol="NIK")
+    load_pack(dest, symbol="NIK")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS alternate data streams")
+def test_ntfs_alternate_stream_is_refused(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, price_factor=1.7, volume_factor=0.42,
+    )
+    target = pack / "manifest.json"
+    assert _stream_names(target) == ["::$DATA"]
+    payload = b"2024-01-02\n"
+    stream = "date_map"
+    with open(f"{os.fspath(target)}:{stream}", "wb") as handle:
+        handle.write(payload)
+    assert _has_nondefault_stream(target)
+    assert payload not in target.read_bytes()
+    with pytest.raises(ValueError, match="alternate data stream") as audit:
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    with pytest.raises(ValueError, match="alternate data stream") as loaded:
+        load_pack(pack, symbol="NIK")
+    for message in (str(audit.value), str(loaded.value)):
+        assert stream not in message
+        assert "2024" not in message
+        assert payload.decode("ascii").strip() not in message
+    fresh = tmp_path / "fresh.json"
+    fd = os.open(fresh, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(target.read_bytes())
+    assert not _has_nondefault_stream(fresh)
+    with pytest.raises(ValueError, match="alternate data stream"):
+        copy_anonymized_pack(pack, tmp_path / "copied")
+    assert not (tmp_path / "copied").exists()

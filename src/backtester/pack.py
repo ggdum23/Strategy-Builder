@@ -15,7 +15,8 @@ refused, named or anonymized. Verification accepts only this version.
 Session ids use ASCII digits. An anonymized pack is a schema: regular
 files with the builder's names, a typed manifest, and a typed CSV cell
 for every column. There is no free-text column and no format scan of
-prices.
+prices. Trade count is rescaled by the same volume factor as volume,
+and the daily count is the sum of those bar counts.
 """
 
 from __future__ import annotations
@@ -116,11 +117,15 @@ _DAY = r"(?:0?[1-9]|[12][0-9]|3[01])"
 _MONTH2 = r"(?:0[1-9]|1[0-2])"
 _DAY2 = r"(?:0[1-9]|[12][0-9]|3[01])"
 _SEP = r"[-/._ ]"
-# Digit lookarounds, not \\b. Applied only to a cell that already failed its
-# column grammar. A price or volume that merely looks like a date is a number.
+# Digit lookarounds, not \\b. Used only to word the error when a cell has
+# already failed its column grammar. Session ids are not scanned: the gate
+# requires the builder's exact ``S{day:05d}`` and the day sequence 1..n.
 _LEAK_DATE_RE = re.compile(
     rf"(?<![0-9])(?:{_YEAR}{_SEP}{_MONTH}{_SEP}{_DAY}|{_DAY}{_SEP}{_MONTH}{_SEP}{_YEAR}|{_YEAR}{_MONTH2}{_DAY2})(?![0-9])"
 )
+_ALT_STREAM = "pack file has an alternate data stream"
+_STREAM_UNREADABLE = "pack file streams could not be read"
+_DEFAULT_STREAM = "::$DATA"
 _PACK_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _INT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _PHASES = frozenset({"pre", "rth", "post"})
@@ -394,10 +399,20 @@ def _pack_id(files: list[tuple[str, bytes]]) -> str:
     return digest.hexdigest()
 
 
+def _emitted_count(value) -> float:
+    """The count decimal ``to_csv`` will write, parsed back.
+
+    Anonymized counts are ``source * volume_factor``. Named counts are the
+    source integers. Both spellings are ``format(value, '.17g')``.
+    """
+    return float(format(float(value), ".17g"))
+
+
 def _gzip_csv(frame: pd.DataFrame) -> bytes:
     ordered = frame.loc[:, list(PACK_COLUMNS)].copy()
-    for name in ("day", "weekday", "minute", "count", "filled", "short_session", "bar_minutes", "partial"):
+    for name in ("day", "weekday", "minute", "filled", "short_session", "bar_minutes", "partial"):
         ordered[name] = ordered[name].astype(int)
+    ordered["count"] = [_emitted_count(value) for value in ordered["count"].tolist()]
     text = ordered.to_csv(index=False, float_format="%.17g")
     buffer = io.BytesIO()
     with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0, filename="") as handle:
@@ -618,6 +633,13 @@ def _canonical_decimal(cell: str) -> bool:
     return math.isfinite(value) and cell == format(value, ".17g")
 
 
+def _canonical_count(cell: str) -> bool:
+    """A non-negative count decimal. The same spelling as a scaled volume."""
+    if not _canonical_decimal(cell):
+        return False
+    return float(cell) >= 0.0
+
+
 def _fail_cell(name: str, column: str, cell: str) -> None:
     """A cell that is not its column. A date-shaped leftover still says so."""
     if _LEAK_DATE_RE.search(cell):
@@ -697,8 +719,22 @@ def _clock_text(minute: int) -> str:
     return f"{minute // 60:02d}:{minute % 60:02d}"
 
 
-def _csv_days(name: str, text: str, *, symbol: str | None, bar_minutes: int) -> list[int]:
-    """Typed rows. Returns the sorted unique day ordinals."""
+def _csv_days(
+    name: str,
+    text: str,
+    *,
+    symbol: str | None,
+    bar_minutes: int,
+    single_row: bool = False,
+) -> tuple[list[int], dict[int, float], dict[int, float]]:
+    """Typed rows.
+
+    Returns the day ordinals in appearance order, the sum of every count
+    cell for each day, and the daily count the builder writes: the regular
+    session when the day has one, otherwise every bar. ``single_row`` is
+    the daily file. Days inside the file are contiguous. ``session_id`` is
+    exactly ``S{day:05d}``.
+    """
     try:
         rows = list(csv.reader(io.StringIO(text)))
     except csv.Error as exc:
@@ -707,6 +743,10 @@ def _csv_days(name: str, text: str, *, symbol: str | None, bar_minutes: int) -> 
         raise ValueError(f"{name} CSV header is not the pack schema")
     index = {column: position for position, column in enumerate(PACK_COLUMNS)}
     days: list[int] = []
+    counts: dict[int, float] = {}
+    session_counts: dict[int, float] = {}
+    saw_rth: set[int] = set()
+    previous: int | None = None
     for row in rows[1:]:
         if symbol and any(_token_present(symbol, cell) for cell in row):
             raise ValueError(f"{name} contains the ticker")
@@ -724,32 +764,104 @@ def _csv_days(name: str, text: str, *, symbol: str | None, bar_minutes: int) -> 
             _fail_cell(name, "time", row[index["time"]])
         if row[index["session"]] not in _PHASES:
             _fail_cell(name, "session", row[index["session"]])
-        ordinal = _session_ordinal(row[index["session_id"]])
-        if ordinal is None or ordinal != day:
+        if row[index["session_id"]] != f"S{day:05d}":
             _fail_cell(name, "session_id", row[index["session_id"]])
         for column in _PRICE_COLUMNS:
             if not _canonical_decimal(row[index[column]]):
                 _fail_cell(name, column, row[index[column]])
-        if _canonical_int(row[index["count"]], 0, _MAX_ORDINAL) is None:
-            _fail_cell(name, "count", row[index["count"]])
+        count_cell = row[index["count"]]
+        if not _canonical_count(count_cell):
+            _fail_cell(name, "count", count_cell)
         for column in _FLAG_COLUMNS:
             if _canonical_int(row[index[column]], 0, 1) is None:
                 _fail_cell(name, column, row[index[column]])
         if _canonical_int(row[index["bar_minutes"]], bar_minutes, bar_minutes) is None:
             _fail_cell(name, "bar_minutes", row[index["bar_minutes"]])
-        for column in ("time", "session", "session_id"):
-            if _LEAK_DATE_RE.search(row[index[column]]):
-                raise ValueError(f"{name} contains a calendar date")
-        days.append(day)
+        if previous is None or day == previous + 1:
+            days.append(day)
+        elif day == previous:
+            if single_row:
+                raise ValueError(f"{name} repeats a session")
+        else:
+            raise ValueError(f"{name} sessions are not sequential")
+        previous = day
+        value = float(count_cell)
+        counts[day] = counts.get(day, 0.0) + value
+        if row[index["session"]] == "rth":
+            saw_rth.add(day)
+            session_counts[day] = session_counts.get(day, 0.0) + value
     if not days:
         raise ValueError(f"{name} CSV row does not match the pack header")
-    return sorted(set(days))
+    # The daily row sums the regular session when the day has one, else every bar.
+    for day in days:
+        if day not in saw_rth:
+            session_counts[day] = counts[day]
+    return days, counts, session_counts
 
 
 def _reject_banned(name: str, text: str) -> None:
     for key in _BANNED_TEXT:
         if key in text:
             raise ValueError(f"{name} contains {key}")
+
+
+def _stream_names(path: Path) -> list[str]:
+    """NTFS stream names on ``path``. Empty on platforms without them.
+
+    Callers that refuse a pack must not put these names in the error.
+    """
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class _StreamData(ctypes.Structure):
+        _fields_ = (
+            ("StreamSize", ctypes.c_longlong),
+            ("cStreamName", ctypes.c_wchar * 296),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    find_first = kernel32.FindFirstStreamW
+    find_first.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(_StreamData), wintypes.DWORD]
+    find_first.restype = wintypes.HANDLE
+    find_next = kernel32.FindNextStreamW
+    find_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_StreamData)]
+    find_next.restype = wintypes.BOOL
+    find_close = kernel32.FindClose
+    find_close.argtypes = [wintypes.HANDLE]
+    find_close.restype = wintypes.BOOL
+    data = _StreamData()
+    handle = find_first(os.fspath(path), 0, ctypes.byref(data), 0)
+    if handle is None or int(handle) in {0, -1, 2**32 - 1, 2**64 - 1}:
+        raise OSError(_STREAM_UNREADABLE)
+    names = []
+    try:
+        while True:
+            names.append(data.cStreamName.replace("\x00", ""))
+            data = _StreamData()
+            if not find_next(handle, ctypes.byref(data)):
+                error = ctypes.get_last_error()
+                if error in {18, 38}:
+                    return names
+                raise OSError(_STREAM_UNREADABLE)
+    finally:
+        find_close(handle)
+
+
+def _has_nondefault_stream(path: Path) -> bool:
+    """True when ``path`` has an NTFS stream other than ``::$DATA``."""
+    return any(name.casefold() != _DEFAULT_STREAM.casefold() for name in _stream_names(path))
+
+
+def _reject_alternate_streams(path: Path) -> None:
+    """Refuse an NTFS alternate stream. The error does not name it."""
+    try:
+        extra = _has_nondefault_stream(path)
+    except OSError:
+        raise ValueError(_STREAM_UNREADABLE) from None
+    if extra:
+        raise ValueError(_ALT_STREAM)
 
 
 def _anonymized_directory(root: Path) -> list[str]:
@@ -787,6 +899,7 @@ def _read_regular(root: Path, name: str) -> bytes:
         raise ValueError(_NOT_REGULAR) from None
     if not _entry_is_regular_pack_file(info.st_mode, name):
         raise ValueError(_NOT_REGULAR)
+    _reject_alternate_streams(path)
     if info.st_size >= MAX_FILE_BYTES:
         raise ValueError(f"{name} is not under {MAX_FILE_BYTES} bytes")
     flags = os.O_RDONLY
@@ -819,8 +932,10 @@ def _anonymized_text(name: str, raw: bytes) -> str:
 def _anonymized_pack_gate(root: Path, *, symbol: str | None = None) -> dict:
     """One schema verdict for the audit and for ``load_pack``.
 
-    Directory entries, the manifest, and every CSV cell. A price or volume
-    may equal a date-shaped integer. That is a number, not a calendar field.
+    Directory entries, the manifest, and every CSV cell. A scaled price,
+    volume, or trade count may equal a date-shaped integer. That is a
+    number, not a calendar field. ``session_id`` is the day ordinal, and
+    ``pack_id`` is the hash of the chunk and daily bytes.
     """
     names = _anonymized_directory(root)
     if _MANIFEST_NAME not in names:
@@ -842,21 +957,39 @@ def _anonymized_pack_gate(root: Path, *, symbol: str | None = None) -> dict:
     if set(names) != expected:
         raise ValueError("pack files are not the manifest set")
     bar_minutes = document["bar_minutes"]
-    seen: set[int] = set()
+    seen: list[int] = []
+    bar_counts: dict[int, float] = {}
+    hashed: list[tuple[str, bytes]] = []
+    next_day = 1
     for chunk in document["chunks"]:
         name = chunk["file"]
-        payload = _anonymized_text(name, _read_regular(root, name))
-        days = _csv_days(name, payload, symbol=symbol, bar_minutes=bar_minutes)
+        blob = _read_regular(root, name)
+        hashed.append((name, blob))
+        payload = _anonymized_text(name, blob)
+        days, _totals, sums = _csv_days(name, payload, symbol=symbol, bar_minutes=bar_minutes)
         if days[0] != chunk["first_day"] or days[-1] != chunk["last_day"] or len(days) != chunk["sessions"]:
             raise ValueError(f"{name} does not match its manifest day range")
-        seen.update(days)
+        if days[0] != next_day:
+            raise ValueError(f"{name} sessions are not sequential")
+        next_day = days[-1] + 1
+        seen.extend(days)
+        bar_counts.update(sums)
         _reject_banned(name, payload)
         if symbol and _text_has_ticker(name, payload, symbol):
             raise ValueError(f"{name} contains the ticker")
-    daily = _anonymized_text(_DAILY_NAME, _read_regular(root, _DAILY_NAME))
-    daily_days = _csv_days(_DAILY_NAME, daily, symbol=symbol, bar_minutes=bar_minutes)
-    if set(daily_days) != seen:
+    if seen != list(range(1, len(seen) + 1)) or document["n_sessions"] != len(seen):
+        raise ValueError("pack sessions are not sequential")
+    daily_blob = _read_regular(root, _DAILY_NAME)
+    hashed.append((_DAILY_NAME, daily_blob))
+    daily = _anonymized_text(_DAILY_NAME, daily_blob)
+    daily_days, daily_counts, _session_counts = _csv_days(
+        _DAILY_NAME, daily, symbol=symbol, bar_minutes=bar_minutes, single_row=True
+    )
+    if daily_days != seen:
         raise ValueError(f"{_DAILY_NAME} does not match its manifest day range")
+    for day, total in daily_counts.items():
+        if format(total, ".17g") != format(bar_counts[day], ".17g"):
+            raise ValueError("count is not the session trade count")
     _reject_banned(_DAILY_NAME, daily)
     if symbol and _text_has_ticker(_DAILY_NAME, daily, symbol):
         raise ValueError(f"{_DAILY_NAME} contains the ticker")
@@ -867,6 +1000,8 @@ def _anonymized_pack_gate(root: Path, *, symbol: str | None = None) -> dict:
         for name in names:
             if _token_present(symbol, name):
                 raise ValueError(f"{name} leaks identity in the file name")
+    if _pack_id(hashed) != document["pack_id"]:
+        raise ValueError("pack files do not match the manifest pack_id")
     return document
 
 
@@ -875,6 +1010,41 @@ def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
     if not symbol:
         raise ValueError("symbol is empty")
     _anonymized_pack_gate(Path(pack_dir), symbol=symbol)
+
+
+def copy_anonymized_pack(source, destination) -> None:
+    """Write a new pack directory from each file's default data stream.
+
+    The designer child is given the bar frame, not this directory. A file
+    handoff uses this copy. The bytes are the ones ``open`` reads, and the
+    destination files are created empty and then written, so an NTFS
+    alternate stream on the source does not ride along. A non-default
+    stream is refused before the copy.
+    """
+    src = Path(source)
+    dest = Path(destination)
+    if dest.exists() and any(dest.iterdir()):
+        raise ValueError("pack copy destination is not empty")
+    names = _anonymized_directory(src)
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        for name in sorted(names):
+            blob = _read_regular(src, name)
+            target = dest / name
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(target, flags | nofollow, 0o644)
+            except OSError:
+                raise ValueError(_NOT_REGULAR) from None
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(blob)
+            except OSError:
+                raise ValueError(_NOT_REGULAR) from None
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
 
 
 def _designer_frame(frame: pd.DataFrame, *, anonymize: bool, price_factor: float, volume_factor: float):
@@ -902,7 +1072,10 @@ def _designer_frame(frame: pd.DataFrame, *, anonymize: bool, price_factor: float
             "close": frame["close"].astype(float).to_numpy() * price_factor,
             "volume": frame["volume"].astype(float).to_numpy() * volume_factor,
             "wap": frame["wap"].astype(float).to_numpy() * price_factor,
-            "count": frame["count"].astype(int).to_numpy(),
+            "count": [
+                _emitted_count((float(value) * volume_factor) if anonymize else value)
+                for value in frame["count"].tolist()
+            ],
             "filled": frame["filled"].astype(int).to_numpy(),
             "short_session": frame["short_session"].astype(int).to_numpy(),
             "bar_minutes": frame["bar_minutes"].astype(int).to_numpy(),
@@ -922,6 +1095,9 @@ def _daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
             wap = float((source["wap"] * source["volume"]).sum()) / volume
         else:
             wap = float(source["close"].iloc[-1])
+        count = 0.0
+        for value in source["count"].tolist():
+            count += float(value)
         rows.append(
             {
                 "day": int(day),
@@ -936,7 +1112,7 @@ def _daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
                 "close": float(source["close"].iloc[-1]),
                 "volume": volume,
                 "wap": wap,
-                "count": int(source["count"].sum()),
+                "count": count,
                 "filled": int(source["filled"].max()),
                 "short_session": int(source["short_session"].iloc[0]),
                 "bar_minutes": int(source["bar_minutes"].iloc[0]),
@@ -1275,7 +1451,10 @@ def load_pack(pack_dir, *, symbol: str | None = None) -> LoadedPack:
     hashed = []
     for chunk in manifest["chunks"]:
         path = root / chunk["file"]
-        blob = path.read_bytes()
+        if manifest["anonymized"]:
+            blob = _read_regular(root, chunk["file"])
+        else:
+            blob = path.read_bytes()
         if len(blob) >= MAX_FILE_BYTES:
             raise ValueError(f"{chunk['file']} is not under {MAX_FILE_BYTES} bytes")
         if manifest["anonymized"]:
@@ -1287,7 +1466,10 @@ def load_pack(pack_dir, *, symbol: str | None = None) -> LoadedPack:
             raise ValueError(f"{chunk['file']} does not match its manifest day range")
         frames.append(frame)
     daily_path = root / manifest["daily_file"]
-    daily_blob = daily_path.read_bytes()
+    if manifest["anonymized"]:
+        daily_blob = _read_regular(root, manifest["daily_file"])
+    else:
+        daily_blob = daily_path.read_bytes()
     if manifest["anonymized"]:
         _reject_anonymized_gzip(manifest["daily_file"], daily_blob)
     hashed.append((manifest["daily_file"], daily_blob))
