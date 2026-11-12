@@ -618,14 +618,13 @@ def test_the_phase_log_sits_beside_the_jail_directory(tmp_path):
 def _memory_cap(baseline: int, linux_margin: int) -> int:
     """Cap above one process. On Windows, above the worker plus the jail.
 
-    The poll sums those working sets. On the GitHub runner that pair sits
-    about 100–130 MiB above one process, past the 96 MiB and 128 MiB
-    margins, so the flat strategy was stopped before the hog's allocation
-    showed up. 192 MiB clears the pair. The hog still crosses it: its
-    extra allocation is on top of the same pair. Linux keeps the tighter
-    margin.
+    The poll sums those working sets. On the GitHub runner the pair sits
+    anywhere from about 96 MiB to just over 192 MiB above one process, so
+    a flat strategy was stopped before the hog's allocation showed up.
+    224 MiB is above that pair and below the pair plus the hog's extra
+    allocation (160 MiB or 192 MiB). Linux keeps the tighter margin.
     """
-    margin = 192 * 1024 * 1024 if sys.platform == "win32" else linux_margin
+    margin = 224 * 1024 * 1024 if sys.platform == "win32" else linux_margin
     return baseline + margin
 
 
