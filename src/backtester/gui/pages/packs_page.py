@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from ..jobs import build_pack_job
 from ..widgets import Banner, DictTable, PageHeader, PathField, Section, clear_layout
+from .run_page import _run_failure_line
 
 
 class PacksPage(QWidget):
@@ -209,7 +210,7 @@ class PacksPage(QWidget):
 
     def _failed(self, text: str) -> None:
         clear_layout(self.banners)
-        first = text.strip().splitlines()[-1] if text.strip() else "pack build failed"
-        self.banners.addWidget(Banner("error", first))
-        self.summary.setText(text)
+        sentence = _run_failure_line(text)
+        self.banners.addWidget(Banner("error", sentence))
+        self.summary.setText(sentence)
         self.host.set_status("Pack build failed")

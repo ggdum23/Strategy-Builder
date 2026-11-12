@@ -67,6 +67,46 @@ def test_pack_result_has_no_sidecar_fields(tmp_path):
     text = sidecar.read_text(encoding="utf-8")
     assert "price_factor" in text
     assert text not in blob
+    from backtester.pack import load_sidecar
+
+    secret = load_sidecar(sidecar)
+    assert len(secret["factor_mac"]) == 64
+    assert len(secret["factor_key"]) == 64
+    assert "factor_key" not in blob
+    assert "factor_mac" not in blob
+    assert "borrow_rate_source" not in blob
+    document = json.loads(text)
+    document.pop("factor_mac", None)
+    document.pop("factor_key", None)
+    sidecar.write_text(json.dumps(document), encoding="utf-8")
+    strategy = write_strategy(tmp_path / "strategy.py", 1.0)
+    try:
+        execute_run(
+            {
+                "mode": "single",
+                "profile": "arena",
+                "source": "pack",
+                "strategies": [str(strategy)],
+                "pack": str(pack),
+                "sidecar": str(sidecar),
+                "out": str(tmp_path / "out"),
+                "bar_minutes": 1,
+                "initial_equity": 1_000_000,
+                "borrow_rate_annual": None,
+                "financing_rate_annual": None,
+                "fee_mult": 1,
+                "dividends": "",
+                "warmup_sessions": 0,
+                "warmup_days": 0,
+                "design_end_day": None,
+                "design_end_date": "",
+                "design_fraction": None,
+            }
+        )
+    except ValueError as exc:
+        assert "rebuild the pack" in str(exc)
+    else:
+        raise AssertionError("a sidecar with no factor MAC was accepted")
 
 
 def test_named_run_display_matches_the_report_file(tmp_path):

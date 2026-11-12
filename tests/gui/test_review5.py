@@ -205,6 +205,17 @@ def test_run_page_shows_anonymization_rejection_and_ignores_renamed_files(qtbot,
     assert "reserved vocabulary" in banner
     assert "metrics" in banner
     assert banner != "RuntimeError: worker exited 1"
+    assert not banner.startswith("ValueError:")
+
+    window.run_page.on_failed(
+        "Traceback (most recent call last):\n"
+        "ValueError: sidecar factor_mac: sidecar has no operator factor MAC; rebuild the pack\n"
+        "RuntimeError: worker exited 1\n"
+    )
+    QApplication.processEvents()
+    rebuild = _banners(window.run_page)
+    assert rebuild == "sidecar factor_mac: sidecar has no operator factor MAC; rebuild the pack"
+    assert "worker exited" not in rebuild
 
     renamed = tmp_path / "renamed"
     renamed.mkdir()

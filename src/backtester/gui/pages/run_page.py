@@ -495,20 +495,29 @@ class RunPage(QWidget):
         )
 
 
-def _run_failure_line(text: str) -> str:
-    """The line the Run page shows when anonymization or the worker rejects the run.
+def _without_exception_prefix(line: str) -> str:
+    """``ValueError: sidecar ...`` becomes the sentence after the class name."""
+    match = re.match(r"^(?:[A-Za-z_][\w.]*)?(?:Error|Exception):\s*(.+)$", line)
+    if match:
+        return match.group(1).strip()
+    return line
 
-    A wrapper such as ``RuntimeError: worker exited 1`` is not the message. The
-    anonymization rejection is, even when it is not the last traceback line.
+
+def _run_failure_line(text: str) -> str:
+    """The line the Run page shows when the worker rejects the run.
+
+    A wrapper such as ``RuntimeError: worker exited 1`` is not the message.
+    An anonymization rejection, and a sidecar that says to rebuild the pack,
+    are, even when they are not the last traceback line.
     """
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     if not lines:
         return "run failed"
     for line in lines:
         folded = line.casefold()
-        if "anonymiz" in folded or "reserved" in folded:
-            return line
+        if "rebuild the pack" in folded or "anonymiz" in folded or "reserved" in folded:
+            return _without_exception_prefix(line)
     for line in reversed(lines):
         if re.search(r"\b(?:Error|Exception)\b", line):
-            return line
+            return _without_exception_prefix(line)
     return lines[-1]
