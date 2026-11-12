@@ -257,6 +257,7 @@ def run_parallel(
     financing_rate_annual: float | None = None,
     fee_mult: float = 1.0,
     dividends: dict | None = None,
+    dividend_file_sha256: str | None = None,
     warmup_sessions: int = 0,
     initial_equity: float = 1_000_000.0,
     with_benchmarks: bool = True,
@@ -597,6 +598,7 @@ def run_parallel(
             "workers": workers,
             "jobs": jobs,
             **({} if accounting is None else {"accounting": accounting.as_dict(), **accounting.as_dict()}),
+            **({} if not dividend_file_sha256 else {"dividend_file_sha256": dividend_file_sha256}),
         },
     )
     if index_path is not None:
