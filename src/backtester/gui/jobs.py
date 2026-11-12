@@ -32,6 +32,59 @@ from .backend import read_designer_manifest
 from .preferences import as_path
 from .validate import config_record, normalize, validate_config
 
+@dataclass(frozen=True)
+class JobFailure:
+    """The exception a job worker caught, separate from its traceback.
+
+    The banner shows ``message`` (``str(exc)``). The log shows ``traceback``.
+    The UI does not read the traceback to decide the sentence.
+    """
+
+    type_name: str
+    message: str
+    traceback: str
+
+    @classmethod
+    def capture(cls, exc: BaseException) -> JobFailure:
+        return cls(type(exc).__name__, str(exc), traceback.format_exc())
+
+    def as_dict(self) -> dict:
+        return {"type": self.type_name, "message": self.message, "traceback": self.traceback}
+
+    @classmethod
+    def from_dict(cls, payload) -> JobFailure | None:
+        if not isinstance(payload, dict):
+            return None
+        message = payload.get("message")
+        if not isinstance(message, str):
+            return None
+        type_name = payload.get("type")
+        trace = payload.get("traceback")
+        return cls(
+            type_name if isinstance(type_name, str) and type_name else "Exception",
+            message,
+            trace if isinstance(trace, str) else "",
+        )
+
+
+def failure_message(value) -> str:
+    """The sentence a banner shows. A plain string is already that sentence."""
+    if isinstance(value, JobFailure):
+        text = value.message.strip()
+        return text or "run failed"
+    if isinstance(value, str):
+        text = value.strip()
+        return text or "run failed"
+    return "run failed"
+
+
+def failure_detail(value) -> str:
+    """The log text. The traceback stays here, off the banner."""
+    if isinstance(value, JobFailure):
+        return value.traceback or value.message
+    return str(value)
+
+
 _PUBLIC_PACK_KEYS = (
     "pack_dir",
     "sidecar_path",
@@ -529,5 +582,6 @@ def process_entry(mode: str, config: dict, status_path: str) -> None:
         _status(status_path, {"state": "running", "message": "Starting"})
         result = execute_run(config, status_path)
         _status(status_path, {"state": "done", "result": result})
-    except Exception:
-        _status(status_path, {"state": "error", "error": traceback.format_exc()})
+    except Exception as exc:
+        failure = JobFailure.capture(exc)
+        _status(status_path, {"state": "error", "failure": failure.as_dict()})

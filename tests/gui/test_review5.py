@@ -38,12 +38,6 @@ _WHOLE_NUMBERS = (
 _GLUED_YEARS = ("Jan2024", "January2024", "FY2024", "year2024")
 _GLUED_SCALES = ("scale7.777", "x7.777")
 _PATH_KEY = r"C:\Users\Jeu\Desktop\Strategy Builder\QQQ\data.csv"
-_TRACE = """Traceback (most recent call last):
-  File "worker.py", line 3, in run
-    raise RuntimeError("worker exited 1")
-ValueError: anonymization rejected symbol 'metrics': reserved vocabulary
-RuntimeError: worker exited 1
-"""
 
 
 def _banners(page) -> str:
@@ -197,26 +191,7 @@ def test_status_and_chip_drop_paths_and_use_random(qtbot, tmp_path):
     assert root in window.root_chip.toolTip()
 
 
-def test_run_page_shows_anonymization_rejection_and_ignores_renamed_files(qtbot, tmp_path):
-    window = _window(qtbot, tmp_path)
-    window.run_page.on_failed(_TRACE)
-    QApplication.processEvents()
-    banner = _banners(window.run_page)
-    assert "reserved vocabulary" in banner
-    assert "metrics" in banner
-    assert banner != "RuntimeError: worker exited 1"
-    assert not banner.startswith("ValueError:")
-
-    window.run_page.on_failed(
-        "Traceback (most recent call last):\n"
-        "ValueError: sidecar factor_mac: sidecar has no operator factor MAC; rebuild the pack\n"
-        "RuntimeError: worker exited 1\n"
-    )
-    QApplication.processEvents()
-    rebuild = _banners(window.run_page)
-    assert rebuild == "sidecar factor_mac: sidecar has no operator factor MAC; rebuild the pack"
-    assert "worker exited" not in rebuild
-
+def test_renamed_report_files_are_not_a_book(tmp_path):
     renamed = tmp_path / "renamed"
     renamed.mkdir()
     (renamed / "metrics_QQQ.json").write_text(json.dumps(ARENA_METRICS), encoding="utf-8")

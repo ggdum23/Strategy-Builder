@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from ..backend import scan_history
+from ..jobs import failure_message
 from ..widgets import DictTable, PageHeader, PathField, Section
 
 
@@ -118,5 +119,6 @@ class HistoryPage(QWidget):
         if path:
             self.host.open_results(str(path))
 
-    def _failed(self, text: str) -> None:
-        self.note.setText(text.strip().splitlines()[-1] if text.strip() else "scan failed")
+    def _failed(self, failure) -> None:
+        sentence = failure_message(failure)
+        self.note.setText("scan failed" if sentence == "run failed" else sentence)

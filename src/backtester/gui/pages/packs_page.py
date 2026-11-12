@@ -16,9 +16,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..jobs import build_pack_job
+from ..jobs import build_pack_job, failure_message
 from ..widgets import Banner, DictTable, PageHeader, PathField, Section, clear_layout
-from .run_page import _run_failure_line
 
 
 class PacksPage(QWidget):
@@ -208,9 +207,9 @@ class PacksPage(QWidget):
         self.host.remember(last_pack=str(payload.get("pack_dir") or ""), last_sidecar=str(payload.get("sidecar_path") or ""))
         self.host.set_status(f"{kind} pack ready. Sidecar not displayed.")
 
-    def _failed(self, text: str) -> None:
+    def _failed(self, failure) -> None:
         clear_layout(self.banners)
-        sentence = _run_failure_line(text)
+        sentence = failure_message(failure)
         self.banners.addWidget(Banner("error", sentence))
         self.summary.setText(sentence)
         self.host.set_status("Pack build failed")

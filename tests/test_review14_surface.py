@@ -44,6 +44,16 @@ DATES = (
     "4-Jan-24",
     "Jan-24",
     "01-04-24",
+    "01\u201504\u201524",
+    "01\u200b04\u200b24",
+    "01 04 24",
+    "01\u00a004\u00a024",
+    "01\u200304\u200324",
+    "01\u300004\u300024",
+    "01\u00ad04\u00ad24",
+    "01\u201404\u201424",
+    "4\u2015Jan\u201524",
+    "Jan\u201524",
     "4 Jan 24",
     "Jan 4, 24",
     "alpha_2024-01-04_v2",
@@ -108,6 +118,50 @@ def test_publishable_ids_pass_every_gate(text):
     assert strategy_id_problem(text) is None
     assert designer_component_problem(text, symbols=(), scale=_SCALE) is None
     assert scrub_text(text, (), scale=_SCALE) == text
+
+
+def test_other_dashes_spaces_and_format_characters_are_dates():
+    """A separator is any non-alphanumeric, after format characters become a break."""
+    samples = (
+        "01\u201504\u201524",  # horizontal bar, not folded to ASCII hyphen
+        "01\u200b04\u200b24",  # zero-width space
+        "01\u00ad04\u00ad24",  # soft hyphen
+        "01\u00a004\u00a024",  # no-break space
+        "01\u200304\u200324",  # em space
+        "01\u200904\u200924",  # thin space
+        "01\u300004\u300024",  # ideographic space
+        "01\u201404\u201424",  # em dash
+        "01\u221204\u221224",  # minus
+        "4\u2015Jan\u201524",
+        "Jan\u201524",
+        "01 04 24",
+    )
+    for text in samples:
+        assert _date_hits(text) == (True, True, True, True, True), text
+        assert contains_calendar_date(text)
+        assert strategy_id_problem(text) == "a calendar date"
+
+
+def test_clocks_and_decimals_stay_out_of_the_separator_scan():
+    for text in (
+        "09:25:00",
+        "09:25",
+        "07:30",
+        "2024.50",
+        "0.2024",
+        "count 12 and 20",
+        "long_2x",
+        "ma_20_50",
+        "ratio 2.5",
+        "2.5 2024.50",
+        "2024.50 0.2024",
+        "2024.50 0",
+    ):
+        assert not contains_calendar_date(text), text
+        assert scrub_text(text, ()) == text
+        assert strip_calendar_dates(text) == text
+    kept = "long_2x 2.5 2024.50 0.2024 day 2024 count 12"
+    assert strip_calendar_dates(kept) == "long_2x 2.5 2024.50 0.2024 day  count 12"
 
 
 def test_decimals_stay_numbers_and_are_not_ids():

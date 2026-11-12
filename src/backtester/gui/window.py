@@ -307,9 +307,9 @@ class MainWindow(QMainWindow):
         self.run_page.on_finished(payload)
         self.set_status("Run finished. Results are the report files.")
 
-    def _on_failed(self, text: str) -> None:
+    def _on_failed(self, failure) -> None:
         self.run_page.set_running(False)
-        self.run_page.on_failed(text)
+        self.run_page.on_failed(failure)
         self.set_status("Run failed. See the worker log. No metric was substituted.")
 
     def _on_cancelled(self) -> None:

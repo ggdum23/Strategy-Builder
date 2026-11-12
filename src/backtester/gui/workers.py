@@ -4,19 +4,18 @@ from __future__ import annotations
 
 import json
 import multiprocessing
-import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
-from .jobs import process_entry
+from .jobs import JobFailure, process_entry
 
 
 class FunctionThread(QThread):
     """One call off the UI thread. Used for inspect, registry, and pack builds."""
 
     succeeded = Signal(object)
-    failed = Signal(str)
+    failed = Signal(object)
 
     def __init__(self, fn):
         super().__init__()
@@ -25,8 +24,8 @@ class FunctionThread(QThread):
     def run(self) -> None:
         try:
             result = self._fn()
-        except Exception:
-            self.failed.emit(traceback.format_exc())
+        except Exception as exc:
+            self.failed.emit(JobFailure.capture(exc))
         else:
             self.succeeded.emit(result)
 
@@ -74,7 +73,7 @@ class ProcessSupervisor(QObject):
 
     progress = Signal(dict)
     finished = Signal(dict)
-    failed = Signal(str)
+    failed = Signal(object)
     cancelled = Signal()
 
     def __init__(self):
@@ -143,6 +142,10 @@ class ProcessSupervisor(QObject):
             self.finished.emit(payload)
             return
         if state == "error":
-            self.failed.emit(str(payload.get("error") or f"worker exited {code}"))
+            failure = JobFailure.from_dict(payload.get("failure"))
+            if failure is None:
+                self.failed.emit(f"worker exited {code}")
+                return
+            self.failed.emit(failure)
             return
-        self.failed.emit(str(payload.get("error") or f"worker exited {code} without a finished report"))
+        self.failed.emit(f"worker exited {code} without a finished report")

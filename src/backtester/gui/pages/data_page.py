@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...registry import hours_text
-from ..jobs import inspect_series, list_registry, record_series
+from ..jobs import failure_detail, failure_message, inspect_series, list_registry, record_series
 from ..widgets import Banner, DictTable, PageHeader, Section, clear_layout
 
 _PRICE = ("", "raw", "total_return")
@@ -312,11 +312,13 @@ class DataPage(QWidget):
         self.host.set_status(f"Inspected {info.get('symbol')}: {info.get('n_sessions')} sessions, tick {info.get('native_tick')}")
         self.host.remember(last_src=self.src_path.text(), last_ticker=self.ticker.text().strip())
 
-    def _failed(self, text: str) -> None:
+    def _failed(self, failure) -> None:
         clear_layout(self.banners)
-        first = text.strip().splitlines()[-1] if text.strip() else "inspection failed"
-        self.banners.addWidget(Banner("error", first))
-        self.notes.setPlainText(text)
+        sentence = failure_message(failure)
+        if sentence == "run failed":
+            sentence = "inspection failed"
+        self.banners.addWidget(Banner("error", sentence))
+        self.notes.setPlainText(failure_detail(failure))
         self.host.set_status("Inspection failed")
 
     def banner_texts(self) -> list[str]:

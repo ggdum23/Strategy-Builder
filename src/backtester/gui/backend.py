@@ -605,17 +605,82 @@ def _job_error(directory: Path) -> str | None:
     return None
 
 
+def _status_word(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _prefer_status(current: str | None, incoming: str | None) -> str | None:
+    """A non-ok word from either record wins. ``run.json`` is read first."""
+    if current and current.casefold() != "ok":
+        return current
+    if incoming and incoming.casefold() != "ok":
+        return incoming
+    return current or incoming
+
+
+def _status_by_job(directory: Path) -> dict[tuple[str, str], str]:
+    """Status words from ``run.json`` jobs and a leaderboard ``status`` column.
+
+    ``metrics.json`` is not a status. A later reader uses it only when neither
+    record names the job.
+    """
+    found: dict[tuple[str, str], str] = {}
+    info = directory / "run.json"
+    if info.is_file():
+        try:
+            document = _read_json(info)
+        except (OSError, json.JSONDecodeError):
+            document = None
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if isinstance(jobs, list):
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                status = _status_word(job.get("status"))
+                if not status:
+                    continue
+                key = (str(job.get("strategy_id") or ""), str(job.get("source_id") or ""))
+                found[key] = _prefer_status(found.get(key), status) or status
+    board = directory / LEADERBOARD_FILE
+    if board.is_file():
+        try:
+            table = _load_table(board)
+        except (OSError, UnicodeError, csv.Error, ValueError):
+            table = None
+        if table is not None and "status" in table.columns:
+            for row in table.rows:
+                status = _status_word(row.get("status"))
+                if not status:
+                    continue
+                key = (str(row.get("strategy_id") or ""), str(row.get("source_id") or ""))
+                found[key] = _prefer_status(found.get(key), status) or status
+    return found
+
+
 def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
-    """Phase 3 tree: ``jobs/<id>/<source>/`` plus ``designer/`` and ``error.json``."""
+    """Phase 3 tree: ``jobs/<id>/<source>/`` plus ``designer/`` and ``error.json``.
+
+    The Jobs table takes its word from ``run.json`` and the leaderboard.
+    ``metrics.json`` means ok only when those records do not name the job.
+    """
     report = RunReport(directory=directory, kind="batch")
     jobs_root = directory / "jobs"
     pairs = _nested_job_dirs(jobs_root) if jobs_root.is_dir() else []
     if not pairs:
         pairs = _nested_job_dirs(directory)
+    recorded = _status_by_job(directory)
     for strategy_id, source_id, job in pairs:
         metrics_path = job / METRICS_FILE
         error = _job_error(job)
-        if metrics_path.is_file():
+        status = recorded.get((strategy_id, source_id))
+        if status and status.casefold() == "ok":
+            state = "ok"
+        elif status:
+            state = status
+        elif metrics_path.is_file():
             state = "ok"
         elif error:
             state = "failed"
@@ -628,7 +693,7 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
                 "strategy_id": strategy_id,
                 "source_id": source_id,
                 "state": state,
-                "error": None if state == "ok" else error,
+                "error": None if state.casefold() == "ok" else error,
             }
         )
     board_path = directory / LEADERBOARD_FILE

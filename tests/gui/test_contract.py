@@ -262,7 +262,7 @@ def test_parallel_tree_loads_jobs_failures_and_designer_board(tmp_path):
     assert operator.kind == "batch"
     assert operator.audience == "operator"
     assert any(row.get("symbol") == "QQQ" for row in operator.leaderboard.rows)
-    failed = [child for child in operator.children if child["state"] == "failed"]
+    failed = [child for child in operator.children if child["state"] == "error"]
     assert failed and "boom" in (failed[0]["error"] or "")
     assert operator.leaderboard.rows[0]["calmar"] == math.inf
     assert operator.leaderboard.rows[0]["total_return"] == 0.041

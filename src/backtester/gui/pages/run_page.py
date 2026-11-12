@@ -6,8 +6,6 @@ The page shows a readable summary of the draft. The stored contract is still
 
 from __future__ import annotations
 
-import re
-
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -29,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..disclosures import profile_rows
+from ..jobs import failure_detail, failure_message
 from ..validate import validate_config
 from ..widgets import Banner, DictTable, PageHeader, PathField, Section, clear_layout
 
@@ -476,13 +475,13 @@ class RunPage(QWidget):
         self.log.appendPlainText(f"wrote {result.get('out')}")
         self.host.open_results(result.get("out"))
 
-    def on_failed(self, text: str) -> None:
+    def on_failed(self, failure) -> None:
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setFormat("Failed")
-        self.log.setPlainText(text)
+        self.log.setPlainText(failure_detail(failure))
         clear_layout(self.banners)
-        self.banners.addWidget(Banner("error", _run_failure_line(text)))
+        self.banners.addWidget(Banner("error", failure_message(failure)))
 
     def on_cancelled(self) -> None:
         self.progress.setRange(0, 1)
@@ -494,30 +493,3 @@ class RunPage(QWidget):
             Banner("warn", "Cancelled. If the folder contains a partial file, it is not a finished report.")
         )
 
-
-def _without_exception_prefix(line: str) -> str:
-    """``ValueError: sidecar ...`` becomes the sentence after the class name."""
-    match = re.match(r"^(?:[A-Za-z_][\w.]*)?(?:Error|Exception):\s*(.+)$", line)
-    if match:
-        return match.group(1).strip()
-    return line
-
-
-def _run_failure_line(text: str) -> str:
-    """The line the Run page shows when the worker rejects the run.
-
-    A wrapper such as ``RuntimeError: worker exited 1`` is not the message.
-    An anonymization rejection, and a sidecar that says to rebuild the pack,
-    are, even when they are not the last traceback line.
-    """
-    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
-    if not lines:
-        return "run failed"
-    for line in lines:
-        folded = line.casefold()
-        if "rebuild the pack" in folded or "anonymiz" in folded or "reserved" in folded:
-            return _without_exception_prefix(line)
-    for line in reversed(lines):
-        if re.search(r"\b(?:Error|Exception)\b", line):
-            return _without_exception_prefix(line)
-    return lines[-1]

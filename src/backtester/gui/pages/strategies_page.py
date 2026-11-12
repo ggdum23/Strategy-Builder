@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..discover import discover_strategies, summarize_strategy
+from ..jobs import failure_message
 from ..disclosures import profile_rows
 from ..widgets import Banner, PageHeader, PathField, Section, clear_layout
 
@@ -221,8 +222,10 @@ class StrategiesPage(QWidget):
             self.disclosure_layout.addWidget(text)
         self.disclosure_layout.addStretch(1)
 
-    def _failed(self, text: str) -> None:
+    def _failed(self, failure) -> None:
         clear_layout(self.banners)
-        first = text.strip().splitlines()[-1] if text.strip() else "scan failed"
-        self.banners.addWidget(Banner("error", first))
+        sentence = failure_message(failure)
+        if sentence == "run failed":
+            sentence = "scan failed"
+        self.banners.addWidget(Banner("error", sentence))
         self.host.set_status("Strategy scan failed")
