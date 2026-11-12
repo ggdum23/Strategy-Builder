@@ -455,6 +455,36 @@ def _is_volume(path: str) -> bool:
     return _is_volume_acl_path(path)
 
 
+def test_the_private_directory_uses_the_runtime_parent(monkeypatch, tmp_path):
+    import backtester.sandbox as sandbox
+
+    monkeypatch.setattr(sandbox, "_owned_work_parent", lambda: None)
+    monkeypatch.setattr(sandbox, "_RUNTIME_PARENT", str(tmp_path))
+    work = Path(sandbox._private_dir())
+    try:
+        assert work.is_dir()
+        assert work.parent == tmp_path
+        assert work.name.startswith("bt-referee-")
+    finally:
+        work.rmdir()
+        sandbox._RUNTIME_PARENT = ""
+
+
+def test_a_private_directory_under_the_container_folder_is_trusted():
+    import backtester.sandbox as sandbox
+
+    folder = r"C:\Users\runner\AppData\Local\Packages\strategybuilderjail"
+    work = folder + r"\bt-referee-abc"
+    sandbox._TRUSTED_STAGE_ROOTS = [folder]
+    sandbox._RUNTIME_COPIES = []
+    try:
+        assert sandbox._trusted_runtime_root(work)
+        assert not sandbox._trusted_runtime_root(r"C:\Users\RUNNER~1\AppData\Local\Temp\bt-referee-abc")
+        assert not sandbox._trusted_runtime_root(r"C:\Users\runner")
+    finally:
+        sandbox._TRUSTED_STAGE_ROOTS = []
+
+
 def test_the_child_command_uses_the_staged_interpreter(monkeypatch):
     import backtester.sandbox as sandbox
 

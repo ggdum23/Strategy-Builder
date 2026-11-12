@@ -626,9 +626,17 @@ _CREATED_APP_DIRS: list[Path] = []
 
 
 def _private_dir() -> str:
+    """A directory the container can already reach.
+
+    The default user Temp directory is not that parent on the GitHub
+    runner. The runtime copy's parent is: ProgramData or Public when
+    those already have traverse, otherwise the AppContainer folder.
+    """
     import tempfile
 
     parent = _owned_work_parent()
+    if parent is None and _RUNTIME_PARENT:
+        parent = Path(_RUNTIME_PARENT)
     if parent is None:
         return tempfile.mkdtemp(prefix="bt-referee-")
     return tempfile.mkdtemp(prefix="bt-referee-", dir=str(parent))
@@ -2204,6 +2212,9 @@ _RUNTIME_COPY_VERSION = "1"
 # folder are not granted and are not required to show a package ACE.
 _CONTAINER_FOLDER_NOTE = ""
 _TRUSTED_STAGE_ROOTS: list[str] = []
+# Parent of the staged runtime. The private directory is created here when
+# ProgramData and Public are not already traversable.
+_RUNTIME_PARENT = ""
 
 
 def _child_executable() -> str:
@@ -2613,8 +2624,9 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
     tried first. The AppContainer folder is used only when none of those
     already let the container through. Its ancestors are not granted.
     """
-    global _RUNTIME_COPIES, _TRUSTED_STAGE_ROOTS
+    global _RUNTIME_COPIES, _TRUSTED_STAGE_ROOTS, _RUNTIME_PARENT
     _TRUSTED_STAGE_ROOTS = []
+    _RUNTIME_PARENT = ""
     roots = [str(path) for path in _windows_grant_roots()]
     if sys.platform != "win32":
         _RUNTIME_COPIES = []
@@ -2630,6 +2642,7 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
             trust = parent is not None
         if parent is not None:
             stage_root = str((Path(parent) / "runtime").resolve())
+            _RUNTIME_PARENT = str(Path(parent))
             if trust:
                 _TRUSTED_STAGE_ROOTS = [str(Path(parent)), stage_root]
             allow = _dedupe_acl(allow + [str(path) for path in _CREATED_APP_DIRS] + [stage_root])
@@ -3487,7 +3500,12 @@ def _win_grant_work(lease: _WinLease, work: Path) -> list[tuple[Path, bool]]:
     allow.extend(str(path) for path in _CREATED_APP_DIRS)
     allow.append(str(work))
     lease.acl_allow = _dedupe_acl(allow)
-    _require_existing_ancestor_traverse(work, lease.acl_allow)
+    # A private directory under the AppContainer folder is reachable because
+    # that folder is the profile's own directory. Its ancestors, including
+    # the user-profile root and Temp, are not granted and are not required
+    # to show a package ACE.
+    if not _trusted_runtime_root(work):
+        _require_existing_ancestor_traverse(work, lease.acl_allow)
     for parent in acl_ancestor_paths(str(work)):
         if not any(acl_same(parent, root) for root in lease.acl_allow):
             continue
