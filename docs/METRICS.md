@@ -215,8 +215,9 @@ label, a clock time, an accounting enum, or a safe id (`strategy_id`,
 decimal. It is not scanned as a price. The scan still applies the scale,
 the ticker, and dates. `publish_designer` scans the tree with the operator
 scale and does not leave the directory behind when that scan fails. The
-publication scan and the export check both read a `pack_` hex id as the
-letter id this tree stores.
+publication scan and the export check read the text stored on this tree.
+A source id is the letter form. A raw `pack_` id that is still in the text
+is judged as written, so a scale inside it fails both gates.
 
 The designer tree is an allow-list. Share counts, prices, notionals,
 per-component fees, the dollar `fees_total`, and accounting dollars are not

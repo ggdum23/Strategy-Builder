@@ -166,18 +166,23 @@ def test_path_predicate_skips_price_and_keeps_scale():
     assert designer_component_problem("qqq_momentum", symbols=("QQQ",), scale=1.1) == "the ticker"
 
 
-def test_unsigned_exponent_skip_is_only_the_rewritten_pack_id():
+def test_unsigned_exponent_matches_when_the_value_is_the_scale():
     assert _scale_in_token("note25e2", 0.25) is True
     assert _scale_in_token("pack_185e2abcdef", 2) is False
-    assert _scale_in_token("pack_2e2abcdef0", 2) is False
+    assert _scale_in_token("pack_2e2abcdef0", 2) is True
+    assert _scale_in_token("pack_25e2abcd", 0.25) is True
     assert _scale_in_token("build2_7.777e3", 7.777) is True
     assert scan_publication("note25e2", scale=0.25) == "the scale"
     assert export_allowed("note25e2", symbols=(), scale=0.25) is False
     assert export_block_reason("note25e2", symbols=(), scale=0.25) == "the scale"
+    assert scan_publication("pack_2e2abcdef0", scale=2) == "the scale"
+    assert export_block_reason("pack_2e2abcdef0", symbols=(), scale=2) == "the scale"
     assert scan_publication("4738e304", scale=2) is None
 
 
 def test_both_gates_agree_on_forty_thousand_pack_ids():
+    from backtester.designer_allow import designer_source_id
+
     rng = random.Random(11)
     pinned = (
         "pack_b2040abcde",
@@ -190,10 +195,11 @@ def test_both_gates_agree_on_forty_thousand_pack_ids():
     ids.extend("pack_" + "".join(rng.choice("0123456789abcdef") for _ in range(12)) for _ in range(40_000))
     scales = (0.25, 0.5, 0.7, 2.0)
     for ident in ids:
+        stored = designer_source_id(ident)
         for scale in scales:
-            allowed = export_allowed(ident, symbols=(), scale=scale)
-            scanned = scan_publication(ident, scale=scale)
-            assert allowed is True
+            allowed = export_allowed(stored, symbols=(), scale=scale)
+            scanned = scan_publication(stored, scale=scale)
+            assert allowed is True, (ident, stored, scale)
             assert scanned is None
             assert allowed == (scanned is None)
 

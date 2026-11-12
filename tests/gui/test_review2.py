@@ -96,7 +96,7 @@ def test_scrub_keeps_numbers_and_uses_one_ticker_rule():
     assert "2024" not in scrub_text("January 2024", ()).casefold()
     assert "jan" not in scrub_text("04.Jan.2024", ()).casefold()
     assert scrub_text("held QQQ1", ("QQQ",)) == "held RANDOM1"
-    assert scrub_text("ticker V1", ("V",)) == "ticker RANDOM1"
+    assert scrub_text("ticker V1", ("V",)) == "ticker V1"
     assert not export_allowed("held V overnight", symbols=("V",), scale=None)
     cleaned = scrub_text("applied share_scale 7.777 for QQQ1", ("QQQ",), scale=7.777)
     folded = cleaned.casefold()

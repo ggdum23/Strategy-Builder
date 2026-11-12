@@ -1126,10 +1126,24 @@ def _fail_published_row(results, row, message: str) -> None:
             return
 
 
-def _audit_job_tree(dest, symbols) -> None:
+def _audit_scales(scales) -> tuple:
+    """Scales to pass into ``assert_designer_clean``. ``None`` checks no invoice scale."""
+    if scales is None:
+        return (None,)
+    if isinstance(scales, bool):
+        return (None,)
+    if isinstance(scales, (int, float)):
+        return (float(scales),)
+    found = tuple(scales)
+    return found or (None,)
+
+
+def _audit_job_tree(dest, symbols, scales=None) -> None:
+    """Audit one job directory at each of that job's invoice scales."""
     probes = list(dict.fromkeys([*symbols, ""]))
     for probe in probes:
-        assert_designer_clean(dest, symbol=probe or "")
+        for scale in _audit_scales(scales):
+            assert_designer_clean(dest, symbol=probe or "", scale=scale)
 
 
 def _cell_violation(copied: dict, symbols) -> str | None:
@@ -1144,7 +1158,7 @@ def _cell_violation(copied: dict, symbols) -> str | None:
     return None
 
 
-def _write_clean_designer_error(dest, folder: str, source_name: str, profile: str, symbols) -> None:
+def _write_clean_designer_error(dest, folder: str, source_name: str, profile: str, symbols, scales=None) -> None:
     """Replace ``dest`` with an error file that passes the audit for every symbol.
 
     The directory is removed again when the audit fails, so a ticker suffix is
@@ -1169,7 +1183,7 @@ def _write_clean_designer_error(dest, folder: str, source_name: str, profile: st
     dest.mkdir(parents=True, exist_ok=True)
     write_json(dest / "error.json", payload)
     try:
-        _audit_job_tree(dest, symbols)
+        _audit_job_tree(dest, symbols, scales)
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)
         raise
@@ -1276,7 +1290,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             dest = designer / folder / source_name
             try:
                 _write_clean_designer_error(
-                    dest, folder, source_name, row.get("profile") or "", unique_symbols
+                    dest, folder, source_name, row.get("profile") or "", unique_symbols, scales
                 )
             except Exception:
                 if dest.exists():
@@ -1299,7 +1313,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                 source_id=opaque_source,
                 source_name=source_name,
             )
-            _audit_job_tree(dest, unique_symbols)
+            _audit_job_tree(dest, unique_symbols, scales)
         except Exception as exc:
             mutated = True
             names_dirty = _name_dirty(folder, unique_symbols) or _name_dirty(source_name, unique_symbols)
@@ -1311,7 +1325,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             _fail_published_row(results, row, _clip(f"designer audit failed: {exc}"))
             try:
                 _write_clean_designer_error(
-                    dest, folder, source_name, row.get("profile") or "", unique_symbols
+                    dest, folder, source_name, row.get("profile") or "", unique_symbols, scales
                 )
             except Exception:
                 if dest.exists():
@@ -1480,11 +1494,12 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                         source_name,
                         row.get("profile") or "",
                         unique_symbols,
+                        _scales_for_rows(rows_here),
                     )
                 except Exception:
                     _fail_published_row(results, row, "the strategy failed")
             try:
-                _audit_job_tree(designer / new_folder, unique_symbols)
+                _audit_job_tree(designer / new_folder, unique_symbols, _scales_for_rows(rows_here))
             except Exception:
                 if (designer / new_folder).exists():
                     shutil.rmtree(designer / new_folder, ignore_errors=True)
@@ -1513,7 +1528,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             if not folder_path.exists():
                 continue
             try:
-                _audit_job_tree(folder_path, unique_symbols)
+                _audit_job_tree(folder_path, unique_symbols, _scales_for_rows(_rows_for(folder)))
             except Exception as exc:
                 dirty.append((folder, exc))
         if not dirty:
@@ -1529,7 +1544,11 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                 if names_dirty:
                     new_folder = _rename_clean(folder)
                     try:
-                        _audit_job_tree(designer / new_folder, unique_symbols)
+                        _audit_job_tree(
+                            designer / new_folder,
+                            unique_symbols,
+                            _scales_for_rows(_rows_for(new_folder)),
+                        )
                         continue
                     except Exception:
                         folder = new_folder
@@ -1558,7 +1577,7 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             if not folder_path.exists():
                 continue
             try:
-                _audit_job_tree(folder_path, unique_symbols)
+                _audit_job_tree(folder_path, unique_symbols, _scales_for_rows(_rows_for(folder)))
             except Exception:
                 shutil.rmtree(folder_path, ignore_errors=True)
                 for row in ranked_rows:

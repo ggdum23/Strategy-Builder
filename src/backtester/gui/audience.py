@@ -5,8 +5,10 @@ the runner wrote. ``designer`` reads ``designer/`` when that tree was published,
 and otherwise reads the operator files. Every designer surface then keeps only
 the shared allow-list. There is no unredacted designer path.
 
-This module does not import the runner or ``report.py``. The allow-list lives
-in ``designer_allow``, which ``report.py`` imports as well.
+This module does not import the runner or ``report.py`` at load time. The
+ticker match is ``report.ticker_token_spans``, imported inside
+``_ticker_spans``. The allow-list lives in ``designer_allow``, which
+``report.py`` imports as well.
 """
 
 from __future__ import annotations
@@ -145,11 +147,16 @@ _SURFACE_TOKEN = re.compile(
     rf"|{_WORD_WITH_EXP}"
 )
 _GLUED_YEAR = re.compile(r"(?i)(?:[A-Za-z](?:19|20)\d{2}|(?:19|20)\d{2}[A-Za-z])")
-# The designer tree stores pack_ plus hex as pack- plus letters. Both gates
-# read that stored form, so a glued year inside the hex is not a second verdict.
-_PACK_ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])pack_[0-9a-fA-F]{8,64}(?![A-Za-z0-9_])")
 # Strategy and source ids are designer-supplied names. A decimal in one is not a price.
 _ID_COLUMNS = frozenset({"strategy_id", "source_id"})
+# One identifier, judged the same way by both gates. A signed exponent inside a
+# name, or a name that starts with a digit. A bare price and free prose are not.
+_IDENTIFIER = re.compile(
+    r"(?i)(?:"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:[eE][+-](?:\d+(?:\.\d*)?|\.\d+))[A-Za-z0-9_]*"
+    r"|\d+[A-Za-z_][A-Za-z0-9_]*(?:[eE][+-](?:\d+(?:\.\d*)?|\.\d+))?[A-Za-z0-9_]*"
+    r")\Z"
+)
 _MONTH_IN_TOKEN = re.compile(rf"(?i)(?<![A-Za-z]){_MONTH}(?![A-Za-z])")
 _YEAR_IN_TOKEN = re.compile(r"(?:19|20)\d{2}")
 # Designer surfaces say RANDOM where a ticker was. The operator view keeps the ticker.
@@ -229,11 +236,6 @@ def normalize_surface(text: str) -> str:
     return unicodedata.normalize("NFKC", str(text)).translate(_DASH_TO_HYPHEN)
 
 
-def _as_stored_ids(text: str) -> str:
-    """Replace each ``pack_`` hex id with the letter id the designer tree stores."""
-    return _PACK_ID_IN_TEXT.sub(lambda match: designer_source_id(match.group(0)), text)
-
-
 def _hide_column(name: str, *, drop_prices: bool, allow_list: bool = False) -> bool:
     if allow_list:
         return not redacted_key_allowed(name)
@@ -247,55 +249,18 @@ def _consume_paths(text: str, replacement: str = " ") -> str:
     return _ABS_PATH.sub(replacement, text)
 
 
-def _casefold_index(text: str) -> tuple[str, list[int]]:
-    """Casefold ``text`` and remember which original character each fold came from.
-
-    The same index the report token rule uses. ``ß`` becomes ``ss`` and ``ﬁ``
-    becomes ``fi``, and a hit can be mapped back onto ``text``.
-    """
-    folded: list[str] = []
-    origins: list[int] = []
-    for index, char in enumerate(text):
-        piece = char.casefold()
-        folded.append(piece)
-        origins.extend([index] * len(piece))
-    return "".join(folded), origins
-
-
 def _ticker_spans(text: str, symbol: str) -> list[tuple[int, int]]:
-    """Original spans where ``symbol`` is its own token, matched on casefold.
+    """The same token match the publisher uses.
 
-    The boundary is a letter, not a digit: ``QQQ1`` matches ``QQQ`` and ``MA``
-    does not match inside ``max_drawdown``. Matching uses ``str.casefold``, so
-    ``ß`` matches ``SS`` and ``ﬁ`` matches ``FI``, including a fold that is
-    longer than the original character.
+    A symbol that contains a letter and is longer than one character uses a
+    letter boundary, so ``QQQ1`` matches ``QQQ``. A one-character symbol, and
+    a digits-only symbol, uses an alphanumeric boundary, so ``V`` does not
+    match ``v2`` and ``10`` does not match ``S00010``. Imported lazily: this
+    module does not import ``report.py`` at load time.
     """
-    if not text or not symbol:
-        return []
-    needle = symbol.casefold()
-    if not needle:
-        return []
-    folded, origins = _casefold_index(text)
-    spans: list[tuple[int, int]] = []
-    start = 0
-    limit = len(folded)
-    size = len(needle)
-    while start <= limit - size:
-        found = folded.find(needle, start)
-        if found < 0:
-            break
-        end = found + size
-        before = found == 0 or not folded[found - 1].isalpha()
-        after = end == limit or not folded[end].isalpha()
-        if not before or not after:
-            start = found + 1
-            continue
-        orig_start = origins[found]
-        orig_end = origins[end - 1] + 1
-        if orig_end > orig_start and (not spans or orig_start >= spans[-1][1]):
-            spans.append((orig_start, orig_end))
-        start = end
-    return spans
+    from ..report import ticker_token_spans
+
+    return ticker_token_spans(text, symbol)
 
 
 def _replace_ticker(text: str, symbol: str) -> str:
@@ -332,10 +297,12 @@ def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = No
     dotted abbreviations, a period with no space (``Jan.4, 2024``), ordinal
     days, ``YYYY-MM`` keys, and a bare year all count. ``2024.50``, ``0.2024``,
     and ``day 2024`` stay. ``today 2024`` does not. Session ids such as ``S01``
-    stay. A one-letter ticker is a ticker.
-    A digit glued to a ticker is still that ticker, and the ticker is shown as
-    ``RANDOM``. The operator view never calls this. Ticker matching uses
-    casefold, so ``ß`` and ``ﬁ`` count.
+    stay. A one-letter ticker is a ticker. A longer symbol that contains a
+    letter uses a letter boundary, so a digit does not glue and ``QQQ1`` is
+    shown as ``RANDOM1``. A one-character symbol, and a digits-only symbol,
+    uses an alphanumeric boundary, so ``V`` does not match ``v2`` and ``10``
+    does not match ``S00010``. The operator view never calls this. Ticker
+    matching uses casefold, so ``ß`` and ``ﬁ`` count.
     """
     text = value
     for pattern in _DATE_PATTERNS:
@@ -435,12 +402,25 @@ def _scrub_obj(
     if isinstance(value, str):
         if key == "source_id":
             value = designer_source_id(value)
+        if key in _ID_COLUMNS:
+            return _accepted_id(value, symbols, scale)
         return _scrub_string(value, symbols, scale)
     return value
 
 
 def _scrub_string(value: str, symbols: tuple[str, ...], scale: float | None) -> str:
     return designer_surface_text(value, symbols, scale=scale)
+
+
+def _accepted_id(value: str, symbols: tuple[str, ...], scale: float | None) -> str:
+    """A strategy or source id the publisher already accepted.
+
+    Tickers are still rewritten with the shared token match. The free-word
+    filter is not applied, so an id that starts with a digit stays visible.
+    A name and any other free text do not use this path.
+    """
+    text = normalize_surface(value)
+    return scrub_text(text, symbols, scale=scale).strip()
 
 
 def _is_period_map(value: dict) -> bool:
@@ -524,7 +504,10 @@ def _scrub_table(
             if original == "source_id" and isinstance(value, str):
                 value = designer_source_id(value)
             if isinstance(value, str):
-                value = _scrub_string(value, symbols, scale)
+                if original in _ID_COLUMNS:
+                    value = _accepted_id(value, symbols, scale)
+                else:
+                    value = _scrub_string(value, symbols, scale)
             cleaned[renamed] = value
         rows.append(cleaned)
     return _replace_table(table, [renamed for _, renamed in pairs], rows)
@@ -758,20 +741,6 @@ def _scale_in_token(token: str, scale: float | None) -> bool:
         whole = match.start() == 0 and match.end() == len(probed)
         if bare_integer and not whole:
             continue
-        # An unsigned integer exponent is an identifier only when the whole
-        # token is a pack_ hex id the designer tree stores as letters.
-        # ``note25e2`` is still the scale. A decimal significand (``7.777e3``)
-        # and a signed exponent still count.
-        parts = _scientific_parts(literal)
-        if (
-            parts is not None
-            and not whole
-            and "." not in parts[0]
-            and parts[1][:1] not in "+-"
-            and "." not in parts[1]
-            and designer_source_id(probed) != probed
-        ):
-            continue
         if _literal_is_scale(literal, number):
             return True
     return False
@@ -982,9 +951,8 @@ def peek_symbols(folder: Path) -> tuple[str, ...]:
     return tuple(ordered)
 
 
-def peek_scale(folder: Path) -> float | None:
-    """Invoice scale, if the operator metrics recorded one. Not for display."""
-    document = _read_json(folder / "metrics.json")
+def _scale_value(document) -> float | None:
+    """``cost_basis.share_scale``, or ``share_factor`` when the scale is absent."""
     if not isinstance(document, dict):
         return None
     basis = document.get("cost_basis")
@@ -998,6 +966,43 @@ def peek_scale(folder: Path) -> float | None:
     if not math.isfinite(number):
         return None
     return number
+
+
+def peek_scale(folder: Path) -> float | None:
+    """Invoice scale recorded on operator metrics. Not for display.
+
+    A single book uses ``folder/metrics.json``. A parallel batch has no file
+    there; the needle is ``share_scale`` on an operator job under ``jobs/``.
+    Opening ``designer/`` reads the sibling ``jobs/`` tree. The number is
+    never shown.
+    """
+    folder = Path(folder)
+    found = _scale_value(_read_json(folder / "metrics.json"))
+    if found is not None:
+        return found
+    roots: list[Path] = []
+    jobs = folder / "jobs"
+    if jobs.is_dir():
+        roots.append(jobs)
+    if folder.name == "designer":
+        parent_jobs = folder.parent / "jobs"
+        if parent_jobs.is_dir() and parent_jobs not in roots:
+            roots.append(parent_jobs)
+    for root in roots:
+        try:
+            strategies = sorted(path for path in root.iterdir() if path.is_dir())
+        except OSError:
+            continue
+        for strategy in strategies:
+            try:
+                sources = sorted(path for path in strategy.iterdir() if path.is_dir())
+            except OSError:
+                continue
+            for source in sources:
+                found = _scale_value(_read_json(source / "metrics.json"))
+                if found is not None:
+                    return found
+    return None
 
 
 def designer_tree(folder: Path) -> bool:
@@ -1145,16 +1150,83 @@ def _itxt_text(chunk: bytes) -> str:
     return "\n".join(pieces)
 
 
+def _is_identifier(text: str) -> bool:
+    """True when ``text`` is one strategy or source id, not free prose.
+
+    A signed exponent inside the name counts, and so does a name that starts
+    with a digit. A bare price does not.
+    """
+    token = text.strip()
+    if not token or any(char.isspace() for char in token):
+        return False
+    return _IDENTIFIER.fullmatch(token) is not None
+
+
+def _identifier_reason(text: str, scale: float | None) -> str | None:
+    """Why one identifier cannot be published, or None. Both gates call this.
+
+    The scale still fails. A year glued into the token is a date. The token
+    is not a withheld word and it is not a price.
+    """
+    if _GLUED_YEAR.search(text):
+        return "a date"
+    if _contains_scale(text, scale):
+        return "the scale"
+    return None
+
+
+def _identifier_in_value(value, scale: float | None) -> str | None:
+    """The shared identifier verdict for a JSON value, or None."""
+    if isinstance(value, dict):
+        for item in value.values():
+            reason = _identifier_in_value(item, scale)
+            if reason:
+                return reason
+        return None
+    if isinstance(value, list):
+        for item in value:
+            reason = _identifier_in_value(item, scale)
+            if reason:
+                return reason
+        return None
+    if isinstance(value, str) and _is_identifier(value):
+        return _identifier_reason(value.strip(), scale)
+    return None
+
+
+def _structured_identifier_reason(kind: str, payload, scale: float | None) -> str | None:
+    """The shared identifier verdict for a JSON document or a CSV table."""
+    if kind == "json":
+        return _identifier_in_value(payload, scale)
+    for row in payload:
+        for cell in row:
+            if _is_identifier(cell):
+                reason = _identifier_reason(cell.strip(), scale)
+                if reason:
+                    return reason
+    return None
+
+
 def scan_publication(text: str, *, symbols: tuple[str, ...] = (), scale: float | None = None) -> str | None:
     """None when ``text`` may be published. Otherwise ``the scale`` or ``a price``.
 
     The scale decision is the same token check as the screen. A price is a
     decimal literal in free text whose absolute value is at least 1.
     Allow-listed numeric cells are neither. A clock is neither. An exponent
-    inside a hex id is not a price. Tickers and dates are the other audit.
+    inside a hex id is not a price. An identifier uses the same predicate as
+    the export check. The text is read as stored: a raw id is not rewritten
+    before this look. Tickers and dates are the other audit.
     """
     del symbols
-    normalized = _as_stored_ids(normalize_surface(text))
+    normalized = normalize_surface(text)
+    structured = _structured_document(normalized)
+    if structured is None:
+        if _is_identifier(normalized):
+            return _identifier_reason(normalized, scale)
+    else:
+        reason = _structured_identifier_reason(structured[0], structured[1], scale)
+        if reason:
+            return reason
     if _publication_has_scale(normalized, scale):
         return "the scale"
     if _publication_has_price(normalized):
@@ -1345,10 +1417,11 @@ def export_block_reason(text: str, *, symbols: tuple[str, ...], scale: float | N
     """Why ``text`` cannot be exported, or None when it can.
 
     The reason names the file's problem for the status bar: a secret, a date,
-    a path, a ticker, the scale, or a price. Pack hex is read as the letter
-    id the designer tree stores. A strategy or source id is not a price.
+    a path, a ticker, the scale, or a price. The text is read as stored. A
+    raw id is not rewritten before this look. A strategy or source id is not
+    a price. An identifier uses the same predicate as the publication scan.
     """
-    text = _as_stored_ids(normalize_surface(text))
+    text = normalize_surface(text)
     structured = _structured_document(text)
     if structured is None:
         return _free_text_reason(text, symbols, scale)
@@ -1373,8 +1446,8 @@ def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) 
     The column key is the allow-list, not the display label. A strategy or
     source id is not a price. Free text, filenames, labels, and other string
     values still are. Text is NFKC-normalized, and unicode minus and dash
-    characters are ASCII ``-``, before that scan. A ``pack_`` hex id is read
-    as the letter id the designer tree stores.
+    characters are ASCII ``-``, before that scan. The text is read as stored.
+    A raw id is not rewritten before this look.
     """
     return export_block_reason(text, symbols=symbols, scale=scale) is None
 
@@ -1416,6 +1489,9 @@ def _free_text_reason(
     reason = _preamble_reason(text, symbols)
     if reason:
         return reason
+    token = text.strip()
+    if _is_identifier(token):
+        return _identifier_reason(token, scale)
     if _contains_scale(text, scale):
         return "the scale"
     if price and _free_text_has_price(text):

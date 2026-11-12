@@ -167,7 +167,7 @@ def test_source_id_mapping_is_letters_and_leaves_other_ids_alone():
 
 
 def test_forty_thousand_hex_ids_are_not_false_scales():
-    """Embedded unsigned exponents are not the scale, and a huge exponent does not crash."""
+    """The stored letter id is not a scale. A raw id whose value is the scale still is."""
     rng = random.Random(20261111)
     pinned = (
         "pack_25e2abcdef",
@@ -182,15 +182,16 @@ def test_forty_thousand_hex_ids_are_not_false_scales():
     ids = list(pinned)
     ids.extend("pack_" + "".join(rng.choice("0123456789abcdef") for _ in range(12)) for _ in range(40_000))
     for ident in ids:
-        payload = json.dumps({"source_id": ident})
+        stored = designer_source_id(ident)
+        payload = json.dumps({"source_id": stored})
         for scale in _SCALES:
-            assert scan_publication(payload, scale=scale) is None, (ident, scale)
-            assert scan_publication(ident, scale=scale) is None, (ident, scale)
+            assert scan_publication(payload, scale=scale) is None, (ident, stored, scale)
+            assert scan_publication(stored, scale=scale) is None, (ident, stored, scale)
     for scale in (*_SCALES, 1e-7, 7.777):
         assert _literal_is_scale("4738e304", scale) is False
         assert scan_publication("4738e304", scale=scale) is None
     assert _literal_is_scale("2e2", 2) is True
     assert _literal_is_scale("7.777e3", 7.777) is True
     assert _scale_in_token("build2_7.777e3", 7.777) is True
-    assert _scale_in_token("pack_2e2abcdef0", 2) is False
+    assert _scale_in_token("pack_2e2abcdef0", 2) is True
     assert _scale_in_token("pack_185e2abcdef", 2) is False

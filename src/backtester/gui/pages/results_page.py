@@ -160,6 +160,7 @@ class ResultsPage(QWidget):
         self.jobs = DictTable()
         self.jobs.setObjectName("jobsTable")
         self.jobs.setMinimumHeight(72)
+        self.jobs.doubleClicked.connect(self._open_job)
         self.leaderboard_title = Section("Leaderboard")
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filter the leaderboard")
@@ -699,14 +700,52 @@ class ResultsPage(QWidget):
         self.period_title.setVisible(visible)
         self.periods.setVisible(visible)
 
+    def _job_designer_dir(self, report: RunReport, child: dict) -> str:
+        """Published designer directory for one batch row. Not shown in the table."""
+        strategy = str(child.get("strategy_id") or "").strip()
+        source = str(child.get("source_id") or "").strip()
+        root = Path(report.directory) if report.directory else None
+        if report.audience == "designer" and root is not None and strategy and source:
+            candidate = root / strategy / source
+            if candidate.is_dir():
+                return str(candidate)
+        raw = child.get("path")
+        if isinstance(raw, str) and raw:
+            nested = Path(raw) / "designer"
+            if nested.is_dir():
+                return str(nested)
+        if root is not None and strategy and source:
+            published = root / "designer" / strategy / source
+            if published.is_dir():
+                return str(published)
+            direct = root / strategy / source
+            if direct.is_dir():
+                return str(direct)
+        return ""
+
+    def _open_job(self, index) -> None:
+        """Double-click loads that row's designer directory."""
+        row = self.jobs.source_row(index)
+        records = self.jobs.raw_rows()
+        if not 0 <= row < len(records):
+            return
+        target = records[row].get("designer")
+        if not target or not Path(target).is_dir():
+            return
+        audience = self._report.audience if self._report is not None else None
+        self.load_path(str(target), audience=audience)
+
     def _fill_jobs(self, report: RunReport) -> None:
         rows = []
         for child in report.children:
+            if not isinstance(child, dict):
+                continue
             rows.append(
                 {
                     "job": child.get("name"),
                     "state": child.get("state"),
                     "error": child.get("error"),
+                    "designer": self._job_designer_dir(report, child),
                 }
             )
         self.jobs.set_records(("job", "state", "error"), rows, {"job": "Job", "state": "State", "error": "Error"})

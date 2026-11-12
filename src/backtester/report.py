@@ -357,12 +357,14 @@ def ticker_token_spans(text: str, symbol: str) -> list[tuple[int, int]]:
     """Original spans where ``symbol`` is its own token in ``text``.
 
     Matching uses ``str.casefold`` on both sides, then maps the hit back onto
-    ``text``. A one-character symbol uses the same non-alphanumeric boundary
-    as a longer one, so ``V`` matches ``my_V_v2`` and does not match ``avg``
-    or ``equity``. ``ß`` matches ``SS`` and ``ﬁ`` matches ``FI``. A character
-    is a boundary when it is not alphanumeric, which is the same rule as
-    ``[A-Za-z0-9]`` for ASCII. This is the only token match. Report scrubbing,
-    the designer audit, and the pack scan all call it.
+    ``text``. A symbol that contains a letter and is longer than one character
+    uses a letter boundary, so a digit does not glue: ``QQQ1``,
+    ``QQQ2momentum``, and ``1QQQ`` all match ``QQQ``. A one-character symbol,
+    and a symbol that is only digits, keeps an alphanumeric boundary, so ``V``
+    matches ``my_V_v2`` and does not match ``v2``, ``2`` does not match
+    ``S00002``, and ``10`` does not match ``S00010``. ``ß`` matches ``SS`` and
+    ``ﬁ`` matches ``FI``. This is the only token match. Report scrubbing, the
+    designer audit, and the screen all call it.
     """
     if not text or not symbol:
         return []
@@ -374,13 +376,18 @@ def ticker_token_spans(text: str, symbol: str) -> list[tuple[int, int]]:
     start = 0
     limit = len(folded)
     size = len(needle)
+    letters = len(symbol) > 1 and any(char.isalpha() for char in symbol)
+
+    def _glued(char: str) -> bool:
+        return char.isalpha() if letters else char.isalnum()
+
     while start <= limit - size:
         found = folded.find(needle, start)
         if found < 0:
             break
         end = found + size
-        before = found == 0 or not folded[found - 1].isalnum()
-        after = end == limit or not folded[end].isalnum()
+        before = found == 0 or not _glued(folded[found - 1])
+        after = end == limit or not _glued(folded[end])
         if not before or not after:
             start = found + 1
             continue
