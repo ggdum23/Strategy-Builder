@@ -235,9 +235,10 @@ def test_frozen_sandbox_child_is_this_executable_on_linux(monkeypatch):
         "--sandbox-child",
     ]
     monkeypatch.setattr(sandbox.sys, "frozen", False, raising=False)
-    source = sandbox._interpreter_command(Path("/tmp/work/sandbox_child.py"), child=True)
+    script = Path("/tmp/work/sandbox_child.py")
+    source = sandbox._interpreter_command(script, child=True)
     assert source[1:4] == ["-I", "-S", "-B"]
-    assert source[-1] == "/tmp/work/sandbox_child.py"
+    assert source[-1] == str(script)
     assert "--sandbox-child" not in source
 
     ran = []

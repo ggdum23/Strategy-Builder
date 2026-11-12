@@ -358,16 +358,21 @@ visible. The timer now fails only the slow test.
 - `tests/test_designer_jail.py::test_absolute_read_arm_memory_and_network_stay_in_the_jail`
 - `tests/test_reserved.py::test_a_passing_symbol_publishes_canonical_benchmark_names`
 - `tests/test_parallel.py::test_a_hang_times_out_without_stopping_the_other_strategy`
+- `tests/test_parallel.py::test_schema_token_tickers_publish_and_register`
+  On `b9abba5` this file-backed pack exceeded 60s on Python 3.11, 3.12, and
+  3.13. The other parallel tests in that run finished. The Windows matrix
+  was then cancelled at the 25-minute job cap while pytest was printing the
+  summary, so this was the only timeout recorded.
 
 H7, numpy on Windows, not marked. On `844626d` the child aborted with
 `OSError: [WinError 87] The parameter is incorrect: 'pydeps\00\numpy.libs'`
 because `add_dll_directory` was given the junction. `20359e2` does not link
 `*.libs` into the slot and calls `add_dll_directory` on the real directory.
-On `aa90226` the Windows jailed-examples job in push run 43129181253 passed
+On `aa90226` and again on `b9abba5` the Windows jailed-examples job passed
 all 40 (D01–D20, arena and desk), including the numpy strategies. Those
 examples stay strict on both runners. Ubuntu matches them jailed against
 in-process, with `/etc/ld.so.cache` bound and the parent's import order on
-`sys.path`.
+`sys.path`. The frozen installer smoke on `b9abba5` (run 43131711177) completed.
 
 ### What the child is not given
 

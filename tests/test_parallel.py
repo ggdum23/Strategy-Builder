@@ -1478,6 +1478,7 @@ def _registered(index: Path, run_id: str, out: Path) -> None:
     assert Path(index_doc["runs"][run_id]["path"]) == out.resolve()
 
 
+@OWNER_PC
 def test_schema_token_tickers_publish_and_register(tmp_path):
     """Headers such as borrow_cost are not the ticker COST."""
     from backtester.report import read_leaderboard
