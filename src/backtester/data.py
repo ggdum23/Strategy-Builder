@@ -17,6 +17,7 @@ or two phases. A partial tail is kept and marked ``partial``.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections import Counter
@@ -302,6 +303,15 @@ def _as_utc_stamp(value) -> datetime:
     if stamp.tzinfo is None:
         raise ValueError(f"timestamp_et {value!r} has no offset")
     return stamp
+
+
+def dividend_file_sha256(path) -> str:
+    """SHA-256 of the dividend file bytes. This is not a pack or designer field."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_dividends(path) -> dict[str, float]:

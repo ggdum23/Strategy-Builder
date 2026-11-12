@@ -9,7 +9,7 @@ import signal
 import sys
 from pathlib import Path
 
-from .data import load_dividends, load_named
+from .data import dividend_file_sha256, load_dividends, load_named
 from .profiles import ARENA, DESK
 from .registry import (
     entry_from_inspection,
@@ -203,6 +203,12 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _dividend_sha(path) -> str | None:
+    if not path:
+        return None
+    return dividend_file_sha256(path)
+
+
 def _dividends(path):
     if path is None:
         return None
@@ -282,6 +288,7 @@ def _cmd_run(args) -> int:
             symbol=payload.get("symbol"),
             anonymized=bool((payload.get("run") or {}).get("anonymized")),
             accounting=payload.get("accounting"),
+            dividend_file_sha256=_dividend_sha(args.dividends),
         )
         return 0
     if not args.src or not args.ticker:
@@ -314,6 +321,7 @@ def _cmd_run(args) -> int:
         profile=payload.get("profile") or args.profile,
         symbol=payload.get("symbol"),
         accounting=payload.get("accounting"),
+        dividend_file_sha256=_dividend_sha(args.dividends),
     )
     return 0
 
@@ -422,6 +430,7 @@ def _cmd_walk(args) -> int:
             symbol=summary.get("symbol"),
             anonymized=(Path(args.out) / "cost_comparison.json").is_file(),
             accounting=summary.get("accounting"),
+            dividend_file_sha256=_dividend_sha(args.dividends),
         )
         return 0
     if not args.src or not args.ticker:
@@ -463,6 +472,7 @@ def _cmd_walk(args) -> int:
         profile=args.profile,
         symbol=args.ticker,
         accounting=summary.get("accounting"),
+        dividend_file_sha256=_dividend_sha(args.dividends),
     )
     return 0
 
@@ -579,6 +589,7 @@ def _remember(
     symbol: str | None = None,
     anonymized: bool = False,
     accounting: dict | None = None,
+    dividend_file_sha256: str | None = None,
 ) -> str:
     from .report import register_run
 
@@ -596,6 +607,8 @@ def _remember(
         document["accounting"] = accounting
         for key, value in accounting.items():
             document.setdefault(key, value)
+    if dividend_file_sha256:
+        document["dividend_file_sha256"] = dividend_file_sha256
     write_json(Path(out) / "run.json", document)
     register_run(Path.cwd() / ".backtester-runs.json", run_id, out, kind=kind, profile=profile)
     print(f"run {run_id}")
@@ -659,6 +672,7 @@ def _cmd_parallel(args) -> int:
             financing_rate_annual=args.financing_rate,
             fee_mult=args.fee_mult,
             dividends=_dividends(args.dividends),
+            dividend_file_sha256=_dividend_sha(args.dividends),
             warmup_sessions=args.warmup_sessions,
             initial_equity=args.initial_equity,
             with_benchmarks=not args.no_benchmarks,

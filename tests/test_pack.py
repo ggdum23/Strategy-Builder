@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import hmac
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from backtester import runner as runner_mod
 from backtester.__main__ import main
 from backtester.data import load_named
 from backtester.pack import (
     CHUNK_SESSIONS,
     MAX_FILE_BYTES,
+    _factor_mac_message,
+    canonical_price_factor,
     _gzip_csv,
     _pack_id,
     _read_csv_gz,
@@ -24,7 +28,8 @@ from backtester.pack import (
     load_sidecar,
     require_build_price_factor,
 )
-from backtester.runner import run_pack
+from backtester.parallel import PackMarket, _prepare_pack
+from backtester.runner import run_pack, walk_pack
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 
 ET = timezone(timedelta(hours=-4))
@@ -241,8 +246,8 @@ def test_manifest_or_sidecar_tamper_is_refused(tmp_path):
     del legacy["factor_key"]
     del legacy["factor_mac"]
     named_side.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
-    loaded = load_sidecar(named_side)
-    assert require_build_price_factor(loaded) == 1.0
+    with pytest.raises(ValueError, match="rebuild the pack"):
+        load_sidecar(named_side)
     named = load_pack(named_pack)
     assert named.anonymized is False
     assert str(named.frame["session_id"].iloc[0]).startswith("2024-")
@@ -333,6 +338,200 @@ def test_calendar_session_id_requires_a_named_pack(tmp_path):
     _retouch(pack, _date)
     with pytest.raises(ValueError, match="anonymized flag must be false"):
         load_pack(pack)
+
+
+def test_fullwidth_digit_session_id_is_refused_for_both_flags(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    wide = "2024-03-\uff10\uff11"
+
+    def _wide(frame):
+        frame["session_id"] = wide
+
+    _retouch(pack, _wide)
+    with pytest.raises(ValueError, match="not an anonymized session id"):
+        load_pack(pack)
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    manifest["anonymized"] = False
+    manifest["asset_name"] = "NIK"
+    _write_json(pack / "manifest.json", manifest)
+    with pytest.raises(ValueError, match="not a calendar date"):
+        load_pack(pack)
+
+
+def test_tampered_borrow_rate_is_refused(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    secret = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert require_build_price_factor(secret) == pytest.approx(1.7)
+    assert secret["borrow_rate_annual"] != 0.5
+    null_borrow = dict(secret)
+    null_borrow["borrow_rate_annual"] = None
+    assert b'"borrow_rate_annual":null' in _factor_mac_message(null_borrow)
+    secret["borrow_rate_source"] = "explicit"
+    secret["borrow_rate_annual"] = 0.5
+    _write_json(sidecar, secret)
+    with pytest.raises(ValueError, match="factor_mac"):
+        load_sidecar(sidecar)
+    with pytest.raises(ValueError, match="factor_mac"):
+        run_pack(_Quiet, pack, sidecar, "arena", tmp_path / "out", with_benchmarks=False)
+
+
+def test_stripped_named_sidecar_cannot_book_a_tampered_borrow(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=False, registry_path=registry, profile="arena",
+    )
+    secret = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert require_build_price_factor(secret) == 1.0
+    secret["borrow_rate_source"] = "explicit"
+    secret["borrow_rate_annual"] = 0.5
+    del secret["factor_key"]
+    del secret["factor_mac"]
+    _write_json(sidecar, secret)
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="rebuild the pack"):
+        run_pack(_Quiet, pack, sidecar, "arena", out, with_benchmarks=False)
+    assert not (out / "metrics.json").exists()
+    with pytest.raises(ValueError, match="rebuild the pack"):
+        walk_pack(_Quiet, pack, sidecar, "arena", tmp_path / "walk", with_benchmarks=False)
+    assert not (tmp_path / "walk" / "metrics.json").exists()
+    with pytest.raises(ValueError, match="rebuild the pack"):
+        _prepare_pack(
+            PackMarket(str(pack), str(sidecar)),
+            None,
+            None,
+            runner_mod,
+            price_basis="raw",
+        )
+
+
+def test_dated_downgrade_without_a_mac_does_not_run(tmp_path):
+    src, registry = _series(tmp_path, 2)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    secret = json.loads(sidecar.read_text(encoding="utf-8"))
+    date_map = secret["date_map"]
+
+    def _dates(frame):
+        frame["session_id"] = [date_map[str(int(day))] for day in frame["day"]]
+
+    pack_id = _retouch(pack, _dates)
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    manifest["anonymized"] = False
+    manifest["asset_name"] = "NIK"
+    _write_json(pack / "manifest.json", manifest)
+    loaded = load_pack(pack)
+    assert loaded.anonymized is False
+    assert str(loaded.frame["session_id"].iloc[0]).startswith("2024-")
+    secret["anonymized"] = False
+    secret["pack_id"] = pack_id
+    secret["price_factor"] = 1
+    secret["volume_factor"] = 1
+    secret["share_scale"] = 1
+    secret["borrow_rate_source"] = "explicit"
+    secret["borrow_rate_annual"] = 0.5
+    del secret["factor_key"]
+    del secret["factor_mac"]
+    _write_json(sidecar, secret)
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="rebuild the pack"):
+        run_pack(_Quiet, pack, sidecar, "arena", out, with_benchmarks=False)
+    assert not (out / "metrics.json").exists()
+    with pytest.raises(ValueError, match="rebuild the pack"):
+        walk_pack(_Quiet, pack, sidecar, "arena", tmp_path / "walk", with_benchmarks=False)
+    with pytest.raises(ValueError, match="rebuild the pack"):
+        _prepare_pack(
+            PackMarket(str(pack), str(sidecar)),
+            None,
+            None,
+            runner_mod,
+            price_basis="raw",
+        )
+
+
+def test_version_1_mac_is_refused(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    secret = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert require_build_price_factor(secret) == pytest.approx(1.7)
+    date_map = {key: secret["date_map"][key] for key in sorted(secret["date_map"])}
+    version_one = {
+        "v": 1,
+        "pack_id": secret["pack_id"],
+        "anonymized": secret["anonymized"],
+        "date_map": date_map,
+        "price_factor": canonical_price_factor(secret["price_factor"]),
+        "share_scale": canonical_price_factor(secret["share_scale"]),
+    }
+    message = json.dumps(version_one, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    secret["factor_mac"] = hmac.new(bytes.fromhex(secret["factor_key"]), message, hashlib.sha256).hexdigest()
+    _write_json(sidecar, secret)
+    with pytest.raises(ValueError, match="does not match"):
+        load_sidecar(sidecar)
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="does not match"):
+        run_pack(_Quiet, pack, sidecar, "arena", out, with_benchmarks=False)
+    assert not (out / "metrics.json").exists()
+
+
+def test_unicode_digit_dates_fail_the_anonymized_leak_scan(tmp_path):
+    src, registry = _series(tmp_path, 1)
+    pack = tmp_path / "pack"
+    build_pack(
+        src, "NIK", pack, tmp_path / "side.json",
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    leaks = (
+        "2024-03-\uff10\uff11",
+        "2024-03-\u0660\u0661",
+        "2024-03-\u0966\u0967",
+        "2024-03-\u2070\u00b9",
+        "\uff12\uff10\uff12\uff14",
+    )
+    note = pack / "note.txt"
+    for leak in leaks:
+        note.write_text(leak + "\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="calendar date"):
+            assert_anonymized_pack_clean(pack, symbol="NIK")
+    note.write_text("price 2024.50\n", encoding="utf-8")
+    assert_anonymized_pack_clean(pack, symbol="NIK")
+    note.unlink()
+    target = pack / "bars_part_001.csv.gz"
+    original = target.read_bytes()
+    payload = gzip.decompress(original) + "\n2024-03-\uff10\uff11\n".encode("utf-8")
+    target.write_bytes(_recompress(payload))
+    with pytest.raises(ValueError, match="calendar date"):
+        assert_anonymized_pack_clean(pack, symbol="NIK")
+    target.write_bytes(original)
+    assert_anonymized_pack_clean(pack, symbol="NIK")
 
 
 def test_mac_binds_pack_id_date_map_and_share_scale(tmp_path):
@@ -525,6 +724,51 @@ def test_pack_cli_does_not_print_the_scale_factor(tmp_path, capsys):
     assert "cost basis" in report
     assert "share_scale=0.25" in report
     assert "desk" in report
+
+
+def test_dividend_file_sha256_is_recorded_only_on_the_operator_manifest(tmp_path):
+    src, registry = _series(tmp_path, 2)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "side.json"
+    build_pack(
+        src, "NIK", pack, sidecar,
+        anonymize=True, registry_path=registry, profile="arena",
+        price_factor=1.7, volume_factor=0.42,
+    )
+    secret = json.loads(sidecar.read_text(encoding="utf-8"))
+    day = secret["date_map"][max(secret["date_map"], key=int)]
+    dividends = tmp_path / "dividends.csv"
+    dividends.write_bytes(f"session,amount\n{day},1.25\n".encode())
+    expected = hashlib.sha256(dividends.read_bytes()).hexdigest()
+    hold = Path(__file__).resolve().parents[1] / "examples" / "desk" / "buy_and_hold.py"
+    out = tmp_path / "run"
+    code = main(
+        [
+            "run", "--profile", "desk", "--strategy", str(hold),
+            "--pack", str(pack), "--sidecar", str(sidecar),
+            "--out", str(out), "--dividends", str(dividends),
+        ]
+    )
+    assert code == 0
+    document = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert document["dividend_file_sha256"] == expected
+    designer = out / "designer"
+    assert designer.is_dir()
+    for path in designer.rglob("*"):
+        if path.is_file():
+            assert path.name != "run.json"
+            assert expected.encode() not in path.read_bytes()
+    bare = tmp_path / "bare"
+    code = main(
+        [
+            "run", "--profile", "desk", "--strategy", str(hold),
+            "--pack", str(pack), "--sidecar", str(sidecar),
+            "--out", str(bare),
+        ]
+    )
+    assert code == 0
+    bare_doc = json.loads((bare / "run.json").read_text(encoding="utf-8"))
+    assert "dividend_file_sha256" not in bare_doc
 
 
 def test_total_return_is_recorded_by_refusing_the_pack(tmp_path):
