@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from backtester.gui.backend import load_run
-from backtester.gui.jobs import process_entry
+from backtester.gui.jobs import JobFailure, failure_message, process_entry
 
 
 def _job(root, strategy_id: str, *, metrics: bool, error: str | None = None) -> None:
@@ -122,3 +122,6 @@ def test_process_entry_records_base_exception(tmp_path, monkeypatch):
     gone = json.loads(exited.read_text(encoding="utf-8"))
     assert gone["state"] == "error"
     assert gone["failure"]["type"] == "SystemExit"
+    failure = JobFailure.from_dict(gone["failure"])
+    assert failure is not None
+    assert failure_message(failure) == "SystemExit: 3"

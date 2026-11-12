@@ -286,6 +286,10 @@ class DictModel(QAbstractTableModel):
             if self._tokens[source][key][0] == 1:
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.ToolTipRole:
+            record = self.rows[source]
+            extra = record.get(f"{key}_detail")
+            if isinstance(extra, str) and extra.strip():
+                return extra
             return self._cache[source][key]
         return None
 
