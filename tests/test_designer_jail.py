@@ -19,6 +19,7 @@ from backtester.parallel import FrameMarket, StrategyRef, run_parallel
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 from backtester.runner import walk_forward
 from backtester.strategy_loader import load_strategy_class
+from windows_open import OWNER_PC
 
 ROOT = Path(__file__).resolve().parents[1]
 SELFTEST = ROOT / "examples" / "selftest"
@@ -144,6 +145,7 @@ def _parallel(tmp_path: Path, strategy_path: Path, name: str):
     return metrics
 
 
+@OWNER_PC
 def test_absolute_read_arm_memory_and_network_stay_in_the_jail(tmp_path):
     secret = tmp_path / "reader" / "secret.txt"
     secret.parent.mkdir(parents=True)

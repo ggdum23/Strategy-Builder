@@ -242,7 +242,8 @@ The backend name is `job+appcontainer`.
   directory once, traverse-only on the directories between those and the
   volume root. The volume root itself is not edited. Later launches see a
   marker and do not walk that tree again. Each launch grants the private
-  temp directory only. There is no per-launch recursive deny: the container
+  temp directory only. An `icacls` invocation that does not return in 45
+  seconds fails the launch. There is no per-launch recursive deny: the container
   token is not the user, so a directory that was not granted is not readable.
   A child whose token is not an AppContainer, or whose token has a
   capability, is not resumed. Loopback exemptions for this profile are
@@ -310,6 +311,54 @@ namespace, so the network block is the seccomp filter alone. `/proc` is not
 in the allow-list. A raw `clone3` task on this backend is not reaped by a
 pid namespace; bubblewrap is the stronger backend and is the one CI installs.
 If landlock cannot be applied either, the launch is refused.
+
+### Open Windows items
+
+These are the Windows-only cases left for a live check on the owner PC.
+Linux runs the same assertions and does not take the `xfail`. The mark is
+`xfail(strict=False, reason="verify live on owner Windows PC")`. A pass on
+Windows is an xpass. The Windows CI job stops at 25 minutes, and each test
+stops at 60 seconds (`pytest-timeout`, thread method), so a hang cannot
+hold the job for hours.
+
+H3, network. AppContainer drops loopback in the receive layer, so `connect`
+to a listening loopback server waits until the socket times out unless a
+WFP connect-layer filter for the package SID is installed. `netsh` rejects
+`package=` on the CI image. Firewall rules do not cover `127.0.0.1`. The
+probe still requires access denied (`EPERM`, `EACCES`, or `10013`) on both
+the listener and `1.1.1.1:443`. A refused or timed-out connect is not a
+block. The installer smoke on `642f31f` (run 43125742983) saw that access
+error from the frozen app. The unit probe has not been observed after that
+filter, because the child died in import first (see H7).
+
+- `tests/test_referee.py::test_selftest_probes_are_blocked[net.py-0.0]`
+- `tests/test_designer_jail.py::test_absolute_read_arm_memory_and_network_stay_in_the_jail`
+  (the network leg is this probe; the same test is also H5)
+
+H5, time. On `0852f71` the Windows Test step took 2h 40m and 3h 15m.
+Per-launch `icacls /T` was the cost, and `icacls` on
+`C:\hostedtoolcache\windows` did not return (session start died at 180s).
+Grants are once per machine now, and traverse uses the ACL API instead of
+`icacls`. The sleep disqualification was 13.1s against an 8s wall-clock
+bound while that grant ran inside the call. The parallel leg of the
+designer-jail test hit 60s. The reserved benchmark publish uses a 90s
+worker budget. The fast strategy in the hang test also came back as a
+timeout when startup was slower than its 6s budget. None of these have
+been re-measured on a finished Windows run since the grant change.
+
+- `tests/test_referee.py::test_sleep_and_lookahead_are_disqualified_within_eight_seconds`
+- `tests/test_designer_jail.py::test_absolute_read_arm_memory_and_network_stay_in_the_jail`
+- `tests/test_reserved.py::test_a_passing_symbol_publishes_canonical_benchmark_names`
+- `tests/test_parallel.py::test_a_hang_times_out_without_stopping_the_other_strategy`
+
+H7, numpy on Windows, not marked. On `844626d` the child aborted with
+`OSError: [WinError 87] The parameter is incorrect: 'pydeps\00\numpy.libs'`
+because `add_dll_directory` was given the junction. `20359e2` does not link
+`*.libs` into the slot and calls `add_dll_directory` on the real directory.
+That has not been observed on Windows. The jailed D05, D06, D09, and D11
+examples stay strict on both runners. Ubuntu already matches those examples
+jailed against in-process, including numpy, with `/etc/ld.so.cache` bound
+and the parent's import order on `sys.path`.
 
 ### What the child is not given
 

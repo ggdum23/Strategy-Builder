@@ -779,7 +779,13 @@ def _cmd_test() -> int:
     root = _repo_root()
     # The October-sample jail comparison is its own CI job. Running it inside
     # every matrix cell walks 20 strategies twice through the pipe.
-    return int(pytest.main(["-q", "-m", "not jailed_sample", str(root / "tests")]))
+    args = ["-q", "-m", "not jailed_sample"]
+    if sys.platform == "win32":
+        # A hung AppContainer grant or a pipe that never returns used to hold
+        # the Windows job for hours. Sixty seconds is the per-test cap there.
+        args.extend(["--timeout=60", "--timeout-method=thread"])
+    args.append(str(root / "tests"))
+    return int(pytest.main(args))
 
 
 def main(argv=None) -> int:

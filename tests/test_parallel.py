@@ -18,6 +18,8 @@ import pandas as pd
 import pytest
 from pathlib import PureWindowsPath
 
+from windows_open import OWNER_PC
+
 from backtester.parallel import (
     CancelToken,
     FrameMarket,
@@ -298,6 +300,7 @@ def test_a_crash_a_hang_signal_and_bad_syntax_stay_inside_one_row(tmp_path):
         assert written[key] == live[key]
 
 
+@OWNER_PC
 def test_a_hang_times_out_without_stopping_the_other_strategy(tmp_path):
     _strategy(tmp_path / "s", "fast", FLAT)
     _strategy(

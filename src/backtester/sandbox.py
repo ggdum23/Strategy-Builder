@@ -1528,7 +1528,7 @@ def _icacls() -> str:
 
 def _icacls_run(args: list[str]) -> None:
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=180, check=False)
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=45, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SandboxError(f"icacls did not finish: {exc}") from exc
     if proc.returncode != 0:

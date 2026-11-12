@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "pytest-timeout>=2.2"]
 
 [project.scripts]
 backtester = "backtester.__main__:main"
