@@ -29,6 +29,7 @@ from backtester.sandbox import (
     stage_unreachable_runtimes,
     translate_staged_path,
     _firewall_block_command,
+    firewall_block_is_current,
 )
 
 ENV = {
@@ -516,6 +517,22 @@ def test_a_grant_refusal_fails_each_test_and_does_not_abort(monkeypatch):
             suite.pytest_runtest_setup(object())
     finally:
         suite._PROFILE_ERROR = None
+
+
+def test_a_recorded_firewall_block_is_not_run_again_for_a_copy_refresh():
+    sid = "S-1-15-2-1"
+    assert firewall_block_is_current(
+        {"firewall_blocked": True, "loopback_cleared": True, "sid": sid},
+        sid,
+    )
+    assert not firewall_block_is_current(
+        {"firewall_blocked": False, "loopback_cleared": True, "sid": sid},
+        sid,
+    )
+    assert not firewall_block_is_current(
+        {"firewall_blocked": True, "loopback_cleared": True, "sid": "S-1-15-2-2"},
+        sid,
+    )
 
 
 def test_the_firewall_command_does_not_format_the_rule_object():

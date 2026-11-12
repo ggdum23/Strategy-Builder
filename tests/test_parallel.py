@@ -615,17 +615,26 @@ def test_the_phase_log_sits_beside_the_jail_directory(tmp_path):
     assert work not in path.parents
 
 
+_WIN_PAIR_MARGIN = 512 * 1024 * 1024
+_WIN_HOG_BYTES = 640 * 1024 * 1024
+
+
 def _memory_cap(baseline: int, linux_margin: int) -> int:
     """Cap above one process. On Windows, above the worker plus the jail.
 
-    The poll sums those working sets. On the GitHub runner the pair sits
-    anywhere from about 96 MiB to just over 192 MiB above one process, so
-    a flat strategy was stopped before the hog's allocation showed up.
-    224 MiB is above that pair and below the pair plus the hog's extra
-    allocation (160 MiB or 192 MiB). Linux keeps the tighter margin.
+    The poll sums those working sets. On the GitHub runner that pair has
+    been anywhere from about 96 MiB to about 240 MiB above one process, so
+    a fixed gap smaller than the pair stopped the flat strategy. 512 MiB
+    is above that pair. The hog allocates more than 512 MiB on Windows, so
+    it still crosses the cap whatever the pair was. Linux keeps the tighter
+    margin and the smaller allocation.
     """
-    margin = 224 * 1024 * 1024 if sys.platform == "win32" else linux_margin
+    margin = _WIN_PAIR_MARGIN if sys.platform == "win32" else linux_margin
     return baseline + margin
+
+
+def _hog_bytes(linux_bytes: int) -> int:
+    return _WIN_HOG_BYTES if sys.platform == "win32" else linux_bytes
 
 
 @windows_jails(1)
@@ -851,7 +860,7 @@ def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
     baseline = int(probe.stdout.strip())
     cap = _memory_cap(baseline, 128 * 1024 * 1024)
     memory_marker = tmp_path / "memory.json"
-    _strategy(tmp_path / "memory", "hog", _sleeper_strategy(memory_marker, allocate=192 * 1024 * 1024))
+    _strategy(tmp_path / "memory", "hog", _sleeper_strategy(memory_marker, allocate=_hog_bytes(192 * 1024 * 1024)))
     _strategy(tmp_path / "memory", "good", FLAT)
     try:
         remembered = run_parallel(
@@ -863,6 +872,7 @@ def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
             timeout_s=runner_timeout(2, 40),
             memory_bytes=cap,
             with_benchmarks=False,
+            call_timeout=45.0 if sys.platform == "win32" else None,
         )
         by_id = {item.strategy_id: item for item in remembered.results}
         detail = [(item.strategy_id, item.status, item.error) for item in remembered.results]
@@ -1272,7 +1282,7 @@ def test_rss_poll_kills_without_a_memory_error(tmp_path):
         "class Strategy:\n"
         "    def on_bar(self, bar, state):\n"
         "        blobs = []\n"
-        "        remaining = 160 * 1024 * 1024\n"
+        f"        remaining = {_hog_bytes(160 * 1024 * 1024)}\n"
         "        while remaining > 0:\n"
         "            chunk = bytearray(min(remaining, 8 * 1024 * 1024))\n"
         "            for index in range(0, len(chunk), 4096):\n"
@@ -1292,6 +1302,7 @@ def test_rss_poll_kills_without_a_memory_error(tmp_path):
         workers=2,
         timeout_s=runner_timeout(2, 30),
         memory_bytes=cap,
+        call_timeout=45.0 if sys.platform == "win32" else None,
         with_benchmarks=False,
     )
     by_id = {item.strategy_id: item for item in result.results}

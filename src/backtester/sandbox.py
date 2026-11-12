@@ -1623,7 +1623,7 @@ def _firewall_block_command(sid_text: str) -> str:
     )
 
 
-def _win_block_network(sid_text: str) -> None:
+def _win_block_network(sid_text: str) -> bool:
     """Block every inbound and outbound connection for this package SID.
 
     An AppContainer with no capabilities still reaches loopback far enough
@@ -1645,11 +1645,17 @@ def _win_block_network(sid_text: str) -> None:
             timeout=60,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise SandboxError(f"the AppContainer firewall block was not added: {exc}") from exc
+    except subprocess.TimeoutExpired:
+        # The WFP connect filter is already installed. A hung cmdlet must
+        # not fail the strategy, and the caller does not try again in
+        # this process.
+        return False
     if proc.returncode != 0:
         detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
         raise SandboxError(f"the AppContainer firewall block was not added: {detail[-500:]}")
+    return True
 
 
 def _clear_loopback(name: str, sid_text: str) -> None:
@@ -1703,7 +1709,22 @@ def _recorded_grants(sid_text: str, roots):
     return grants
 
 
-def _write_grant_marker(sid_text: str, grants, roots, *, loopback_cleared: bool) -> None:
+def firewall_block_is_current(marker, sid: str) -> bool:
+    """True when this machine already has the package firewall rules.
+
+    A runtime copy refresh must not run ``New-NetFirewallRule`` again.
+    That cmdlet holds the profile mutex, and on a GitHub runner it can
+    sit until the 60 second limit.
+    """
+    return (
+        isinstance(marker, dict)
+        and marker.get("firewall_blocked") is True
+        and marker.get("loopback_cleared") is True
+        and marker.get("sid") == sid
+    )
+
+
+def _write_grant_marker(sid_text: str, grants, roots, *, loopback_cleared: bool, firewall_blocked: bool = True) -> None:
     payload = {
         "version": _ACL_MARKER_VERSION,
         "sid": sid_text,
@@ -1711,7 +1732,7 @@ def _write_grant_marker(sid_text: str, grants, roots, *, loopback_cleared: bool)
         "grants": [[str(path), bool(recurse)] for path, recurse in grants],
         "local_denied": False,
         "loopback_cleared": bool(loopback_cleared),
-        "firewall_blocked": True,
+        "firewall_blocked": bool(firewall_blocked),
     }
     path = _grant_marker_path()
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1804,20 +1825,26 @@ def _win_lease_open(lease: _WinLease) -> None:
             marker = {}
         if (
             recorded is not None
-            and marker.get("loopback_cleared")
-            and marker.get("firewall_blocked")
-            and marker.get("sid") == sid_text
+            and firewall_block_is_current(marker, sid_text)
             and _runtime_copies_ready()
         ):
             lease.grant_paths = recorded
             return
-        # Once per machine. CheckNetIsolation and netsh can take longer than
-        # a strategy timeout, so a later process must not run them again.
-        _clear_loopback(name, sid_text)
-        _win_block_network(sid_text)
+        # Once per machine when the marker says the rules exist. A copy
+        # refresh must not call the cmdlet again. A hung cmdlet is not
+        # retried in this process; the WFP filter is already in place.
+        global _FIREWALL_TRIED
+        if firewall_block_is_current(marker, sid_text) or _FIREWALL_TRIED:
+            firewall_blocked = firewall_block_is_current(marker, sid_text)
+        else:
+            _FIREWALL_TRIED = True
+            _clear_loopback(name, sid_text)
+            firewall_blocked = _win_block_network(sid_text)
         if recorded is not None and _runtime_copies_ready():
             lease.grant_paths = recorded
-            _write_grant_marker(sid_text, recorded, roots, loopback_cleared=True)
+            _write_grant_marker(
+                sid_text, recorded, roots, loopback_cleared=True, firewall_blocked=firewall_blocked
+            )
             return
         grants: list[tuple[Path, bool]] = list(made)
         try:
@@ -1834,7 +1861,9 @@ def _win_lease_open(lease: _WinLease) -> None:
                 pass
             raise
         lease.grant_paths = grants
-        _write_grant_marker(sid_text, grants, roots, loopback_cleared=True)
+        _write_grant_marker(
+            sid_text, grants, roots, loopback_cleared=True, firewall_blocked=firewall_blocked
+        )
 
     try:
         # Every process that launches a jail holds this filter. A scrubbed
@@ -2217,6 +2246,7 @@ def _acl_same_prefix(path: Path) -> bool:
 # (source, dest) for an interpreter the container cannot walk to.
 # The dest is an app-owned copy. The source's ancestors are not edited.
 _RUNTIME_COPIES: list[tuple[str, str]] = []
+_FIREWALL_TRIED = False
 _RUNTIME_COPY_VERSION = "1"
 # Set when the copy parent is the AppContainer folder. Ancestors of that
 # folder are not granted and are not required to show a package ACE.
