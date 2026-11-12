@@ -26,7 +26,7 @@ from ..registry import (
     upsert_series,
 )
 from ..report import json_ready
-from ..runner import run_named, run_pack, walk_forward
+from ..runner import failure_line, run_named, run_pack, walk_forward
 from ..strategy_loader import load_strategy_class
 from .backend import read_designer_manifest
 from .preferences import as_path
@@ -36,20 +36,31 @@ from .validate import config_record, normalize, validate_config
 class JobFailure:
     """The exception a job worker caught, separate from its traceback.
 
-    The banner shows ``message`` (``str(exc)``). The log shows ``traceback``.
-    The UI does not read the traceback to decide the sentence.
+    A direct failure's banner is ``message`` (``str(exc)``). A strategy failure
+    (``strategy`` is true) banners :func:`failure_line` of the strategy type and
+    message. The log shows ``traceback``. The UI does not read the traceback
+    to decide the sentence.
     """
 
     type_name: str
     message: str
     traceback: str
+    strategy: bool = False
 
     @classmethod
     def capture(cls, exc: BaseException) -> JobFailure:
-        return cls(type(exc).__name__, str(exc), traceback.format_exc())
+        from ..runner import WorkerFailure
+
+        trace = traceback.format_exc()
+        if isinstance(exc, WorkerFailure) and exc.type_name:
+            return cls(exc.type_name, exc.detail, exc.trace or trace, True)
+        return cls(type(exc).__name__, str(exc), trace, False)
 
     def as_dict(self) -> dict:
-        return {"type": self.type_name, "message": self.message, "traceback": self.traceback}
+        payload = {"type": self.type_name, "message": self.message, "traceback": self.traceback}
+        if self.strategy:
+            payload["strategy"] = True
+        return payload
 
     @classmethod
     def from_dict(cls, payload) -> JobFailure | None:
@@ -64,12 +75,15 @@ class JobFailure:
             type_name if isinstance(type_name, str) and type_name else "Exception",
             message,
             trace if isinstance(trace, str) else "",
+            bool(payload.get("strategy")),
         )
 
 
 def failure_message(value) -> str:
     """The sentence a banner shows. A plain string is already that sentence."""
     if isinstance(value, JobFailure):
+        if value.strategy:
+            return failure_line(value.type_name, value.message)
         text = value.message.strip()
         return text or "run failed"
     if isinstance(value, str):
@@ -582,6 +596,9 @@ def process_entry(mode: str, config: dict, status_path: str) -> None:
         _status(status_path, {"state": "running", "message": "Starting"})
         result = execute_run(config, status_path)
         _status(status_path, {"state": "done", "result": result})
-    except Exception as exc:
+    except BaseException as exc:
+        # Cancel still kills this process from outside. An exception that
+        # unwinds the worker, including KeyboardInterrupt and SystemExit,
+        # is recorded so the window has a banner instead of a stuck "running".
         failure = JobFailure.capture(exc)
         _status(status_path, {"state": "error", "failure": failure.as_dict()})

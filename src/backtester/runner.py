@@ -599,12 +599,48 @@ _STDIO_CAP_BYTES = 256 * 1024
 _STDIO_NAME = "stdio.log"
 
 
-class WorkerFailure(RuntimeError):
-    """A book process failed. ``tail`` is its own stdout/stderr, not a path."""
+# One line on a banner. A strategy traceback stays in the log and in the
+# operator error file, not in this sentence.
+_BANNER_LIMIT = 240
 
-    def __init__(self, message: str, *, tail: str = ""):
+
+def failure_line(type_name: str, message: str) -> str:
+    """``Type: message``, or ``strategy raised Type`` when the message is empty.
+
+    Newlines collapse. The outermost exception is the caller's job: pass its
+    type and ``str(exc)``, not ``__cause__``.
+    """
+    name = str(type_name or "Exception").split()
+    label = name[0] if name else "Exception"
+    text = " ".join(str(message).split())
+    line = f"{label}: {text}" if text else f"strategy raised {label}"
+    if len(line) <= _BANNER_LIMIT:
+        return line
+    return line[: _BANNER_LIMIT - 3].rstrip() + "..."
+
+
+class WorkerFailure(RuntimeError):
+    """A book process failed. ``tail`` is its own stdout/stderr, not a path.
+
+    ``type_name`` and ``detail`` are the strategy exception. ``trace`` is the
+    traceback. The RuntimeError message stays the traceback so an operator
+    error file still has it. A banner uses :func:`failure_line` instead.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tail: str = "",
+        type_name: str = "",
+        detail: str = "",
+        trace: str = "",
+    ):
         super().__init__(message)
         self.tail = tail or ""
+        self.type_name = type_name or ""
+        self.detail = detail if isinstance(detail, str) else ""
+        self.trace = trace if isinstance(trace, str) else ""
 
 
 class _StdioCapture:
@@ -892,14 +928,24 @@ def _books_worker(queue, job):
             )
         _note_child(books, inherited_argv, inherited_cwd)
         queue.put(("ok", _picklable_books(books)))
-    except BaseException:
+    except BaseException as exc:
         tail = ""
         if spool is not None:
             try:
                 tail = spool.tail()
             except Exception:
                 tail = ""
-        queue.put(("err", traceback.format_exc(), tail))
+        queue.put(
+            (
+                "err",
+                {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+                tail,
+            )
+        )
     finally:
         queue.close()
         queue.join_thread()
@@ -991,7 +1037,7 @@ def _wait_until_started(proc, event, queue, timeout: float, stop=None, job=None,
             except queue_mod.Empty:
                 message = None
             if message is not None and message[0] == "err":
-                raise RuntimeError(message[1])
+                raise _failure_from_message(message)
             raise RuntimeError(f"walk-forward worker exited {proc.exitcode} before it was ready")
     raise RuntimeError("walk-forward worker did not start")
 
@@ -1148,6 +1194,20 @@ def _accept_child_books(profile: str, frame, child_books: dict, kwargs: dict) ->
 def _failure_from_message(message) -> WorkerFailure:
     detail = message[1] if len(message) > 1 else ""
     tail = message[2] if len(message) > 2 and isinstance(message[2], str) else ""
+    if isinstance(detail, dict):
+        type_name = detail.get("type")
+        label = type_name if isinstance(type_name, str) and type_name.strip() else "Exception"
+        text = detail.get("message")
+        text = text if isinstance(text, str) else ""
+        trace = detail.get("traceback")
+        trace = trace if isinstance(trace, str) else ""
+        return WorkerFailure(
+            trace or failure_line(label, text),
+            tail=tail,
+            type_name=label,
+            detail=text,
+            trace=trace,
+        )
     return WorkerFailure(str(detail), tail=tail)
 
 
@@ -1237,9 +1297,13 @@ def _isolated_books(
         if message[0] != "ok":
             failure = _failure_from_message(message)
             if proc.exitcode not in (0, None):
+                shown = failure_line(failure.type_name, failure.detail) if failure.type_name else str(failure)
                 raise WorkerFailure(
-                    f"walk-forward worker exited {proc.exitcode}\n{failure}",
+                    f"walk-forward worker exited {proc.exitcode}\n{shown}",
                     tail=failure.tail,
+                    type_name=failure.type_name,
+                    detail=failure.detail,
+                    trace=failure.trace,
                 )
             raise failure
         if proc.exitcode not in (0, None):

@@ -621,6 +621,20 @@ def _prefer_status(current: str | None, incoming: str | None) -> str | None:
     return current or incoming
 
 
+def _note_text(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    return text or None
+
+
+def _remember_note(found: dict[tuple[str, str], str], key: tuple[str, str], status: str, note: str | None) -> None:
+    """Keep a message that says more than the status word."""
+    if not note or note.casefold() == status.casefold():
+        return
+    found.setdefault(key, note)
+
+
 def _status_by_job(directory: Path) -> dict[tuple[str, str], str]:
     """Status words from ``run.json`` jobs and a leaderboard ``status`` column.
 
@@ -660,11 +674,48 @@ def _status_by_job(directory: Path) -> dict[tuple[str, str], str]:
     return found
 
 
+def _error_by_job(directory: Path) -> dict[tuple[str, str], str]:
+    """Operator sentences from ``run.json`` and the leaderboard ``error`` column.
+
+    A cell that only repeats the status word is not a message. ``error.json``
+    is read separately and wins when it has text.
+    """
+    found: dict[tuple[str, str], str] = {}
+    info = directory / "run.json"
+    if info.is_file():
+        try:
+            document = _read_json(info)
+        except (OSError, json.JSONDecodeError):
+            document = None
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if isinstance(jobs, list):
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                status = _status_word(job.get("status")) or ""
+                key = (str(job.get("strategy_id") or ""), str(job.get("source_id") or ""))
+                _remember_note(found, key, status, _note_text(job.get("error")))
+    board = directory / LEADERBOARD_FILE
+    if board.is_file():
+        try:
+            table = _load_table(board)
+        except (OSError, UnicodeError, csv.Error, ValueError):
+            table = None
+        if table is not None and "error" in table.columns:
+            for row in table.rows:
+                status = _status_word(row.get("status")) or ""
+                key = (str(row.get("strategy_id") or ""), str(row.get("source_id") or ""))
+                _remember_note(found, key, status, _note_text(row.get("error")))
+    return found
+
+
 def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
     """Phase 3 tree: ``jobs/<id>/<source>/`` plus ``designer/`` and ``error.json``.
 
     The Jobs table takes its word from ``run.json`` and the leaderboard.
-    ``metrics.json`` means ok only when those records do not name the job.
+    With no such word, ``error.json`` wins over ``metrics.json``. A metrics
+    file alone is ok. The error cell is ``error.json`` when it has text, then
+    a run or leaderboard message.
     """
     report = RunReport(directory=directory, kind="batch")
     jobs_root = directory / "jobs"
@@ -672,6 +723,7 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
     if not pairs:
         pairs = _nested_job_dirs(directory)
     recorded = _status_by_job(directory)
+    noted = _error_by_job(directory)
     for strategy_id, source_id, job in pairs:
         metrics_path = job / METRICS_FILE
         error = _job_error(job)
@@ -680,12 +732,14 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
             state = "ok"
         elif status:
             state = status
-        elif metrics_path.is_file():
-            state = "ok"
         elif error:
             state = "failed"
+        elif metrics_path.is_file():
+            state = "ok"
         else:
             state = "incomplete"
+        if not error:
+            error = noted.get((strategy_id, source_id))
         report.children.append(
             {
                 "path": str(job),
@@ -712,14 +766,18 @@ def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
             for job in document.get("jobs") or []:
                 if not isinstance(job, dict):
                     continue
+                state = "ok" if job.get("status") == "ok" else str(job.get("status") or "failed")
+                note = _note_text(job.get("error"))
+                if note and note.casefold() == str(job.get("status") or "").casefold():
+                    note = None
                 report.children.append(
                     {
                         "path": "",
                         "name": f"{job.get('strategy_id')}/{job.get('source_id')}",
                         "strategy_id": job.get("strategy_id"),
                         "source_id": job.get("source_id"),
-                        "state": "ok" if job.get("status") == "ok" else str(job.get("status") or "failed"),
-                        "error": None,
+                        "state": state,
+                        "error": None if state == "ok" else note,
                     }
                 )
     config_path = directory / RUN_CONFIG_FILE

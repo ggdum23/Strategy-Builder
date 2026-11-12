@@ -24,7 +24,9 @@ class FunctionThread(QThread):
     def run(self) -> None:
         try:
             result = self._fn()
-        except Exception as exc:
+        except BaseException as exc:
+            # The thread records the failure and returns. A kill of the run
+            # process is the supervisor's cancel path, not this handler.
             self.failed.emit(JobFailure.capture(exc))
         else:
             self.succeeded.emit(result)
