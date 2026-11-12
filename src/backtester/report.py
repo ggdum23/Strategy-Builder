@@ -17,13 +17,17 @@ import struct
 import sys
 import tempfile
 import threading
+import unicodedata
 import zlib
 from pathlib import Path
 
 import pandas as pd
 
 from .accounting import EXACT_RESERVED, LEADERBOARD_KEYS, VOCABULARY, refuse_mixed_rows
+from .calendar_text import contains_calendar_date
 from .costs_designer import flat_bps, is_cost_label, label as cost_label
+from .designer_allow import canonical_png, designer_csv_cell, project_designer, redacted_key_allowed
+from .designer_ids import is_report_filename, strategy_id_problem
 
 _ISO_DATE = re.compile(r"(?:19|20)\d{2}-\d{2}-\d{2}")
 _BANNED_DESIGNER_KEYS = frozenset(
@@ -41,6 +45,9 @@ _BANNED_DESIGNER_KEYS = frozenset(
         "inspection",
         "sidecar",
         "sidecar_path",
+        "factor_key",
+        "factor_mac",
+        "borrow_rate_source",
     }
 )
 _BANNED_DESIGNER_TEXT = (
@@ -53,6 +60,9 @@ _BANNED_DESIGNER_TEXT = (
     "source_root",
     "source_glob",
     "sidecar",
+    "factor_key",
+    "factor_mac",
+    "borrow_rate_source",
 )
 # Free-text values and names use the underscore-aware ticker pattern.
 # Schema keys and CSV headers do not. Status, bool, and numeric columns keep
@@ -142,7 +152,9 @@ OPERATOR_LEADERBOARD_COLUMNS = (
     "error",
 )
 DESIGNER_LEADERBOARD_COLUMNS = tuple(
-    column for column in OPERATOR_LEADERBOARD_COLUMNS if column != "symbol"
+    column
+    for column in OPERATOR_LEADERBOARD_COLUMNS
+    if column != "symbol" and redacted_key_allowed(column)
 ) + ("cost_model",)
 
 # What ``load_report`` returns. The desktop window reads this shape.
@@ -277,7 +289,7 @@ def enrich_arena_metrics(result: dict, metrics: dict) -> dict:
     return out
 
 
-def write_book(directory: Path, profile: str, result: dict, metrics: dict, frame) -> None:
+def write_book(directory: Path, profile: str, result: dict, metrics: dict, frame, *, designer: bool = False) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     if profile == "arena":
         write_arena_curves(directory, result, frame)
@@ -286,7 +298,7 @@ def write_book(directory: Path, profile: str, result: dict, metrics: dict, frame
     else:
         raise ValueError(f"unknown profile {profile}")
     write_json(directory / "metrics.json", metrics)
-    _plot_equity(directory / "equity.png", profile, result)
+    _plot_equity(directory / "equity.png", profile, result, designer=designer)
     if profile == "desk" and result.get("liquidation"):
         write_json(directory / "liquidation.json", result["liquidation"])
 
@@ -305,8 +317,13 @@ def _equity_points(profile: str, result: dict) -> list[float]:
     raise ValueError(f"unknown profile {profile}")
 
 
-def _plot_equity(path: Path, profile: str, result: dict) -> None:
-    """Equity against the session index. The chart has no ticker and no date."""
+def _plot_equity(path: Path, profile: str, result: dict, *, designer: bool = False) -> None:
+    """Equity against the session index. The chart has no ticker and no date.
+
+    The operator file keeps a title and a software tag. A designer file asks
+    matplotlib to write neither, and ``publish_designer`` then drops every
+    text chunk.
+    """
     points = _equity_points(profile, result)
     if not points:
         return
@@ -328,7 +345,7 @@ def _plot_equity(path: Path, profile: str, result: dict) -> None:
             path,
             format="png",
             facecolor="white",
-            metadata={"Title": "equity", "Software": "strategy-builder"},
+            metadata={"Software": None} if designer else {"Title": "equity", "Software": "strategy-builder"},
         )
     finally:
         plt.close(fig)
@@ -349,12 +366,14 @@ def ticker_token_spans(text: str, symbol: str) -> list[tuple[int, int]]:
     """Original spans where ``symbol`` is its own token in ``text``.
 
     Matching uses ``str.casefold`` on both sides, then maps the hit back onto
-    ``text``. A one-character symbol uses the same non-alphanumeric boundary
-    as a longer one, so ``V`` matches ``my_V_v2`` and does not match ``avg``
-    or ``equity``. ``ß`` matches ``SS`` and ``ﬁ`` matches ``FI``. A character
-    is a boundary when it is not alphanumeric, which is the same rule as
-    ``[A-Za-z0-9]`` for ASCII. This is the only token match. Report scrubbing,
-    the designer audit, and the pack scan all call it.
+    ``text``. A symbol that contains a letter and is longer than one character
+    uses a letter boundary, so a digit does not glue: ``QQQ1``,
+    ``QQQ2momentum``, and ``1QQQ`` all match ``QQQ``. A one-character symbol,
+    and a symbol that is only digits, keeps an alphanumeric boundary, so ``V``
+    matches ``my_V_v2`` and does not match ``v2``, ``2`` does not match
+    ``S00002``, and ``10`` does not match ``S00010``. ``ß`` matches ``SS`` and
+    ``ﬁ`` matches ``FI``. This is the only token match. Report scrubbing, the
+    designer audit, and the screen all call it.
     """
     if not text or not symbol:
         return []
@@ -366,13 +385,18 @@ def ticker_token_spans(text: str, symbol: str) -> list[tuple[int, int]]:
     start = 0
     limit = len(folded)
     size = len(needle)
+    letters = len(symbol) > 1 and any(char.isalpha() for char in symbol)
+
+    def _glued(char: str) -> bool:
+        return char.isalpha() if letters else char.isalnum()
+
     while start <= limit - size:
         found = folded.find(needle, start)
         if found < 0:
             break
         end = found + size
-        before = found == 0 or not folded[found - 1].isalnum()
-        after = end == limit or not folded[end].isalnum()
+        before = found == 0 or not _glued(folded[found - 1])
+        after = end == limit or not _glued(folded[end])
         if not before or not after:
             start = found + 1
             continue
@@ -522,19 +546,21 @@ RESERVED_VOCABULARY = _reserved_vocabulary()
 def reserved_symbol_conflict(symbol: str) -> str | None:
     """The reserved token ``symbol`` matches, or None.
 
-    Report-name tokens use :func:`ticker_token_spans`: casefolded, bounded by a
-    non-alphanumeric character. ``SS`` does not match ``random``. ``2`` does
+    The symbol is NFKC-normalized first, then casefolded. Report-name tokens
+    use :func:`ticker_token_spans`, bounded by a non-alphanumeric character.
+    ``SS`` does not match ``random``. ``2`` does
     not match ``2x`` or ``001``. Accounting values and keys match the whole
     symbol only. ``session_boundary_1_252`` does not reserve ``1``, ``SESSION``,
     or ``252``.
     """
     if not isinstance(symbol, str) or symbol == "":
         return None
-    folded = symbol.casefold()
+    normalized = unicodedata.normalize("NFKC", symbol)
+    folded = normalized.casefold()
     if folded in EXACT_RESERVED:
         return folded
     for token in RESERVED_VOCABULARY:
-        if ticker_token_spans(token, symbol):
+        if ticker_token_spans(token, normalized):
             return token
     return None
 
@@ -637,12 +663,12 @@ def redact_metrics(payload, *, symbol: str = ""):
 
 
 def scrub_frame_dates(frame):
-    """Blank ISO dates. Session ids such as ``S00001`` stay."""
+    """Blank calendar dates. Session ids such as ``S00001`` stay."""
     if frame is None or "date" not in getattr(frame, "columns", ()):
         return frame
     out = frame.copy(deep=True)
     out["date"] = [
-        "" if _ISO_DATE.search(str(value)) else str(value) for value in out["date"].tolist()
+        "" if contains_calendar_date(str(value)) else str(value) for value in out["date"].tolist()
     ]
     return out
 
@@ -764,6 +790,22 @@ def scrub_designer_tree(
             path.write_text(updated, encoding="utf-8")
 
 
+def _listed_metric_number(key: str, text: str) -> bool:
+    """An allow-listed numeric cell. A yyyymmdd integer is not a date there."""
+    if not key or key in {"strategy_id", "source_id", "name", "message", "error"}:
+        return False
+    if not redacted_key_allowed(key):
+        return False
+    token = text.strip().replace(",", "").replace("$", "").replace("%", "")
+    if token.endswith(" bp"):
+        token = token[: -len(" bp")].strip()
+    try:
+        number = float(token)
+    except ValueError:
+        return False
+    return math.isfinite(number)
+
+
 def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
     """Why this value cannot be shown, or None when it is safe.
 
@@ -774,10 +816,13 @@ def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
     """
     if not isinstance(text, str) or text == "":
         return None
+    text = unicodedata.normalize("NFKC", text)
     for token in _BANNED_DESIGNER_TEXT:
         if token in text:
             return token
-    if _ISO_DATE.search(text):
+    from .gui.audience import normalize_surface
+
+    if not _listed_metric_number(key, text) and contains_calendar_date(normalize_surface(text)):
         return "a calendar date"
     if not symbol:
         return None
@@ -805,12 +850,59 @@ def _raise_designer_name(name: str, symbol: str) -> None:
         raise RuntimeError(f"{name} contains {reason}")
 
 
+def designer_component_problem(name: str, *, symbols=(), scale: float | None = None) -> str | None:
+    """Why a path component cannot be published, or None when it can.
+
+    A strategy id is designer-supplied. The allow-list grammar decides a
+    single-token name before the ticker and the scale. A decimal is not an
+    id. ``day 2024`` is a date. A slash is an unsafe name before it is a
+    date. The directory check and the publication audit both call this.
+    """
+    if not isinstance(name, str) or name == "":
+        return "an empty name"
+    if name in {".", ".."} or any(ch in name for ch in '\\/:*?"<>|') or name.endswith((" ", ".")):
+        return "an unsafe name"
+    text = unicodedata.normalize("NFKC", name)
+    for token in _BANNED_DESIGNER_TEXT:
+        if token in text:
+            return token
+    from .gui.audience import _contains_scale, normalize_surface
+
+    stored = normalize_surface(text)
+    if contains_calendar_date(stored):
+        return "a calendar date"
+    if not any(char.isspace() for char in stored) and not is_report_filename(stored):
+        grammar = strategy_id_problem(stored)
+        if grammar:
+            return grammar
+    seen: set[str] = set()
+    for symbol in symbols or ():
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        if ticker_token_spans(stored, symbol):
+            return "the ticker"
+    if _contains_scale(stored, scale):
+        return "the scale"
+    return None
+
+
+def _fallback_component(symbols=(), scale: float | None = None, stems: tuple[str, ...] = ()) -> str:
+    """An opaque path component that passes :func:`designer_component_problem`."""
+    choices = stems or ("strategy", "book", "result", "entry")
+    for stem in choices:
+        if designer_component_problem(stem, symbols=symbols, scale=scale) is None:
+            return stem
+    return "q"
+
+
 def _raise_schema_label(filename: str, label: str) -> None:
     """A JSON key or a CSV header. The ticker pattern does not apply."""
+    label = unicodedata.normalize("NFKC", label)
     for token in _BANNED_DESIGNER_TEXT:
         if token in label:
             raise RuntimeError(f"{filename} contains {token}")
-    if _ISO_DATE.search(label):
+    if contains_calendar_date(label):
         raise RuntimeError(f"{filename} contains a calendar date")
 
 
@@ -903,6 +995,9 @@ def _png_metadata_texts(blob: bytes) -> list[str]:
         elif kind == b"iTXt":
             texts.extend(_itxt_strings(data))
         elif kind == b"IEND":
+            pos = end + 4
+            if pos < len(blob):
+                texts.append(blob[pos:].decode("utf-8", "replace"))
             return texts
         pos = end + 4
     raise ValueError("png ended without IEND")
@@ -917,8 +1012,8 @@ def _audit_png_file(path: Path, symbol: str) -> None:
         _raise_designer_value(path.name, "caption", text, symbol)
 
 
-def assert_designer_clean(directory, *, symbol: str) -> None:
-    """Raise if a designer tree still carries a ticker, a date, or a factor.
+def assert_designer_clean(directory, *, symbol: str, scale: float | None = None) -> None:
+    """Raise if a designer tree still carries a ticker, a date, a factor, or a price.
 
     JSON and CSV are parsed. The ticker pattern is not applied to schema keys
     or CSV headers, so a column such as ``borrow_cost`` is not the ticker
@@ -927,7 +1022,9 @@ def assert_designer_clean(directory, *, symbol: str) -> None:
     ``my_V_v2``. The match is casefolded, so ``ß`` is ``SS``. A value that is
     exactly the ticker fails, including PNG text and metadata, unless that
     column is where the report writes the token (``ok``, ``inf``, ``true``,
-    a float). A file named ``V.json`` fails.
+    a float). A file named ``V.json`` fails. The same walk then scans names
+    and text with the operator scale. A scale or a price in free text raises.
+    PNG pixel bytes are not part of that scan.
     """
     root = Path(directory)
     paths = [root, *list(root.rglob("*"))]
@@ -952,6 +1049,58 @@ def assert_designer_clean(directory, *, symbol: str) -> None:
         except UnicodeDecodeError as exc:
             raise RuntimeError(f"{path.name} is not text") from exc
         _raise_designer_value(path.name, "caption", text, symbol)
+    _audit_publication(root, symbol=symbol, scale=scale)
+
+
+def _operator_scale(wrapper: dict) -> float | None:
+    """The invoice scale still on the operator wrapper. Not written into ``designer/``."""
+    if not isinstance(wrapper, dict):
+        return None
+
+    def _number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value):
+            return None
+        return float(value)
+
+    for key in ("share_scale", "share_factor"):
+        found = _number(wrapper.get(key))
+        if found is not None:
+            return found
+    basis = wrapper.get("cost_basis")
+    if isinstance(basis, dict):
+        for key in ("share_scale", "share_factor"):
+            found = _number(basis.get(key))
+            if found is not None:
+                return found
+    return None
+
+
+def _audit_publication(root: Path, *, symbol: str, scale: float | None) -> None:
+    """NFKC scale check plus a price check. A hit raises. Pixel bytes are not read."""
+    from .gui.audience import export_text, scan_publication
+
+    symbols = (symbol,) if symbol else ()
+    for path in [root, *list(root.rglob("*"))]:
+        # The same predicate as a designer path component. A strategy id is
+        # not a price. The message does not repeat the rejected name.
+        if designer_component_problem(path.name, symbols=symbols, scale=scale):
+            raise RuntimeError("a designer folder failed the designer check")
+        if not path.is_file():
+            continue
+        blob = path.read_bytes()
+        if not blob:
+            continue
+        try:
+            text = export_text(path) if blob.startswith(_PNG_SIGNATURE) else blob.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"{path.name} is not text") from exc
+        except (OSError, ValueError, MemoryError) as exc:
+            raise RuntimeError(f"{path.name} could not be read") from exc
+        reason = scan_publication(text, symbols=symbols, scale=scale)
+        if reason:
+            raise RuntimeError(f"{path.name} contains {reason}")
 
 
 _COMPARE_FIELDS = (
@@ -1052,24 +1201,90 @@ def get_profile_name(profile: str) -> str:
     return str(profile).strip().lower()
 
 
-def publish_designer(out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str) -> Path:
-    """Write the designer-facing copy under ``out_dir/designer``."""
+def publish_designer(
+    out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str, scale: float | None = None
+) -> Path:
+    """Write the designer-facing copy under ``out_dir/designer``.
+
+    ``books`` are the designer books. Cost drag is that book's fees over its
+    equity. ``scale`` is the operator invoice scale used only to scan the
+    tree; it is not written into ``designer/``. When the caller omits it, a
+    scale still sitting on the wrapper is used. Metrics, fills, trades,
+    liquidation, and benchmarks keep the shared allow-list, and a string is
+    kept only when that key's schema allows it. A hit deletes ``designer/``
+    and raises, so a dirty tree is not left to open. The operator files next
+    to this tree are not rewritten.
+    """
     root = Path(out_dir) / "designer"
     if root.exists():
         shutil.rmtree(root)
-    safe_frame = scrub_frame_dates(frame)
-    for label, (result, metrics) in books.items():
-        dest = root if label == "strategy" else root / "benchmarks" / label
-        write_book(
-            dest,
-            profile,
-            _scrub_result(result, symbol),
-            redact_metrics(metrics, symbol=symbol),
-            safe_frame,
-        )
-    write_json(root / "metrics.json", redact_metrics(wrapper, symbol=symbol))
-    assert_designer_clean(root, symbol=symbol)
+    if scale is None:
+        scale = _operator_scale(wrapper)
+    if scale is None:
+        scale = 1.0
+    try:
+        safe_frame = scrub_frame_dates(frame)
+        for label, (result, metrics) in books.items():
+            dest = root if label == "strategy" else root / "benchmarks" / label
+            write_book(
+                dest,
+                profile,
+                _scrub_result(result, symbol),
+                project_designer(redact_metrics(metrics, symbol=symbol)),
+                safe_frame,
+                designer=True,
+            )
+            _restrict_designer_book(dest)
+        write_json(root / "metrics.json", project_designer(redact_metrics(wrapper, symbol=symbol)))
+        assert_designer_clean(root, symbol=symbol, scale=scale)
+    except Exception:
+        if root.exists():
+            shutil.rmtree(root)
+        raise
     return root
+
+
+def _restrict_designer_book(dest: Path) -> None:
+    """Drop columns the allow-list does not name. Equity values stay exact."""
+    for name in ("equity_curve.csv", "fills.csv", "trades.csv"):
+        _filter_designer_csv(dest / name)
+    curve = dest / "equity_curve.csv"
+    mirror = dest / "equity.csv"
+    if curve.is_file() and mirror.is_file():
+        mirror.write_bytes(curve.read_bytes())
+    liquidation = dest / "liquidation.json"
+    if liquidation.is_file():
+        payload = json.loads(liquidation.read_text(encoding="utf-8"))
+        write_json(liquidation, project_designer(payload))
+    figure = dest / "equity.png"
+    if figure.is_file():
+        figure.write_bytes(canonical_png(figure.read_bytes()))
+
+
+def _filter_designer_csv(path: Path) -> None:
+    if not path.is_file():
+        return
+    with path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle))
+    if not rows:
+        return
+    keep = [index for index, name in enumerate(rows[0]) if redacted_key_allowed(name)]
+    filtered = []
+    for row_index, row in enumerate(rows):
+        cells = []
+        for index in keep:
+            cell = row[index] if index < len(row) else ""
+            if row_index == 0:
+                cells.append(cell)
+            else:
+                cells.append(designer_csv_cell(rows[0][index], cell))
+        filtered.append(cells)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        if filtered and filtered[0]:
+            writer.writerows(filtered)
+        else:
+            handle.write("\n")
 
 
 def _csv_cell(value) -> str:

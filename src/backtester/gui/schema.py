@@ -1,0 +1,437 @@
+"""Report-file contract the window reads. It does not compute these figures.
+
+Phase 3 owns ``metrics.json``, the equity and fill CSVs, the equity PNG, and
+``leaderboard.csv``. This module is the shape the window expects. A field or
+file that is absent is left absent. Nothing here is filled in with a zero or
+with a local recalculation.
+
+Official definitions, from the engine metric functions:
+
+- 252 sessions per year.
+- Risk-free rate is 0.
+- Returns are regular-session close marks. The first return is against initial equity.
+- Sharpe is mean(return) / sample stdev * sqrt(252). Sortino uses the downside
+  deviation of the same returns (population form, matching the engines).
+- Max drawdown is the minimum of equity / running peak − 1, with initial equity
+  on the path. Duration counts sessions from peak until recovery.
+- Calmar is CAGR / |max drawdown|.
+- Desk daily marks are the last regular-session close of each session.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+CONTRACT = "strategy-builder.report.v1"
+
+ANNUALIZATION = (
+    "252 sessions per year. Risk-free rate is 0. "
+    "Returns are regular-session close marks, and the first return is measured against initial equity. "
+    "The window displays the number stored in the report. It does not recompute it."
+)
+
+# A finished book. Everything else is optional.
+# These are the names ``backtester.report`` writes. Each file has one role.
+# ``equity.csv`` is the byte copy of ``equity_curve.csv``. It is not a second
+# curve, and a renamed file is not read in its place.
+METRICS_FILE = "metrics.json"
+WALKFORWARD_FILE = "walkforward.json"
+EQUITY_CURVE_FILE = "equity_curve.csv"
+EQUITY_MIRROR_FILE = "equity.csv"
+FILLS_FILE = "fills.csv"
+TRADES_FILE = "trades.csv"
+FIGURE_FILE = "equity.png"
+LIQUIDATION_FILE = "liquidation.json"
+LEADERBOARD_FILE = "leaderboard.csv"
+RUN_CONFIG_FILE = "run_config.json"
+BATCH_STATUS_FILE = "batch_status.json"
+# Operator export copies these names. A designer export writes the on-screen
+# columns instead, including when the folder is a published ``designer/`` tree.
+COPY_FILES = (
+    METRICS_FILE,
+    EQUITY_CURVE_FILE,
+    EQUITY_MIRROR_FILE,
+    FILLS_FILE,
+    TRADES_FILE,
+    FIGURE_FILE,
+    LIQUIDATION_FILE,
+)
+
+EQUITY_COLUMNS = ("equity",)
+EXPOSURE_COLUMNS = ("exposure", "position")
+SESSION_COLUMNS = ("date", "session", "day")
+
+# Operator sidecar keys. A designer-facing view must not render these.
+# Named operator runs still show ``cost_basis`` (the invoice, scale 1).
+# An anonymized or designer view drops that object. See ``gui.audience``.
+WITHHELD_KEYS = frozenset(
+    {
+        "date_map",
+        "price_factor",
+        "volume_factor",
+        "operator_note",
+        "factor_key",
+        "factor_mac",
+        "borrow_rate_source",
+    }
+)
+
+FILL_COLUMNS = frozenset(
+    {
+        "shares_delta",
+        "fill_price",
+        "fees",
+        "price",
+        "shares_after",
+    }
+)
+EPISODE_COLUMNS = frozenset({"pnl", "side", "entry_notional"})
+
+# Keys already presented in a dedicated panel. Other scalar keys are listed
+# under "other reported fields" so a Phase 3 addition is visible.
+PANEL_KEYS = frozenset(
+    {
+        "benchmarks",
+        "fees_breakdown",
+        "period_returns",
+        "cost_basis",
+        "run",
+        "liquidation",
+        "profile",
+        "symbol",
+        "bar_minutes",
+        "error",
+        "accounting",
+    }
+)
+
+
+@dataclass(frozen=True)
+class MetricSpec:
+    """How to label one reported field. ``kind`` is a display format, not a formula."""
+
+    key: str
+    label: str
+    kind: str
+    group: str
+    tooltip: str
+
+
+def _ann(text: str) -> str:
+    return f"{text} {ANNUALIZATION}"
+
+
+METRICS: tuple[MetricSpec, ...] = (
+    MetricSpec("total_return", "Total return", "fraction", "headline", _ann("Final equity / initial equity − 1.")),
+    MetricSpec("cagr", "CAGR", "fraction", "headline", _ann("Compound annual growth from initial equity to final equity.")),
+    MetricSpec("ann_vol", "Volatility", "fraction", "headline", _ann("Sample standard deviation of session returns, annualized.")),
+    MetricSpec("sharpe", "Sharpe", "ratio", "headline", _ann("Mean session return / sample standard deviation, annualized.")),
+    MetricSpec("sortino", "Sortino", "ratio", "headline", _ann("Mean session return / downside deviation, annualized.")),
+    MetricSpec("max_drawdown", "Max drawdown", "fraction", "headline", _ann("Minimum of equity / running peak − 1, initial equity included.")),
+    MetricSpec(
+        "max_dd_duration_sessions",
+        "DD duration",
+        "count",
+        "headline",
+        "Longest run of sessions from a peak until equity recovers. Unit: sessions.",
+    ),
+    MetricSpec("calmar", "Calmar", "ratio", "headline", _ann("CAGR / |max drawdown|. No drawdown is stored as infinity.")),
+    MetricSpec(
+        "excess_total_return",
+        "Excess vs 1×",
+        "fraction",
+        "kpi",
+        "Stored strategy total return minus the 1× book. The window does not subtract the two figures.",
+    ),
+    MetricSpec("final_equity", "Final equity", "money", "headline", "Account equity at the last session mark. Unit: dollars."),
+    MetricSpec("initial_equity", "Initial equity", "money", "activity", "Starting capital recorded by the engine. Unit: dollars."),
+    MetricSpec("n_fills", "Fills", "count", "activity", "Number of fills the engine recorded."),
+    MetricSpec("fees_total", "Fees", "money", "activity", "Commission and exchange fees recorded by the engine. Slippage is separate. Unit: dollars."),
+    MetricSpec(
+        "cost_drag_bps",
+        "Cost drag",
+        "bps",
+        "activity",
+        "Cost drag reported on the book, in basis points. "
+        "The window shows that figure and does not recompute it. The dollar fee total is an operator field.",
+    ),
+    MetricSpec("slippage_cost", "Slippage", "money", "activity", "Slippage dollars recorded by the engine. Unit: dollars."),
+    MetricSpec("borrow_cost", "Borrow", "money", "activity", "Short-borrow dollars recorded by the engine. Unit: dollars."),
+    MetricSpec("costs_total", "Costs", "money", "activity", "Fees, slippage, borrow, and (Desk) financing, as stored. Unit: dollars."),
+    MetricSpec("turnover_per_year", "Turnover", "ratio", "activity", _ann("Traded notional / mean equity / years. Unit: times equity per year.")),
+    MetricSpec("hit_rate", "Hit rate", "fraction", "activity", "Share of closed round trips with positive pnl. Stored as a fraction."),
+    MetricSpec("percent_up_days", "Up sessions", "fraction", "activity", "Share of session marks that rose. Stored as a fraction."),
+    MetricSpec("round_trips", "Round trips", "count", "activity", "Closed episodes recorded by the engine."),
+    MetricSpec("best_day", "Best session", "fraction", "activity", "Largest session return stored in the report."),
+    MetricSpec("worst_day", "Worst session", "fraction", "activity", "Smallest session return stored in the report."),
+    MetricSpec("avg_abs_exposure_close", "Avg |exposure|", "ratio", "activity", "Mean absolute exposure at the session mark. Exposure is position value / equity."),
+    MetricSpec("avg_net_exposure_close", "Avg net exposure", "ratio", "activity", "Mean signed exposure at the session mark."),
+    MetricSpec("sessions", "Sessions", "count", "activity", "Session marks in the equity curve the metrics used."),
+    MetricSpec("years", "Years", "year", "activity", "Sessions / 252, as stored. Unit: years."),
+    MetricSpec(
+        "financing_cost",
+        "Financing",
+        "money",
+        "desk",
+        "Desk financing dollars. 7%/252 on max(0, |position value| − equity) unless the run overrode the rate. Unit: dollars.",
+    ),
+    MetricSpec("dividends_net", "Dividends", "money", "desk", "Net cash dividends the Desk engine credited. Unit: dollars."),
+    MetricSpec("margin_calls_queued", "Margin calls queued", "count", "desk", "Times gross leverage at a regular close queued a reduction."),
+    MetricSpec("margin_calls_filled", "Margin calls filled", "count", "desk", "Queued margin reductions that filled."),
+    MetricSpec("max_gross_leverage", "Max leverage", "leverage", "desk", "Maximum gross leverage the Desk engine stored. Unit: times equity."),
+    MetricSpec("avg_gross_leverage", "Avg leverage", "leverage", "desk", "Average gross leverage the Desk engine stored. Unit: times equity."),
+    MetricSpec(
+        "worst_equity_over_hwm",
+        "Worst equity / HWM",
+        "ratio",
+        "desk",
+        "Smallest equity / running high-water mark on any bar. Liquidation is below 0.30. This is the stored ratio, not a drawdown the window derived.",
+    ),
+    MetricSpec(
+        "disqualified",
+        "Disqualified",
+        "flag",
+        "desk",
+        "Desk liquidation flag. True means the book was flattened and trading stopped. Displayed only when the report contains the field.",
+    ),
+    MetricSpec("fee_mult", "Fee multiple", "ratio", "desk", "Desk cost-stress multiple recorded on the run. 1 is the unstressed schedule."),
+    MetricSpec("financing_rate_annual", "Financing rate", "fraction", "desk", "Annual financing rate stored on the run. Arena stays at 0."),
+    MetricSpec("borrow_rate_annual", "Borrow rate", "fraction", "desk", "Annual borrow rate stored on the run."),
+    MetricSpec("share_factor", "Share factor", "ratio", "desk", "Share factor stored on the Desk result. Named raw runs are 1."),
+    MetricSpec("price_basis", "Price basis", "text", "accounting", "raw or total_return, as stored on the run."),
+    MetricSpec(
+        "total_return_method",
+        "Total-return method",
+        "text",
+        "accounting",
+        "none, profile_dividends, cash_dividends, or registry_series.",
+    ),
+    MetricSpec("series_kind", "Series kind", "text", "accounting", "raw or total_return, the kind the file was declared as."),
+    MetricSpec(
+        "cash_rate_annual",
+        "Cash rate",
+        "fraction",
+        "accounting",
+        "Annual decimal earned by idle cash. 0.05 is 5 percent. Unit: fraction per year.",
+    ),
+    MetricSpec(
+        "withholding_rate",
+        "Withholding",
+        "fraction",
+        "accounting",
+        "Fraction of a positive long dividend withheld. 0.15 is 15 percent.",
+    ),
+    MetricSpec("accrual", "Accrual", "text", "accounting", "session_boundary_1_252. One step of rate / 252 at each session boundary."),
+    MetricSpec("sessions_per_year", "Sessions / year", "count", "accounting", "252. The accrual divisor stored on the run."),
+    MetricSpec(
+        "dividends_applied",
+        "Dividends applied",
+        "text",
+        "accounting",
+        "True when a dividend file was credited. This is the stored flag, not a guess.",
+    ),
+    MetricSpec(
+        "cash_interest",
+        "Cash interest",
+        "money",
+        "accounting",
+        "Dollars credited on idle cash. rate / 252 on max(0, equity − |position value|). Unit: dollars.",
+    ),
+)
+
+# Settings and dollar amounts from the accounting record. The results page
+# lists these in this order. Dollar amounts can be inverted into a notional
+# or a share count; the designer allow-list drops those and keeps the settings.
+ACCOUNTING_KEYS = (
+    "price_basis",
+    "total_return_method",
+    "series_kind",
+    "cash_rate_annual",
+    "financing_rate_annual",
+    "withholding_rate",
+    "accrual",
+    "sessions_per_year",
+    "dividends_applied",
+    "cash_interest",
+    "financing_cost",
+    "dividends_net",
+)
+
+SPECS = {spec.key: spec for spec in METRICS}
+HEADLINE_KEYS = tuple(spec.key for spec in METRICS if spec.group == "headline")
+ACTIVITY_KEYS = tuple(spec.key for spec in METRICS if spec.group == "activity")
+DESK_KEYS = tuple(spec.key for spec in METRICS if spec.group == "desk")
+
+# The results page leads with these seven stored fields, in this order.
+KPI_KEYS = (
+    "total_return",
+    "cagr",
+    "sharpe",
+    "sortino",
+    "max_drawdown",
+    "calmar",
+    "excess_total_return",
+)
+
+
+# Phase 3 ``leaderboard.csv`` columns (operator set; designer drops ``symbol``).
+# Kinds follow docs/METRICS.md at 3016825: a return or a session fraction is a
+# fraction, Calmar is a ratio, and dollars stay dollars.
+_LEADERBOARD_KIND = {
+    "rank": "count",
+    "strategy_id": "text",
+    "source_id": "text",
+    "symbol": "text",
+    "profile": "text",
+    "status": "text",
+    "error": "text",
+    "total_return": "fraction",
+    "excess_total_return": "fraction",
+    "bh_total_return": "fraction",
+    "long_2x_total_return": "fraction",
+    "cagr": "fraction",
+    "ann_vol": "fraction",
+    "max_drawdown": "fraction",
+    "hit_rate": "fraction",
+    "best_day": "fraction",
+    "worst_day": "fraction",
+    "percent_up_days": "fraction",
+    "frac_sessions_long_at_close": "fraction",
+    "frac_sessions_short_at_close": "fraction",
+    "frac_bars_long": "fraction",
+    "frac_bars_short": "fraction",
+    "extended_hours_fill_notional_frac": "fraction",
+    "financing_rate_annual": "fraction",
+    "borrow_rate_annual": "fraction",
+    "cash_rate_annual": "fraction",
+    "withholding_rate": "fraction",
+    "price_basis": "text",
+    "total_return_method": "text",
+    "series_kind": "text",
+    "accrual": "text",
+    "sessions_per_year": "count",
+    "dividends_applied": "text",
+    "cash_interest": "money",
+    "sharpe": "ratio2",
+    "sortino": "ratio2",
+    "calmar": "ratio2",
+    "turnover_per_year": "ratio2",
+    "avg_abs_exposure_close": "ratio2",
+    "avg_net_exposure_close": "ratio2",
+    "avg_abs_exposure_bars": "ratio2",
+    "worst_equity_over_hwm": "ratio2",
+    "fee_mult": "ratio2",
+    "share_factor": "ratio2",
+    "max_dd_duration_sessions": "count",
+    "n_fills": "count",
+    "round_trips": "count",
+    "long_round_trips": "count",
+    "short_round_trips": "count",
+    "sessions": "count",
+    "margin_calls_filled": "count",
+    "margin_calls_queued": "count",
+    "final_equity": "money",
+    "initial_equity": "money",
+    "fees_total": "money",
+    "cost_drag_bps": "bps",
+    "slippage_cost": "money",
+    "borrow_cost": "money",
+    "costs_total": "money",
+    "financing_cost": "money",
+    "dividends_net": "money",
+    "avg_trade_pnl": "money",
+    "long_pnl": "money",
+    "short_pnl": "money",
+    "max_gross_leverage": "leverage",
+    "avg_gross_leverage": "leverage",
+    "avg_holding_sessions": "number",
+    "avg_holding_bars": "number",
+    "timeout_s": "number",
+    "years": "year",
+    "slippage_bps": "number",
+    "disqualified": "flag",
+    "open_position_at_end": "flag",
+}
+
+LEADERBOARD_LABELS = {
+    "rank": "Rank",
+    "strategy_id": "Strategy",
+    "source_id": "Source",
+    "symbol": "Symbol",
+    "profile": "Profile",
+    "status": "Status",
+    "error": "Error",
+    "bh_total_return": "1× return",
+    "long_2x_total_return": "2× return",
+    "avg_holding_sessions": "Avg hold",
+    "frac_sessions_long_at_close": "Sessions long",
+    "frac_sessions_short_at_close": "Sessions short",
+    "long_round_trips": "Long trips",
+    "short_round_trips": "Short trips",
+    "timeout_s": "Timeout s",
+    "price_basis": "Price basis",
+    "total_return_method": "Total-return method",
+    "series_kind": "Series kind",
+    "cash_rate_annual": "Cash rate",
+    "withholding_rate": "Withholding",
+    "accrual": "Accrual",
+    "sessions_per_year": "Sessions / year",
+    "dividends_applied": "Dividends applied",
+    "cash_interest": "Cash interest",
+}
+
+
+def leaderboard_kind(key: str) -> str:
+    """Display kind for one leaderboard or metric column. Ratios are two decimals.
+
+    Every Phase 3 leaderboard column has a kind, so the cell goes through
+    ``format_number`` and not a raw significant-figure dump.
+    """
+    if key in _LEADERBOARD_KIND:
+        return _LEADERBOARD_KIND[key]
+    if key.endswith("_return") or key.startswith("frac_sessions") or key.startswith("frac_bars") or key.endswith("_frac"):
+        return "fraction"
+    if key.endswith("_pnl") or key.endswith("_cost"):
+        return "money"
+    spec = SPECS.get(key)
+    if spec is None:
+        return "number"
+    if spec.kind == "ratio":
+        return "ratio2"
+    return spec.kind
+
+# Columns used when a batch has no leaderboard.csv. Each cell is copied from
+# that run's metrics.json. The window does not rank by a formula of its own.
+ASSEMBLED_COLUMNS = (
+    "strategy",
+    "profile",
+    "symbol",
+    "total_return",
+    "cagr",
+    "ann_vol",
+    "sharpe",
+    "sortino",
+    "max_drawdown",
+    "calmar",
+    "final_equity",
+    "n_fills",
+    "fees_total",
+    "turnover_per_year",
+    "disqualified",
+    "financing_cost",
+    "borrow_cost",
+    "dividends_net",
+    "cash_interest",
+    "price_basis",
+    "cash_rate_annual",
+    "margin_calls_filled",
+    "max_gross_leverage",
+    "worst_equity_over_hwm",
+)
+
+BENCHMARK_TITLES = {
+    "buy_and_hold_1x": "1× buy and hold",
+    "long_2x": "2× long",
+    "buy_and_hold": "1× buy and hold",
+    "constant_2x": "2× long",
+}

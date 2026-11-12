@@ -1,13 +1,15 @@
-"""Seam for a later desktop window.
+"""Window entry. ``python -m backtester gui`` and a frozen executable both call this.
 
-This phase does not draw a GUI. A future front end calls
-``backtester.parallel.run_parallel`` and ``backtester.report.load_report``.
-Those functions take a progress callback, a cancel token, and return
-structured results. They do not print, and they do not import this module.
+The implementation lives in ``backtester.gui``. Importing this module does not
+import Qt; ``main`` does, so a CLI install without the gui extra still imports.
+The window calls ``backtester.parallel.run_parallel`` and reads the files
+``backtester.report`` writes. Those functions do not import this module.
 """
 
+from __future__ import annotations
 
-def main() -> None:
-    raise NotImplementedError(
-        "The desktop GUI is not in this phase. Run `python -m backtester run`."
-    )
+
+def main() -> int:
+    from .gui.app import main as gui_main
+
+    return int(gui_main())
