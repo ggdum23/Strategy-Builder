@@ -130,7 +130,7 @@ def capture_books(monkeypatch):
     return found
 
 
-def test_cli_paths_do_not_import_the_strategy(tmp_path, capsys, capture_books):
+def _prepared_sample(tmp_path):
     src = tmp_path / "src"
     _write_days(src, "TEST", 4)
     # The anonymized sidecar carries the real symbol. The strategy must not
@@ -148,55 +148,51 @@ def test_cli_paths_do_not_import_the_strategy(tmp_path, capsys, capture_books):
         anonymize=True, registry_path=nik_registry, profile="arena",
         price_factor=1.7, volume_factor=0.4,
     )
+    return src, nik_pack, nik_side
+
+
+@pytest.mark.parametrize("kind", ["run", "pack", "walkforward", "parallel"])
+def test_cli_paths_do_not_import_the_strategy(tmp_path, capsys, capture_books, kind):
+    src, nik_pack, nik_side = _prepared_sample(tmp_path)
     before = _modules()
-
-    run_strategy = _strategy(tmp_path / "run-strategy")
-    code = main(
-        [
-            "run", "--profile", "arena", "--ticker", "TEST",
-            "--strategy", str(run_strategy), "--src", str(src),
-            "--out", str(tmp_path / "run-out"),
-        ]
-    )
+    if kind == "run":
+        strategy = _strategy(tmp_path / "run-strategy")
+        code = main(
+            [
+                "run", "--profile", "arena", "--ticker", "TEST",
+                "--strategy", str(strategy), "--src", str(src),
+                "--out", str(tmp_path / "run-out"),
+            ]
+        )
+    elif kind == "pack":
+        strategy = _strategy(tmp_path / "pack-strategy")
+        code = main(
+            [
+                "run", "--profile", "arena", "--strategy", str(strategy),
+                "--pack", str(nik_pack), "--sidecar", str(nik_side),
+                "--out", str(tmp_path / "pack-out"),
+            ]
+        )
+    elif kind == "walkforward":
+        strategy = _strategy(tmp_path / "walk-strategy")
+        code = main(
+            [
+                "walkforward", "--profile", "arena", "--ticker", "TEST",
+                "--strategy", str(strategy), "--src", str(src),
+                "--out", str(tmp_path / "walk-out"), "--design-end-day", "1",
+            ]
+        )
+    else:
+        strategy = _strategy(tmp_path / "parallel-strategy")
+        code = main(
+            [
+                "parallel", "--strategies", str(strategy.parent), "--workers", "1",
+                "--profile", "arena", "--ticker", "TEST", "--src", str(src),
+                "--out", str(tmp_path / "parallel-out"), "--no-benchmarks",
+            ]
+        )
     assert code == 0, capsys.readouterr()
-    _assert_clean(run_strategy, before, capture_books)
-    capture_books.clear()
-
-    pack_strategy = _strategy(tmp_path / "pack-strategy")
-    code = main(
-        [
-            "run", "--profile", "arena", "--strategy", str(pack_strategy),
-            "--pack", str(nik_pack), "--sidecar", str(nik_side),
-            "--out", str(tmp_path / "pack-out"),
-        ]
-    )
-    assert code == 0, capsys.readouterr()
-    _assert_clean(pack_strategy, before, capture_books)
-    capture_books.clear()
-
-    walk_strategy = _strategy(tmp_path / "walk-strategy")
-    code = main(
-        [
-            "walkforward", "--profile", "arena", "--ticker", "TEST",
-            "--strategy", str(walk_strategy), "--src", str(src),
-            "--out", str(tmp_path / "walk-out"), "--design-end-day", "1",
-        ]
-    )
-    assert code == 0, capsys.readouterr()
-    _assert_clean(walk_strategy, before, capture_books)
-    capture_books.clear()
-
-    parallel_dir = tmp_path / "parallel-strategy"
-    parallel_strategy = _strategy(parallel_dir)
-    code = main(
-        [
-            "parallel", "--strategies", str(parallel_dir), "--workers", "1",
-            "--profile", "arena", "--ticker", "TEST", "--src", str(src),
-            "--out", str(tmp_path / "parallel-out"), "--no-benchmarks",
-        ]
-    )
-    assert code == 0, capsys.readouterr()
-    _assert_clean(parallel_strategy, before, capture_books)
+    _assert_clean(strategy, before, capture_books)
 
 
 def test_unsafe_in_process_warns_and_refuses_a_pack(tmp_path, capsys):

@@ -376,9 +376,15 @@ waits only on the process sentinel. Every two seconds it writes
 `walk-forward wait waited=… alive=… exit=… pipe_bytes=…` to the real
 stderr. A timeout includes `alive` and `pipe_bytes`. Each Windows
 `_walk_cli` call writes `walk-cli profile=… out=… seconds=… code=…`.
-If a call is still sitting there with the child alive, the test stays
-red. Split a test only when those lines show each call is fast and only
-the sum exceeds 60s.
+On `c0daa62` the peek saw no bytes. Completed calls wrote
+`walk-cli profile=arena … seconds=23.937 code=0` and
+`walk-cli profile=desk … seconds=27.203 code=0` on Python 3.11, and
+`25.744` / `22.744` on Python 3.13. The 60s cap then fired on the next
+call while `pipe_bytes=0` and the child was still alive, about 12s into
+that call. Python 3.12 finished the combined tests inside 60s. The cap
+was the sum of the calls. Each of those calls is now its own test. A
+single call that stays at `pipe_bytes=0` with the child alive until 60s
+stays red.
 
 - `tests/test_referee.py::test_sleep_and_lookahead_are_disqualified_within_eight_seconds`
 - `tests/test_designer_jail.py::test_absolute_read_arm_memory_and_network_stay_in_the_jail`
@@ -416,7 +422,7 @@ python -m pytest --runxfail -vv --timeout=180 --timeout-method=thread tests/test
 `--runxfail` makes a miss fail the process. Record the duration of the schema test. The CI cap that marked it was 60s.
 
 ```
-python -m pytest -vv -s --timeout=180 --timeout-method=thread tests/test_accounting.py::test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date tests/test_accounting.py::test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo tests/test_file_jail.py::test_cli_paths_do_not_import_the_strategy
+python -m pytest -vv -s --timeout=180 --timeout-method=thread tests/test_accounting.py::test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date tests/test_accounting.py::test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo tests/test_accounting.py::test_run_rejects_a_dividend_date_outside_the_sample tests/test_file_jail.py::test_cli_paths_do_not_import_the_strategy
 ```
 
 Watch whether a single walk-forward stays inside `_take_result` with the child alive. The desk-raw call was the one that sat there. The log lines are `walk-cli profile=…` and `walk-forward wait waited=… alive=… exit=… pipe_bytes=…`.
