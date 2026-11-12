@@ -18,6 +18,7 @@ import math
 import os
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 # Decisions go here. File descriptor 1 stays the protocol unless the parent
@@ -34,6 +35,20 @@ _stdio_done = False
 def _send(payload: dict) -> None:
     line = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
     os.write(_PROTO, line + b"\n")
+
+
+def _exception_error(exc: BaseException) -> dict:
+    """One protocol line for a strategy exception.
+
+    ``error`` is ``Type: message`` so the parent banner can name the
+    exception. ``trace`` is the strategy process traceback, which the
+    operator log shows and the banner does not. The tail is kept when the
+    text is long, because the raised line is at the end.
+    """
+    trace = traceback.format_exc()
+    if len(trace) > 16_000:
+        trace = trace[-16_000:]
+    return {"op": "error", "error": f"{type(exc).__name__}: {exc}", "trace": trace}
 
 
 def _prepare_stdio(capture: bool) -> None:
@@ -375,7 +390,7 @@ def main() -> int:
             # Wait for hello so the error is the reply, not a write into a
             # pipe the parent has not opened yet.
             _recv()
-            _send({"op": "error", "error": f"{type(exc).__name__}: {exc}"})
+            _send(_exception_error(exc))
             return 1
         hello = _recv()
         if hello is None or hello.get("op") != "hello":
@@ -402,7 +417,7 @@ def main() -> int:
                 try:
                     target = strategy.on_bar(message["bar"], _second(message))
                 except BaseException as exc:
-                    _send({"op": "error", "error": f"{type(exc).__name__}: {exc}"})
+                    _send(_exception_error(exc))
                     return 1
                 _send({"op": "decision", "target": _encode(target)})
                 continue
@@ -412,7 +427,7 @@ def main() -> int:
                     if callable(hook):
                         hook(message.get("summary") or {})
                 except BaseException as exc:
-                    _send({"op": "error", "error": f"{type(exc).__name__}: {exc}"})
+                    _send(_exception_error(exc))
                     return 1
                 _send({"op": "decision", "target": None})
                 continue
@@ -422,7 +437,7 @@ def main() -> int:
         return 0
     except BaseException as exc:
         try:
-            _send({"op": "error", "error": f"{type(exc).__name__}: {exc}"})
+            _send(_exception_error(exc))
         except Exception:
             pass
         return 1

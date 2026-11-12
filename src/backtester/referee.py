@@ -65,9 +65,10 @@ _JAIL_MARKERS = ("bwrap:", "landlock", "seccomp", "no-new-privs", "parent-death"
 class Disqualified(Exception):
     """The strategy timed out, crashed, or broke the one-bar protocol."""
 
-    def __init__(self, reason: str, detail: str = ""):
+    def __init__(self, reason: str, detail: str = "", trace: str = ""):
         self.reason = reason
         self.detail = detail
+        self.trace = trace if isinstance(trace, str) else ""
         text = reason if not detail else f"{reason}: {detail}"
         super().__init__(text)
 
@@ -851,7 +852,11 @@ class _Pipe:
         self._write({"op": "hello"})
         payload = self._message(self._read_line(timeout, extend=False))
         if payload.get("op") == "error":
-            raise Disqualified("strategy", str(payload.get("error") or "strategy failed to load"))
+            raise Disqualified(
+                "strategy",
+                str(payload.get("error") or "strategy failed to load"),
+                str(payload.get("trace") or ""),
+            )
         if payload.get("op") != "ready":
             raise Disqualified("protocol", "expected ready")
         return payload
@@ -866,7 +871,11 @@ class _Pipe:
         self._write(payload)
         message = self._message(self._read_line(timeout))
         if message.get("op") == "error":
-            raise Disqualified("strategy", str(message.get("error") or "strategy error"))
+            raise Disqualified(
+                "strategy",
+                str(message.get("error") or "strategy error"),
+                str(message.get("trace") or ""),
+            )
         if message.get("op") != "decision" or "target" not in message:
             raise Disqualified("protocol", "expected a decision")
         return _decode_target(message.get("target"))
@@ -882,7 +891,11 @@ class _Pipe:
         self._write({"op": "state"})
         message = self._message(self._read_line(timeout))
         if message.get("op") == "error":
-            raise Disqualified("strategy", str(message.get("error") or "strategy error"))
+            raise Disqualified(
+                "strategy",
+                str(message.get("error") or "strategy error"),
+                str(message.get("trace") or ""),
+            )
         values = message.get("values")
         if message.get("op") != "state" or not isinstance(values, dict):
             raise Disqualified("protocol", "expected state")

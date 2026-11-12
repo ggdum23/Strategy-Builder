@@ -345,6 +345,9 @@ def _assert_no_scale(tree: dict[str, bytes]) -> None:
         assert "share_scale" not in text
         assert "share_factor" not in text
         assert "price_factor" not in text
+        assert "factor_key" not in text
+        assert "factor_mac" not in text
+        assert "borrow_rate_source" not in text
 
 
 @pytest.mark.parametrize("profile", ["arena", "desk"])
@@ -392,13 +395,16 @@ def test_designer_tree_is_identical_across_share_scales(tmp_path, profile):
         assert "final_equity" not in block["difference"]
         assert "final_equity" in block["real_fees"]
         assert "final_equity" in block["designer_cost"]
+        from backtester.designer_allow import cost_drag_bps
+
         fills = list(csv.DictReader((out / "designer" / "fills.csv").open(encoding="utf-8")))
-        signs = [float(row["shares_delta"]) > 0 for row in fills]
-        assert True in signs and False in signs
-        for row in fills:
-            delta = float(row["shares_delta"])
-            price = float(row["fill_price"])
-            assert float(row["fees"]) == pytest.approx(_fee(delta, price), rel=0.0, abs=1e-9)
+        assert fills
+        withheld = {"shares_delta", "fill_price", "fees", "shares", "price", "open"}
+        assert withheld.isdisjoint(fills[0])
+        assert designer["cost_drag_bps"] == cost_drag_bps(
+            block["designer_cost"]["fees_total"], designer["initial_equity"]
+        )
+        assert "fees_total" not in designer
         tree = _tree(out / "designer")
         _assert_no_scale(tree)
         assert_designer_clean(out / "designer", symbol="NIK")
@@ -484,9 +490,20 @@ def test_designer_dividend_is_real_div_times_build_price_factor(tmp_path):
         )
         designer = json.loads((out / "designer" / "metrics.json").read_text(encoding="utf-8"))
         curve = list(csv.DictReader((out / "designer" / "equity_curve.csv").open(encoding="utf-8")))
-        shares = int(float(curve[0]["shares"]))
+        assert "shares" not in curve[0]
+        assert "dividends_net" not in designer
+        comparison = json.loads((out / "cost_comparison.json").read_text(encoding="utf-8"))
+        cash = comparison["books"]["strategy"]["designer_cost"]["dividends_net"]
+        secret = load_sidecar(sidecar, allow_scale_mismatch=True)
+        from backtester.runner import _designer_dividends
+
+        mapped = _designer_dividends(dividends, secret["date_map"], secret["price_factor"])
+        _result, metrics = designer_execute(
+            BuyAndHold(), load_pack(pack).frame, "desk", dividends=mapped, with_benchmarks=False
+        )
+        shares = int(_result["daily"][0]["shares"])
         assert shares > 0
-        cash = designer["dividends_net"]
+        assert cash == metrics["dividends_net"]
         assert cash / shares == pytest.approx(2.125)
         assert cash == pytest.approx(shares * 1.25 * 1.7)
         assert cash != pytest.approx(shares * 1.25)
@@ -593,11 +610,7 @@ def test_walk_pack_charges_the_flat_fee_in_both_windows(tmp_path):
     assert designer["sessions"] == summary["design_sessions"]
     fills = list(csv.DictReader((out / "designer" / "fills.csv").open(encoding="utf-8")))
     assert fills
-    assert any(float(row["shares_delta"]) > 0 for row in fills)
-    assert any(float(row["shares_delta"]) < 0 for row in fills)
-    for row in fills:
-        delta = float(row["shares_delta"])
-        assert float(row["fees"]) == pytest.approx(_fee(delta, float(row["fill_price"])), rel=0.0, abs=1e-9)
+    assert {"shares_delta", "fill_price", "fees", "price"}.isdisjoint(fills[0])
     comparison = json.loads((out / "cost_comparison.json").read_text(encoding="utf-8"))
     assert set(comparison["windows"]) == {"design", "locked"}
     loaded = load_pack(pack)
@@ -638,7 +651,8 @@ def test_walk_pack_charges_the_flat_fee_in_both_windows(tmp_path):
     assert "summary" not in designer_view
     assert "cost_comparison" not in designer_view
     assert designer_view["metrics"]["total_return"] == designer["total_return"]
-    assert designer_view["metrics"]["fees_total"] == designer["fees_total"]
+    assert "fees_total" not in designer_view["metrics"]
+    assert designer_view["metrics"]["cost_drag_bps"] == designer["cost_drag_bps"]
     for number in (
         walk["design"]["total_return"],
         walk["locked"]["total_return"],
@@ -646,7 +660,7 @@ def test_walk_pack_charges_the_flat_fee_in_both_windows(tmp_path):
         walk["locked"]["fees_total"],
     ):
         assert number != designer_view["metrics"]["total_return"]
-        assert number != designer_view["metrics"]["fees_total"]
+        assert number != designer_view["metrics"]["cost_drag_bps"]
         assert json.dumps(number) not in blob
     from backtester.__main__ import _cmd_report
 

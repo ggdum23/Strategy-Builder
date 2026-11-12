@@ -1,0 +1,10 @@
+{
+  "strategy_id": "crash",
+  "source_id": "book",
+  "profile": "desk",
+  "status": "error",
+  "error": "Traceback (most recent call last):\n  File \"/tmp/phase3-src/src/backtester/runner.py\", line 616, in _books_worker\n    books = run_books(\n            ^^^^^^^^^^\n  File \"/tmp/phase3-src/src/backtester/runner.py\", line 989, in run_books\n    result, metrics = execute(strategy, frame, profile, share_factor=_release(billing), **common)\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/tmp/phase3-src/src/backtester/runner.py\", line 214, in execute\n    result = engine_desk.run(\n             ^^^^^^^^^^^^^^^^\n  File \"/tmp/phase3-src/src/backtester/engine_desk.py\", line 596, in run\n    raw = strategy.on_bar(view, account)\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/tmp/phase3-run2/s/crash/strategy.py\", line 3, in on_bar\n    raise RuntimeError('boom')\nRuntimeError: boom\n",
+  "timeout_s": 90,
+  "anonymized": false,
+  "symbol": "TEST"
+}

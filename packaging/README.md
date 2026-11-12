@@ -13,8 +13,8 @@ stays in `backtester.__main__`.
   The installed program is `backtester.exe`.
 - Windowed entry, same file: `Strategy Builder.exe` runs `backtester gui`
   when the `backtester.gui` package exists, and a short placeholder until then.
-- `backtester.desktop:main` is the older empty seam. The launcher does not
-  call it.
+- `backtester.desktop:main` opens that window. The frozen launcher reaches it
+  through the `gui` command. `freeze_support` runs before the window.
 - The bundle carries its own Python. The machine interpreter is not required.
 - Inno Setup runs the bundled executables. It does not copy or unzip market
   data. `--src` points at files that are already on disk.

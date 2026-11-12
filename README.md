@@ -18,7 +18,7 @@ The same target is not rebalanced for drift. Costs, splits, data roots, share fa
 and borrow are configuration. The two fee schedules are not.
 
 Phase 2 adds the series registry, session-anchored resampling, and the pack
-builder on top of the engines. The desktop window is still a later phase.
+builder on top of the engines. The desktop window is `docs/GUI.md`.
 The Windows installer is `docs/INSTALLER.md`. The registry schema is `docs/REGISTRY.md`.
 Packs, the sidecar, and the residual leaks are `docs/PACK.md`.
 
@@ -29,7 +29,14 @@ Python 3.11 or newer. From this directory:
 ```powershell
 py -3 -m pip install -e ".[dev]"
 py -3 -m backtester test
+py -3 -m pip install -e ".[gui]"
+py -3 -m backtester gui
 ```
+
+On Python 3.11 the GUI extra installs PySide6 6.6 or newer, and not 6.12. PySide6 6.12.0 drops references to `True` while a widget is torn down, and 3.11 still reference-counts that singleton, so the process aborts. Python 3.12 and 3.13 may use 6.12. The Windows installer stays on Python 3.12.
+
+The window is optional. The commands below do not need it. Paths with spaces,
+including `C:\Users\Jeu\Desktop\Strategy Builder`, are passed through as one path.
 
 `run.ps1` and `run.bat` call `python -m backtester` and do not copy or unzip data.
 
@@ -238,12 +245,8 @@ Raw runs keep `share_factor` 1.0. An anonymized pack still passes the sidecar `s
 
 ## What this checkout does not do yet
 
-No desktop window. The one-bar referee is `python -m backtester referee`.
-The parallel runner, the report
-files, and the equity PNG are in place for a later GUI. The Windows
-`setup.exe` is built by the installer workflow. See `docs/INSTALLER.md`.
-The engines, the registry, and the pack builder
-stay importable. Interpretations that the Desk spec left open are in
+The desktop window reads report files and does not score a book itself (`docs/GUI.md`). The one-bar referee is `python -m backtester referee`. The parallel runner, the report files, and the equity PNG are in place. The Windows `setup.exe` is built by the installer workflow. See `docs/INSTALLER.md`.
+The engines, the registry, and the pack builder stay importable. Interpretations that the Desk spec left open are in
 `docs/DESK_SPEC_DECISIONS.md`. The Arena port is in `docs/ARENA_PORT_NOTES.md`.
 Walk-forward and parallel isolation are `docs/ISOLATION.md`. Metric
 definitions are `docs/METRICS.md`.

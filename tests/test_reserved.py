@@ -94,6 +94,15 @@ def test_reserved_symbols_are_rejected_up_front(symbol):
     assert str(caught.value) == _reserved_message(symbol)
 
 
+def test_fullwidth_random_is_reserved():
+    symbol = "\uff32\uff21\uff2e\uff24\uff2f\uff2d"
+    assert symbol.casefold() != "random"
+    assert reserved_symbol_conflict(symbol) is not None
+    with pytest.raises(ValueError, match="reserved report name") as caught:
+        require_anonymizable_symbol(symbol)
+    assert str(caught.value) == _reserved_message(symbol)
+
+
 def test_the_stand_in_is_random_and_reserved():
     assert TICKER_STAND_IN == "RANDOM"
     assert "random" in RESERVED_VOCABULARY
