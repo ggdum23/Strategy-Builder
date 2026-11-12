@@ -158,6 +158,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pack.add_argument("--phase-map", default=None)
 
     sub.add_parser("test", help="Run the unit suite")
+    sub.add_parser("gui", help="Open the desktop research terminal")
 
     parallel = sub.add_parser("parallel", help="Score many strategies, each in its own process")
     parallel.add_argument("--strategies", required=True, help="Directory of strategy.py files")
@@ -770,6 +771,10 @@ def main(argv=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "gui":
+            from .desktop import main as gui_main
+
+            return int(gui_main())
         if args.command == "run":
             return _cmd_run(args)
         if args.command == "walkforward":

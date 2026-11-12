@@ -218,6 +218,17 @@ def test_freeze_support_runs_before_the_application():
     assert "main" not in calls[:3]
 
 
+def test_frozen_smoke_requires_the_gui_launcher():
+    import smoke_frozen
+
+    source = (PACKAGING / "smoke_frozen.py").read_text(encoding="utf-8")
+    assert "require_gui_launcher(report_text)" in source
+    assert "launcher-check: placeholder" not in source
+    smoke_frozen.require_gui_launcher("launcher-check: gui")
+    with pytest.raises(SystemExit, match="placeholder"):
+        smoke_frozen.require_gui_launcher("launcher-check: placeholder")
+
+
 def test_version_and_placeholder_and_launcher_check(tmp_path, capsys):
     env = _env(tmp_path)
     defaults = tmp_path / "defaults.json"
@@ -233,7 +244,8 @@ def test_version_and_placeholder_and_launcher_check(tmp_path, capsys):
         gui=True,
         environ=env,
     ) == 0
-    assert report.read_text(encoding="utf-8").strip() == "launcher-check: placeholder"
+    # The desktop package is on this branch, so the frozen window launches it.
+    assert report.read_text(encoding="utf-8").strip() == "launcher-check: gui"
     config = strategy_builder_config.ensure_user_config(env, defaults)
     assert frozen_entry.show_placeholder(config, interactive=False) == 0
     text = capsys.readouterr().out

@@ -1,0 +1,2 @@
+session,time,phase,minute,shares_delta,price,fill_price,fees,commission,exchange,clearing,pass_through,cat,sec,taf,shares_after,kind,tier_month
+2026-03-02,09:31,rth,571,10000,100.0,100.01,67.055725,35.0,30.0,2.0,0.025724999999999998,0.030000000000000002,0.0,0.0,10000,strategy,0

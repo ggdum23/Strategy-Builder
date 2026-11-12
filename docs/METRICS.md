@@ -215,16 +215,35 @@ design window and a locked window. The locked window is not published under
 `designer/`. A designer audience of that walk reads `designer/metrics.json`
 only and does not include the operator design or locked statistics.
 
-The equity chart is session index against equity. The title is `equity`.
-It has no ticker and no date axis. PNG bytes are not part of the determinism
-contract. An encoder may stamp the file.
+The equity chart is session index against equity. The title drawn on the
+axes is `equity`. It has no ticker and no date axis. PNG bytes are not part
+of the determinism contract. The designer file is rewritten to the chunks a
+renderer needs, with no text chunk and nothing after `IEND`. The check still
+reads any text chunk that remains (`iTXt` as UTF-8, then NFKC) and it does
+not read pixel bytes. A `pack_` source id whose tail is hex is rewritten to
+an opaque id on this tree. The operator copy keeps the original id.
 
-The exact-equity plus per-share-schedule residual is closed for this tree.
-There is no per-share term, `share_scale` is not an input, the flat constant
-does not depend on the ticker or the pack, and the equity unit is the
-canonical index. Redaction still removes the factor fields. It does not
-promise that a scaled price grid is unrecognizable. That grid leak is the
-native-tick residual in `docs/PACK.md`, which is separate from the fee residual.
+A string on an allow-listed key has to match that key: a phase, a session
+label, a clock time, an accounting enum, the designer cost label, or a safe id (`strategy_id`,
+`source_id`, `name`). Free text is omitted. A designer-visible strategy id matches the allow-list grammar: a leading
+letter, then ASCII letters, digits, underscore, or hyphen, with no four-digit
+run and no month or calendar token. A decimal is not an id. An id that
+passes the grammar is not scanned as a price. The scan still applies the
+scale, the ticker, and that grammar. `publish_designer` scans the tree with the operator
+scale and does not leave the directory behind when that scan fails. The
+publication scan and the export check read the text stored on this tree.
+A source id is the letter form. A raw `pack_` id that is still in the text
+is judged as written, so a scale inside it fails both gates.
+
+The designer tree is an allow-list. Share counts, prices, notionals,
+per-component fees, the dollar `fees_total`, and accounting dollars are not
+in it. Fees are a cost drag in basis points of the designer book's equity,
+`fees_total / initial_equity * 10000`, rounded half-up to 0.1 bp. Exact
+equity stays, on the canonical index. The designer run charges the flat fee
+and is not given `share_scale`. Redaction removes `price_factor`,
+`factor_key`, `factor_mac`, and `borrow_rate_source`. It does not promise
+that a scaled price grid is unrecognizable. That grid leak is the native-tick
+residual in `docs/PACK.md`.
 
 ## Accounting switches
 

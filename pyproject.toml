@@ -16,6 +16,15 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
+gui = [
+    # 6.12.0 drops references to True during widget teardown. Python 3.11 still
+    # reference-counts that singleton, so the process aborts. 3.12 and newer
+    # may use 6.12. The Windows installer stays on Python 3.12.
+    "PySide6>=6.6,<6.12; python_version < '3.12'",
+    "PySide6>=6.6; python_version >= '3.12'",
+    "pyqtgraph>=0.13",
+    "pytest-qt>=4.4",
+]
 
 [project.scripts]
 backtester = "backtester.__main__:main"
