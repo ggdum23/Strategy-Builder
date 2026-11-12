@@ -1601,6 +1601,28 @@ def _win_wfp_block(lease: _WinLease) -> None:
     _WFP_ENGINE = (engine, fwpu, weight, condition, filt, name, session)
 
 
+def _firewall_block_command(sid_text: str) -> str:
+    """PowerShell that installs the package-SID block.
+
+    Windows PowerShell 5.1 formats an object piped to ``Out-Null``. The
+    firewall rule object is large enough that two of those pipes run past
+    the 60 second limit and the launch fails. Assigning to ``$null`` does
+    not format the object.
+    """
+    if not sid_text.startswith("S-1-") or any(ch in sid_text for ch in "\"'$`;\r\n"):
+        raise SandboxError("the AppContainer SID is not a form the firewall rule can use")
+    return (
+        "$names = @('strategybuilderjail-block-out','strategybuilderjail-block-in')\n"
+        "foreach ($name in $names) {\n"
+        "  Remove-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue\n"
+        "}\n"
+        "$null = New-NetFirewallRule -DisplayName 'strategybuilderjail-block-out' -Direction Outbound"
+        f" -Action Block -Package '{sid_text}' -Profile Any -ErrorAction Stop\n"
+        "$null = New-NetFirewallRule -DisplayName 'strategybuilderjail-block-in' -Direction Inbound"
+        f" -Action Block -Package '{sid_text}' -Profile Any -ErrorAction Stop\n"
+    )
+
+
 def _win_block_network(sid_text: str) -> None:
     """Block every inbound and outbound connection for this package SID.
 
@@ -1610,23 +1632,11 @@ def _win_block_network(sid_text: str) -> None:
     ``netsh`` on current Windows rejects ``package=``, so this uses the
     firewall cmdlet.
     """
-    if not sid_text.startswith("S-1-") or any(ch in sid_text for ch in "\"'$`;\r\n"):
-        raise SandboxError("the AppContainer SID is not a form the firewall rule can use")
+    command = _firewall_block_command(sid_text)
     system = os.environ.get("SystemRoot", "")
     powershell = Path(system) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe" if system else None
     if powershell is None or not powershell.is_file():
         raise SandboxError("powershell is not available; refusing to run without a network block")
-    command = (
-        "$names = @('strategybuilderjail-block-out','strategybuilderjail-block-in')\n"
-        "foreach ($name in $names) {\n"
-        "  Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue |"
-        " Remove-NetFirewallRule -ErrorAction SilentlyContinue\n"
-        "}\n"
-        f"New-NetFirewallRule -DisplayName 'strategybuilderjail-block-out' -Direction Outbound"
-        f" -Action Block -Package '{sid_text}' -Profile Any -ErrorAction Stop | Out-Null\n"
-        f"New-NetFirewallRule -DisplayName 'strategybuilderjail-block-in' -Direction Inbound"
-        f" -Action Block -Package '{sid_text}' -Profile Any -ErrorAction Stop | Out-Null\n"
-    )
     try:
         proc = subprocess.run(
             [str(powershell), "-NoProfile", "-NonInteractive", "-Command", command],
@@ -2222,12 +2232,13 @@ def _child_executable() -> str:
 
     A copy under an app-owned directory replaces an interpreter whose
     ancestors the container cannot traverse. Those ancestors are not edited.
-    With no copy, the string is unchanged: ``Path`` on Windows would turn
-    a POSIX path into a different string.
+    The string is not passed through ``Path``. On Windows that rewrites a
+    POSIX path, including when a runtime copy exists and this executable
+    is not one of the copied prefixes.
     """
     if not _RUNTIME_COPIES:
         return sys.executable
-    return str(_translate_runtime(sys.executable))
+    return translate_staged_path(sys.executable, _RUNTIME_COPIES)
 
 
 def first_blocked_ancestor(path, allow, accessible) -> str | None:

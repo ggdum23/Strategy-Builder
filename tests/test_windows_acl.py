@@ -28,6 +28,7 @@ from backtester.sandbox import (
     copy_parent_candidates,
     stage_unreachable_runtimes,
     translate_staged_path,
+    _firewall_block_command,
 )
 
 ENV = {
@@ -515,3 +516,12 @@ def test_a_grant_refusal_fails_each_test_and_does_not_abort(monkeypatch):
             suite.pytest_runtest_setup(object())
     finally:
         suite._PROFILE_ERROR = None
+
+
+def test_the_firewall_command_does_not_format_the_rule_object():
+    command = _firewall_block_command("S-1-15-2-1")
+    assert "Out-Null" not in command
+    assert command.count("$null = New-NetFirewallRule") == 2
+    assert "-Package 'S-1-15-2-1'" in command
+    with pytest.raises(SandboxError):
+        _firewall_block_command("S-1-15-2-1; Remove-Item")

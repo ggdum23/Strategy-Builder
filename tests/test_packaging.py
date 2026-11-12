@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -230,10 +230,16 @@ def test_frozen_sandbox_child_is_this_executable_on_linux(monkeypatch):
 
     monkeypatch.setattr(sandbox.sys, "frozen", True, raising=False)
     monkeypatch.setattr(sandbox.sys, "executable", "/opt/strategy-builder/backtester")
+    monkeypatch.setattr(
+        sandbox,
+        "_RUNTIME_COPIES",
+        [("C:\\hostedtoolcache\\windows\\Python\\3.11.9", "C:\\ProgramData\\Strategy Builder\\jail\\runtime")],
+    )
     assert sandbox._interpreter_command(Path("unused.py"), child=True) == [
         "/opt/strategy-builder/backtester",
         "--sandbox-child",
     ]
+    assert sandbox._child_executable() != str(PureWindowsPath("/opt/strategy-builder/backtester"))
     monkeypatch.setattr(sandbox.sys, "frozen", False, raising=False)
     script = Path("/tmp/work/sandbox_child.py")
     source = sandbox._interpreter_command(script, child=True)
