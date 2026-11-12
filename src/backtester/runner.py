@@ -889,6 +889,7 @@ def _launch_book(ctx, queue, job):
             os.environ.update(old_env)
             if not started:
                 shutil.rmtree(cwd, ignore_errors=True)
+                _forget_phase_log(cwd)
     return proc, cwd
 
 
@@ -943,6 +944,26 @@ def _reported_failure(exc: BaseException) -> tuple[str, str, str]:
     return type(exc).__name__, str(exc), traceback.format_exc()
 
 
+def _forget_phase_log(cwd) -> None:
+    """Remove the sibling phase log after the jail directory is gone."""
+    if os.name != "nt" or not cwd:
+        return
+    try:
+        phase_log_path(cwd).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def phase_log_path(cwd) -> Path:
+    """Phase log beside the jail directory, not inside it.
+
+    The strategy lists its cwd. A log written there is a file the child
+    can read. The parent and the worker both use this sibling path.
+    """
+    directory = Path(cwd)
+    return directory.with_name(directory.name + ".phase.log")
+
+
 def _books_worker(queue, job):
     _new_session()
     # The session is created before the jail. The seccomp filter that denies
@@ -957,7 +978,7 @@ def _books_worker(queue, job):
         if os.name == "nt":
             from .sandbox import note_phase, watch_phase
 
-            watch_phase(str(Path.cwd() / "phase.log"))
+            watch_phase(str(phase_log_path(Path.cwd())))
             note_phase("worker-entered")
         gate = job.get("gate")
         if gate is not None:
@@ -1250,7 +1271,7 @@ def _phase_child_pids(phase_dir) -> list[int]:
     if not phase_dir:
         return []
     try:
-        text = (Path(phase_dir) / "phase.log").read_text(encoding="utf-8")
+        text = phase_log_path(phase_dir).read_text(encoding="utf-8")
     except OSError:
         return []
     found = []
@@ -1286,7 +1307,7 @@ def _windows_hang_detail(proc, job, phase_dir) -> str:
     """Phase, job accounting, commit, and who holds the profile mutex."""
     parts = []
     if phase_dir:
-        path = Path(phase_dir) / "phase.log"
+        path = phase_log_path(phase_dir)
         try:
             lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
         except OSError:
@@ -1621,7 +1642,7 @@ def _isolated_books(
         proc, cwd = _launch_book(ctx, result_queue, job)
         if os.name == "nt" and cwd:
             try:
-                with (Path(cwd) / "phase.log").open("a", encoding="utf-8") as handle:
+                with phase_log_path(cwd).open("a", encoding="utf-8") as handle:
                     handle.write("%.3f parent-spawned\n" % time.monotonic())
             except OSError:
                 pass
@@ -1678,6 +1699,7 @@ def _isolated_books(
         result_queue.join_thread()
         if cwd is not None:
             shutil.rmtree(cwd, ignore_errors=True)
+            _forget_phase_log(cwd)
 
 
 def run_books(

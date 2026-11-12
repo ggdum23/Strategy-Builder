@@ -2222,7 +2222,11 @@ def _child_executable() -> str:
 
     A copy under an app-owned directory replaces an interpreter whose
     ancestors the container cannot traverse. Those ancestors are not edited.
+    With no copy, the string is unchanged: ``Path`` on Windows would turn
+    a POSIX path into a different string.
     """
+    if not _RUNTIME_COPIES:
+        return sys.executable
     return str(_translate_runtime(sys.executable))
 
 

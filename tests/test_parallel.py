@@ -604,6 +604,32 @@ def test_anonymized_pack_keeps_the_sidecar_in_the_parent(tmp_path, monkeypatch):
         assert "share_scale" not in text
 
 
+def test_the_phase_log_sits_beside_the_jail_directory(tmp_path):
+    from backtester.runner import phase_log_path
+
+    work = tmp_path / "bt-referee-abc"
+    work.mkdir()
+    path = phase_log_path(work)
+    assert path.parent == tmp_path
+    assert path.name == "bt-referee-abc.phase.log"
+    assert work not in path.parents
+
+
+def _memory_cap(baseline: int, linux_margin: int) -> int:
+    """Cap above one process. On Windows, above the worker plus the jail.
+
+    The poll sums those working sets. On the GitHub runner that pair sits
+    about 100–130 MiB above one process, past the 96 MiB and 128 MiB
+    margins, so the flat strategy was stopped before the hog's allocation
+    showed up. 192 MiB clears the pair. The hog still crosses it: its
+    extra allocation is on top of the same pair. Linux keeps the tighter
+    margin.
+    """
+    margin = 192 * 1024 * 1024 if sys.platform == "win32" else linux_margin
+    return baseline + margin
+
+
+@windows_jails(1)
 def test_windows_path_with_spaces_runs_from_the_command_line(tmp_path):
     shown = "C:\\Users\\Jeu\\Desktop\\Strategy Builder\\strategies\\D02\\strategy.py"
     assert PureWindowsPath(shown) == PureWindowsPath("C:\\Users\\Jeu\\Desktop\\Strategy Builder\\strategies\\D02\\strategy.py")
@@ -631,7 +657,7 @@ def test_windows_path_with_spaces_runs_from_the_command_line(tmp_path):
             "--out",
             str(out),
             "--timeout",
-            "60",
+            str(int(runner_timeout(1, 60))),
         ],
         cwd=root,
         check=False,
@@ -824,7 +850,7 @@ def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
     )
     assert probe.returncode == 0, probe.stderr
     baseline = int(probe.stdout.strip())
-    cap = baseline + 128 * 1024 * 1024
+    cap = _memory_cap(baseline, 128 * 1024 * 1024)
     memory_marker = tmp_path / "memory.json"
     _strategy(tmp_path / "memory", "hog", _sleeper_strategy(memory_marker, allocate=192 * 1024 * 1024))
     _strategy(tmp_path / "memory", "good", FLAT)
@@ -1241,7 +1267,7 @@ def test_rss_poll_kills_without_a_memory_error(tmp_path):
     )
     assert probe.returncode == 0, probe.stderr
     baseline = int(probe.stdout.strip())
-    cap = baseline + 96 * 1024 * 1024
+    cap = _memory_cap(baseline, 96 * 1024 * 1024)
     source = (
         "import time\n"
         "class Strategy:\n"
@@ -1687,7 +1713,7 @@ def test_parallel_cli_exits_without_a_traceback_when_one_row_fails(tmp_path, mon
             "--out",
             str(out),
             "--timeout",
-            "60",
+            str(int(runner_timeout(4, 60))),
             "--no-benchmarks",
         ]
     )
