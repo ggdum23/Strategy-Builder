@@ -61,6 +61,9 @@ _SECCOMP_MODE_FILTER = 2
 _CLONE_THREAD = 0x00010000
 
 # x86_64 syscall numbers. Other machines fail closed rather than guess.
+# aarch64 uses the generic table for io_uring_setup, io_uring_enter, and
+# io_uring_register (425, 426, 427). Its other numbers differ, so there is
+# no aarch64 map: an unknown machine refuses the launch instead of guessing.
 _X86_64_NR = {
     "socket": 41,
     "connect": 42,
@@ -85,6 +88,9 @@ _X86_64_NR = {
     "process_vm_readv": 310,
     "process_vm_writev": 311,
     "userfaultfd": 323,
+    "io_uring_setup": 425,
+    "io_uring_enter": 426,
+    "io_uring_register": 427,
     "clone3": 435,
     "pidfd_getfd": 438,
 }
@@ -112,6 +118,9 @@ _SANDBOX_DENY = (
     "process_vm_readv",
     "process_vm_writev",
     "userfaultfd",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
     "pidfd_getfd",
 )
 
@@ -271,7 +280,8 @@ def _bwrap_guarantees() -> dict:
         "backend": "bubblewrap",
         "network": (
             "new network namespace, and seccomp returns EPERM for socket, connect, "
-            "and the rest of the socket calls"
+            "the rest of the socket calls, and io_uring_setup, io_uring_enter, "
+            "and io_uring_register"
         ),
         "filesystem": (
             "new mount namespace. The Python runtime and the private temp directory "
@@ -290,7 +300,10 @@ def _bwrap_guarantees() -> dict:
         "parent_memory": (
             "the host /proc is not mounted. ptrace and process_vm_readv return EPERM"
         ),
-        "memory": "RLIMIT_AS and RLIMIT_DATA hard caps, set before the strategy is loaded",
+        "memory": (
+            "RLIMIT_AS, RLIMIT_DATA, and RLIMIT_NPROC (64) hard caps, set before "
+            "the strategy is loaded"
+        ),
         "cpu": "RLIMIT_CPU hard cap, plus the parent's wall-clock per-call timeout",
         "fail_closed": True,
     }
@@ -300,7 +313,10 @@ def _landlock_guarantees() -> dict:
     return {
         "os": "linux",
         "backend": "landlock+seccomp",
-        "network": "seccomp returns EPERM for socket and connect. A network namespace is not created.",
+        "network": (
+            "seccomp returns EPERM for socket, connect, and io_uring_setup, "
+            "io_uring_enter, and io_uring_register. A network namespace is not created."
+        ),
         "filesystem": (
             "landlock allow-list: read the Python runtime and the staged packages, "
             "write the private temp directory. Opening a data or repository path returns "
@@ -315,7 +331,7 @@ def _landlock_guarantees() -> dict:
             "the stronger backend and is used when it runs."
         ),
         "parent_memory": "/proc is not in the allow-list, so /proc/<pid>/mem cannot be opened. ptrace is denied.",
-        "memory": "RLIMIT_AS and RLIMIT_DATA hard caps",
+        "memory": "RLIMIT_AS, RLIMIT_DATA, and RLIMIT_NPROC (64) hard caps",
         "cpu": "RLIMIT_CPU hard cap, plus the parent's wall-clock per-call timeout",
         "fail_closed": True,
     }
@@ -1191,11 +1207,23 @@ def _win_wfp_block(lease: _WinLease) -> None:
         return item
 
     fwpu = ctypes.WinDLL("fwpuclnt", use_last_error=True)
+    class Session(ctypes.Structure):
+        _fields_ = (
+            ("sessionKey", Guid),
+            ("displayData", Display),
+            ("flags", ctypes.c_uint32),
+            ("txnWaitTimeoutInMSec", ctypes.c_uint32),
+            ("processId", ctypes.c_uint32),
+            ("sid", ctypes.c_void_p),
+            ("username", ctypes.c_wchar_p),
+            ("kernelMode", ctypes.c_int),
+        )
+
     fwpu.FwpmEngineOpen0.argtypes = [
         ctypes.c_wchar_p,
         ctypes.c_uint32,
         ctypes.c_void_p,
-        ctypes.c_void_p,
+        ctypes.POINTER(Session),
         ctypes.POINTER(ctypes.c_void_p),
     ]
     fwpu.FwpmEngineOpen0.restype = ctypes.c_uint32
@@ -1207,13 +1235,21 @@ def _win_wfp_block(lease: _WinLease) -> None:
     ]
     fwpu.FwpmFilterAdd0.restype = ctypes.c_uint32
     engine = ctypes.c_void_p()
+    name = "strategybuilderjail block connect"
+    # FWPM_SESSION_FLAG_DYNAMIC. A null session is static: the filter stays
+    # installed after this process exits, and every worker adds another one.
+    # A dynamic session removes the filter when the process exits. The handle
+    # is kept below so the filter lasts for every jail this process starts.
+    session = Session()
+    session.displayData.name = name
+    session.displayData.description = name
+    session.flags = 0x1
     # RPC_C_AUTHN_WINNT
-    status = fwpu.FwpmEngineOpen0(None, 10, None, None, ctypes.byref(engine))
+    status = fwpu.FwpmEngineOpen0(None, 10, None, ctypes.byref(session), ctypes.byref(engine))
     if status != 0 or not engine.value:
         raise SandboxError(f"the firewall engine did not open (winerror {status})")
     # Highest weight. The value is a pointer, and it has to outlive the add.
     weight = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
-    name = "strategybuilderjail block connect"
     condition = Condition()
     # FWPM_CONDITION_ALE_PACKAGE_ID
     condition.fieldKey = guid(0x71BC78FA, 0xF17C, 0x4997, (0xA6, 0x02, 0x6A, 0xBB, 0x26, 0x1F, 0x35, 0x1C))
@@ -1236,8 +1272,10 @@ def _win_wfp_block(lease: _WinLease) -> None:
     status = fwpu.FwpmFilterAdd0(engine, ctypes.byref(filt), None, ctypes.byref(added))
     if status != 0:
         raise SandboxError(f"the connect-layer block was not added (winerror {status})")
-    # Keep the engine open. Closing it removes this dynamic filter.
-    _WFP_ENGINE = (engine, fwpu, weight, condition, filt, name)
+    # The session is dynamic, so closing the engine or exiting this process
+    # removes the filter. Keep the handle, the session, and the strings alive
+    # for the life of the process. Do not close the engine between jails.
+    _WFP_ENGINE = (engine, fwpu, weight, condition, filt, name, session)
 
 
 def _win_block_network(sid_text: str) -> None:

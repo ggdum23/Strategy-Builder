@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -941,7 +943,17 @@ def _walk_cli(tmp_path, profile, dividends_text, *, price_basis=None):
     ]
     if price_basis is not None:
         argv.extend(["--price-basis", price_basis])
-    return main(argv)
+    started = time.monotonic()
+    code = main(argv)
+    # One line per call on the real stderr. Pytest capture hides the normal
+    # stream, and the Windows job log is where a slow call has to be visible.
+    if sys.platform == "win32":
+        sys.__stderr__.write(
+            "walk-cli profile=%s out=%s seconds=%.3f code=%s\n"
+            % (profile, tmp_path.name, time.monotonic() - started, code)
+        )
+        sys.__stderr__.flush()
+    return code
 
 
 def test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date(tmp_path, capsys):

@@ -1065,12 +1065,50 @@ def _wait_until_started(proc, event, queue, timeout: float, stop=None, job=None,
     raise RuntimeError("walk-forward worker did not start")
 
 
+def _pipe_bytes(reader) -> int | None:
+    """Bytes already in a Windows result pipe. ``None`` on other systems.
+
+    ``PeekNamedPipe`` does not consume the message. ``connection.wait`` on
+    this pipe posts a zero-byte overlapped read and then cancels it, which
+    leaves a ``WriteFile`` of a result larger than the 8 KiB pipe buffer
+    blocked in the child.
+    """
+    if os.name != "nt":
+        return None
+    import _winapi
+
+    try:
+        return int(_winapi.PeekNamedPipe(reader.fileno())[0])
+    except OSError:
+        return -1
+
+
+def _note_windows_wait(proc, pending: int | None, started: float) -> None:
+    """One line on the real stderr every two seconds, for the Windows CI log."""
+    waited = time.monotonic() - started
+    slot = int(waited // 2)
+    if slot < 1 or getattr(proc, "_sb_wait_note", -1) == slot:
+        return
+    proc._sb_wait_note = slot
+    try:
+        alive = bool(proc.is_alive())
+    except OSError:
+        alive = False
+    sys.__stderr__.write(
+        "walk-forward wait waited=%.1fs alive=%s exit=%s pipe_bytes=%s\n"
+        % (waited, int(alive), proc.exitcode, pending)
+    )
+    sys.__stderr__.flush()
+
+
 def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None, pgid=None):
     """Read the result, or raise as soon as the child exits without one.
 
     A dead child used to block on ``queue.get`` until the 600s timeout.
-    The process sentinel and the queue are waited together. ``memory_bytes``
-    and ``stop`` are watched in this process. They are not sent to the child.
+    On Linux the process sentinel and the queue are waited together. On
+    Windows only the sentinel is waited: the pipe is drained with
+    ``PeekNamedPipe`` and a real read. ``memory_bytes`` and ``stop`` are
+    watched in this process. They are not sent to the child.
     """
     import queue as queue_mod
     from multiprocessing.connection import wait
@@ -1078,9 +1116,18 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
     from .limits import process_tree_rss_bytes
 
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
     reader = queue._reader
     while True:
-        if wait([reader], timeout=0):
+        pending = _pipe_bytes(reader)
+        if os.name == "nt":
+            if pending is not None and pending > 0:
+                try:
+                    return queue.get_nowait()
+                except queue_mod.Empty:
+                    pass
+            _note_windows_wait(proc, pending, started)
+        elif wait([reader], timeout=0):
             try:
                 return queue.get_nowait()
             except queue_mod.Empty:
@@ -1105,9 +1152,20 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
                 )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            alive = False
+            try:
+                alive = bool(proc.is_alive())
+            except OSError:
+                alive = False
+            detail = f"exit {proc.exitcode}"
+            if os.name == "nt":
+                detail += f", alive={int(alive)}, pipe_bytes={_pipe_bytes(reader)}"
             _stop_process(proc, job, pgid)
-            raise RuntimeError(f"walk-forward worker timed out (exit {proc.exitcode})")
-        wait([reader, proc.sentinel], timeout=min(0.2, remaining))
+            raise RuntimeError(f"walk-forward worker timed out ({detail})")
+        if os.name == "nt":
+            wait([proc.sentinel], timeout=min(0.05, remaining))
+        else:
+            wait([reader, proc.sentinel], timeout=min(0.2, remaining))
 
 
 def _metric_delta(child, parent) -> list[str]:

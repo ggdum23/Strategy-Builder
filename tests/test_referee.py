@@ -578,6 +578,39 @@ def test_launch_fails_closed_without_a_jail(tmp_path, monkeypatch):
         launch(path, memory_bytes=128 * 1024 * 1024, cpu_seconds=5, deny_paths=["/usr"])
 
 
+def _probe_bubblewrap_and_landlock(path, monkeypatch, **kwargs) -> None:
+    settings = {"call_timeout": 8, "startup_timeout": 20}
+    settings.update(kwargs)
+    assert probe(path, **settings) == 0.0
+    import backtester.sandbox as sandbox
+
+    if not sandbox._landlock_available():
+        pytest.skip("landlock is not available")
+    monkeypatch.setattr(sandbox, "_bwrap_available", lambda: False)
+    assert probe(path, **settings) == 0.0
+
+
+def test_io_uring_setup_is_denied_on_both_backends(monkeypatch):
+    if sys.platform != "linux":
+        pytest.skip("io_uring is the Linux seccomp gap")
+    _needs_jail()
+    _probe_bubblewrap_and_landlock(SELFTEST / "iouring.py", monkeypatch)
+
+
+def test_a_spawn_loop_is_capped_on_both_backends(monkeypatch):
+    if sys.platform != "linux":
+        pytest.skip("RLIMIT_NPROC is the Linux process ceiling")
+    _needs_jail()
+    # The loop clones this interpreter. The address-space cap has to hold
+    # those copies, or the loop stops on ENOMEM before the process ceiling.
+    _probe_bubblewrap_and_landlock(
+        SELFTEST / "nproc.py",
+        monkeypatch,
+        memory_bytes=8 * 1024 * 1024 * 1024,
+        call_timeout=30,
+    )
+
+
 def test_landlock_blocks_the_data_file_when_bubblewrap_is_hidden(tmp_path, monkeypatch):
     if sys.platform != "linux":
         pytest.skip("landlock is the Linux fallback")

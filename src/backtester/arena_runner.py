@@ -14,12 +14,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 
 import pandas as pd
 
 from . import engine_arena as B
-from .strategy_loader import load_strategy_class
 
 
 def run_window(strategy_cls, window, bars_cache=None):
@@ -74,40 +74,20 @@ KEYS = [
 
 
 def main(argv=None):
-    """Pack-window CLI. Requires the anonymized bar pack next to the engine data dir."""
+    """Pack-window CLI. A strategy file is not loaded in this process.
+
+    ``run_window`` still accepts an in-memory class. This entry point only
+    receives a path, and loading that path would run designer code here.
+    """
     parser = argparse.ArgumentParser(prog="backtester.arena_runner")
     parser.add_argument("--strategy", required=True)
     parser.add_argument("--window", choices=list(B.WINDOWS), default="full")
     parser.add_argument("--out", default=None)
     parser.add_argument("--label", default=None)
     parser.add_argument("--no-benchmark", action="store_true")
-    args = parser.parse_args(argv)
-    out = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-    os.makedirs(out, exist_ok=True)
-    label = args.label or os.path.splitext(os.path.basename(args.strategy))[0]
-    strategy_cls = load_strategy_class(args.strategy)
-    a, z = B.WINDOWS[args.window]
-    first = max(0, a - B.VALIDATION_WARMUP_DAYS) if args.window == "validation" else a
-    t0 = time.time()
-    bars = B.load_bars(first, z)
-    print(f"loaded {len(bars):,} bars (days {first}..{z}) in {time.time() - t0:.1f}s")
-    res, metrics = run_window(strategy_cls, args.window, bars)
-    write(res, metrics, os.path.join(out, f"{label}_{args.window}"))
-    summary = {"strategy": {key: metrics.get(key) for key in KEYS}}
-    if not args.no_benchmark:
-        bench_res, bench_metrics = run_window(B.BuyAndHold, args.window, bars)
-        write(bench_res, bench_metrics, os.path.join(out, f"buy_and_hold_{args.window}"))
-        summary["buy_and_hold"] = {key: bench_metrics.get(key) for key in KEYS}
-    with open(os.path.join(out, f"{label}_{args.window}_summary.json"), "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=1, default=float)
-    for name, values in summary.items():
-        parts = []
-        for key in KEYS:
-            value = values[key]
-            if isinstance(value, (int, float)):
-                parts.append(f"{key}={value:.4g}")
-            else:
-                parts.append(f"{key}={value}")
-        print(f"[{args.window}] {name:13s} " + " ".join(parts))
-    print(f"strategy runtime {metrics['runtime_seconds']}s")
-    return 0
+    parser.parse_args(argv)
+    print(
+        "error: arena_runner does not load a strategy file. Use python -m backtester.",
+        file=sys.stderr,
+    )
+    return 2

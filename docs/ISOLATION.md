@@ -248,7 +248,11 @@ The backend name is `job+appcontainer`.
   A child whose token is not an AppContainer, or whose token has a
   capability, is not resumed. Loopback exemptions for this profile are
   removed. Inbound and outbound firewall rules block the package SID, and
-  a connect-layer filter blocks it too, including loopback. Windows otherwise
+  a connect-layer filter blocks it too, including loopback. The filter is
+  added in a dynamic WFP session (`FWPM_SESSION_FLAG_DYNAMIC`) and the engine
+  handle is kept for the life of the process. A null session would be static:
+  each worker would add another filter, and the filters would stay until
+  reboot. A dynamic session removes them when the process exits. Windows otherwise
   drops loopback in the receive layer and `connect` waits until it times out.
   A connect to a
   listening loopback server and to an external
@@ -279,12 +283,17 @@ is bound read-only. Data and repository paths are not mounted.
 A seccomp filter returns EPERM for `socket`, `connect`, `accept`, `accept4`,
 `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `shutdown`, `bind`, `listen`,
 `socketpair`, `fork`, `vfork`, `ptrace`, `setpgid`, `setsid`, `unshare`,
-`setns`, `process_vm_readv`, `process_vm_writev`, `userfaultfd`, and
-`pidfd_getfd`. `clone` is allowed only when `CLONE_THREAD` is set. `clone3`
-stays allowed: glibc creates threads with it, and classic BPF cannot read the
-flag pointer. A `clone3` task inherits the filter, the mount namespace, and
-the network namespace, and it dies with the pid namespace when the referee
-exits. It cannot call `setsid`.
+`setns`, `process_vm_readv`, `process_vm_writev`, `userfaultfd`,
+`io_uring_setup`, `io_uring_enter`, `io_uring_register`, and `pidfd_getfd`.
+The io_uring numbers are 425, 426, and 427. Those three are also the generic
+aarch64 numbers, but the other numbers differ, so a machine that is not
+x86_64 still refuses the launch instead of using a partial table. `clone` is
+allowed only when `CLONE_THREAD` is set. `clone3` stays allowed: glibc creates
+threads with it, and classic BPF cannot read the flag pointer. A `clone3`
+task inherits the filter, the mount namespace, and the network namespace, and
+it dies with the pid namespace when the referee exits. It cannot call
+`setsid`. `RLIMIT_NPROC` is 64, so a `clone3` that starts another process
+stops at that ceiling with EAGAIN.
 
 The host `/proc` is not mounted. `os.getppid()` inside the jail is the
 bubblewrap process in the new pid namespace, not the referee. Opening
@@ -294,10 +303,10 @@ visible and is why the child's command line carries no data path, no ticker,
 and no scale. The private directory path is on that command line because it
 is the child's own work directory.
 
-`RLIMIT_AS`, `RLIMIT_DATA`, and `RLIMIT_CPU` are set before the strategy is
-loaded. The parent also enforces the wall-clock per-call timeout and kills
-the sandbox on the way out. `--die-with-parent` covers a referee that dies
-without running that cleanup.
+`RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_NPROC` (64), and `RLIMIT_CPU` are set
+before the strategy is loaded. The parent also enforces the wall-clock
+per-call timeout and kills the sandbox on the way out. `--die-with-parent`
+covers a referee that dies without running that cleanup.
 
 ### Linux without bubblewrap
 
@@ -306,10 +315,11 @@ seccomp filter, the same rlimits, and `PR_SET_PDEATHSIG` set to `SIGKILL`.
 Landlock allows reading the interpreter, the staged package directories, and
 the directory that holds `/etc/ld.so.cache`, and writing the private
 directory. The child is still `python -I -S`, so site-packages is not on
-`sys.path`. Opening a data path returns EPERM. There is no pid namespace and no network
-namespace, so the network block is the seccomp filter alone. `/proc` is not
-in the allow-list. A raw `clone3` task on this backend is not reaped by a
-pid namespace; bubblewrap is the stronger backend and is the one CI installs.
+`sys.path`. Opening a data path returns EPERM. There is no pid namespace and
+no network namespace, so the network block is the seccomp filter alone,
+including `io_uring_setup`. `/proc` is not in the allow-list. A raw `clone3`
+task on this backend is not reaped by a pid namespace; bubblewrap is the
+stronger backend and is the one CI installs.
 If landlock cannot be applied either, the launch is refused.
 
 ### Open Windows items
@@ -348,11 +358,27 @@ worker budget. The fast strategy in the hang test also came back as a
 timeout when startup was slower than its 6s budget. On `aa90226` (push
 run 43129181253) the matrix did not finish. Python 3.12 stopped in
 `tests/test_accounting.py::test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date`
-while `_take_result` waited on the worker pipe. Python 3.13 reached the
-designer-jail test below, at the pack-arm launch, and the thread timer
-then exited the process, so the `xfail` was not recorded. That accounting
-test is not marked: 3.13 got past it, and a real failure there should stay
-visible. The timer now fails only the slow test.
+while `_take_result` waited on the worker pipe. On `76e7e08` that test
+failed at 60s on Python 3.11 and 3.13 of the pull-request run (it passed
+on 3.12 only), and on all three versions of the push run. The traceback
+was `runner.py` inside `_take_result` with the child still alive, on the
+desk-raw call, after the arena and desk reports were already written.
+`test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo` and
+`test_file_jail.py::test_cli_paths_do_not_import_the_strategy` failed the
+same way on some of those jobs. None of those three is marked.
+
+The wait was `multiprocessing.connection.wait` on the result pipe. On
+Windows that posts a zero-byte overlapped read and cancels it. A result
+larger than the 8 KiB message pipe stays stuck in `WriteFile` in the
+child, so the parent loops in `WaitForMultipleObjects` with the child
+alive. The Windows wait now peeks the pipe and does a real read, and it
+waits only on the process sentinel. Every two seconds it writes
+`walk-forward wait waited=… alive=… exit=… pipe_bytes=…` to the real
+stderr. A timeout includes `alive` and `pipe_bytes`. Each Windows
+`_walk_cli` call writes `walk-cli profile=… out=… seconds=… code=…`.
+If a call is still sitting there with the child alive, the test stays
+red. Split a test only when those lines show each call is fast and only
+the sum exceeds 60s.
 
 - `tests/test_referee.py::test_sleep_and_lookahead_are_disqualified_within_eight_seconds`
 - `tests/test_designer_jail.py::test_absolute_read_arm_memory_and_network_stay_in_the_jail`
@@ -373,6 +399,37 @@ all 40 (D01–D20, arena and desk), including the numpy strategies. Those
 examples stay strict on both runners. Ubuntu matches them jailed against
 in-process, with `/etc/ld.so.cache` bound and the parent's import order on
 `sys.path`. The frozen installer smoke on `b9abba5` (run 43131711177) completed.
+
+A separate Windows job, `windows referee`, runs `tests/test_referee.py` and
+`tests/test_reserved.py` with a 60-second test cap and the same 25-minute
+job cap. The main matrix keeps its 25-minute cap.
+
+### Live Windows checklist
+
+From the repo root, with the package installed. These stay open for the
+owner PC. The accounting and file-jail commands are not `xfail` items.
+
+```
+python -m pytest --runxfail -vv --timeout=180 --timeout-method=thread tests/test_referee.py::test_selftest_probes_are_blocked tests/test_referee.py::test_sleep_and_lookahead_are_disqualified_within_eight_seconds tests/test_designer_jail.py::test_absolute_read_arm_memory_and_network_stay_in_the_jail tests/test_reserved.py::test_a_passing_symbol_publishes_canonical_benchmark_names tests/test_parallel.py::test_a_hang_times_out_without_stopping_the_other_strategy tests/test_parallel.py::test_schema_token_tickers_publish_and_register
+```
+
+`--runxfail` makes a miss fail the process. Record the duration of the schema test. The CI cap that marked it was 60s.
+
+```
+python -m pytest -vv -s --timeout=180 --timeout-method=thread tests/test_accounting.py::test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date tests/test_accounting.py::test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo tests/test_file_jail.py::test_cli_paths_do_not_import_the_strategy
+```
+
+Watch whether a single walk-forward stays inside `_take_result` with the child alive. The desk-raw call was the one that sat there. The log lines are `walk-cli profile=…` and `walk-forward wait waited=… alive=… exit=… pipe_bytes=…`.
+
+```
+python -m pytest -q --timeout=120 --timeout-method=thread tests/test_referee.py tests/test_reserved.py tests/test_walkforward.py tests/test_reports.py tests/test_registry.py tests/test_paths.py tests/test_parity.py
+```
+
+```
+python -m pytest -q -m jailed_sample --timeout=60 --timeout-method=thread tests/test_jailed_examples.py
+```
+
+After one jailed run, `netsh wfp show filters file=wfp.xml` and count filters named `strategybuilderjail block connect`. Run a second jail in the same process and see whether the count grows. Those filters should disappear when the process exits.
 
 ### What the child is not given
 

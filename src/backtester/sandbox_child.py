@@ -142,6 +142,10 @@ def _apply_limits() -> bool:
     if os.name != "nt":
         import resource
 
+        # Threads count against this ceiling. 64 leaves room for the ones
+        # numpy starts. clone3 stays allowed so those threads can be created.
+        # A further process gets EAGAIN.
+        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
         memory = int(spec.get("memory_bytes") or 0)
         cpu = int(spec.get("cpu_seconds") or 0)
         if memory > 0:
