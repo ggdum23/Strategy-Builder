@@ -124,7 +124,7 @@ def test_date_id_fails_one_job_and_the_sibling_publishes(tmp_path):
     strategies = [_strategy(root / "strategies", name, FLAT) for name in names]
     pack, sidecar, _built = _anon_pack(root, "QQQ", name="pack", price_factor=_SCALE)
     out = root / "out"
-    run_parallel(
+    result = run_parallel(
         strategies,
         [PackMarket(str(pack), str(sidecar))],
         out,
@@ -137,7 +137,8 @@ def test_date_id_fails_one_job_and_the_sibling_publishes(tmp_path):
     assert (out / "leaderboard.csv").is_file()
     jobs = json.loads((out / "run.json").read_text(encoding="utf-8"))["jobs"]
     by_id = {job["strategy_id"]: job["status"] for job in jobs}
-    assert by_id["opening_drive"] == "ok"
+    opening = next(item for item in result.results if item.strategy_id == "opening_drive")
+    assert by_id["opening_drive"] == "ok", (opening.status, opening.error)
     assert {by_id[name] for name in DATES} == {"error"}
     operator = read_leaderboard(out / "leaderboard.csv")
     designer_root = out / "designer"

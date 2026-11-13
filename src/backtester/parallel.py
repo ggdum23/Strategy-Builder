@@ -28,6 +28,7 @@ import gc
 import hashlib
 import json
 import math
+import sys
 import queue
 import secrets
 import shutil
@@ -577,6 +578,16 @@ def run_parallel(
     _bundle_designer(out, ranked_rows, assignments, results)
 
     run_id = "r" + secrets.token_hex(8)
+    for row in ranked_rows:
+        status = row.get("status")
+        if status in (None, "ok"):
+            continue
+        # Pytest capture does not show this. The Windows job log does.
+        sys.__stderr__.write(
+            "parallel job %s %s: %s\n"
+            % (row.get("strategy_id"), status, _first_line(str(row.get("error") or "")))
+        )
+    sys.__stderr__.flush()
     jobs = []
     for row in ranked_rows:
         jobs.append(
