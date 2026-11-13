@@ -129,7 +129,7 @@ _STREAM_UNREADABLE = "pack file streams could not be read"
 _DIR_ALT_STREAM = "pack directory has an alternate data stream"
 _DIR_STREAM_UNREADABLE = "pack directory streams could not be read"
 _DEFAULT_STREAM = "::$DATA"
-# The filename index. FindFirstStreamW returns it for every directory.
+# The filename index. A directory listing returns it for every directory.
 # It is not an alternate data stream an operator can plant.
 _DIRECTORY_INDEX_STREAM = ":$i30:$index_allocation"
 _PACK_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -814,9 +814,26 @@ def _stream_names(path: Path) -> list[str]:
     """NTFS stream names on ``path``. Empty on platforms without them.
 
     Callers that refuse a pack must not put these names in the error.
+    ``FindFirstStreamW`` does not accept a directory on every Windows
+    build (it fails, and the pack would be unreadable). A directory then
+    uses ``FindFirstFileW`` on ``path:*``, which lists the same names,
+    including ``:$I30:$INDEX_ALLOCATION``.
     """
     if os.name != "nt":
         return []
+    try:
+        directory = stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        raise OSError(_STREAM_UNREADABLE) from None
+    if not directory:
+        return _file_stream_names(path)
+    try:
+        return _file_stream_names(path)
+    except OSError:
+        return _directory_stream_names(path)
+
+
+def _file_stream_names(path: Path) -> list[str]:
     import ctypes
     from ctypes import wintypes
 
@@ -845,6 +862,57 @@ def _stream_names(path: Path) -> list[str]:
         while True:
             names.append(data.cStreamName.replace("\x00", ""))
             data = _StreamData()
+            if not find_next(handle, ctypes.byref(data)):
+                error = ctypes.get_last_error()
+                if error in {18, 38}:
+                    return names
+                raise OSError(_STREAM_UNREADABLE)
+    finally:
+        find_close(handle)
+
+
+def _directory_stream_names(path: Path) -> list[str]:
+    """Stream names via ``FindFirstFileW`` of ``path:*``.
+
+    The returned ``cFileName`` values match ``FindFirstStreamW``
+    (``::$DATA``, ``:name:$DATA``, ``:$I30:$INDEX_ALLOCATION``).
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _FindData(ctypes.Structure):
+        _fields_ = (
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("dwReserved0", wintypes.DWORD),
+            ("dwReserved1", wintypes.DWORD),
+            ("cFileName", wintypes.WCHAR * 260),
+            ("cAlternateFileName", wintypes.WCHAR * 14),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    find_first = kernel32.FindFirstFileW
+    find_first.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_FindData)]
+    find_first.restype = wintypes.HANDLE
+    find_next = kernel32.FindNextFileW
+    find_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_FindData)]
+    find_next.restype = wintypes.BOOL
+    find_close = kernel32.FindClose
+    find_close.argtypes = [wintypes.HANDLE]
+    find_close.restype = wintypes.BOOL
+    data = _FindData()
+    handle = find_first(os.fspath(path) + ":*", ctypes.byref(data))
+    if handle is None or int(handle) in {0, -1, 2**32 - 1, 2**64 - 1}:
+        raise OSError(_STREAM_UNREADABLE)
+    names = []
+    try:
+        while True:
+            names.append(data.cFileName.replace("\x00", ""))
+            data = _FindData()
             if not find_next(handle, ctypes.byref(data)):
                 error = ctypes.get_last_error()
                 if error in {18, 38}:

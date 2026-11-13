@@ -329,6 +329,14 @@ def test_length_prefixed_decisions_keep_bool_int_and_nan(tmp_path):
     box = _Box(proc)
     pipe = _Pipe(box)
     try:
+        if os.name == "nt":
+            # An unconfined sandbox_child must not run the strategy. The
+            # frames themselves are covered above; a real jail is an AppContainer.
+            from backtester.referee import Disqualified
+
+            with pytest.raises(Disqualified, match="not an AppContainer"):
+                pipe.hello(10)
+            return
         ready = pipe.hello(10)
         assert ready["op"] == "ready"
         assert pipe.decision({"op": "bar", "bar": {"probe": "none"}, "state": {}}, 10) is None

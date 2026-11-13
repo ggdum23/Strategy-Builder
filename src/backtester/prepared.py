@@ -706,19 +706,35 @@ def _touch(path: Path) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
+    """Flush one file. A read-only handle makes Windows ``fsync`` raise EBADF.
+
+    The bytes are already in the file. A platform that still refuses the
+    flush does not fail the cache write; the reader checks the BLAKE2b.
+    """
     try:
-        os.fsync(fd)
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
     finally:
         os.close(fd)
 
 
 def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
+    """Flush a directory. Windows often cannot open a directory this way."""
     try:
-        os.fsync(fd)
+        fd = os.open(path, os.O_RDONLY)
     except OSError:
-        pass
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
     finally:
         os.close(fd)
 
