@@ -738,17 +738,20 @@ def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
 
     with pytest.raises(SandboxError, match="refusing to hide the runtime"):
         bwrap_mount_plan([Path("/tmp")], [], [], Path("/work"), "/etc/ld.so.cache")
+    late_root = Path("/tmp/py")
+    late_site = Path("/tmp/py/site")
     cmd = bwrap_mount_plan(
-        [Path("/usr"), Path("/tmp/py")],
-        [Path("/tmp/py/site")],
+        [Path("/usr"), late_root],
+        [late_site],
         [],
         Path("/work"),
         "/etc/ld.so.cache",
     )
-    tmpfs = cmd.index("/tmp")
+    tmp = str(Path("/tmp"))
+    tmpfs = cmd.index(tmp)
     assert cmd[tmpfs - 1] == "--tmpfs"
-    assert cmd.index("/tmp/py") > tmpfs
-    assert cmd.index("/tmp/py/site") > tmpfs
+    assert cmd.index(str(late_root)) > tmpfs
+    assert cmd.index(str(late_site)) > tmpfs
     directories, files = landlock_rule_plan(["/usr", "/etc"], "/etc/ld.so.cache", "/work")
     etc = [item for item in directories if item[0] == "/etc"]
     assert etc == [["/etc", _LANDLOCK_EXECUTE]]

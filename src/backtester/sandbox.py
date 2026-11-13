@@ -2934,9 +2934,14 @@ def runtime_tree_digest(root: Path) -> str:
     for path in paths:
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
         digest.update(b"\0")
-        try:
-            data = path.read_bytes()
-        except OSError:
+        data = None
+        for _attempt in range(3):
+            try:
+                data = path.read_bytes()
+                break
+            except OSError:
+                data = None
+        if data is None:
             digest.update(b"unreadable\0")
             continue
         digest.update(str(len(data)).encode("ascii"))
@@ -2961,15 +2966,31 @@ def _remember_runtime_stamp() -> None:
     _runtime_stamp_path().write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _runtime_copy_ready(dest: Path, src: Path) -> bool:
+def _runtime_tree_present(dest: Path, src: Path) -> bool:
+    """The files that identify this source are in the copy.
+
+    A frozen launch copies every blocked root, and only the root that
+    holds the executable has that executable. A second root is still a
+    copy that the hash has to cover.
+    """
+    dest = Path(dest)
+    src = Path(src)
+    if not dest.exists():
+        return False
     if getattr(sys, "frozen", False):
-        if not (dest / Path(sys.executable).name).is_file():
-            return False
-    else:
-        exe_name = "python.exe" if os.name == "nt" else "python"
-        if not (dest / exe_name).is_file() or not (dest / "Lib" / "os.py").is_file():
-            return False
-    digest = runtime_tree_digest(dest)
+        exe_name = Path(sys.executable).name
+        if src.is_file():
+            return dest.is_file() and dest.name == exe_name
+        if (src / exe_name).is_file():
+            return (dest / exe_name).is_file()
+        return True
+    exe_name = "python.exe" if os.name == "nt" else "python"
+    if (src / exe_name).is_file():
+        return (dest / exe_name).is_file() and (dest / "Lib" / "os.py").is_file()
+    return True
+
+
+def _stamp_matches(dest: Path, src: Path, digest: str) -> bool:
     for item in _load_runtime_stamp():
         if not isinstance(item, dict):
             continue
@@ -2978,6 +2999,17 @@ def _runtime_copy_ready(dest: Path, src: Path) -> bool:
         if acl_same(item.get("source", ""), src) and acl_same(item.get("dest", ""), dest):
             return True
     return False
+
+
+def _runtime_copy_ready(dest: Path, src: Path) -> bool:
+    if not _runtime_tree_present(dest, src):
+        return False
+    digest = runtime_tree_digest(dest)
+    if _stamp_matches(dest, src, digest):
+        return True
+    # A file can be unreadable for one pass while a scanner holds it.
+    digest = runtime_tree_digest(dest)
+    return _stamp_matches(dest, src, digest)
 
 
 def _runtime_copies_ready() -> bool:
