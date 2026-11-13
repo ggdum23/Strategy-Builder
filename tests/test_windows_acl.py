@@ -764,6 +764,7 @@ def test_a_runtime_tree_that_cannot_be_deleted_fails_and_is_not_stamped(tmp_path
     (dest / "python.exe").write_bytes(b"old")
     stamped = []
     monkeypatch.setattr(sandbox, "_remember_runtime_stamp", lambda: stamped.append(True))
+    monkeypatch.setattr(sandbox, "_win_set_runtime_dacl", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(sandbox, "_RUNTIME_COPIES", [(str(src), str(dest))])
     monkeypatch.setattr(sandbox, "_runtime_copy_ready", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(sandbox, "_remove_tree", _remove_tree)
