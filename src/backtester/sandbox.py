@@ -4881,15 +4881,18 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
         # CREATE_BREAKAWAY_FROM_JOB. The worker job's commit ceiling must
         # not charge this child: that wait is the empty result pipe. If the
         # outer job forbids breakaway, start in the worker job instead.
-        # That is not a retry of a missing executable. A second pass is only
-        # for a start the runner refused while the executable was present:
-        # a busy GitHub worker has failed the first AppContainer create and
-        # accepted the same call a moment later. Winerror 2 is file-not-found
-        # and 193 is not a valid application; those do not get the second pass.
+        # That is not a retry of a missing executable. An AppContainer create
+        # also returns winerror 2 (file not found) when the parent can see
+        # the image and the working directory but the container cannot yet.
+        # A busy runner does that just after the private-directory grant.
+        # Two more passes cover it. Winerror 193 is not a valid application
+        # and is not retried. A winerror 2 whose image this process cannot
+        # stat is not retried either.
         ok = False
         failed = 0
+        executable_path = Path(executable)
         passes = ((0x01000000, "breakaway"), (0, "in-job"))
-        for pass_index in (1, 2):
+        for pass_index in (1, 2, 3):
             for extra, label in passes:
                 prefix = "createprocess" if pass_index == 1 else "createprocess-retry"
                 note_phase(f"{prefix}-{label}")
@@ -4912,12 +4915,15 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
                 note_phase(f"createprocess-fail-{label}-{failed}")
                 if extra == 0 or failed != 5:
                     break
-            if ok or failed in (2, 193):
+            if ok or failed == 193:
                 break
-            time.sleep(0.25)
+            if failed == 2 and not (executable_path.is_file() and work.is_dir()):
+                break
+            if pass_index == 3:
+                break
+            time.sleep(0.5)
         if not ok:
             code = failed
-            executable_path = Path(executable)
             raise SandboxError(
                 "CreateProcessW failed (winerror %s); executable %s exists=%s cwd=%s cwd_exists=%s"
                 % (code, executable_path, executable_path.is_file(), work, work.is_dir())
