@@ -12,6 +12,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import struct
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ import pytest
 from backtester.accounting import price_basis_refusal, resolve_accounting
 from backtester.pack import (
     _stream_names,
+    _stream_names_from_information,
     assert_anonymized_pack_clean,
     build_pack,
     copy_anonymized_pack,
@@ -179,6 +181,32 @@ def _names_for(directory: Path, names: list[str]):
         return []
 
     return fake
+
+
+def _stream_info(*names: str) -> bytes:
+    """A ``FileStreamInformation`` buffer. Offsets are 8-byte aligned."""
+    parts = []
+    for name in names:
+        encoded = name.encode("utf-16-le")
+        raw = 24 + len(encoded)
+        pad = (8 - raw % 8) % 8
+        parts.append((encoded, raw + pad))
+    blob = b""
+    for index, (encoded, size) in enumerate(parts):
+        step = 0 if index == len(parts) - 1 else size
+        blob += struct.pack("<IIQQ", step, len(encoded), 0, 0) + encoded
+        blob += b"\x00" * (size - 24 - len(encoded))
+    return blob
+
+
+def test_stream_information_names_match_find_first_stream():
+    blob = _stream_info("::$DATA", ":$I30:$INDEX_ALLOCATION", ":dir_date_map:$DATA")
+    assert _stream_names_from_information(blob + b"\x00" * 64) == [
+        "::$DATA",
+        ":$I30:$INDEX_ALLOCATION",
+        ":dir_date_map:$DATA",
+    ]
+    assert _stream_names_from_information(b"\x00" * 24) == []
 
 
 def test_directory_stream_is_refused_without_its_name(tmp_path, monkeypatch):

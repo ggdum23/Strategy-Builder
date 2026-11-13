@@ -5,7 +5,8 @@ this host (CPython 3.12, NumPy 2.5) and checked against a second run.
 ``sidecar.json`` drops ``factor_key``, ``factor_mac``, and ``source_root``
 (a random key and the operator's directory). ``run.json`` drops ``id``.
 PNG bytes are locked on Linux, where they matched main; Windows checks the
-PNG signature because the chart font is not the same file.
+PNG signature because the chart font is not the same file. Report paths
+are compared with forward slashes, including on Windows.
 
 NumPy 2.4 (CPython 3.11) and NumPy 2.5 disagree by one unit in the last
 place on a few Desk reductions: average exposure, turnover per year,
@@ -91,7 +92,7 @@ def _compare(folder: Path, case: str) -> None:
     for path in sorted(folder.rglob("*")):
         if not path.is_file():
             continue
-        rel = str(path.relative_to(folder))
+        rel = path.relative_to(folder).as_posix()
         if path.suffix.lower() == ".png" and sys.platform == "win32":
             assert path.read_bytes().startswith(_PNG), rel
             expected.pop(rel, None)
