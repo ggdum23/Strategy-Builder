@@ -6,7 +6,10 @@ this host (CPython 3.12, NumPy 2.5) and checked against a second run.
 (a random key and the operator's directory). ``run.json`` drops ``id``.
 PNG bytes are locked on Linux, where they matched main; Windows checks the
 PNG signature because the chart font is not the same file. Report paths
-are compared with forward slashes, including on Windows.
+are compared with forward slashes. Text files are hashed after ``\\r\\n``
+is folded to ``\\n``, because ``Path.write_text`` and the CSV writer use
+the platform newline. The writers are unchanged, so a Windows run still
+matches ``main`` on Windows.
 
 NumPy 2.4 (CPython 3.11) and NumPy 2.5 disagree by one unit in the last
 place on a few Desk reductions: average exposure, turnover per year,
@@ -76,6 +79,8 @@ def _hash(path: Path) -> str:
         blob = json.dumps(document, indent=2, sort_keys=True).encode()
     else:
         blob = path.read_bytes()
+        if path.suffix.lower() in {".csv", ".json"}:
+            blob = blob.replace(b"\r\n", b"\n")
     return hashlib.sha256(blob).hexdigest()
 
 
@@ -103,7 +108,10 @@ def _compare(folder: Path, case: str) -> None:
     changed = sorted(
         key for key in set(expected) & set(actual) if not _accepted(case, key, actual[key])
     )
-    assert not missing and not extra and not changed, (case, missing[:5], extra[:5], changed[:8])
+    sample = ""
+    if changed:
+        sample = repr((folder / changed[0]).read_bytes()[:96])
+    assert not missing and not extra and not changed, (case, missing[:4], extra[:4], changed[:6], sample)
 
 
 def _series(tmp_path: Path) -> tuple[Path, Path]:
