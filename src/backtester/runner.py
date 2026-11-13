@@ -1693,6 +1693,8 @@ def _isolated_books(
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     gate = {"started": ctx.Event(), "release": ctx.Event()}
+    if frame is None and series_path is None:
+        raise ValueError("a jailed book needs a frame or a prepared series")
     if series_path is not None and audience == "designer":
         from .prepared import read_manifest
 
@@ -1762,11 +1764,18 @@ def _isolated_books(
             raise failure
         if proc.exitcode not in (0, None):
             raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n")
-        # A published series is already its own artifact. The parent keeps the
-        # frame it prepared instead of copying every column again. A designer
-        # book still copies so the accept path cannot alias an operator frame.
-        # With no series path the copy is what keeps a view's pickle to its rows.
-        if series_path is not None and audience != "designer":
+        # The child has exited. Load the artifact only when this process still
+        # has to recompute benchmarks or accept a designer book. Until then the
+        # parent does not keep a second copy of the series.
+        wants_frame = audience == "designer" or bool(run_kwargs.get("with_benchmarks", True))
+        if frame is None:
+            if wants_frame:
+                from .prepared import load_frame
+
+                held = load_frame(published)
+            else:
+                held = None
+        elif series_path is not None and audience != "designer":
             held = frame
         else:
             held = _standalone_frame(frame)
@@ -1992,20 +2001,41 @@ def run_named(
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
     )
+    inspection = loaded.inspection
+    series_path = loaded.prepared
     if bound_path is not None:
         if call_timeout is not None:
             book_kwargs["call_timeout"] = float(call_timeout)
-        books = _isolated_books(bound_cls, loaded.frame, profile, strategy_path=bound_path, **book_kwargs)
+        if series_path:
+            # The worker maps this artifact. Drop the parent's frame for the
+            # duration of the jail, then map it again to write the report.
+            loaded = None
+            gc.collect()
+            books = _isolated_books(
+                bound_cls,
+                None,
+                profile,
+                strategy_path=bound_path,
+                series_path=series_path,
+                **book_kwargs,
+            )
+            from .prepared import load_frame
+
+            report_frame = load_frame(series_path)
+        else:
+            report_frame = loaded.frame
+            books = _isolated_books(bound_cls, report_frame, profile, strategy_path=bound_path, **book_kwargs)
     else:
-        books = run_books(bound_cls, loaded.frame, profile, **book_kwargs)
+        report_frame = loaded.frame
+        books = run_books(bound_cls, report_frame, profile, **book_kwargs)
     payload = write_books(
         out_dir,
         profile,
         symbol,
         bar_minutes,
-        loaded.frame,
+        report_frame,
         books,
-        extra={"warnings": warnings, "inspection": loaded.inspection.as_dict()},
+        extra={"warnings": warnings, "inspection": inspection.as_dict()},
     )
     _write_child_surface(out_dir, books)
     return payload

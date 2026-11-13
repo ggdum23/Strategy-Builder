@@ -815,7 +815,8 @@ class _Pipe:
                     break
 
     def _write(self, payload: dict) -> None:
-        frame = bar_ipc.dumps(_jsonable(payload))
+        packed = bar_ipc.pack_bar(payload) if payload.get("op") == "bar" else None
+        frame = packed if packed is not None else bar_ipc.dumps(_jsonable(payload))
         view = memoryview(frame)
         try:
             while view:
@@ -987,8 +988,8 @@ class _Pipe:
 
     def _message(self, line: bytes) -> dict:
         try:
-            payload = json.loads(line.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
+            payload = bar_ipc.loads(line)
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise Disqualified("protocol", "decision was not JSON") from exc
         if not isinstance(payload, dict):
             raise Disqualified("protocol", "decision was not an object")

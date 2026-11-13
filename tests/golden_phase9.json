@@ -1,7 +1,7 @@
 {
   "sessions": 3,
   "symbol": "SYN",
-  "frame_sha256": "9917fc51faea0ecbb97eec85955182db6f7532d0f41068f04fe960e6f23c9bc5",
+  "frame_sha256": "5aa55b96e3bc4c7c7a6566f7f46e7a24f3ea9132d424c3b7be69e893c7489a3d",
   "n_rows": 2880,
   "n_sessions": 3,
   "native_tick": 0.01,

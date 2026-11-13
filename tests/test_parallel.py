@@ -552,10 +552,15 @@ def test_anonymized_pack_keeps_the_sidecar_in_the_parent(tmp_path, monkeypatch):
 
     def spy(strategy_cls, frame, profile, **kwargs):
         books = real(strategy_cls, frame, profile, **kwargs)
+        viewed = frame
+        if viewed is None:
+            from backtester.prepared import load_frame
+
+            viewed = load_frame(kwargs["series_path"])
         recorded.append(
             {
                 "kwargs": dict(kwargs),
-                "csv": frame.to_csv(index=False),
+                "csv": viewed.to_csv(index=False),
                 "observer": books["strategy"][0].get("observer"),
             }
         )

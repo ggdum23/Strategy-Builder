@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-SCHEMA = 1
+SCHEMA = 2
 _KEY_RE_TEXT = r"^[0-9a-f]{64}$"
 _DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024
 _LOCK_STALE_S = 15 * 60
@@ -276,7 +276,11 @@ def screen_designer(frame: pd.DataFrame, *, symbol: str | None = None, manifest:
         values = frame[name]
         if not _is_text(values):
             continue
-        for value in pd.unique(values.astype(str)):
+        if isinstance(values.dtype, pd.CategoricalDtype):
+            texts = [str(value) for value in values.cat.categories]
+        else:
+            texts = [str(value) for value in pd.unique(values)]
+        for value in texts:
             text = str(value)
             if _ISO_DATE.search(text):
                 raise ValueError("designer view contains a calendar date")
@@ -319,12 +323,11 @@ def frame_key(frame: pd.DataFrame, kind: str) -> str:
     digest.update(b"\0")
     digest.update(str(LOADER_VERSION).encode("ascii"))
     for name in frame.columns:
-        array = _export_column(frame[name])
         digest.update(b"\0")
         digest.update(str(name).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(array.dtype.str.encode("ascii"))
-        digest.update(array.tobytes())
+        for blob in _column_hash_bytes(frame[name]):
+            digest.update(b"\0")
+            digest.update(blob)
     return digest.hexdigest()
 
 
@@ -365,21 +368,7 @@ def _store_arrays(key: str, frame: pd.DataFrame, *, kind: str, extra: dict) -> P
         partial.mkdir(parents=True)
         columns = []
         for index, name in enumerate(list(frame.columns)):
-            array = _export_column(frame[name])
-            file_name = f"{index:02d}-{_safe_name(str(name))}.npy"
-            target = partial / file_name
-            with open(target, "wb") as handle:
-                np.save(handle, array)
-                handle.flush()
-                os.fsync(handle.fileno())
-            columns.append(
-                {
-                    "name": str(name),
-                    "file": file_name,
-                    "dtype": array.dtype.str,
-                    "blake2b": _hash_file(target),
-                }
-            )
+            columns.append(_write_column(partial, index, str(name), frame[name]))
         manifest = {
             "schema": SCHEMA,
             "kind": kind,
@@ -408,14 +397,105 @@ def _store_arrays(key: str, frame: pd.DataFrame, *, kind: str, extra: dict) -> P
         _release(lock)
 
 
+def _save_array(directory: Path, file_name: str, array: np.ndarray) -> dict:
+    target = directory / file_name
+    stored = np.ascontiguousarray(array)
+    with open(target, "wb") as handle:
+        np.save(handle, stored)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return {"file": file_name, "dtype": stored.dtype.str, "blake2b": _hash_file(target)}
+
+
+def _category_digest(categories) -> str:
+    blob = json.dumps(list(categories), separators=(",", ":")).encode("utf-8")
+    return hashlib.blake2b(blob, digest_size=32).hexdigest()
+
+
+def _column_hash_bytes(series: pd.Series) -> list[bytes]:
+    """Stable bytes for one column. Categorical text is codes plus labels."""
+    from .frame_columns import StampArray
+
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        codes = np.ascontiguousarray(series.cat.codes.to_numpy())
+        labels = json.dumps([str(value) for value in series.cat.categories], separators=(",", ":")).encode("utf-8")
+        return [b"category", codes.dtype.str.encode("ascii"), codes.tobytes(), labels]
+    array = getattr(series, "array", None)
+    if isinstance(array, StampArray):
+        parts = (array._year, array._month, array._day, array._minute, array._offset)
+        blobs = [b"stamp"]
+        for part in parts:
+            stored = np.ascontiguousarray(part)
+            blobs.append(stored.dtype.str.encode("ascii"))
+            blobs.append(stored.tobytes())
+        return blobs
+    exported = _export_column(series)
+    return [b"plain", exported.dtype.str.encode("ascii"), exported.tobytes()]
+
+
+def _write_column(directory: Path, index: int, name: str, series: pd.Series) -> dict:
+    from .frame_columns import StampArray
+
+    stem = f"{index:02d}-{_safe_name(name)}"
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        codes = np.ascontiguousarray(series.cat.codes.to_numpy())
+        categories = [str(value) for value in series.cat.categories]
+        saved = _save_array(directory, f"{stem}.npy", codes)
+        return {
+            "name": name,
+            "encoding": "category",
+            "categories": categories,
+            "categories_blake2b": _category_digest(categories),
+            **saved,
+        }
+    array = getattr(series, "array", None)
+    if isinstance(array, StampArray):
+        parts = []
+        for key, values in (
+            ("year", array._year),
+            ("month", array._month),
+            ("day", array._day),
+            ("minute", array._minute),
+            ("offset", array._offset),
+        ):
+            saved = _save_array(directory, f"{stem}-{key}.npy", values)
+            saved["key"] = key
+            parts.append(saved)
+        return {"name": name, "encoding": "stamp", "parts": parts}
+    if name == "symbol":
+        values = series.tolist()
+        if values and all(str(value) == str(values[0]) for value in values):
+            return {"name": name, "encoding": "constant", "value": str(values[0])}
+    exported = _export_column(series)
+    saved = _save_array(directory, f"{stem}.npy", exported)
+    return {"name": name, "encoding": "plain", **saved}
+
+
 def _materialize(root: Path, manifest: dict) -> pd.DataFrame:
+    from .frame_columns import StampArray
+
     columns = {}
+    rows = int(manifest["rows"])
     for spec in manifest["columns"]:
-        array = np.load(root / spec["file"], mmap_mode="c")
-        if array.dtype.kind == "U":
-            columns[spec["name"]] = pd.Series(array.tolist(), dtype="str")
+        encoding = spec.get("encoding") or "plain"
+        if encoding == "category":
+            codes = np.load(root / spec["file"], mmap_mode="c")
+            columns[spec["name"]] = pd.Categorical.from_codes(np.asarray(codes), spec["categories"])
+        elif encoding == "stamp":
+            loaded = {part["key"]: np.load(root / part["file"], mmap_mode="c") for part in spec["parts"]}
+            columns[spec["name"]] = StampArray(
+                loaded["year"], loaded["month"], loaded["day"], loaded["minute"], loaded["offset"]
+            )
+        elif encoding == "constant":
+            columns[spec["name"]] = pd.Categorical.from_codes(
+                np.zeros(rows, dtype=np.int8), [str(spec.get("value") or "")]
+            )
         else:
-            columns[spec["name"]] = array
+            array = np.load(root / spec["file"], mmap_mode="c")
+            if array.dtype.kind == "U":
+                columns[spec["name"]] = pd.Series(array.tolist(), dtype="str")
+            else:
+                columns[spec["name"]] = array
     ordered = {spec["name"]: columns[spec["name"]] for spec in manifest["columns"]}
     return pd.DataFrame(ordered, copy=False)
 
@@ -431,13 +511,21 @@ def _verified_manifest(root: Path) -> dict | None:
         if int(manifest.get("schema") or 0) != SCHEMA:
             raise ValueError("schema")
         for spec in columns:
-            target = root / spec["file"]
-            if _hash_file(target) != spec["blake2b"]:
-                raise ValueError("digest")
-            array = np.load(target, mmap_mode="r")
-            if int(array.shape[0]) != rows:
-                raise ValueError("rows")
-            del array
+            encoding = spec.get("encoding") or "plain"
+            if encoding == "constant":
+                continue
+            if encoding == "category":
+                if _category_digest(spec["categories"]) != spec["categories_blake2b"]:
+                    raise ValueError("digest")
+            files = spec["parts"] if encoding == "stamp" else [spec]
+            for part in files:
+                target = root / part["file"]
+                if _hash_file(target) != part["blake2b"]:
+                    raise ValueError("digest")
+                array = np.load(target, mmap_mode="r")
+                if int(array.shape[0]) != rows:
+                    raise ValueError("rows")
+                del array
     except Exception:
         shutil.rmtree(root, ignore_errors=True)
         return None
@@ -555,7 +643,12 @@ def _contains_ticker(text: str, symbol: str) -> bool:
 
 
 def _is_text(series: pd.Series) -> bool:
-    kind = getattr(series.dtype, "kind", "")
+    dtype = series.dtype
+    if isinstance(dtype, pd.CategoricalDtype):
+        return True
+    if getattr(dtype, "name", "") == "stamp":
+        return True
+    kind = getattr(dtype, "kind", "")
     if kind in {"i", "u", "f", "b", "c"}:
         return False
     return True

@@ -371,6 +371,11 @@ def run_parallel(
                 shared_series[id(market)] = str(store_frame(market.frame, kind="window"))
         except Exception:
             shared_series[id(market)] = None
+        if shared_series[id(market)] is not None:
+            # Workers map this artifact. The parent thread reloads it after
+            # the child exits, to write the report.
+            market.frame = None
+    gc.collect()
     assignments = []
     for ref, market in pairs:
         if isinstance(market, _Prepared):
@@ -419,8 +424,9 @@ def run_parallel(
         ref, market, carried = assignment
         series_path = carried if isinstance(carried, str) else None
         if isinstance(market, _Prepared) and series_path is not None:
-            # One frame in this process. Each worker maps that artifact.
-            frame = market.frame
+            # The worker maps the artifact. This thread does not keep a copy
+            # while that child is running.
+            frame = None
         else:
             frame = carried
         source_id = _pair_source(market)
@@ -509,6 +515,10 @@ def run_parallel(
                 designer=designer_call,
                 operator=operator_call,
             )
+            if frame is None:
+                from .prepared import load_frame
+
+                frame = load_frame(series_path)
             extra = {
                 "warnings": [],
                 "anonymized": market.anonymized,

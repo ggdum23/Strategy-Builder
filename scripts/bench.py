@@ -5,7 +5,8 @@
 That is what the perf workflow gates. ``--scale year`` is 252 sessions.
 ``--scale full`` is 23 years of weekdays. Each scale times a cold load, a
 warm load, one Arena book, one Desk book, an Arena walk-forward, the jailed
-Arena and Desk runs, and Arena parallel at 1, 2, 4, and 8 workers.
+Arena and Desk runs, and Arena parallel. The ci and year scales use 1, 2, 4,
+and 8 workers. The full scale stops at 4 workers.
 The generator is synthetic and is not a market download. Nothing it writes
 is committed.
 
@@ -334,7 +335,8 @@ def main(argv=None) -> int:
         discovered = discover_strategies(strategies)
         parallel = {}
         parallel_rss = {}
-        for workers in (1, 2, 4, 8):
+        worker_set = (1, 2, 4) if args.scale == "full" else (1, 2, 4, 8)
+        for workers in worker_set:
             peak.begin()
             elapsed, _result = _time(
                 lambda workers=workers: run_parallel(

@@ -349,6 +349,81 @@ def test_length_prefixed_decisions_keep_bool_int_and_nan(tmp_path):
         proc.wait(timeout=5)
 
 
+def test_compact_bar_frames_roundtrip_the_engine_shape():
+    from backtester import bar_ipc
+
+    arena = {
+        "op": "bar",
+        "bar": {
+            "day": 3,
+            "weekday": 4,
+            "minute": 570,
+            "time": "09:30",
+            "session": "rth",
+            "open": 100.01,
+            "high": 100.5,
+            "low": 99.5,
+            "close": 100.25,
+            "volume": 125.0,
+            "wap": 100.1,
+            "count": 7,
+            "filled": 0,
+            "short_session": 0,
+        },
+        "state": {
+            "equity": 1001631.2114307251,
+            "cash": 900000.0,
+            "shares": 100,
+            "position": 1.0,
+            "target": 1.0,
+            "pending_order": False,
+        },
+    }
+    packed = bar_ipc.pack_bar(arena)
+    assert packed is not None and packed[4] == 1
+    assert bar_ipc.loads(packed[4:]) == arena
+    desk = {
+        "op": "bar",
+        "bar": {
+            "session": "2003-01-02",
+            "time": "09:30",
+            "phase": "rth",
+            "open": 100.01,
+            "high": 100.5,
+            "low": 99.5,
+            "close": 100.25,
+            "volume": 125.0,
+            "wap": 100.1,
+            "count": 1.5,
+            "filled": 0,
+            "new_session": True,
+        },
+        "account": {
+            "cash": 1000000.0,
+            "position_shares": 0,
+            "equity": 1000000.0,
+            "exposure": None,
+            "gross_leverage": None,
+            "hwm": 1000000.0,
+            "drawdown": 0.0,
+            "live": True,
+            "liquidated": False,
+        },
+    }
+    packed = bar_ipc.pack_bar(desk)
+    assert packed is not None and packed[4] == 1
+    assert bar_ipc.loads(packed[4:]) == desk
+    for target in (None, False, True, 1, 1.0, float("nan")):
+        frame = bar_ipc.pack_decision(target)
+        assert frame is not None and frame[4] == 2
+        got = bar_ipc.loads(frame[4:])["target"]
+        if isinstance(target, float) and target != target:
+            assert isinstance(got, float) and got != got
+        else:
+            assert got == target and type(got) is type(target)
+    assert bar_ipc.pack_bar({"op": "bar", "bar": {"probe": "none"}, "state": {}}) is None
+
+
 def test_workers_share_one_mapped_frame(tmp_path):
     write_series(tmp_path / "src", "SYN", sessions=3)
     loaded = load_named(tmp_path / "src", "SYN")

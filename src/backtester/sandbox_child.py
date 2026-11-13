@@ -59,7 +59,12 @@ def _ipc():
 
 
 def _send(payload: dict) -> None:
-    frame = _ipc().dumps(payload)
+    ipc = _ipc()
+    frame = None
+    if payload.get("op") == "decision":
+        frame = ipc.pack_decision(payload.get("target"))
+    if frame is None:
+        frame = ipc.dumps(payload)
     view = memoryview(frame)
     while view:
         count = os.write(_PROTO, view)

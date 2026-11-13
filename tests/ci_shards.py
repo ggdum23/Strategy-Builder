@@ -42,6 +42,7 @@ FILE_SHARDS = {
         "tests/test_mutations.py",
         "tests/test_pack.py",
         "tests/test_phase9_perf.py",
+        "tests/test_phase9_equiv.py",
         "tests/test_phase9_review.py",
         "tests/test_pack_fees.py",
         "tests/test_packaging.py",
