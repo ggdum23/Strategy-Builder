@@ -1058,7 +1058,10 @@ _JAIL_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
 # Headroom above the caller's cap so the jail can cross it by one small
 # allocation and the poll can still report the number. It is not a second
 # ceiling: the kernel limit stays this close to the caller's cap.
-_JAIL_CAP_MARGIN = 32 * 1024 * 1024
+# One poll interval of 8 MiB chunks, plus the headroom the memory tests
+# allocate past the cap before they sleep. Still far under the 2 GiB ceiling,
+# so one mapping cannot reach that ceiling.
+_JAIL_CAP_MARGIN = 256 * 1024 * 1024
 _JAIL_CPU_SECONDS = 3600
 # Same default as the referee. A longer bar has to opt in.
 _JAIL_CALL_TIMEOUT_S = 10.0

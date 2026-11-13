@@ -758,11 +758,11 @@ def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
 
 def test_the_caller_cap_is_the_jail_ceiling_and_a_long_job_fails():
     from backtester.limits import cgroup_memory_available, member_list_overflow, sum_process_tree
-    from backtester.runner import _JAIL_MEMORY_BYTES, _watched_rss, jail_memory_bytes
+    from backtester.runner import _JAIL_CAP_MARGIN, _JAIL_MEMORY_BYTES, _watched_rss, jail_memory_bytes
 
     assert jail_memory_bytes(None) == _JAIL_MEMORY_BYTES
     assert jail_memory_bytes(True) == _JAIL_MEMORY_BYTES
-    assert jail_memory_bytes(100) == 100 + 32 * 1024 * 1024
+    assert jail_memory_bytes(100) == 100 + _JAIL_CAP_MARGIN
     assert jail_memory_bytes(_JAIL_MEMORY_BYTES) == _JAIL_MEMORY_BYTES
     assert member_list_overflow(32) is None
     assert "32-pid prefix" in member_list_overflow(33)

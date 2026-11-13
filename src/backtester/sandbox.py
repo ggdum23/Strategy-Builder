@@ -3365,7 +3365,14 @@ def _runtime_acl_entries(lease, *, lock: bool):
     specs = []
     if lock:
         for text in ("S-1-5-32-545", "S-1-1-0", "S-1-15-2-1", "S-1-15-2-2"):
-            specs.append((sid_for(text), _WRITE_MASK, 3))
+            specs.append((sid_for(text), _WRITE_DENY_MASK, 3))
+        # The user who hashes the tree and owns it. Write stays denied
+        # because this SID is also in Users, and that deny is checked
+        # against the write bits. Read and execute are not those bits.
+        user = _current_user_sid_text()
+        if not user:
+            raise SandboxError("could not read the current user SID")
+        specs.append((sid_for(user), _RX_MASK, 1))
         specs.append((lease.sid, _RX_MASK, 1))
         specs.append((sid_for("S-1-5-18"), _FULL_MASK, 1))
     else:
@@ -3553,7 +3560,11 @@ _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _PROTECTED_DACL = 0x80000000
 # FILE_WRITE_DATA | APPEND | WRITE_EA | DELETE_CHILD | WRITE_ATTRIBUTES
 # | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL
+# The generic bits are for detecting an inheritable write. They are not
+# put on a deny ACE: a GENERIC_ALL deny also denies read and the owner
+# can no longer hash or list the tree.
 _WRITE_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x40000000 | 0x10000000
+_WRITE_DENY_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
 # OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
 _INHERIT_TO_CHILDREN = 0x1 | 0x2
 

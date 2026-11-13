@@ -322,7 +322,7 @@ The backend name is `job+appcontainer`.
   marker is cleared first so the next process installs them again. A
   firewall cmdlet that times out fails the launch unless both dynamic
   layers are already in place. The jail's job memory limit is the
-  caller's cap plus 32 MiB, and never above 2 GiB. The worker job has
+  caller's cap plus 256 MiB, and never above 2 GiB. The worker job has
   no commit limit. The reporter reads working set and commit, and it
   walks the children of every extra pid. A job that reports more than
   32 processes fails the book.
@@ -389,7 +389,7 @@ is the child's own work directory.
 
 `RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_NPROC`, and `RLIMIT_CPU` are set
 before the strategy is loaded. `RLIMIT_AS` and `RLIMIT_DATA` use the
-caller's memory cap plus 32 MiB, and never more than 2 GiB. When the
+caller's memory cap plus 256 MiB, and never more than 2 GiB. When the
 cgroup memory controller is mounted, the same ceiling is written to
 `memory.max` for the jail pid. A missing controller does not fail the
 launch. The parent also enforces the wall-clock
