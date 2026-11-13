@@ -4881,30 +4881,40 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
         # CREATE_BREAKAWAY_FROM_JOB. The worker job's commit ceiling must
         # not charge this child: that wait is the empty result pipe. If the
         # outer job forbids breakaway, start in the worker job instead.
-        # That is not a retry of a missing executable.
+        # That is not a retry of a missing executable. A second pass is only
+        # for a start the runner refused while the executable was present:
+        # a busy GitHub worker has failed the first AppContainer create and
+        # accepted the same call a moment later. Winerror 2 is file-not-found
+        # and 193 is not a valid application; those do not get the second pass.
         ok = False
         failed = 0
-        for extra, label in ((0x01000000, "breakaway"), (0, "in-job")):
-            note_phase(f"createprocess-{label}")
-            ok = kernel.CreateProcessW(
-                executable,
-                command_buf,
-                None,
-                None,
-                1,
-                flags | extra,
-                ctypes.cast(env_buf, ctypes.c_void_p),
-                str(work),
-                ctypes.byref(info),
-                ctypes.byref(created),
-            )
-            if ok:
-                note_phase(f"createprocess-ok-{label}")
+        passes = ((0x01000000, "breakaway"), (0, "in-job"))
+        for pass_index in (1, 2):
+            for extra, label in passes:
+                prefix = "createprocess" if pass_index == 1 else "createprocess-retry"
+                note_phase(f"{prefix}-{label}")
+                ok = kernel.CreateProcessW(
+                    executable,
+                    command_buf,
+                    None,
+                    None,
+                    1,
+                    flags | extra,
+                    ctypes.cast(env_buf, ctypes.c_void_p),
+                    str(work),
+                    ctypes.byref(info),
+                    ctypes.byref(created),
+                )
+                if ok:
+                    note_phase(f"createprocess-ok-{label}")
+                    break
+                failed = ctypes.get_last_error()
+                note_phase(f"createprocess-fail-{label}-{failed}")
+                if extra == 0 or failed != 5:
+                    break
+            if ok or failed in (2, 193):
                 break
-            failed = ctypes.get_last_error()
-            note_phase(f"createprocess-fail-{label}-{failed}")
-            if extra == 0 or failed != 5:
-                break
+            time.sleep(0.25)
         if not ok:
             code = failed
             executable_path = Path(executable)
