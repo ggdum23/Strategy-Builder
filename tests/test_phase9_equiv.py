@@ -2,14 +2,18 @@
 
 The golden file is the normalized report tree of that commit, captured on
 this host (CPython 3.12, NumPy 2.5) and checked against a second run.
-``sidecar.json`` drops ``factor_key``, ``factor_mac``, and ``source_root``
-(a random key and the operator's directory). ``run.json`` drops ``id``.
-PNG bytes are locked on Linux, where they matched main; Windows checks the
-PNG signature because the chart font is not the same file. Report paths
-are compared with forward slashes. Text files are hashed after ``\\r\\n``
-is folded to ``\\n``, because ``Path.write_text`` and the CSV writer use
-the platform newline. The writers are unchanged, so a Windows run still
-matches ``main`` on Windows.
+``sidecar.json`` drops ``factor_key``, ``factor_mac``, ``source_root``,
+and ``pack_id`` (a random key, the operator's directory, and the hash of
+the compressed pack bytes). ``run.json`` drops ``id``. PNG bytes are
+locked on Linux, where they matched main; Windows checks the PNG signature
+because the chart font is not the same file. Report paths are compared
+with forward slashes. Text files are hashed after ``\\r\\n`` is folded to
+``\\n``, because ``Path.write_text`` and the CSV writer use the platform
+newline. A gzip member with mtime 0 and no file name is hashed after it
+is inflated, because zlib does not promise the same compressed bytes on
+Windows and on Linux. ``pack_id`` is that compressed-byte hash, so a JSON
+file is hashed with the id zeroed. The writers are unchanged, so a
+Windows run still matches ``main`` on Windows.
 
 NumPy 2.4 (CPython 3.11) and NumPy 2.5 disagree by one unit in the last
 place on a few Desk reductions: average exposure, turnover per year,
@@ -26,8 +30,10 @@ Packs refuse ``--unsafe-in-process``. The jailed pack is the pack surface.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -66,11 +72,28 @@ class _Hold:
         return None
 
 
+_PACK_ID = re.compile(br'"pack_id": "[0-9a-f]{64}"')
+_PACK_ID_ZERO = b'"pack_id": "' + (b"0" * 64) + b'"'
+# mtime 0, no flags. The OS byte and the compressor's xfl are not part of the check.
+_GZIP_CANON = b"\x1f\x8b\x08\x00\x00\x00\x00\x00"
+
+
+def _neutralize_pack_id(blob: bytes) -> bytes:
+    """Zero ``pack_id`` without reserializing the rest of the document."""
+    return _PACK_ID.sub(_PACK_ID_ZERO, blob)
+
+
 def _hash(path: Path) -> str:
     name = path.name
-    if name == "sidecar.json":
+    if path.suffix.lower() == ".gz":
+        raw = path.read_bytes()
+        if raw[:8] == _GZIP_CANON:
+            blob = gzip.decompress(raw).replace(b"\r\n", b"\n")
+        else:
+            blob = raw
+    elif name == "sidecar.json":
         document = json.loads(path.read_text(encoding="utf-8"))
-        for key in ("factor_key", "factor_mac", "source_root"):
+        for key in ("factor_key", "factor_mac", "source_root", "pack_id"):
             document.pop(key, None)
         blob = json.dumps(document, indent=2, sort_keys=True).encode()
     elif name == "run.json":
@@ -81,6 +104,8 @@ def _hash(path: Path) -> str:
         blob = path.read_bytes()
         if path.suffix.lower() in {".csv", ".json"}:
             blob = blob.replace(b"\r\n", b"\n")
+        if path.suffix.lower() == ".json":
+            blob = _neutralize_pack_id(blob)
     return hashlib.sha256(blob).hexdigest()
 
 
@@ -110,7 +135,11 @@ def _compare(folder: Path, case: str) -> None:
     )
     sample = ""
     if changed:
-        sample = repr((folder / changed[0]).read_bytes()[:96])
+        raw = (folder / changed[0]).read_bytes()[:120]
+        if raw[:8] == _GZIP_CANON:
+            sample = repr(gzip.decompress((folder / changed[0]).read_bytes())[:160])
+        else:
+            sample = repr(raw)
     assert not missing and not extra and not changed, (case, missing[:4], extra[:4], changed[:6], sample)
 
 

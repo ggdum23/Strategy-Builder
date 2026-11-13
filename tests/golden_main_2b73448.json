@@ -205,9 +205,9 @@
       "walkforward.json": "8d92447ebee6c4d63a705f1287ade2a2a9fcb5bb4a8657993010307d3a3b99d8"
     },
     "pack-arena-jailed": {
-      "pack/bars_part_001.csv.gz": "e75d2760a3dc95fd30bdd1816e34afc9b186f6d8a518da9f07e67ee73b95b492",
-      "pack/daily_rth.csv.gz": "291111e7335360598a775bbdbfd3e10ee1fe963b2bcd45544036a70b9481fcdf",
-      "pack/manifest.json": "6ca1096188cec93f254e34aee2f2a516e0c43672dbe56b44ad8d0b3429319693",
+      "pack/bars_part_001.csv.gz": "299e72704c197e4d3148b670f6e34009b5e8b1fda175a72dedc05160edb76e92",
+      "pack/daily_rth.csv.gz": "02894cb7e7903a43ba2613fe6324a335428a94bc1dc46817ceb3f4d0d9595973",
+      "pack/manifest.json": "b5be65c9ad3ff558820559c5aef6454c378ea91982ef3ad6cd19631c4d482552",
       "run/benchmarks/buy_and_hold_1x/equity.csv": "6ab270afd7e2d47b66f77bfa7b39845d6e6eced933ddb042b08605513d6ab255",
       "run/benchmarks/buy_and_hold_1x/equity.png": "7765b63b41afb48893fce49404e5269cae85292a1b1daa583a59857e96309254",
       "run/benchmarks/buy_and_hold_1x/equity_curve.csv": "6ab270afd7e2d47b66f77bfa7b39845d6e6eced933ddb042b08605513d6ab255",
@@ -218,14 +218,14 @@
       "run/equity.png": "7765b63b41afb48893fce49404e5269cae85292a1b1daa583a59857e96309254",
       "run/equity_curve.csv": "6ab270afd7e2d47b66f77bfa7b39845d6e6eced933ddb042b08605513d6ab255",
       "run/fills.csv": "434b176a0c654440fe266594dfc77962d27282f4ed454894dd1988b6c3381527",
-      "run/metrics.json": "66fbd16bd90e85515faf69603751d450edce5ea09a2a643277ba57a10b448785",
+      "run/metrics.json": "7022810509b3607d745e29c0e21f20cde6a5b7d251766cb308f718f00bc7d49f",
       "run/trades.csv": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
-      "sidecar.json": "85ead7f7a3073adc4a103fb65ad4cb93dacf5df17fe468b26de1181525b6e106"
+      "sidecar.json": "d3ea8d32bf299790f520e7f8c82b3e65fbb77e3a2c1b9eef68c463bc131c5882"
     },
     "pack-desk-jailed": {
-      "pack/bars_part_001.csv.gz": "e75d2760a3dc95fd30bdd1816e34afc9b186f6d8a518da9f07e67ee73b95b492",
-      "pack/daily_rth.csv.gz": "291111e7335360598a775bbdbfd3e10ee1fe963b2bcd45544036a70b9481fcdf",
-      "pack/manifest.json": "6ca1096188cec93f254e34aee2f2a516e0c43672dbe56b44ad8d0b3429319693",
+      "pack/bars_part_001.csv.gz": "299e72704c197e4d3148b670f6e34009b5e8b1fda175a72dedc05160edb76e92",
+      "pack/daily_rth.csv.gz": "02894cb7e7903a43ba2613fe6324a335428a94bc1dc46817ceb3f4d0d9595973",
+      "pack/manifest.json": "b5be65c9ad3ff558820559c5aef6454c378ea91982ef3ad6cd19631c4d482552",
       "run/benchmarks/buy_and_hold_1x/equity.csv": "822134435f4e897e9791dc9a3ad0a7cc330ac625b70eb381b52984efafa3e545",
       "run/benchmarks/buy_and_hold_1x/equity.png": "615e24f3dbc1063887bfb44c123c95df12eb241b8414fdf0f948f896e988a801",
       "run/benchmarks/buy_and_hold_1x/equity_curve.csv": "822134435f4e897e9791dc9a3ad0a7cc330ac625b70eb381b52984efafa3e545",
@@ -242,15 +242,15 @@
       "run/equity.png": "d0c4423b62f8babc80a00154a4b1f7508ab01dc05ff8039f9ef9c2d917c7621a",
       "run/equity_curve.csv": "8a7d185125e564753ec31409b1532aef69b1c41b327a5dafb92bd7d5f13868c9",
       "run/fills.csv": "65d13f5c9ba4829029bf68a7112ba7459f7848f46f90ca49d7d7e350d858d45b",
-      "run/metrics.json": "53f1f1c17c7456da1224147fe1176f60a62edca61d09927f8950b9f93d195e91",
+      "run/metrics.json": "736204391a771d64059df20613ebc45c42aeb09d5cfd71e5000a426dc70c3276",
       "run/trades.csv": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
-      "sidecar.json": "85ead7f7a3073adc4a103fb65ad4cb93dacf5df17fe468b26de1181525b6e106"
+      "sidecar.json": "d3ea8d32bf299790f520e7f8c82b3e65fbb77e3a2c1b9eef68c463bc131c5882"
     },
     "walk-pack-arena": {
-      "pack/bars_part_001.csv.gz": "e75d2760a3dc95fd30bdd1816e34afc9b186f6d8a518da9f07e67ee73b95b492",
-      "pack/daily_rth.csv.gz": "291111e7335360598a775bbdbfd3e10ee1fe963b2bcd45544036a70b9481fcdf",
-      "pack/manifest.json": "6ca1096188cec93f254e34aee2f2a516e0c43672dbe56b44ad8d0b3429319693",
-      "sidecar.json": "85ead7f7a3073adc4a103fb65ad4cb93dacf5df17fe468b26de1181525b6e106",
+      "pack/bars_part_001.csv.gz": "299e72704c197e4d3148b670f6e34009b5e8b1fda175a72dedc05160edb76e92",
+      "pack/daily_rth.csv.gz": "02894cb7e7903a43ba2613fe6324a335428a94bc1dc46817ceb3f4d0d9595973",
+      "pack/manifest.json": "b5be65c9ad3ff558820559c5aef6454c378ea91982ef3ad6cd19631c4d482552",
+      "sidecar.json": "d3ea8d32bf299790f520e7f8c82b3e65fbb77e3a2c1b9eef68c463bc131c5882",
       "walk/design/benchmarks/buy_and_hold_1x/equity.csv": "886e6e7403491e8835c7544bfbd3fe364a3cf80c91cf23a76129261e796d334d",
       "walk/design/benchmarks/buy_and_hold_1x/equity.png": "ee08ba77d1fe929525c54a473a5ce6a3d790cdea1ec66e0e5ebee56e43418301",
       "walk/design/benchmarks/buy_and_hold_1x/equity_curve.csv": "886e6e7403491e8835c7544bfbd3fe364a3cf80c91cf23a76129261e796d334d",
@@ -278,10 +278,10 @@
       "walk/walkforward.json": "251bc1f520f6d3f09c5f2566861f64e3a4916f0238fb9a6804295d4e122139c9"
     },
     "walk-pack-desk": {
-      "pack/bars_part_001.csv.gz": "e75d2760a3dc95fd30bdd1816e34afc9b186f6d8a518da9f07e67ee73b95b492",
-      "pack/daily_rth.csv.gz": "291111e7335360598a775bbdbfd3e10ee1fe963b2bcd45544036a70b9481fcdf",
-      "pack/manifest.json": "6ca1096188cec93f254e34aee2f2a516e0c43672dbe56b44ad8d0b3429319693",
-      "sidecar.json": "85ead7f7a3073adc4a103fb65ad4cb93dacf5df17fe468b26de1181525b6e106",
+      "pack/bars_part_001.csv.gz": "299e72704c197e4d3148b670f6e34009b5e8b1fda175a72dedc05160edb76e92",
+      "pack/daily_rth.csv.gz": "02894cb7e7903a43ba2613fe6324a335428a94bc1dc46817ceb3f4d0d9595973",
+      "pack/manifest.json": "b5be65c9ad3ff558820559c5aef6454c378ea91982ef3ad6cd19631c4d482552",
+      "sidecar.json": "d3ea8d32bf299790f520e7f8c82b3e65fbb77e3a2c1b9eef68c463bc131c5882",
       "walk/design/benchmarks/buy_and_hold_1x/equity.csv": "524077d502a52108742514bae4b26fd1010ac996bb018f586f2dff51cdf4fbe4",
       "walk/design/benchmarks/buy_and_hold_1x/equity.png": "3b9eb0c1faacc0f9163ef6ce0e6a9cdbc445373efd02a17345ed2a1b9386965c",
       "walk/design/benchmarks/buy_and_hold_1x/equity_curve.csv": "524077d502a52108742514bae4b26fd1010ac996bb018f586f2dff51cdf4fbe4",
@@ -438,7 +438,7 @@
       },
       "pack-desk-jailed": {
         "run/benchmarks/long_2x/metrics.json": "8aceaf64e00156a00c832898fc34658ddfa9e17dff695a653cac53a5b12a3ae0",
-        "run/metrics.json": "34fce1162c610c57a7fa34a2e116318100ea0a3abac17fb4576f1530b7dbee2e"
+        "run/metrics.json": "8b1f8e34367126b4f4489b1d6e9a557ea22f1e8d08fbf9c8ee38e7b6768dc336"
       },
       "walk-pack-desk": {
         "walk/design/benchmarks/buy_and_hold_1x/metrics.json": "3583746ef74073e74e676200770a5e4276f2452b71a7562f709f0932832ff090",
