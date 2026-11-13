@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import threading
 from pathlib import Path
 
 
@@ -264,17 +265,82 @@ def _child_pids(pid: int) -> list[int]:
     return []
 
 
+_WIN_API = None
+_WIN_API_LOCK = threading.Lock()
+
+
+def _win_api():
+    """Win32 calls bound once, for this module only.
+
+    ``ctypes.WinDLL`` caches one library object and keeps ``argtypes`` on its
+    functions. The resident-set poll runs on every parallel book thread and
+    used to assign those prototypes before every call. Two books then
+    marshalled ``OpenProcess`` and toolhelp with each other's signatures, and
+    one sample came back as a multi-gigabyte sum for a strategy that had not
+    allocated. ``WINFUNCTYPE`` builds a private prototype, so a later
+    assignment on the shared library object cannot change this poll.
+    """
+    global _WIN_API
+    if _WIN_API is not None:
+        return _WIN_API
+    with _WIN_API_LOCK:
+        if _WIN_API is None:
+            _WIN_API = _WinApi()
+        return _WIN_API
+
+
+class _WinApi:
+    def __init__(self):
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+        def bind(dll, name, restype, *argtypes):
+            proto = ctypes.WINFUNCTYPE(restype, *argtypes, use_last_error=True)
+            return proto((name, dll))
+
+        self.CreateToolhelp32Snapshot = bind(
+            kernel, "CreateToolhelp32Snapshot", ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32
+        )
+        self.Process32FirstW = bind(kernel, "Process32FirstW", ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        self.Process32NextW = bind(kernel, "Process32NextW", ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        self.CloseHandle = bind(kernel, "CloseHandle", ctypes.c_int, ctypes.c_void_p)
+        self.OpenProcess = bind(
+            kernel, "OpenProcess", ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32
+        )
+        self.GetProcessMemoryInfo = bind(
+            psapi, "GetProcessMemoryInfo", ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32
+        )
+        self.CreateJobObjectW = bind(
+            kernel, "CreateJobObjectW", ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p
+        )
+        self.SetInformationJobObject = bind(
+            kernel,
+            "SetInformationJobObject",
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        self.AssignProcessToJobObject = bind(
+            kernel, "AssignProcessToJobObject", ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+        )
+        self.TerminateJobObject = bind(kernel, "TerminateJobObject", ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+        self.QueryInformationJobObject = bind(
+            kernel,
+            "QueryInformationJobObject",
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        )
+
+
 def _windows_child_pids(pid: int) -> list[int]:
     """Direct children, so a memory cap includes the jailed strategy."""
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
-    kernel.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-    kernel.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    kernel.Process32FirstW.restype = ctypes.c_int
-    kernel.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    kernel.Process32NextW.restype = ctypes.c_int
-    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel.CloseHandle.restype = ctypes.c_int
+    kernel = _win_api()
 
     class _ProcessEntry(ctypes.Structure):
         _fields_ = (
@@ -312,16 +378,12 @@ def _windows_rss(pid: int) -> int | None:
 
 
 def _windows_memory_field(pid: int, field: str) -> int | None:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-    kernel32.OpenProcess.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel = _win_api()
     # Limited information first. An AppContainer child can refuse that and
     # still answer QUERY_INFORMATION | VM_READ from the process that created it.
     handle = None
     for access in (0x1000, 0x0410):
-        handle = kernel32.OpenProcess(access, 0, pid)
+        handle = kernel.OpenProcess(access, 0, pid)
         if handle:
             break
     if not handle:
@@ -329,15 +391,12 @@ def _windows_memory_field(pid: int, field: str) -> int | None:
     try:
         counters = _PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(counters)
-        psapi = ctypes.WinDLL("psapi", use_last_error=True)
-        psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
-        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
-        ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        ok = kernel.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
         if not ok:
             return None
         return int(getattr(counters, field))
     finally:
-        kernel32.CloseHandle(handle)
+        kernel.CloseHandle(handle)
 
 
 class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
@@ -410,24 +469,7 @@ class _WinJob:
             return None
         if ctypes.sizeof(_PROCESS_MEMORY_COUNTERS) != 72:
             return None
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
-        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
-        kernel32.SetInformationJobObject.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        kernel32.SetInformationJobObject.restype = ctypes.c_int
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        kernel32.AssignProcessToJobObject.restype = ctypes.c_int
-        kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        kernel32.TerminateJobObject.restype = ctypes.c_int
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32 = _win_api()
 
         # PROCESS_SET_QUOTA | PROCESS_TERMINATE, required to assign a job.
         process = kernel32.OpenProcess(0x0100 | 0x0001, 0, pid)
@@ -462,26 +504,19 @@ class _WinJob:
         handle = self._handle
         if not handle:
             return
-        self._kernel.TerminateJobObject(handle, 1)
+        _win_api().TerminateJobObject(handle, 1)
 
     def close(self) -> None:
         handle = self._handle
         self._handle = None
         if handle:
-            self._kernel.CloseHandle(handle)
+            _win_api().CloseHandle(handle)
 
     def _query(self, kind: int, info) -> bool:
-        kernel = self._kernel
-        kernel.QueryInformationJobObject.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-        ]
-        kernel.QueryInformationJobObject.restype = ctypes.c_int
         return bool(
-            kernel.QueryInformationJobObject(self._handle, kind, ctypes.byref(info), ctypes.sizeof(info), None)
+            _win_api().QueryInformationJobObject(
+                self._handle, kind, ctypes.byref(info), ctypes.sizeof(info), None
+            )
         )
 
     def describe(self) -> str:

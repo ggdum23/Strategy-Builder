@@ -788,3 +788,16 @@ def test_the_caller_cap_is_the_jail_ceiling_and_a_long_job_fails():
 
     with pytest.raises(RuntimeError, match="32-pid prefix"):
         _watched_rss(1, Job())
+
+
+def test_the_memory_poll_does_not_rewrite_shared_ctypes_prototypes():
+    """Parallel books poll together. Prototypes stay off the cached WinDLL.
+
+    Assigning ``argtypes`` on ``ctypes.WinDLL("kernel32")`` from each poll
+    raced, and one sample was a multi-gigabyte sum for a flat strategy.
+    """
+    source = Path(__file__).resolve().parents[1].joinpath("src", "backtester", "limits.py").read_text(
+        encoding="utf-8"
+    )
+    assert ".argtypes" not in source
+    assert "WINFUNCTYPE" in source
