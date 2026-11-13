@@ -2589,12 +2589,31 @@ def _trusted_runtime_root(path) -> bool:
     return any(acl_same(path, root) or _acl_inside(path, root) for root in _TRUSTED_STAGE_ROOTS)
 
 
+# GetAppContainerFolderPath returns this when the profile folder is not
+# created yet. Win32 ERROR_FILE_NOT_FOUND, as an HRESULT.
+_FOLDER_NOT_FOUND = 0x80070002
+
+
+def conventional_container_folder(environ, profile: str):
+    """``%LOCALAPPDATA%\\Packages\\<profile>\\AC``, or None when unset.
+
+    This is the path ``GetAppContainerFolderPath`` returns once the folder
+    exists. The caller creates only the missing descendants of an existing
+    Packages directory. Packages itself is not created here.
+    """
+    local = (environ or {}).get("LOCALAPPDATA") or ""
+    if not local or not profile:
+        return None
+    return str(Path(local) / "Packages" / str(profile) / "AC")
+
+
 def _container_runtime_parent(lease) -> Path | None:
     """Path from ``GetAppContainerFolderPath``. This does not create or grant it.
 
     The directory is this profile's own folder. ProgramData, Public, the
     toolcache, and the user-profile root are not this path, and none of
-    them is granted here.
+    them is granted here. A file-not-found result uses the conventional
+    Packages path so the caller can create the missing profile folder.
     """
     global _CONTAINER_FOLDER_NOTE
     userenv = lease.userenv
@@ -2615,10 +2634,16 @@ def _container_runtime_parent(lease) -> Path | None:
             ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
             ole.CoTaskMemFree.restype = None
             ole.CoTaskMemFree(out)
-    if hr != 0 or not text:
-        _CONTAINER_FOLDER_NOTE = f"GetAppContainerFolderPath hresult {hr & 0xFFFFFFFF:08x}"
-        return None
-    return Path(text)
+    if hr == 0 and text:
+        return Path(text)
+    note = f"GetAppContainerFolderPath hresult {hr & 0xFFFFFFFF:08x}"
+    if (hr & 0xFFFFFFFF) == _FOLDER_NOT_FOUND:
+        fallback = conventional_container_folder(os.environ, _PROFILE_NAME)
+        if fallback:
+            _CONTAINER_FOLDER_NOTE = note
+            return Path(fallback)
+    _CONTAINER_FOLDER_NOTE = note
+    return None
 
 
 def container_mkdir_plan(folder, packages, exists) -> list[str] | None:

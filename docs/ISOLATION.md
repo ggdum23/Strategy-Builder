@@ -276,7 +276,8 @@ The backend name is `job+appcontainer`.
   child can read.   When no parent already lets the container through, the
   copy is `{AppContainer folder}\runtime`. That folder is the path
   `GetAppContainerFolderPath` returns for this profile, normally
-  `%LOCALAPPDATA%\Packages\<profile>\AC`. Its ancestors, including the
+  `%LOCALAPPDATA%\Packages\<profile>\AC`. If that call returns
+  file-not-found, the same conventional path is used. Its ancestors, including the
   user-profile root and the Packages directory, are not granted. If
   `<profile>` or `AC` is missing and `Packages` already exists, only
   those missing descendants are created. `Packages`, the user-profile

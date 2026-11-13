@@ -26,6 +26,7 @@ from backtester.sandbox import (
     runtime_relpath_is_copied,
     should_write_ace,
     container_mkdir_plan,
+    conventional_container_folder,
     copy_parent_candidates,
     stage_unreachable_runtimes,
     translate_staged_path,
@@ -557,6 +558,21 @@ def test_a_missing_profile_folder_is_planned_under_existing_packages():
     assert acl_same(parent_ready[0], folder)
     existing.add(folder)
     assert container_mkdir_plan(folder, packages, exists) == []
+
+
+def test_a_missing_container_api_folder_is_the_packages_profile():
+    folder = conventional_container_folder(
+        {"LOCALAPPDATA": r"C:\Users\runneradmin\AppData\Local"},
+        "strategybuilderjail",
+    )
+    packages = r"C:\Users\runneradmin\AppData\Local\Packages"
+    assert acl_same(folder, packages + r"\strategybuilderjail\AC")
+    assert conventional_container_folder({}, "strategybuilderjail") is None
+    assert container_mkdir_plan(folder, packages, lambda _path: False) is None
+    plan = container_mkdir_plan(folder, packages, lambda path: acl_same(path, packages))
+    assert plan is not None
+    assert not any(acl_same(item, packages) for item in plan)
+    assert not any(acl_same(item, r"C:\Users\runneradmin") for item in plan)
 
 
 def test_packages_and_paths_outside_it_are_not_created():
