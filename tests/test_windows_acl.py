@@ -747,8 +747,10 @@ def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
         Path("/work"),
         "/etc/ld.so.cache",
     )
-    tmp = str(Path("/tmp"))
-    tmpfs = cmd.index(tmp)
+    # The plan always names the private tmpfs ``/tmp``. A Windows test
+    # process renders ``Path("/tmp/py")`` with backslashes, which is the
+    # string the late bind uses.
+    tmpfs = cmd.index("/tmp")
     assert cmd[tmpfs - 1] == "--tmpfs"
     assert cmd.index(str(late_root)) > tmpfs
     assert cmd.index(str(late_site)) > tmpfs
