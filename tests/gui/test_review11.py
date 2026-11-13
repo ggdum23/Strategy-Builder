@@ -19,11 +19,13 @@ from PySide6.QtWidgets import QApplication
 from backtester.gui.audience import export_allowed
 from backtester.gui.backend import TableData
 from backtester.parallel import PackMarket, run_parallel
+from windows_open import windows_jails
 
 
 _SCALES = (0.25, 0.5, 0.7, 2.0, 7.777)
 
 
+@windows_jails(4)
 def test_parallel_designer_export_writes_the_leaderboard_at_every_scale(qtbot, tmp_path, monkeypatch):
     _export_leaderboard(qtbot, tmp_path, monkeypatch)
 

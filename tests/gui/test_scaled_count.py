@@ -26,6 +26,7 @@ from backtester.pack import load_sidecar
 
 from synthetic import write_filled
 from test_window import _window
+from windows_open import windows_jails
 
 
 def _count_cells(pack: Path, name: str) -> list[str]:
@@ -36,16 +37,23 @@ def _count_cells(pack: Path, name: str) -> list[str]:
     return cells
 
 
-def _strategy(path: Path, log: Path, scaled: float) -> None:
+def _strategy(path: Path, scaled: float) -> None:
+    """Trade once, and refuse a bar whose count is not the scaled fraction.
+
+    The strategy file is copied into the jail. It cannot open a host log.
+    A drifted count raises in the child, so the run fails instead of filling.
+    """
     path.write_text(
         "class Strategy:\n"
         "    def on_bar(self, bar, state):\n"
-        f"        handle = open({str(log)!r}, 'a', encoding='ascii')\n"
-        "        handle.write(repr(float(bar['count'])) + '\\n')\n"
-        "        handle.close()\n"
-        f"        if float(bar['count']) + 1e-9 >= {scaled!r}:\n"
-        "            return 1.0\n"
-        "        return 0.0\n",
+        "        count = float(bar['count'])\n"
+        f"        expected = {scaled!r}\n"
+        "        if abs(count - expected) > 1e-6 * max(1.0, abs(expected)):\n"
+        "            raise ValueError('scaled count did not reach the child')\n"
+        "        if state.get('sent'):\n"
+        "            return 0.0\n"
+        "        state['sent'] = True\n"
+        "        return 1.0\n",
         encoding="utf-8",
     )
 
@@ -83,6 +91,7 @@ def _activity(page, label: str):
     return None
 
 
+@windows_jails(4)
 def test_gui_pack_run_and_export_keep_a_fractional_count(qtbot, tmp_path):
     assert format_number("count", 1.26) == "1.26"
     assert format_number("count", 0.42) == "0.42"
@@ -118,8 +127,7 @@ def test_gui_pack_run_and_export_keep_a_fractional_count(qtbot, tmp_path):
 
     strategy = tmp_path / "count_signal.py"
     for profile in ("arena", "desk"):
-        log = tmp_path / f"{profile}.log"
-        _strategy(strategy, log, scaled)
+        _strategy(strategy, scaled)
         out = tmp_path / profile
         result = _run(strategy, pack, sidecar, profile, out)
         assert result["headline"]["n_fills"] == 1
@@ -127,9 +135,6 @@ def test_gui_pack_run_and_export_keep_a_fractional_count(qtbot, tmp_path):
         designer = json.loads((out / "designer" / "metrics.json").read_text(encoding="utf-8"))
         assert operator["n_fills"] == 1
         assert designer["n_fills"] == 1
-        seen = [float(line) for line in log.read_text(encoding="ascii").splitlines()]
-        assert seen
-        assert seen == pytest.approx([scaled] * len(seen))
 
         window = _window(qtbot, tmp_path)
         page = window.results_page

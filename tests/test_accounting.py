@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +27,7 @@ from backtester.accounting import (
 )
 from backtester.engine_desk import DeskConfig
 from backtester.report import assert_designer_clean, write_json, write_leaderboard
+from windows_open import windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 ET = timezone(timedelta(hours=-4))
@@ -728,7 +731,7 @@ def test_walk_forward_hides_a_locked_ex_date(tmp_path, profile):
         )
 
 
-def test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo(tmp_path, capsys):
+def _locked_sample(tmp_path):
     from backtester.__main__ import main
 
     days = [datetime(2024, 6, 3), datetime(2024, 6, 4), datetime(2024, 6, 5)]
@@ -748,52 +751,43 @@ def test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo(tmp_path,
         "class Strategy:\n    def on_bar(self, bar, state):\n        return 1.0\n",
         encoding="utf-8",
     )
-    arena = main(
-        [
-            "walkforward",
-            "--profile",
-            "arena",
-            "--ticker",
-            "NIK",
-            "--strategy",
-            str(strategy),
-            "--src",
-            str(src),
-            "--out",
-            str(tmp_path / "arena"),
-            "--price-basis",
-            "total_return",
-            "--dividends",
-            str(dividends),
-            "--design-end-day",
-            "1",
-            "--warmup-days",
-            "1",
-        ]
-    )
-    assert arena == 0
-    desk = main(
-        [
-            "walkforward",
-            "--profile",
-            "desk",
-            "--ticker",
-            "NIK",
-            "--strategy",
-            str(strategy),
-            "--src",
-            str(src),
-            "--out",
-            str(tmp_path / "desk"),
-            "--dividends",
-            str(dividends),
-            "--design-end-day",
-            "1",
-            "--warmup-days",
-            "1",
-        ]
-    )
-    assert desk == 0
+    return main, src, dividends, strategy
+
+
+@pytest.mark.parametrize(
+    "profile,price_basis",
+    [("arena", "total_return"), ("desk", None)],
+)
+@windows_jails(2)
+def test_walkforward_cli_keeps_a_locked_ex_date_and_run_rejects_a_typo(tmp_path, profile, price_basis):
+    main, src, dividends, strategy = _locked_sample(tmp_path)
+    argv = [
+        "walkforward",
+        "--profile",
+        profile,
+        "--ticker",
+        "NIK",
+        "--strategy",
+        str(strategy),
+        "--src",
+        str(src),
+        "--out",
+        str(tmp_path / profile),
+        "--dividends",
+        str(dividends),
+        "--design-end-day",
+        "1",
+        "--warmup-days",
+        "1",
+    ]
+    if price_basis is not None:
+        argv.extend(["--price-basis", price_basis])
+    assert main(argv) == 0
+
+
+@windows_jails(1)
+def test_run_rejects_a_dividend_date_outside_the_sample(tmp_path, capsys):
+    main, src, _dividends, strategy = _locked_sample(tmp_path)
     typo = tmp_path / "typo.csv"
     typo.write_text("session,amount\n1999-01-01,1.0\n2024-06-04,1.25\n", encoding="utf-8")
     rejected = main(
@@ -941,35 +935,54 @@ def _walk_cli(tmp_path, profile, dividends_text, *, price_basis=None):
     ]
     if price_basis is not None:
         argv.extend(["--price-basis", price_basis])
-    return main(argv)
+    started = time.monotonic()
+    code = main(argv)
+    # One line per call on the real stderr. Pytest capture hides the normal
+    # stream, and the Windows job log is where a slow call has to be visible.
+    if sys.platform == "win32":
+        sys.__stderr__.write(
+            "walk-cli profile=%s out=%s seconds=%.3f code=%s\n"
+            % (profile, tmp_path.name, time.monotonic() - started, code)
+        )
+        sys.__stderr__.flush()
+    return code
 
 
-def test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date(tmp_path, capsys):
+@pytest.mark.parametrize(
+    "profile,price_basis,expect",
+    [
+        ("arena", "total_return", 0),
+        ("desk", "total_return", 0),
+        ("desk", None, 0),
+        ("arena", None, 2),
+    ],
+)
+@windows_jails(2)
+def test_walkforward_cli_keeps_a_file_when_the_design_window_has_no_ex_date(
+    tmp_path, capsys, profile, price_basis, expect
+):
     locked = "session,amount\n2024-06-05,19.19\n"
-    for profile in ("arena", "desk"):
-        code = _walk_cli(tmp_path / profile, profile, locked, price_basis="total_return")
-        assert code == 0
-        payload = json.loads((tmp_path / profile / profile / "walkforward.json").read_text(encoding="utf-8"))
-        record = payload["accounting"]
+    label = profile if price_basis == "total_return" else f"{profile}-raw"
+    code = _walk_cli(tmp_path / label, profile, locked, price_basis=price_basis)
+    assert code == expect
+    if expect == 2:
+        err = capsys.readouterr().err
+        assert err.startswith("error: ")
+        assert "Traceback" not in err
+        assert "The arena profile does not credit dividends." in err
+        return
+    payload = json.loads((tmp_path / label / profile / "walkforward.json").read_text(encoding="utf-8"))
+    record = payload["accounting"]
+    assert record["dividends_applied"] is True
+    assert payload["design"]["dividends_net"] == 0.0
+    if price_basis == "total_return":
         assert record["total_return_method"] == "cash_dividends"
-        assert record["dividends_applied"] is True
         assert payload["design"]["dividends_applied"] is True
         assert payload["locked"]["dividends_applied"] is True
-        assert payload["design"]["dividends_net"] == 0.0
         assert payload["design"]["total_return_method"] == payload["locked"]["total_return_method"]
-    desk = _walk_cli(tmp_path / "desk-raw", "desk", locked)
-    assert desk == 0
-    payload = json.loads((tmp_path / "desk-raw" / "desk" / "walkforward.json").read_text(encoding="utf-8"))
-    assert payload["accounting"]["total_return_method"] == "profile_dividends"
-    assert payload["accounting"]["dividends_applied"] is True
-    assert payload["design"]["dividends_net"] == 0.0
-    assert payload["design"]["dividends_applied"] == payload["locked"]["dividends_applied"]
-    arena = _walk_cli(tmp_path / "arena-raw", "arena", locked)
-    assert arena == 2
-    err = capsys.readouterr().err
-    assert err.startswith("error: ")
-    assert "Traceback" not in err
-    assert "The arena profile does not credit dividends." in err
+    else:
+        assert record["total_return_method"] == "profile_dividends"
+        assert payload["design"]["dividends_applied"] == payload["locked"]["dividends_applied"]
 
 
 def test_walkforward_cli_rejects_an_out_of_sample_date_for_both_profiles(tmp_path, capsys):

@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "pytest-timeout>=2.2"]
 gui = [
     # 6.12.0 drops references to True during widget teardown. Python 3.11 still
     # reference-counts that singleton, so the process aborts. 3.12 and newer
@@ -35,3 +35,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "jailed_sample: full October sample, jailed file strategy versus in-process",
+    "windows_jails(count): Windows pytest-timeout budget of 90 seconds per AppContainer jail",
+]

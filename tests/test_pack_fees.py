@@ -19,6 +19,7 @@ from backtester.data import load_named
 from backtester.pack import assert_anonymized_pack_clean, build_pack, load_pack
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 from backtester.runner import execute, run_named, run_pack
+from windows_open import windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 QQQ = ROOT / "assets" / "sample" / "QQQ" / "filled"
@@ -380,7 +381,10 @@ def test_an_unknown_dividend_date_is_an_error(tmp_path):
         )
 
 
+@windows_jails(4)
 def test_child_runner_frames_do_not_keep_the_scale(tmp_path):
+    from backtester.strategy_loader import load_strategy_class
+
     src, registry = _tiny_series(tmp_path)
     pack = tmp_path / "pack"
     sidecar = tmp_path / "side.json"
@@ -389,15 +393,46 @@ def test_child_runner_frames_do_not_keep_the_scale(tmp_path):
         anonymize=True, registry_path=registry, profile="desk",
         price_factor=ScaleFrame.SCALE, volume_factor=0.4,
     )
-    for profile, attr in (("arena", "engine_scale"), ("desk", "desk_scale")):
+    strategy = tmp_path / "scale_strategy.py"
+    strategy.write_text(
+        "import os, sys\n"
+        "class Strategy:\n"
+        "    def __init__(self):\n"
+        "        self.saw_name = False\n"
+        "        self.saw_value = False\n"
+        "        self.frames = []\n"
+        "    def on_bar(self, bar, state):\n"
+        "        if self.frames:\n"
+        "            return 0.0\n"
+        "        frame = sys._getframe()\n"
+        "        while frame is not None:\n"
+        "            self.frames.append(frame.f_code.co_name)\n"
+        "            for key, value in frame.f_locals.items():\n"
+        "                if key in ('share_scale', 'share_factor'):\n"
+        "                    self.saw_name = True\n"
+        "                if value == 1.7:\n"
+        "                    self.saw_value = True\n"
+        "            frame = frame.f_back\n"
+        "        text = '\\n'.join(f'{key}={value}' for key, value in os.environ.items())\n"
+        "        text += '\\n' + ' '.join(sys.argv)\n"
+        "        text += '\\n' + ' '.join(str(key) for key in dict(bar))\n"
+        "        text += '\\n' + ' '.join(str(key) for key in dict(state))\n"
+        "        if 'share_scale' in text or 'share_factor' in text:\n"
+        "            self.saw_name = True\n"
+        "        return 0.0\n",
+        encoding="utf-8",
+    )
+    cls = load_strategy_class(strategy)
+    for profile in ("arena", "desk"):
         payload = run_pack(
-            ScaleFrame, pack, sidecar, profile, tmp_path / profile, with_benchmarks=False,
+            cls, pack, sidecar, profile, tmp_path / profile, with_benchmarks=False,
         )
         observer = payload["strategy_observer"]
-        names = [name for name, _bad in observer.runner]
-        assert {"execute", "run_books", "_books_worker"} <= set(names)
-        assert all(not bad for _name, bad in observer.runner)
-        assert getattr(observer, attr) == ScaleFrame.SCALE
+        assert observer.saw_name is False
+        assert observer.saw_value is False
+        assert "execute" not in observer.frames
+        assert "run_books" not in observer.frames
+        assert payload["share_factor"] == ScaleFrame.SCALE
 
 
 def test_the_report_must_not_live_inside_the_pack(tmp_path):
@@ -455,6 +490,7 @@ def _tiny_series(tmp_path):
     return path.parent, registry
 
 
+@windows_jails(4)
 def test_explicit_borrow_overrides_the_run_profile(tmp_path):
     src, _registry = _tiny_series(tmp_path)
     loaded = load_named(src, "NIK")

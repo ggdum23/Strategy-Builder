@@ -19,6 +19,7 @@ from backtester.gui.jobs import JobFailure, build_pack_job, process_entry, recor
 from backtester.gui.workers import FunctionThread
 from backtester.runner import failure_line
 from synthetic import write_filled
+from windows_open import windows_jails
 from test_review5 import _banners, _table_text
 from test_window import _window
 
@@ -139,6 +140,7 @@ def _failure(status) -> JobFailure:
     return failure
 
 
+@windows_jails(14)
 def test_on_bar_exceptions_banner_one_line_on_run_and_packs(qtbot, tmp_path):
     pack, sidecar = _anon_pack(tmp_path)
     window = _window(qtbot, tmp_path)

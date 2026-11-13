@@ -19,6 +19,7 @@ from backtester.data import (
     monthly_filled_filename,
     resample,
 )
+from windows_open import windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 ET = timezone(timedelta(hours=-4))
@@ -273,6 +274,7 @@ def test_fractional_count_survives_the_desk_conversion():
         frame_to_desk_bars(frame)
 
 
+@windows_jails(3)
 def test_missing_month_is_named_and_a_gap_inside_a_file_is_kept(tmp_path, capsys):
     from backtester.__main__ import main
 

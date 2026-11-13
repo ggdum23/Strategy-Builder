@@ -42,6 +42,7 @@ from backtester.pack import (
 from backtester.parallel import PackMarket, _prepare_pack
 from backtester.runner import run_pack, walk_pack
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
+from windows_open import windows_jails
 
 ET = timezone(timedelta(hours=-4))
 
@@ -830,6 +831,7 @@ def test_named_pack_is_unscaled_and_factors_of_one_are_refused(tmp_path):
         )
 
 
+@windows_jails(2)
 def test_pack_cli_does_not_print_the_scale_factor(tmp_path, capsys):
     src, registry = _series(tmp_path, 1)
     pack = tmp_path / "cli-pack"
@@ -862,6 +864,7 @@ def test_pack_cli_does_not_print_the_scale_factor(tmp_path, capsys):
     assert "desk" in report
 
 
+@windows_jails(4)
 def test_dividend_file_sha256_is_recorded_only_on_the_operator_manifest(tmp_path):
     src, registry = _series(tmp_path, 2)
     pack = tmp_path / "pack"

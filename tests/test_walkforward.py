@@ -613,3 +613,56 @@ def test_pack_windows_still_exist_and_are_not_the_named_default():
     assert validation["last_day"] == 3795
     assert engine_arena.WINDOWS["validation"] == (3000, 3795)
     assert engine_arena.VALIDATION_WARMUP_DAYS == 504
+
+
+def test_arena_runner_main_does_not_load_a_strategy_file(tmp_path, capsys):
+    from backtester.arena_runner import main as arena_main
+
+    marker = tmp_path / "loaded.txt"
+    strategy = tmp_path / "strategy.py"
+    strategy.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('loaded', encoding='utf-8')\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        return 0.0\n",
+        encoding="utf-8",
+    )
+    code = arena_main(["--strategy", str(strategy), "--window", "design", "--no-benchmark"])
+    assert code == 2
+    assert not marker.exists()
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_python_module_arena_runner_refuses_without_loading(tmp_path):
+    import subprocess
+
+    marker = tmp_path / "loaded.txt"
+    strategy = tmp_path / "strategy.py"
+    strategy.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('loaded', encoding='utf-8')\n"
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        return 0.0\n",
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-m", "backtester.arena_runner", "--strategy", str(strategy)],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert not marker.exists()
+    assert "error:" in proc.stderr
+    assert "Traceback" not in proc.stderr

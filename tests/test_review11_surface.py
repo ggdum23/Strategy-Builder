@@ -15,6 +15,7 @@ from backtester.gui.audience import (
 from backtester.parallel import assert_designer_clean as parallel_assert
 from backtester.report import assert_designer_clean, designer_component_problem, read_leaderboard
 from test_parallel import FLAT, _anon_pack, _strategy
+from windows_open import windows_jails
 
 _SCALES = (0.25, 0.5, 0.7, 2.0, 7.777)
 
@@ -40,6 +41,7 @@ def _statuses(rows) -> list[str]:
     return sorted(row["status"] for row in rows)
 
 
+@windows_jails(10)
 def test_decimal_strategy_id_is_not_a_price_and_the_batch_finishes(tmp_path):
     strategies = [
         _strategy(tmp_path / "strategies", name, FLAT)
@@ -57,11 +59,19 @@ def test_decimal_strategy_id_is_not_a_price_and_the_batch_finishes(tmp_path):
         "qqq_momentum",
     }
     by_id = {job["strategy_id"]: job["status"] for job in jobs}
+
+    def _failed(strategy_id: str) -> str:
+        return "; ".join(
+            f"{item.status}: {item.error}"
+            for item in result.results
+            if item.strategy_id == strategy_id and item.status != "ok"
+        )
+
     assert by_id["vol_1.5"] == "error"
-    assert by_id["opening_drive"] == "ok"
-    assert by_id["mean_reversion"] == "ok"
-    assert by_id["ema12"] == "ok"
-    assert by_id["qqq_momentum"] == "ok"
+    assert by_id["opening_drive"] == "ok", _failed("opening_drive")
+    assert by_id["mean_reversion"] == "ok", _failed("mean_reversion")
+    assert by_id["ema12"] == "ok", _failed("ema12")
+    assert by_id["qqq_momentum"] == "ok", _failed("qqq_momentum")
     operator = read_leaderboard(out / "leaderboard.csv")
     designer_root = out / "designer"
     designer = read_leaderboard(designer_root / "leaderboard.csv")
@@ -101,6 +111,7 @@ def test_decimal_strategy_id_is_not_a_price_and_the_batch_finishes(tmp_path):
     assert result.failures == 1
 
 
+@windows_jails(4)
 def test_scale_in_a_strategy_id_fails_one_job_and_the_batch_finishes(tmp_path):
     strategies = [
         _strategy(tmp_path / "scale-strategies", "opening_drive", FLAT),
@@ -142,6 +153,7 @@ def test_scale_in_a_strategy_id_fails_one_job_and_the_batch_finishes(tmp_path):
     assert_designer_clean(designer_root, symbol="QQQ", scale=0.25)
 
 
+@windows_jails(4)
 def test_isolate_dirty_folders_does_not_abort_the_batch(tmp_path, monkeypatch):
     real = parallel_assert
 

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 from backtester.gui.backend import load_run, read_designer_manifest
 from backtester.gui.jobs import build_pack_job, execute_run, inspect_series, record_series
+from windows_open import windows_jails
 
 from synthetic import write_filled, write_strategy
 
@@ -109,6 +112,7 @@ def test_pack_result_has_no_sidecar_fields(tmp_path):
         raise AssertionError("a sidecar with no factor MAC was accepted")
 
 
+@windows_jails(1)
 def test_named_run_display_matches_the_report_file(tmp_path):
     src = _series(tmp_path)
     strategy = write_strategy(tmp_path / "Strategy Builder" / "book" / "strategy.py", 1.0)
@@ -151,6 +155,51 @@ def test_named_run_display_matches_the_report_file(tmp_path):
     assert "price_factor" not in json.dumps(config)
 
 
+@windows_jails(1)
+def test_execute_run_single_on_a_file_strategy_launches_the_jail(tmp_path):
+    from backtester import sandbox
+
+    src = _series(tmp_path)
+    strategy = write_strategy(tmp_path / "Strategy Builder" / "book" / "strategy.py", 1.0)
+    out = tmp_path / "Strategy Builder" / "out" / "jailed"
+    seen = []
+    previous = sandbox._LAUNCH_OBSERVER
+
+    def observer():
+        seen.append(1)
+        if previous is not None:
+            previous()
+
+    sandbox.set_launch_observer(observer)
+    try:
+        execute_run(
+            {
+                "mode": "single",
+                "profile": "arena",
+                "source": "named",
+                "strategies": [str(strategy)],
+                "src": str(src),
+                "ticker": "QQQ",
+                "out": str(out),
+                "bar_minutes": 1,
+                "initial_equity": 1_000_000,
+                "borrow_rate_annual": None,
+                "financing_rate_annual": None,
+                "fee_mult": 1,
+                "dividends": "",
+                "warmup_sessions": 0,
+                "warmup_days": 0,
+                "design_end_day": None,
+                "design_end_date": "",
+                "design_fraction": None,
+            }
+        )
+    finally:
+        sandbox.set_launch_observer(previous)
+    assert seen
+
+
+@windows_jails(2)
 def test_walkforward_writes_two_legs(tmp_path):
     src = _series(tmp_path)
     strategy = write_strategy(tmp_path / "hold.py", 1.0)
@@ -282,3 +331,198 @@ def test_batch_calls_run_parallel_with_progress_and_cancel(tmp_path, monkeypatch
     failed = [child for child in report.children if child["state"] == "failed"]
     assert failed and "boom" in (failed[0]["error"] or "")
     assert any(child["state"] == "ok" for child in report.children)
+
+
+def _write_probe(path: Path, out: Path) -> Path:
+    """Module-level code writes a pid marker beside the file it actually executed.
+
+    The GUI worker passes the source path into the jail. The jail copies the
+    file, so a marker beside this path exists only when the caller imported it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out_literal = json.dumps(str(out))
+    path.write_text(
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        f"\n_OUT = Path({out_literal})\n"
+        "\n"
+        "def _facts():\n"
+        "    saw = False\n"
+        "    try:\n"
+        "        import gc\n"
+        "        for obj in gc.get_objects():\n"
+        "            if not isinstance(obj, dict) or 'frame' not in obj:\n"
+        "                continue\n"
+        "            frame = obj.get('frame')\n"
+        "            try:\n"
+        "                closes = [round(float(value), 2) for value in list(frame['close'])[:3]]\n"
+        "            except Exception:\n"
+        "                continue\n"
+        "            if closes == [100.01, 100.02, 100.03]:\n"
+        "                saw = True\n"
+        "                break\n"
+        "    except Exception:\n"
+        "        saw = False\n"
+        "    leaked = None\n"
+        "    try:\n"
+        "        record = json.loads((_OUT / 'run_config.json').read_text(encoding='utf-8'))\n"
+        "        side = (record.get('arguments') or {}).get('sidecar_path')\n"
+        "        if side:\n"
+        "            document = json.loads(Path(side).read_text(encoding='utf-8'))\n"
+        "            leaked = document.get('symbol') or document.get('price_factor')\n"
+        "    except Exception:\n"
+        "        leaked = None\n"
+        "    return {'pid': int(os.getpid()), 'saw_holder_frame': bool(saw), 'sidecar': leaked}\n"
+        "\n"
+        "_FACTS = _facts()\n"
+        "try:\n"
+        "    Path(__file__).with_name('import-marker.json').write_text(\n"
+        "        json.dumps(_FACTS), encoding='utf-8'\n"
+        "    )\n"
+        "except Exception:\n"
+        "    pass\n"
+        "\n"
+        "class Strategy:\n"
+        "    def __init__(self):\n"
+        "        self.surface = dict(_FACTS)\n"
+        "\n"
+        "    def on_bar(self, bar, state):\n"
+        "        return 0\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _run_config(**overrides) -> dict:
+    config = {
+        "mode": "single",
+        "profile": "arena",
+        "source": "named",
+        "strategies": [],
+        "src": "",
+        "ticker": "QQQ",
+        "out": "",
+        "bar_minutes": 1,
+        "initial_equity": 1_000_000,
+        "borrow_rate_annual": None,
+        "financing_rate_annual": None,
+        "fee_mult": 1,
+        "dividends": "",
+        "warmup_sessions": 0,
+        "warmup_days": 0,
+        "design_end_day": None,
+        "design_end_date": "",
+        "design_fraction": None,
+    }
+    config.update(overrides)
+    return config
+
+
+def _assert_caller_did_not_exec(strategy: Path, *surfaces: Path) -> None:
+    """The caller's pid is not the process that executed the strategy file."""
+    caller = os.getpid()
+    marker = strategy.with_name("import-marker.json")
+    assert not marker.is_file()
+    assert str(strategy.resolve().parent) not in sys.path
+    assert surfaces
+    for path in surfaces:
+        body = json.loads(path.read_text(encoding="utf-8"))
+        assert int(body["pid"]) != caller
+        assert body["saw_holder_frame"] is False
+        assert body["sidecar"] is None
+
+
+def test_an_in_process_load_writes_the_caller_pid_and_drops_sys_path(tmp_path):
+    """The marker mechanism sees this process. The GUI tests require that it does not."""
+    out = tmp_path / "out"
+    out.mkdir()
+    sidecar = tmp_path / "sidecar.json"
+    sidecar.write_text(json.dumps({"symbol": "QQQ", "price_factor": 1.25}), encoding="utf-8")
+    (out / "run_config.json").write_text(
+        json.dumps({"arguments": {"sidecar_path": str(sidecar)}}) + "\n",
+        encoding="utf-8",
+    )
+    strategy = _write_probe(tmp_path / "book" / "strategy.py", out)
+    holder = {"frame": {"close": [100.01, 100.02, 100.03]}, "factor": 1.0}
+    from backtester.strategy_loader import load_strategy_class
+
+    parent = str(strategy.resolve().parent)
+    assert parent not in sys.path
+    load_strategy_class(strategy)
+    assert parent not in sys.path
+    body = json.loads(strategy.with_name("import-marker.json").read_text(encoding="utf-8"))
+    assert int(body["pid"]) == os.getpid()
+    assert body["saw_holder_frame"] is True
+    assert body["sidecar"] == "QQQ"
+    del holder
+
+
+@windows_jails(1)
+def test_single_run_does_not_execute_the_strategy_in_the_caller(tmp_path):
+    src = _series(tmp_path)
+    out = tmp_path / "out"
+    strategy = _write_probe(tmp_path / "book" / "strategy.py", out)
+    execute_run(_run_config(strategies=[str(strategy)], src=str(src), out=str(out)))
+    _assert_caller_did_not_exec(strategy, out / "child_surface.json")
+
+
+@windows_jails(1)
+def test_pack_run_does_not_execute_the_strategy_in_the_caller(tmp_path):
+    src = _series(tmp_path)
+    registry = tmp_path / "registry.json"
+    record_series(src, "QQQ", registry, profile="arena", price_kind="raw", bar_minutes=1)
+    pack = tmp_path / "pack"
+    sidecar = tmp_path / "operator" / "sidecar.json"
+    build_pack_job(
+        src,
+        "QQQ",
+        pack,
+        sidecar,
+        registry,
+        anonymize=False,
+        profile="arena",
+        bar_minutes=1,
+        price_kind="raw",
+    )
+    out = tmp_path / "out"
+    strategy = _write_probe(tmp_path / "book" / "strategy.py", out)
+    execute_run(
+        _run_config(
+            source="pack",
+            strategies=[str(strategy)],
+            pack=str(pack),
+            sidecar=str(sidecar),
+            out=str(out),
+        )
+    )
+    _assert_caller_did_not_exec(strategy, out / "child_surface.json")
+    # Import-time code that ran here could open the sidecar. The caller did not.
+    secret = sidecar.read_text(encoding="utf-8")
+    assert "QQQ" in secret
+    marker = strategy.with_name("import-marker.json")
+    assert not marker.is_file()
+    surface = json.loads((out / "child_surface.json").read_text(encoding="utf-8"))
+    assert surface["sidecar"] is None
+    assert secret not in json.dumps(surface)
+
+
+@windows_jails(2)
+def test_walk_forward_does_not_execute_the_strategy_in_the_caller(tmp_path):
+    src = _series(tmp_path)
+    out = tmp_path / "walk"
+    strategy = _write_probe(tmp_path / "book" / "strategy.py", out)
+    execute_run(
+        _run_config(
+            mode="walkforward",
+            strategies=[str(strategy)],
+            src=str(src),
+            out=str(out),
+            design_end_date="2024-01-02",
+        )
+    )
+    _assert_caller_did_not_exec(
+        strategy,
+        out / "design" / "child_surface.json",
+        out / "locked" / "child_surface.json",
+    )

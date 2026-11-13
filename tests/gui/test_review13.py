@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from test_parallel import FLAT, _anon_pack, _strategy
 from test_window import _window
+from windows_open import windows_jails
 
 import pytest
 
@@ -44,6 +45,7 @@ def _publish(tmp_path: Path) -> Path:
     return out
 
 
+@windows_jails(6)
 def test_double_click_opens_the_opaque_directory(qtbot, tmp_path):
     out = _publish(tmp_path)
     window = _window(qtbot, tmp_path)

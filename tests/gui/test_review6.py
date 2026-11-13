@@ -27,6 +27,7 @@ from backtester.report import TICKER_STAND_IN
 
 from synthetic import write_filled, write_strategy
 from test_window import _window
+from windows_open import windows_jails
 
 ROOT = Path(__file__).resolve().parents[2]
 _SCALE_TOKENS = ("build2_7.777", "v2_7.777", "scale__7.777", "build2_1e7.777")
@@ -143,6 +144,7 @@ def test_redacted_export_cannot_rebuild_close(qtbot, tmp_path):
     assert not _number_present(published_text, "500")
 
 
+@windows_jails(2)
 def test_phase3_pack_loads_in_operator_and_designer_views(qtbot, tmp_path):
     src = write_filled(tmp_path / "Strategy Builder" / "QQQ" / "filled")
     registry = tmp_path / "registry.json"

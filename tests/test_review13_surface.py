@@ -12,6 +12,7 @@ from backtester.gui import audience
 from backtester.gui.audience import export_allowed, export_block_reason, scan_publication, scrub_text
 from backtester.report import _designer_value_error, assert_designer_clean, designer_component_problem, read_leaderboard
 from test_parallel import FLAT, _anon_pack, _strategy
+from windows_open import windows_jails
 
 # Every spelling the publisher used to accept, plus the controls that stay.
 # ``day 2024`` is a date. A decimal year is still a number.
@@ -114,6 +115,7 @@ def test_slash_date_stays_an_unsafe_name():
     assert export_block_reason("2024/01/04", symbols=(), scale=_SCALE) == "a date"
 
 
+@windows_jails(28)
 def test_date_id_fails_one_job_and_the_sibling_publishes(tmp_path):
     from backtester.parallel import PackMarket, run_parallel
 
@@ -122,7 +124,7 @@ def test_date_id_fails_one_job_and_the_sibling_publishes(tmp_path):
     strategies = [_strategy(root / "strategies", name, FLAT) for name in names]
     pack, sidecar, _built = _anon_pack(root, "QQQ", name="pack", price_factor=_SCALE)
     out = root / "out"
-    run_parallel(
+    result = run_parallel(
         strategies,
         [PackMarket(str(pack), str(sidecar))],
         out,
@@ -135,7 +137,8 @@ def test_date_id_fails_one_job_and_the_sibling_publishes(tmp_path):
     assert (out / "leaderboard.csv").is_file()
     jobs = json.loads((out / "run.json").read_text(encoding="utf-8"))["jobs"]
     by_id = {job["strategy_id"]: job["status"] for job in jobs}
-    assert by_id["opening_drive"] == "ok"
+    opening = next(item for item in result.results if item.strategy_id == "opening_drive")
+    assert by_id["opening_drive"] == "ok", (opening.status, opening.error)
     assert {by_id[name] for name in DATES} == {"error"}
     operator = read_leaderboard(out / "leaderboard.csv")
     designer_root = out / "designer"

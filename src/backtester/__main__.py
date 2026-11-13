@@ -24,7 +24,6 @@ from .registry import (
     upsert_series,
 )
 from .report import write_json
-from .strategy_loader import load_strategy_class
 
 
 def _repo_root() -> Path:
@@ -106,6 +105,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_data_args(run, require_out=True, require_src=False)
     run.add_argument("--pack", default=None, help="Chunked pack directory")
     run.add_argument("--sidecar", default=None, help="Operator sidecar for that pack. Never ship this file.")
+    run.add_argument(
+        "--call-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds for one strategy call inside the jail.",
+    )
+    run.add_argument(
+        "--unsafe-in-process",
+        action="store_true",
+        help="Execute the strategy file in this process. Refuses a pack or an anonymized run.",
+    )
 
     walk = sub.add_parser("walkforward", help="Design window, then a locked tail")
     _add_data_args(walk, require_out=True, require_src=False)
@@ -119,6 +129,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Sessions of history before the locked tail. Profile decides what warm-up does.",
+    )
+    walk.add_argument(
+        "--call-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds for one strategy call inside the jail.",
+    )
+    walk.add_argument(
+        "--unsafe-in-process",
+        action="store_true",
+        help="Execute the strategy file in this process. Refuses a pack or an anonymized run.",
     )
 
     ingest = sub.add_parser("ingest", help="Inspect filled files and, with --registry, record the series")
@@ -171,6 +192,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parallel.add_argument("--sidecar", action="append", default=None)
     parallel.add_argument("--bar-minutes", type=int, default=1, help="Named files only. A pack keeps the bar size it was built with.")
     parallel.add_argument("--timeout", type=float, default=600.0, help="Seconds for one strategy after its process has started")
+    parallel.add_argument(
+        "--call-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds for one strategy call inside the jail.",
+    )
     parallel.add_argument("--memory-mb", type=int, default=None, help="Resident-set cap for one strategy process")
     parallel.add_argument("--borrow-rate", type=float, default=None)
     parallel.add_argument(
@@ -197,8 +224,33 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--run", required=True, help="Run id or the directory that contains run.json")
     report.add_argument("--audience", choices=("operator", "designer"), default="operator")
 
-    referee = sub.add_parser("referee", help="One-bar replay (later phase)")
-    referee.add_argument("rest", nargs=argparse.REMAINDER)
+    referee = sub.add_parser("referee", help="Replay one bar at a time in the OS jail")
+    referee.add_argument("--strategy", default=None, help="Path to a strategy.py that defines Strategy")
+    referee.add_argument("--hidden", default=None, help="Hidden sample: a filled directory or a pack directory")
+    referee.add_argument("--profile", choices=("arena", "desk"), default=None)
+    referee.add_argument("--out", default=None)
+    referee.add_argument("--train", default=None, help="Warm-up sample. Arena keeps about the last 504 sessions.")
+    referee.add_argument("--ticker", default=None, help="Named data only. A pack takes the ticker from the sidecar.")
+    referee.add_argument("--sidecar", default=None, help="Operator sidecar for --hidden when it is a pack")
+    referee.add_argument("--train-sidecar", default=None, help="Operator sidecar for --train when it is a pack")
+    referee.add_argument("--bar-minutes", type=int, default=1)
+    referee.add_argument("--share-factor", type=float, default=None, help="Refused on a pack. Raw files stay 1.0.")
+    referee.add_argument("--borrow-rate", type=float, default=None)
+    referee.add_argument("--financing-rate", type=float, default=None, help="Desk only. Arena stays at 0.")
+    referee.add_argument("--fee-mult", type=float, default=1.0, help="Desk only.")
+    referee.add_argument("--dividends", default=None, help="CSV with columns session,amount. Desk only.")
+    referee.add_argument("--initial-equity", type=float, default=1_000_000.0)
+    referee.add_argument(
+        "--warmup-days",
+        type=int,
+        default=None,
+        help="Arena only: how many train sessions to replay before the rescale. Default 504. Desk rejects this.",
+    )
+    referee.add_argument("--memory-mb", type=int, default=2048)
+    referee.add_argument("--cpu-seconds", type=int, default=3600)
+    referee.add_argument("--call-timeout", type=float, default=10.0, help="Seconds per bar. A look-ahead blocks until this.")
+    referee.add_argument("--startup-timeout", type=float, default=60.0)
+    referee.add_argument("--no-benchmarks", action="store_true")
 
     return parser
 
@@ -247,10 +299,20 @@ def _print_headline(profile: str, payload: dict) -> None:
         )
 
 
+_UNSAFE_IN_PROCESS = (
+    "WARNING: --unsafe-in-process runs the strategy file outside the OS jail. "
+    "It can read this machine's files, open the network, and see process memory. "
+    "It refuses a pack or an anonymized run."
+)
+
+
 def _cmd_run(args) -> int:
     from .runner import run_named, run_pack
 
-    strategy_cls = load_strategy_class(args.strategy)
+    if args.unsafe_in_process and (args.pack or args.sidecar):
+        raise ValueError("--unsafe-in-process cannot run a pack or an anonymized book")
+    if args.unsafe_in_process:
+        print(_UNSAFE_IN_PROCESS, file=sys.stderr)
     if args.pack or args.sidecar:
         if args.share_factor is not None:
             raise ValueError(
@@ -263,7 +325,7 @@ def _cmd_run(args) -> int:
         if args.bar_minutes != 1:
             raise ValueError("bar size is fixed when the pack is built. Build another pack to change it.")
         payload = run_pack(
-            strategy_cls,
+            args.strategy,
             args.pack,
             args.sidecar,
             args.profile,
@@ -277,6 +339,7 @@ def _cmd_run(args) -> int:
             price_basis=args.price_basis,
             cash_rate_annual=args.cash_rate,
             withholding_rate=args.withholding,
+            call_timeout=args.call_timeout,
         )
         _print_headline(args.profile, payload)
         _print_cost_comparison(args.out)
@@ -294,7 +357,7 @@ def _cmd_run(args) -> int:
     if not args.src or not args.ticker:
         raise ValueError("a named run needs --src and --ticker")
     payload = run_named(
-        strategy_cls,
+        args.strategy,
         args.src,
         args.ticker,
         args.profile,
@@ -311,6 +374,8 @@ def _cmd_run(args) -> int:
         cash_rate_annual=args.cash_rate,
         withholding_rate=args.withholding,
         registry_path=args.registry,
+        in_process=bool(args.unsafe_in_process),
+        call_timeout=args.call_timeout,
     )
     _print_headline(args.profile, payload)
     _print_data_notes(((payload.get("run") or {}).get("inspection") or {}).get("notes"))
@@ -386,8 +451,11 @@ def _cmd_walk(args) -> int:
             "walkforward warm-up is --warmup-days, counted back from the locked tail. "
             "--warmup-sessions belongs to `run`."
         )
-    strategy_cls = load_strategy_class(args.strategy)
+    if args.unsafe_in_process:
+        print(_UNSAFE_IN_PROCESS, file=sys.stderr)
     if args.pack or args.sidecar:
+        if args.unsafe_in_process:
+            raise ValueError("--unsafe-in-process cannot run a pack or an anonymized book")
         if args.share_factor is not None:
             raise ValueError("a pack walk-forward does not take --share-factor. The sidecar holds the scale.")
         if not args.pack or not args.sidecar:
@@ -397,7 +465,7 @@ def _cmd_walk(args) -> int:
         if args.bar_minutes != 1:
             raise ValueError("bar size is fixed when the pack is built. Build another pack to change it.")
         summary = walk_pack(
-            strategy_cls,
+            args.strategy,
             args.pack,
             args.sidecar,
             args.profile,
@@ -437,7 +505,7 @@ def _cmd_walk(args) -> int:
         raise ValueError("a named walk-forward needs --src and --ticker")
     pack = _walk_inputs(args)
     summary, _slices, _design, _locked = walk_forward(
-        strategy_cls,
+        args.strategy,
         pack.pop("frame"),
         args.profile,
         args.out,
@@ -458,6 +526,8 @@ def _cmd_walk(args) -> int:
         series_kind=pack["series_kind"],
         cash_rate_annual=args.cash_rate,
         withholding_rate=args.withholding,
+        in_process=bool(args.unsafe_in_process),
+        call_timeout=args.call_timeout,
     )
     print(
         f"[{args.profile}] design through {summary['design_end_date']} "
@@ -681,6 +751,7 @@ def _cmd_parallel(args) -> int:
             cash_rate_annual=args.cash_rate,
             withholding_rate=args.withholding,
             registry_path=args.registry,
+            call_timeout=args.call_timeout,
         )
     finally:
         signal.signal(signal.SIGINT, previous)
@@ -760,11 +831,66 @@ def _cmd_report(args) -> int:
     return 0
 
 
+def _cmd_referee(args) -> int:
+    from .referee import run_referee
+    from .sandbox import SandboxError
+
+    try:
+        outcome = run_referee(
+            strategy=args.strategy,
+            hidden=args.hidden,
+            profile=args.profile,
+            out=args.out,
+            train=args.train,
+            ticker=args.ticker,
+            sidecar=args.sidecar,
+            train_sidecar=args.train_sidecar,
+            bar_minutes=args.bar_minutes,
+            warmup_days=args.warmup_days,
+            share_factor=args.share_factor,
+            borrow_rate=args.borrow_rate,
+            financing_rate=args.financing_rate,
+            fee_mult=args.fee_mult,
+            dividends=args.dividends,
+            initial_equity=args.initial_equity,
+            memory_mb=args.memory_mb,
+            cpu_seconds=args.cpu_seconds,
+            call_timeout=args.call_timeout,
+            startup_timeout=args.startup_timeout,
+            with_benchmarks=not args.no_benchmarks,
+        )
+    except SandboxError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if outcome.exit_code != 0:
+        print(outcome.message, file=sys.stderr)
+        return outcome.exit_code
+    if outcome.metrics:
+        _print_headline(outcome.profile, outcome.metrics)
+    print(f"wrote {args.out}")
+    _remember(
+        args.out,
+        kind="referee",
+        profile=outcome.profile,
+        symbol=outcome.symbol,
+        anonymized=outcome.anonymized,
+    )
+    return 0
+
+
 def _cmd_test() -> int:
     import pytest
 
     root = _repo_root()
-    return int(pytest.main(["-q", str(root / "tests")]))
+    # The October-sample jail comparison is its own CI job. Running it inside
+    # every matrix cell walks 20 strategies twice through the pipe.
+    args = ["-q", "-m", "not jailed_sample"]
+    if sys.platform == "win32":
+        # A hung AppContainer grant or a pipe that never returns used to hold
+        # the Windows job for hours. Sixty seconds is the per-test cap there.
+        args.extend(["--timeout=60", "--timeout-method=thread"])
+    args.append(str(root / "tests"))
+    return int(pytest.main(args))
 
 
 def main(argv=None) -> int:
@@ -790,13 +916,25 @@ def main(argv=None) -> int:
         if args.command == "parallel":
             return _cmd_parallel(args)
         if args.command == "referee":
-            raise NotImplementedError("The one-bar referee is a later phase.")
+            return _cmd_referee(args)
         if args.command == "report":
             return _cmd_report(args)
         parser.error(f"unknown command {args.command}")
         return 2
     except (ValueError, FileNotFoundError, NotImplementedError, AttributeError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        from .runner import WorkerFailure
+        from .sandbox import SandboxError
+
+        if not isinstance(exc, (WorkerFailure, SandboxError)):
+            raise
+        text = str(exc).strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("  ")]
+        lines = [line for line in lines if not line.startswith("Traceback")]
+        message = lines[-1] if lines else type(exc).__name__
+        print(f"error: {message}", file=sys.stderr)
         return 2
 
 

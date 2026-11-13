@@ -28,6 +28,7 @@ import gc
 import hashlib
 import json
 import math
+import sys
 import queue
 import secrets
 import shutil
@@ -213,6 +214,37 @@ def discover_strategies(directory) -> tuple[StrategyRef, ...]:
     return tuple(refs)
 
 
+def _both_books(frame, *, anonymized: bool, designer, operator):
+    """Return ``(designer_books, operator_books)``.
+
+    An anonymized job runs both children. They do not share a result. On
+    Windows each child pays for a jail launch, so the two launches overlap.
+    One after another, a two-by-two batch crossed the 60-second test cap.
+    """
+    if not anonymized:
+        return None, operator(frame)
+    designer_frame = frame.copy(deep=True)
+    designer_books = None
+    books = None
+    designer_error = None
+    operator_error = None
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="bt-designer") as pool:
+        pending = pool.submit(designer, designer_frame)
+        try:
+            books = operator(frame)
+        except Exception as exc:
+            operator_error = exc
+        try:
+            designer_books = pending.result()
+        except Exception as exc:
+            designer_error = exc
+    if designer_error is not None:
+        raise designer_error
+    if operator_error is not None:
+        raise operator_error
+    return designer_books, books
+
+
 def run_parallel(
     strategies,
     markets,
@@ -237,6 +269,7 @@ def run_parallel(
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
     registry_path=None,
+    call_timeout: float | None = None,
 ) -> ParallelResult:
     """Cartesian product of strategies and markets. See the module docstring."""
     from . import runner as runner_mod
@@ -381,18 +414,29 @@ def run_parallel(
             return _job_result(ref, source_id, "error", directory, None, market[1], timeout_s)
         emit(ref.strategy_id, source_id, "started", "")
         try:
-            designer_books = None
-            if market.anonymized:
-                from .designer_run import spawn_kwargs
+            from .designer_run import spawn_kwargs
 
-                designer_books = runner_mod._isolated_books(
+            common = dict(
+                timeout=timeout_s,
+                memory_bytes=memory_bytes,
+                stop=stop,
+                strategy_path=ref.path,
+                borrow_rate_annual=market.borrow_rate_annual,
+                financing_rate_annual=financing_rate_annual,
+                fee_mult=fee_mult,
+                warmup_sessions=warmup_sessions,
+                with_benchmarks=with_benchmarks,
+                price_basis=basis,
+                series_kind=market.series_kind,
+                cash_rate_annual=cash_rate_annual,
+                withholding_rate=withholding_rate,
+            )
+
+            def designer_call(designer_frame):
+                return runner_mod._isolated_books(
                     None,
-                    frame,
+                    designer_frame,
                     name,
-                    timeout=timeout_s,
-                    memory_bytes=memory_bytes,
-                    stop=stop,
-                    strategy_path=ref.path,
                     audience="designer",
                     **spawn_kwargs(
                         borrow_rate_annual=market.borrow_rate_annual,
@@ -406,29 +450,31 @@ def run_parallel(
                         cash_rate_annual=cash_rate_annual,
                         withholding_rate=withholding_rate,
                     ),
+                    timeout=timeout_s,
+                    memory_bytes=memory_bytes,
+                    stop=stop,
+                    strategy_path=ref.path,
                 )
-            books = runner_mod._isolated_books(
-                None,
+
+            def operator_call(operator_frame):
+                return runner_mod._isolated_books(
+                    None,
+                    operator_frame,
+                    name,
+                    during=_ready,
+                    call_timeout=10.0 if call_timeout is None else float(call_timeout),
+                    share_factor=market.share_factor,
+                    dividends=market.dividends,
+                    initial_equity=initial_equity,
+                    anonymized=market.anonymized,
+                    **common,
+                )
+
+            designer_books, books = _both_books(
                 frame,
-                name,
-                during=_ready,
-                timeout=timeout_s,
-                memory_bytes=memory_bytes,
-                stop=stop,
-                strategy_path=ref.path,
-                share_factor=market.share_factor,
-                borrow_rate_annual=market.borrow_rate_annual,
-                financing_rate_annual=financing_rate_annual,
-                fee_mult=fee_mult,
-                dividends=market.dividends,
-                warmup_sessions=warmup_sessions,
-                initial_equity=initial_equity,
-                with_benchmarks=with_benchmarks,
                 anonymized=market.anonymized,
-                price_basis=basis,
-                series_kind=market.series_kind,
-                cash_rate_annual=cash_rate_annual,
-                withholding_rate=withholding_rate,
+                designer=designer_call,
+                operator=operator_call,
             )
             extra = {
                 "warnings": [],
@@ -532,6 +578,16 @@ def run_parallel(
     _bundle_designer(out, ranked_rows, assignments, results)
 
     run_id = "r" + secrets.token_hex(8)
+    for row in ranked_rows:
+        status = row.get("status")
+        if status in (None, "ok"):
+            continue
+        # Pytest capture does not show this. The Windows job log does.
+        sys.__stderr__.write(
+            "parallel job %s %s: %s\n"
+            % (row.get("strategy_id"), status, _first_line(str(row.get("error") or "")))
+        )
+    sys.__stderr__.flush()
     jobs = []
     for row in ranked_rows:
         jobs.append(

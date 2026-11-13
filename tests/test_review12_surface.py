@@ -20,6 +20,7 @@ from backtester.gui.audience import (
 )
 from backtester.report import assert_designer_clean, designer_component_problem, read_leaderboard, scrub_symbols, ticker_token_spans
 from test_parallel import FLAT, _anon_pack, _strategy
+from windows_open import windows_jails
 
 
 def _same(text: str, symbol: str) -> None:
@@ -48,6 +49,7 @@ def test_longer_tickers_use_a_letter_boundary_and_one_character_does_not():
     assert designer_component_problem("v2", symbols=("V",), scale=1.1) is None
 
 
+@windows_jails(6)
 def test_glued_ticker_ids_publish_and_a_leftover_fails(tmp_path):
     from backtester.parallel import PackMarket, run_parallel
 
@@ -111,6 +113,7 @@ def test_glued_ticker_ids_publish_and_a_leftover_fails(tmp_path):
         assert_designer_clean(leftover, symbol="QQQ", scale=1.1)
 
 
+@windows_jails(8)
 def test_raw_scale_id_fails_one_job(tmp_path):
     from backtester.parallel import PackMarket, run_parallel
 

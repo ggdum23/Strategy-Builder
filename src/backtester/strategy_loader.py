@@ -1,8 +1,12 @@
 """Load a ``Strategy`` class from a file path.
 
-The strategy directory is put on ``sys.path`` so a parameter module that sits
-next to ``strategy.py`` can be imported. ``run`` executes that code in this
-process. It is not the referee sandbox.
+The strategy directory is put on ``sys.path`` only while the file is
+executing, so a parameter module that sits next to ``strategy.py`` can be
+imported. It is removed when the load finishes, including when the load
+succeeds. The loaded class is stamped with ``__strategy_path__``. A caller
+that did not ask for ``--unsafe-in-process`` sends that path to the jail
+instead of calling this function. Tests and ``--unsafe-in-process`` strip
+the stamp and run the class in this process.
 """
 
 from __future__ import annotations
@@ -32,9 +36,15 @@ def load_strategy_class(path):
         spec.loader.exec_module(module)
     except Exception:
         sys.modules.pop(module_name, None)
-        if inserted and parent in sys.path:
-            sys.path.remove(parent)
         raise
+    finally:
+        # A successful load used to leave the strategy directory on sys.path.
+        # Sibling imports have already happened. The directory does not stay.
+        if inserted:
+            try:
+                sys.path.remove(parent)
+            except ValueError:
+                pass
     if not hasattr(module, "Strategy"):
         raise AttributeError(f"{file_path} does not define Strategy")
     strategy_cls = module.Strategy

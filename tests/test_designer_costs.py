@@ -35,6 +35,7 @@ from backtester.pack import build_pack, factor_mac, load_pack, load_sidecar
 from backtester.registry import entry_from_inspection, save_registry, upsert_series
 from backtester.report import assert_designer_clean, load_report
 from backtester.runner import execute, run_named, run_pack, walk_forward, walk_pack
+from windows_open import windows_jails
 
 ROOT = Path(__file__).resolve().parents[1]
 COSTS_SHA256 = "a3b0a522d8bf469001e75aaf274b0c5d3cbef624a68ed9fb94d29298110fe281"
@@ -350,6 +351,7 @@ def _assert_no_scale(tree: dict[str, bytes]) -> None:
 
 
 @pytest.mark.parametrize("profile", ["arena", "desk"])
+@windows_jails(8)
 def test_designer_tree_is_identical_across_share_scales(tmp_path, profile):
     src, registry = _write_series(tmp_path)
     pack, sidecar = _build(tmp_path, src, registry)
@@ -413,6 +415,7 @@ def test_designer_tree_is_identical_across_share_scales(tmp_path, profile):
     assert len(set(operator_fees)) == len(SCALES)
 
 
+@windows_jails(4)
 def test_designer_equity_ignores_the_operator_account(tmp_path):
     src, registry = _write_series(tmp_path, days=1)
     pack, sidecar = _build(tmp_path, src, registry)
@@ -429,6 +432,7 @@ def test_designer_equity_ignores_the_operator_account(tmp_path):
     assert left["final_equity"] != right["final_equity"]
 
 
+@windows_jails(6)
 def test_sidecar_ticker_does_not_change_designer_bytes(tmp_path):
     src, registry = _write_series(tmp_path, days=1)
     pack, sidecar = _build(tmp_path, src, registry, symbol="NIK", price_factor=1.7)
@@ -463,6 +467,7 @@ def test_anonymized_sidecar_rejects_a_share_scale_other_than_the_price_factor(tm
         _rewrite(sidecar, resign=True, share_scale=0.25)
 
 
+@windows_jails(8)
 def test_designer_dividend_is_real_div_times_build_price_factor(tmp_path):
     """A $1.25 dividend on a 1.7x pack pays 2.125 per pack share, at every billing scale."""
     src, registry = _write_series(tmp_path, days=2)
@@ -581,6 +586,7 @@ def test_named_run_stays_on_the_real_schedule(tmp_path):
     assert direct["fees"]["total"] == payload["fees_total"]
 
 
+@windows_jails(4)
 def test_walk_pack_charges_the_flat_fee_in_both_windows(tmp_path):
     src, registry = _write_series(tmp_path, days=4)
     pack, sidecar = _build(tmp_path, src, registry)

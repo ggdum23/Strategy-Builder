@@ -28,8 +28,19 @@ def _prefer_agg_backend() -> None:
     ``matplotlib.use`` with another backend before it imports pyplot.
     The resource-tracker process does not import pyplot; skip the matplotlib
     import there.
+
+    A frozen jail is this same executable. ``--sandbox-child`` runs the
+    bundled child entry and stops, before ``freeze_support`` and before
+    matplotlib. The working directory is already the private jail directory.
+    Spawn workers do not pass that flag.
     """
     import os
+
+    if "--sandbox-child" in sys.argv:
+        sys.argv = ["strategy"]
+        from backtester.sandbox_child import main as sandbox_main
+
+        raise SystemExit(sandbox_main())
 
     os.environ["MPLBACKEND"] = "Agg"
     argv = sys.argv[1:]

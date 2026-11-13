@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -216,6 +216,53 @@ def test_freeze_support_runs_before_the_application():
             break
     assert calls[:3] == ["_prefer_agg_backend", "freeze_support", "freeze_support"]
     assert "main" not in calls[:3]
+
+
+def test_frozen_sandbox_child_is_this_executable_on_linux(monkeypatch):
+    """The frozen jail child is the same executable. Source runs keep the .py shim.
+
+    This does not build a Windows installer. It checks the command the jail
+    would exec, and that ``--sandbox-child`` enters ``sandbox_child.main``
+    before matplotlib and before the CLI.
+    """
+    import backtester.sandbox as sandbox
+    import backtester.sandbox_child as child
+
+    monkeypatch.setattr(sandbox.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sandbox.sys, "executable", "/opt/strategy-builder/backtester")
+    monkeypatch.setattr(
+        sandbox,
+        "_RUNTIME_COPIES",
+        [("C:\\hostedtoolcache\\windows\\Python\\3.11.9", "C:\\ProgramData\\Strategy Builder\\jail\\runtime")],
+    )
+    assert sandbox._interpreter_command(Path("unused.py"), child=True) == [
+        "/opt/strategy-builder/backtester",
+        "--sandbox-child",
+    ]
+    assert sandbox._child_executable() != str(PureWindowsPath("/opt/strategy-builder/backtester"))
+    monkeypatch.setattr(sandbox.sys, "frozen", False, raising=False)
+    script = Path("/tmp/work/sandbox_child.py")
+    source = sandbox._interpreter_command(script, child=True)
+    assert source[1:4] == ["-I", "-S", "-B"]
+    assert source[-1] == str(script)
+    assert "--sandbox-child" not in source
+
+    ran = []
+
+    def fake_main():
+        ran.append(list(sys.argv))
+        return 0
+
+    monkeypatch.setattr(child, "main", fake_main)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["/opt/strategy-builder/backtester", "--sandbox-child", "not-a-strategy-path"],
+    )
+    with pytest.raises(SystemExit) as caught:
+        frozen_entry._prefer_agg_backend()
+    assert caught.value.code == 0
+    assert ran == [["strategy"]]
 
 
 def test_frozen_smoke_requires_the_gui_launcher():

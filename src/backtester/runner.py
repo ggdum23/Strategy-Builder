@@ -6,7 +6,9 @@ strategy. Omitted switches are the profile defaults: Arena raw prices, cash
 total-return, a cash rate, or a financing rate is recorded on the metrics.
 
 Phase 1 walk-forward isolation is the heap, class attributes, module globals,
-the environment, argv, and cwd. It is not an OS jail. See docs/ISOLATION.md.
+the environment, argv, and cwd. A strategy file does not run in that worker.
+It runs in the referee jail, one bar at a time, while this process keeps the
+engine, the accounting record, and the window's dividends. See docs/ISOLATION.md.
 """
 
 from __future__ import annotations
@@ -499,7 +501,27 @@ def _standalone_frame(frame):
     return out
 
 
+_JOB_BANNED = (
+    "sidecar",
+    "sidecar_path",
+    "factor_key",
+    "factor_mac",
+    "price_factor",
+    "date_map",
+    "volume_factor",
+    "operator_note",
+)
+_DESIGNER_BANNED = _JOB_BANNED + ("share_factor", "share_scale")
+
+
+def _refuse_keys(kwargs, banned, label: str) -> None:
+    found = [key for key in banned if key in kwargs]
+    if found:
+        raise RuntimeError(f"{label} was given {', '.join(found)}")
+
+
 def _plain_kwargs(kwargs):
+    _refuse_keys(kwargs, _JOB_BANNED, "worker job")
     out = dict(kwargs)
     dividends = out.get("dividends")
     if dividends:
@@ -584,6 +606,10 @@ _ENV_KEEP = frozenset(
         "DYLD_LIBRARY_PATH",
         "LANG",
         "LC_ALL",
+        # The Windows AppContainer profile is stored under this directory.
+        # The worker keeps the value so the jail can be created. The jail
+        # denies the directory. It is not a data root the strategy can read.
+        "LOCALAPPDATA",
         "LC_CTYPE",
         "TZ",
     }
@@ -863,6 +889,7 @@ def _launch_book(ctx, queue, job):
             os.environ.update(old_env)
             if not started:
                 shutil.rmtree(cwd, ignore_errors=True)
+                _forget_phase_log(cwd)
     return proc, cwd
 
 
@@ -897,36 +924,111 @@ def _restore_dumpable(previous: int | None) -> None:
     _set_dumpable(bool(previous))
 
 
+def _reported_failure(exc: BaseException) -> tuple[str, str, str]:
+    """Type, message, and traceback stored on the worker's error.
+
+    The jail reports a strategy exception as ``Disqualified`` reason
+    ``strategy``. The detail is ``Type: message`` and ``trace`` is the
+    strategy process traceback. The operator banner uses the type and the
+    message. The log uses the traceback. A timeout, a protocol break, and a
+    worker failure stay the exception this process caught.
+    """
+    reason = getattr(exc, "reason", None)
+    detail = getattr(exc, "detail", None)
+    child_trace = getattr(exc, "trace", None)
+    if reason == "strategy" and isinstance(detail, str):
+        head, sep, tail = detail.partition(": ")
+        if sep and head.isidentifier():
+            trace = child_trace if isinstance(child_trace, str) and child_trace.strip() else traceback.format_exc()
+            return head, tail, trace
+    return type(exc).__name__, str(exc), traceback.format_exc()
+
+
+def _forget_phase_log(cwd) -> None:
+    """Remove the sibling phase log after the jail directory is gone."""
+    if os.name != "nt" or not cwd:
+        return
+    try:
+        phase_log_path(cwd).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def phase_log_path(cwd) -> Path:
+    """Phase log beside the jail directory, not inside it.
+
+    The strategy lists its cwd. A log written there is a file the child
+    can read. The parent and the worker both use this sibling path.
+    """
+    directory = Path(cwd)
+    return directory.with_name(directory.name + ".phase.log")
+
+
 def _books_worker(queue, job):
     _new_session()
+    # The session is created before the jail. The seccomp filter that denies
+    # setsid is installed after a file strategy's jail is up: bubblewrap needs
+    # setsid for its own new session, and the filter would be inherited.
+    # Class strategies have no jail process, so the filter is installed before
+    # they run. See docs/ISOLATION.md.
     spool = None
     try:
         inherited_argv, inherited_cwd = _enter_child(job)
         spool = _StdioCapture(job["cwd"])
+        if os.name == "nt":
+            from .sandbox import note_phase, watch_phase
+
+            watch_phase(str(phase_log_path(Path.cwd())))
+            note_phase("worker-entered")
         gate = job.get("gate")
         if gate is not None:
             gate["started"].set()
             if not gate["release"].wait(timeout=180):
                 raise RuntimeError("design parent did not release the walk-forward child")
-        strategy_cls = _load_strategy(job["strategy"])
+            if os.name == "nt":
+                from .sandbox import note_phase
+
+                note_phase("worker-released")
+        spec = job["strategy"]
         frame = job["frame"]
         profile = job["profile"]
         audience = job.get("audience") or "operator"
         kwargs = job["kwargs"]
+        call_timeout = float(job.get("call_timeout", _JAIL_CALL_TIMEOUT_S))
+        memory_cap = job.get("memory_bytes")
         job.clear()
         if audience == "designer":
-            from .designer_run import run_books as designer_books
-
-            books = designer_books(strategy_cls, frame, profile, **kwargs)
-        else:
-            books = run_books(
-                strategy_cls,
+            _refuse_keys(kwargs, _DESIGNER_BANNED, "designer child")
+        if spec.get("kind") == "path":
+            books = _run_jailed_books(
+                spec["path"],
                 frame,
                 profile,
-                share_factor=kwargs.pop("share_factor"),
-                **kwargs,
+                kwargs,
+                inherited_argv,
+                inherited_cwd,
+                call_timeout,
+                audience=audience,
+                memory_cap=memory_cap,
             )
-        _note_child(books, inherited_argv, inherited_cwd)
+        else:
+            from .sandbox import lock_worker_session
+
+            lock_worker_session()
+            strategy_cls = _load_strategy(spec)
+            if audience == "designer":
+                from .designer_run import run_books as designer_books
+
+                books = designer_books(strategy_cls, frame, profile, **kwargs)
+            else:
+                books = run_books(
+                    strategy_cls,
+                    frame,
+                    profile,
+                    share_factor=kwargs.pop("share_factor"),
+                    **kwargs,
+                )
+            _note_child(books, inherited_argv, inherited_cwd)
         queue.put(("ok", _picklable_books(books)))
     except BaseException as exc:
         tail = ""
@@ -935,13 +1037,14 @@ def _books_worker(queue, job):
                 tail = spool.tail()
             except Exception:
                 tail = ""
+        type_name, text, trace = _reported_failure(exc)
         queue.put(
             (
                 "err",
                 {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "traceback": traceback.format_exc(),
+                    "type": type_name,
+                    "message": text,
+                    "traceback": trace,
                 },
                 tail,
             )
@@ -949,6 +1052,140 @@ def _books_worker(queue, job):
     finally:
         queue.close()
         queue.join_thread()
+
+
+_JAIL_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
+# Headroom above the caller's cap so the jail can cross it by one small
+# allocation and the poll can still report the number. It is not a second
+# ceiling: the kernel limit stays this close to the caller's cap.
+# One poll interval of 8 MiB chunks, plus the headroom the memory tests
+# allocate past the cap before they sleep. Still far under the 2 GiB ceiling,
+# so one mapping cannot reach that ceiling.
+_JAIL_CAP_MARGIN = 256 * 1024 * 1024
+_JAIL_CPU_SECONDS = 3600
+# Same default as the referee. A longer bar has to opt in.
+_JAIL_CALL_TIMEOUT_S = 10.0
+
+
+def jail_memory_bytes(memory_cap, *, ceiling: int = _JAIL_MEMORY_BYTES, margin: int = _JAIL_CAP_MARGIN) -> int:
+    """Kernel ceiling for the jailed strategy.
+
+    With no caller cap the ceiling stays at ``ceiling`` (2 GiB). A caller
+    cap is passed through with ``margin`` added, and it is never raised
+    above ``ceiling``. The worker job does not receive this number.
+    """
+    if memory_cap is None or isinstance(memory_cap, bool) or not isinstance(memory_cap, int):
+        return int(ceiling)
+    if memory_cap <= 0:
+        return int(ceiling)
+    limited = int(memory_cap) + int(margin)
+    if limited > int(ceiling):
+        return int(ceiling)
+    return limited
+
+
+def _bind_strategy(strategy, *, in_process: bool):
+    """Return ``(class_or_none, path_or_none)``.
+
+    A path is the jail. A class stamped with ``__strategy_path__`` is a file
+    the caller already loaded, and it takes the same jail unless
+    ``in_process`` is set. ``in_process`` loads a path in this process and
+    strips the file marker so the worker does not jail it. A class with no
+    file marker stays in this process.
+    """
+    if in_process:
+        if isinstance(strategy, (str, os.PathLike)):
+            from .strategy_loader import load_strategy_class
+
+            strategy = load_strategy_class(strategy)
+        if getattr(strategy, "__strategy_path__", None):
+            try:
+                delattr(strategy, "__strategy_path__")
+            except AttributeError:
+                strategy.__strategy_path__ = None
+        return strategy, None
+    if isinstance(strategy, (str, os.PathLike)):
+        return None, str(strategy)
+    path = getattr(strategy, "__strategy_path__", None)
+    if path:
+        return None, str(path)
+    return strategy, None
+
+
+def _run_jailed_books(
+    strategy_path,
+    frame,
+    profile,
+    kwargs,
+    inherited_argv,
+    inherited_cwd,
+    call_timeout,
+    audience="operator",
+    memory_cap=None,
+):
+    """Engine in this process. The strategy file runs in the referee jail.
+
+    ``kwargs`` already holds the accounting record and this window's dividend
+    slice. Those stay here. The pipe carries bars and decisions only, so a
+    locked ex-date is not in the design strategy and the scale is not in
+    either strategy process. The jail's kernel ceiling is the caller's cap
+    plus a small margin, and never the 2 GiB default when a cap was set.
+    The parent's poll still reports that cap. The worker job has no commit
+    limit.
+    """
+    from .referee import Disqualified, jailed_strategy
+    from .sandbox import lock_worker_session
+
+    deny = [Path(strategy_path).resolve().parent]
+    cwd = Path.cwd()
+    if cwd not in deny:
+        deny.append(cwd)
+    share_factor = kwargs.pop("share_factor", None)
+    if audience == "designer":
+        _refuse_keys(kwargs, _DESIGNER_BANNED, "designer child")
+        if share_factor is not None:
+            raise RuntimeError("designer child was given share_factor")
+    elif share_factor is None:
+        share_factor = 1.0
+    crash_code = None
+    with jailed_strategy(
+        strategy_path,
+        profile,
+        deny_paths=deny,
+        memory_bytes=jail_memory_bytes(memory_cap),
+        cpu_seconds=_JAIL_CPU_SECONDS,
+        call_timeout=float(call_timeout),
+        memory_cap=memory_cap,
+    ) as remote:
+        # The jail is already a new session. Later forks of this worker cannot
+        # leave the group.
+        lock_worker_session()
+        try:
+            if audience == "designer":
+                from .designer_run import run_books as designer_books
+
+                books = designer_books(lambda: remote, frame, profile, **kwargs)
+            else:
+                books = run_books(lambda: remote, frame, profile, share_factor=share_factor, **kwargs)
+            surface = remote.snapshot()
+        except Disqualified as exc:
+            # Prints live in the jail log. Attach them to this worker's stdio
+            # before the operator error is built. A hard exit (os._exit) has
+            # no decision line; leave with that status so the row is a crash.
+            remote.spill_stdio(wait=exc.reason in {"strategy", "crash", "protocol"})
+            if exc.reason == "crash":
+                code = remote.exit_code()
+                if isinstance(code, int) and 1 < code < 128:
+                    crash_code = code
+                else:
+                    raise
+            else:
+                raise
+    if crash_code is not None:
+        os._exit(crash_code)
+    books["strategy"][0]["observer"] = _ObserverView(surface)
+    _note_child(books, inherited_argv, inherited_cwd)
+    return books
 
 
 def _note_child(books, inherited_argv, inherited_cwd) -> None:
@@ -1042,22 +1279,168 @@ def _wait_until_started(proc, event, queue, timeout: float, stop=None, job=None,
     raise RuntimeError("walk-forward worker did not start")
 
 
-def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None, pgid=None):
+def _pipe_bytes(reader) -> int | None:
+    """Bytes already in a Windows result pipe. ``None`` on other systems.
+
+    ``PeekNamedPipe`` does not consume the message. ``connection.wait`` on
+    this pipe posts a zero-byte overlapped read and then cancels it, which
+    leaves a ``WriteFile`` of a result larger than the 8 KiB pipe buffer
+    blocked in the child.
+    """
+    if os.name != "nt":
+        return None
+    import _winapi
+
+    try:
+        return int(_winapi.PeekNamedPipe(reader.fileno())[0])
+    except OSError:
+        return -1
+
+
+def _phase_child_pids(phase_dir) -> list[int]:
+    """Jailed pids the worker recorded. Toolhelp can miss an AppContainer."""
+    if not phase_dir:
+        return []
+    try:
+        text = phase_log_path(phase_dir).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    found = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "child-pid":
+            try:
+                found.append(int(parts[2]))
+            except ValueError:
+                continue
+    return found
+
+
+def _watched_rss(pid: int, job, phase_dir=None):
+    """Resident set of the worker, its children, and any jailed pid it named.
+
+    On Windows the same walk also reads commit, and the larger total is
+    what the cap compares. Job members and phase-log pids that toolhelp
+    already listed are not counted twice. Children of those extra pids
+    are included. A job that reports more than 32 members fails the book
+    instead of summing the 32-pid prefix.
+    """
+    from .limits import member_list_overflow, process_tree_watch_bytes
+
+    if job is not None and hasattr(job, "assigned_process_count"):
+        try:
+            assigned = job.assigned_process_count()
+        except Exception:
+            assigned = None
+        problem = member_list_overflow(assigned) if assigned is not None else None
+        if problem:
+            raise RuntimeError(problem)
+    extra = _phase_child_pids(phase_dir)
+    if job is not None and hasattr(job, "member_pids"):
+        try:
+            extra = list(extra) + [int(item) for item in job.member_pids() if int(item) != int(pid)]
+        except Exception:
+            pass
+    return process_tree_watch_bytes(pid, extra)
+
+
+def _windows_hang_detail(proc, job, phase_dir) -> str:
+    """Phase, job accounting, commit, and who holds the profile mutex."""
+    parts = []
+    if phase_dir:
+        path = phase_log_path(phase_dir)
+        try:
+            lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except OSError:
+            lines = []
+        parts.append("phase=" + (" | ".join(lines[-6:]) if lines else "missing"))
+    if job is not None and hasattr(job, "describe"):
+        try:
+            parts.append(job.describe())
+        except Exception as exc:
+            parts.append(f"job_describe_failed={exc}")
+    try:
+        from .limits import process_tree_detail
+
+        parts.append(process_tree_detail(int(proc.pid)))
+    except Exception as exc:
+        parts.append(f"proc_detail_failed={exc}")
+    try:
+        from .sandbox import profile_lock_state
+
+        parts.append(f"lock={profile_lock_state()}")
+    except Exception as exc:
+        parts.append(f"lock_failed={exc}")
+    text = " ".join(parts)
+    return text[:1500]
+
+
+def _note_windows_wait(proc, pending: int | None, started: float, job=None, phase_dir=None) -> None:
+    """One line on the real stderr every two seconds, for the Windows CI log.
+
+    Every ten seconds the line includes the phase file, the job limits, the
+    worker commit, and whether the profile mutex is held. A pytest timeout
+    kills the test before the worker-timeout exception is raised, so the
+    diagnosis has to be on this path.
+    """
+    waited = time.monotonic() - started
+    slot = int(waited // 2)
+    if slot < 1 or getattr(proc, "_sb_wait_note", -1) == slot:
+        return
+    proc._sb_wait_note = slot
+    try:
+        alive = bool(proc.is_alive())
+    except OSError:
+        alive = False
+    sys.__stderr__.write(
+        "walk-forward wait waited=%.1fs alive=%s exit=%s pipe_bytes=%s\n"
+        % (waited, int(alive), proc.exitcode, pending)
+    )
+    if slot % 5 == 0:
+        try:
+            detail = _windows_hang_detail(proc, job, phase_dir)
+        except Exception as exc:
+            detail = f"diag_failed={exc}"
+        sys.__stderr__.write(f"walk-forward diag waited={waited:.1f}s {detail}\n")
+    sys.__stderr__.flush()
+
+
+def _take_result(
+    proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None, pgid=None, phase_dir=None
+):
     """Read the result, or raise as soon as the child exits without one.
 
     A dead child used to block on ``queue.get`` until the 600s timeout.
-    The process sentinel and the queue are waited together. ``memory_bytes``
-    and ``stop`` are watched in this process. They are not sent to the child.
+    On Linux the process sentinel and the queue are waited together. On
+    Windows only the sentinel is waited: the pipe is drained with
+    ``PeekNamedPipe`` and a real read. ``memory_bytes`` and ``stop`` are
+    watched in this process. They are not sent to the child.
     """
     import queue as queue_mod
     from multiprocessing.connection import wait
 
-    from .limits import process_tree_rss_bytes
-
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
     reader = queue._reader
     while True:
-        if wait([reader], timeout=0):
+        pending = _pipe_bytes(reader)
+        queued = False
+        if os.name == "nt":
+            queued = pending is not None and pending > 0
+            if not queued:
+                _note_windows_wait(proc, pending, started, job, phase_dir)
+        elif wait([reader], timeout=0):
+            queued = True
+        if queued:
+            # A timeout posted as the resident set crosses the cap is the
+            # memory stop. The cap is what the caller asked to enforce.
+            if memory_bytes is not None:
+                rss = _watched_rss(proc.pid, job, phase_dir)
+                if rss is not None and rss > int(memory_bytes):
+                    _stop_process(proc, job, pgid)
+                    raise RuntimeError(
+                        f"walk-forward worker exceeded memory limit ({rss} > {int(memory_bytes)})"
+                    )
             try:
                 return queue.get_nowait()
             except queue_mod.Empty:
@@ -1074,7 +1457,7 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
             _stop_process(proc, job, pgid)
             raise RuntimeError("walk-forward worker cancelled")
         if memory_bytes is not None:
-            rss = process_tree_rss_bytes(proc.pid)
+            rss = _watched_rss(proc.pid, job, phase_dir)
             if rss is not None and rss > int(memory_bytes):
                 _stop_process(proc, job, pgid)
                 raise RuntimeError(
@@ -1082,9 +1465,20 @@ def _take_result(proc, queue, timeout: float, *, memory_bytes: int | None = None
                 )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            alive = False
+            try:
+                alive = bool(proc.is_alive())
+            except OSError:
+                alive = False
+            detail = f"exit {proc.exitcode}"
+            if os.name == "nt":
+                detail += f", alive={int(alive)}, pipe_bytes={_pipe_bytes(reader)} {_windows_hang_detail(proc, job, phase_dir)}"
             _stop_process(proc, job, pgid)
-            raise RuntimeError(f"walk-forward worker timed out (exit {proc.exitcode})")
-        wait([reader, proc.sentinel], timeout=min(0.2, remaining))
+            raise RuntimeError(f"walk-forward worker timed out ({detail})")
+        if os.name == "nt":
+            wait([proc.sentinel], timeout=min(0.05, remaining))
+        else:
+            wait([reader, proc.sentinel], timeout=min(0.2, remaining))
 
 
 def _metric_delta(child, parent) -> list[str]:
@@ -1247,13 +1641,27 @@ def _isolated_books(
 
     from .limits import arm_worker_job
 
+    if os.name == "nt":
+        # The runtime ACL is once per machine. Pay for it here, before the
+        # worker's timeout clock starts, so a book does not spend its budget
+        # walking the Python tree.
+        from .sandbox import warm_windows_profile
+
+        warm_windows_profile()
+    run_kwargs = dict(kwargs)
+    call_timeout = float(run_kwargs.pop("call_timeout", _JAIL_CALL_TIMEOUT_S))
+    audience = run_kwargs.pop("audience", "operator")
     if strategy_path is not None:
         spec = {"kind": "path", "path": str(strategy_path)}
     elif strategy_cls is None:
         raise ValueError("strategy is missing")
     else:
         spec = _strategy_spec(strategy_cls)
-    audience = kwargs.pop("audience", "operator")
+    if spec.get("kind") == "path":
+        # launch() runs in the worker, where the pytest observer is not set.
+        from .sandbox import note_launch
+
+        note_launch()
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     gate = {"started": ctx.Event(), "release": ctx.Event()}
@@ -1262,7 +1670,9 @@ def _isolated_books(
         "frame": _standalone_frame(frame),
         "profile": profile,
         "audience": audience,
-        "kwargs": _plain_kwargs(kwargs),
+        "kwargs": _plain_kwargs(run_kwargs),
+        "call_timeout": call_timeout,
+        "memory_bytes": None if memory_bytes is None else int(memory_bytes),
         "gate": gate,
     }
     proc = None
@@ -1271,6 +1681,12 @@ def _isolated_books(
     pgid = None
     try:
         proc, cwd = _launch_book(ctx, result_queue, job)
+        if os.name == "nt" and cwd:
+            try:
+                with phase_log_path(cwd).open("a", encoding="utf-8") as handle:
+                    handle.write("%.3f parent-spawned\n" % time.monotonic())
+            except OSError:
+                pass
         guard = arm_worker_job(proc.pid, None if memory_bytes is None else int(memory_bytes))
         if os.name == "nt" and guard is None:
             raise RuntimeError("the worker could not be placed in a job object")
@@ -1292,6 +1708,7 @@ def _isolated_books(
             stop=stop,
             job=guard,
             pgid=pgid,
+            phase_dir=cwd,
         )
         proc.join(timeout=60)
         if message[0] != "ok":
@@ -1311,8 +1728,8 @@ def _isolated_books(
         if audience == "designer":
             from .designer_run import accept_books
 
-            return accept_books(profile, _standalone_frame(frame), message[1], kwargs)
-        return _accept_child_books(profile, _standalone_frame(frame), message[1], kwargs)
+            return accept_books(profile, _standalone_frame(frame), message[1], run_kwargs)
+        return _accept_child_books(profile, _standalone_frame(frame), message[1], run_kwargs)
     finally:
         # Success, a strategy exception, and a parent-side failure all come
         # through here. The group is signaled even when the worker has exited.
@@ -1323,6 +1740,7 @@ def _isolated_books(
         result_queue.join_thread()
         if cwd is not None:
             shutil.rmtree(cwd, ignore_errors=True)
+            _forget_phase_log(cwd)
 
 
 def run_books(
@@ -1379,6 +1797,20 @@ def run_books(
             billing.append(bench_metrics["share_factor"])
             books[label] = (_tag_observer(bench_result, bench), bench_metrics)
     return books
+
+
+def _write_child_surface(directory, books) -> None:
+    """Write a strategy's own report when it stored one.
+
+    The jail cannot create that file beside the strategy. The worker writes
+    it into the operator directory after the engine has finished. It is not
+    copied into ``designer/``.
+    """
+    observer = books["strategy"][0].get("observer")
+    surface = getattr(observer, "surface", None)
+    if not isinstance(surface, dict):
+        return
+    write_json(Path(directory) / "child_surface.json", surface)
 
 
 def write_books(
@@ -1471,6 +1903,8 @@ def run_named(
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
     registry_path=None,
+    in_process: bool = False,
+    call_timeout: float | None = None,
 ):
     loaded, declared_kind = load_run_series(
         src,
@@ -1495,10 +1929,8 @@ def run_named(
             "0.9 is not a kit constant."
         )
     warnings = []
-    books = run_books(
-        strategy_cls,
-        loaded.frame,
-        profile,
+    bound_cls, bound_path = _bind_strategy(strategy_cls, in_process=in_process)
+    book_kwargs = dict(
         share_factor=factor,
         borrow_rate_annual=borrow_rate_annual,
         financing_rate_annual=financing_rate_annual,
@@ -1512,6 +1944,12 @@ def run_named(
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
     )
+    if bound_path is not None:
+        if call_timeout is not None:
+            book_kwargs["call_timeout"] = float(call_timeout)
+        books = _isolated_books(bound_cls, loaded.frame, profile, strategy_path=bound_path, **book_kwargs)
+    else:
+        books = run_books(bound_cls, loaded.frame, profile, **book_kwargs)
     payload = write_books(
         out_dir,
         profile,
@@ -1521,6 +1959,7 @@ def run_named(
         books,
         extra={"warnings": warnings, "inspection": loaded.inspection.as_dict()},
     )
+    _write_child_surface(out_dir, books)
     return payload
 
 
@@ -1619,6 +2058,8 @@ def walk_forward(
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
     anonymized: bool = False,
+    in_process: bool = False,
+    call_timeout: float | None = None,
 ):
     """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
 
@@ -1646,6 +2087,7 @@ def walk_forward(
     reports is allowed. ``anonymized`` stamps those operator books. Named
     walks leave it false.
     """
+    strategy_cls, strategy_path = _bind_strategy(strategy_cls, in_process=in_process)
     if share_factor != 1.0 and not allow_scale:
         raise ValueError(
             f"share_factor {share_factor} is not 1.0. Raw runs use 1.0. "
@@ -1701,6 +2143,8 @@ def walk_forward(
         withholding_rate=withholding_rate,
         anonymized=anonymized,
     )
+    if call_timeout is not None:
+        common["call_timeout"] = float(call_timeout)
     notes = [str(note) for note in (inspection_notes or ())]
     previous_dumpable = _set_dumpable(False)
     try:
@@ -1709,6 +2153,7 @@ def walk_forward(
                 strategy_cls,
                 design,
                 profile,
+                strategy_path=strategy_path,
                 max_day=meta.design_end_day,
                 warmup_sessions=0,
                 during=during_design,
@@ -1739,6 +2184,7 @@ def walk_forward(
                 strategy_cls,
                 rebuilt.locked_with_warmup,
                 profile,
+                strategy_path=strategy_path,
                 reset_day=meta.locked_start_day if meta.warmup_sessions else None,
                 max_day=meta.locked_day_max,
                 warmup_sessions=0,
@@ -1751,6 +2197,7 @@ def walk_forward(
                 strategy_cls,
                 rebuilt.locked_with_warmup,
                 profile,
+                strategy_path=strategy_path,
                 warmup_sessions=meta.warmup_sessions,
                 max_day=meta.locked_day_max,
                 dividends=locked_dividends,
@@ -1766,6 +2213,8 @@ def walk_forward(
     locked_payload = write_books(
         out / "locked", profile, symbol, bar_minutes, rebuilt.locked_with_warmup, locked_books
     )
+    _write_child_surface(out / "design", design_books)
+    _write_child_surface(out / "locked", locked_books)
     summary = {
         "profile": profile,
         "symbol": symbol,
@@ -1816,6 +2265,8 @@ def run_pack(
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
     allow_scale_mismatch: bool = False,
+    in_process: bool = False,
+    call_timeout: float | None = None,
 ):
     """Run a pack. The sidecar stays in this process.
 
@@ -1831,6 +2282,9 @@ def run_pack(
     than that price factor. The invoice then records both factors. The MAC
     is still checked.
     """
+    if in_process:
+        raise ValueError("--unsafe-in-process cannot run a pack or an anonymized book")
+    strategy_cls, strategy_path = _bind_strategy(strategy_cls, in_process=False)
     from .pack import load_pack, load_sidecar, require_build_price_factor
 
     if _report_inside_pack(pack_dir, out_dir):
@@ -1879,6 +2333,8 @@ def run_pack(
             strategy_cls,
             loaded.frame,
             profile,
+            strategy_path=strategy_path,
+            call_timeout=_JAIL_CALL_TIMEOUT_S if call_timeout is None else float(call_timeout),
             audience="designer",
             **spawn_kwargs(
                 borrow_rate_annual=borrow_rate_annual,
@@ -1897,6 +2353,8 @@ def run_pack(
         strategy_cls,
         loaded.frame,
         profile,
+        strategy_path=strategy_path,
+        call_timeout=_JAIL_CALL_TIMEOUT_S if call_timeout is None else float(call_timeout),
         share_factor=share_scale,
         borrow_rate_annual=borrow_rate_annual,
         financing_rate_annual=financing_rate_annual,
@@ -1929,6 +2387,7 @@ def run_pack(
             "anonymized": anonymized,
         },
     )
+    _write_child_surface(out_dir, books)
     # Not written to metrics.json. A test reads what the child strategy observed.
     observer = books["strategy"][0].get("observer")
     if observer is not None:
@@ -1971,6 +2430,8 @@ def walk_pack(
 
     if _report_inside_pack(pack_dir, out_dir):
         raise ValueError("the report must not live inside the pack directory")
+    strategy, strategy_path = _bind_strategy(strategy_cls, in_process=False)
+    strategy_cls = strategy
     loaded = load_pack(pack_dir)
     secret = load_sidecar(sidecar_path)
     if secret["pack_id"] != loaded.pack_id:
@@ -2006,7 +2467,7 @@ def walk_pack(
     del secret
     gc.collect()
     summary, rebuilt, design_books, locked_books = walk_forward(
-        strategy_cls,
+        strategy_path or strategy_cls,
         loaded.frame,
         profile,
         out_dir,
@@ -2059,6 +2520,8 @@ def walk_pack(
         strategy_cls,
         rebuilt.design,
         profile,
+        strategy_path=strategy_path,
+        call_timeout=_JAIL_CALL_TIMEOUT_S,
         audience="designer",
         **design_kwargs,
     )
@@ -2102,6 +2565,8 @@ def walk_pack(
         strategy_cls,
         rebuilt.locked_with_warmup,
         profile,
+        strategy_path=strategy_path,
+        call_timeout=_JAIL_CALL_TIMEOUT_S,
         audience="designer",
         **locked_kwargs,
     )

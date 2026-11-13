@@ -11,6 +11,7 @@ from backtester.designer_ids import strategy_id_problem
 from backtester.gui.audience import export_allowed, export_block_reason, scan_publication, scrub_text
 from backtester.report import _designer_value_error, assert_designer_clean, designer_component_problem, read_leaderboard
 from test_parallel import FLAT, _anon_pack, _strategy
+from windows_open import windows_jails
 
 # Spellings from reviews 13 and 14, plus two-digit years, epochs, and weekdays.
 DATES = (
@@ -200,6 +201,7 @@ def test_listed_numbers_are_masked_before_the_date_scan():
     assert export_allowed(sheet, symbols=(), scale=_SCALE)
 
 
+@windows_jails(50)
 def test_grammar_runs_before_the_date_is_scrubbed_out_of_the_id(tmp_path):
     from backtester.parallel import PackMarket, run_parallel
 
