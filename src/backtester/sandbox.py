@@ -18,7 +18,9 @@ parallel workers after they become session leaders. It denies ``setsid`` and
 
 from __future__ import annotations
 
+import atexit
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -175,7 +177,9 @@ _SANDBOX_DENY = (
 )
 
 _LANDLOCK_HANDLED_FS = 0xFFFF
-_LANDLOCK_READ = (1 << 0) | (1 << 2) | (1 << 3)  # execute, read file, read dir
+_LANDLOCK_EXECUTE = 1 << 0
+_LANDLOCK_READ_FILE = 1 << 2
+_LANDLOCK_READ = _LANDLOCK_EXECUTE | _LANDLOCK_READ_FILE | (1 << 3)  # execute, read file, read dir
 _LANDLOCK_WRITE = _LANDLOCK_READ | (1 << 1) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 13) | (1 << 14)
 
 
@@ -377,10 +381,12 @@ def _landlock_guarantees() -> dict:
         ),
         "filesystem": (
             "landlock allow-list: read the Python runtime and the staged packages, "
-            "write the private temp directory. Opening a data or repository path returns "
-            "EPERM. This is not a mount namespace. The child is python -I -S, so "
-            "site-packages is not on sys.path. Landlock rules are directories, so a "
-            "prefix that contains site-packages cannot have that one directory punched out."
+            "traverse /etc, and read only /etc/ld.so.cache. The rest of /etc is not "
+            "readable. stat is not mediated by landlock and is not a confinement "
+            "check. Opening a data or repository path returns EPERM. This is not a "
+            "mount namespace. The child is python -I -S, so site-packages is not on "
+            "sys.path. Landlock rules are directories, so a prefix that contains "
+            "site-packages cannot have that one directory punched out."
         ),
         "process": (
             "seccomp denies setsid, setpgid, fork, vfork, and clone without CLONE_THREAD. "
@@ -534,6 +540,12 @@ class Sandbox:
             self._cleanup = None
             if cleanup is not None:
                 cleanup()
+            try:
+                from .limits import release_cgroup_memory
+
+                release_cgroup_memory(int(self.process.pid))
+            except (OSError, ValueError, ImportError):
+                pass
             shutil.rmtree(self.workdir, ignore_errors=True)
 
 
@@ -614,6 +626,10 @@ def launch(
             raise SandboxError(
                 "bubblewrap is not available and landlock cannot be applied; refusing to run the strategy"
             )
+        if sys.platform == "linux":
+            from .limits import apply_cgroup_memory_max
+
+            apply_cgroup_memory_max(int(box.process.pid), int(memory_bytes))
         note_launch()
         return box
     except Exception:
@@ -696,14 +712,158 @@ def copy_parent_candidates(environ, roots, accessible) -> list[str]:
     return found
 
 
+def _read_dacl_entries(path: Path):
+    """``(type, flags, mask)`` for every ACE, or None when the DACL cannot be read."""
+    if sys.platform != "win32":
+        return []
+    try:
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return None
+    advapi.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi.GetAce.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.GetAce.restype = ctypes.c_int
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    dacl = ctypes.c_void_p()
+    security = ctypes.c_void_p()
+    status = advapi.GetNamedSecurityInfoW(
+        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+    )
+    if status != 0 or not security.value:
+        if security.value:
+            kernel.LocalFree(security)
+        return None
+    try:
+        if not dacl.value:
+            return []
+        header = _ACL_HEADER.from_address(int(dacl.value))
+        found = []
+        for index in range(min(int(header.AceCount), 256)):
+            ace = ctypes.c_void_p()
+            if not advapi.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
+                continue
+            info = _ACE_HEADER.from_address(int(ace.value))
+            mask = int(ctypes.c_uint32.from_address(int(ace.value) + 4).value)
+            found.append((int(info.AceType), int(info.AceFlags), mask))
+        return found
+    finally:
+        kernel.LocalFree(security)
+
+
+def _parent_inheritable_write(path: Path) -> bool:
+    """Fail closed when the DACL cannot be read."""
+    entries = _read_dacl_entries(path)
+    if entries is None:
+        return True
+    return dacl_has_inheritable_write(entries)
+
+
+def _sid_text(advapi, kernel, sid) -> str:
+    advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi.ConvertSidToStringSidW.restype = ctypes.c_int
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    text = ctypes.c_wchar_p()
+    if not advapi.ConvertSidToStringSidW(sid, ctypes.byref(text)) or not text.value:
+        return ""
+    try:
+        return str(text.value)
+    finally:
+        kernel.LocalFree(text)
+
+
+def _current_user_sid_text() -> str:
+    if sys.platform != "win32":
+        return ""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    kernel.OpenProcessToken.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    advapi.GetTokenInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    advapi.GetTokenInformation.restype = ctypes.c_int
+    token = ctypes.c_void_p()
+    if not kernel.OpenProcessToken(kernel.GetCurrentProcess(), 0x8, ctypes.byref(token)):
+        return ""
+    try:
+        needed = ctypes.c_uint32()
+        advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+        buf = ctypes.create_string_buffer(max(int(needed.value), 8))
+        if not advapi.GetTokenInformation(token, 1, buf, len(buf), ctypes.byref(needed)):
+            return ""
+        sid = ctypes.c_void_p.from_buffer(buf)
+        return _sid_text(advapi, kernel, sid)
+    finally:
+        kernel.CloseHandle(token)
+
+
+def _owner_sid_text(path: Path) -> str:
+    if sys.platform != "win32":
+        return ""
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    owner = ctypes.c_void_p()
+    security = ctypes.c_void_p()
+    # OWNER_SECURITY_INFORMATION = 1
+    status = advapi.GetNamedSecurityInfoW(
+        str(path), 1, 1, ctypes.byref(owner), None, None, None, ctypes.byref(security)
+    )
+    if status != 0 or not security.value or not owner.value:
+        if security.value:
+            kernel.LocalFree(security)
+        return ""
+    try:
+        return _sid_text(advapi, kernel, owner)
+    finally:
+        kernel.LocalFree(security)
+
+
+def _directory_owned_by_us(path: Path) -> bool:
+    return owner_matches(_owner_sid_text(path), _current_user_sid_text())
+
+
 def _owned_work_parent() -> Path | None:
     """An app-created folder whose parents already allow package traverse.
 
-    The DACL of the parent is not modified. ProgramData and Public are
-    tried first. When those do not already let All Application Packages
-    through, the copy is created under the nearest ancestor of the blocked
-    interpreter that does. The volume root, Windows, and System32 are
-    never used. Only the directories this function creates are later granted.
+    The DACL of the parent is not modified. This is the fallback used when
+    the per-user container folder cannot be created. ProgramData and Public
+    are tried only when they already let the package through, have no
+    inheritable write ACE, and an existing child is owned by this user.
+    The volume root, Windows, and System32 are never used. Only the
+    directories this function creates are later granted.
     """
     if sys.platform != "win32":
         return None
@@ -713,15 +873,30 @@ def _owned_work_parent() -> Path | None:
         try:
             if not parent.is_dir():
                 continue
-            if not _chain_has_package_traverse(parent):
-                continue
             app = (parent / "Strategy Builder").resolve()
             jail = (app / "jail").resolve()
             if not _can_be_allow_root(app, os.environ) or not _can_be_allow_root(jail, os.environ):
                 continue
+            created_app = not app.exists()
+            if not shared_parent_usable(
+                traversable=_chain_has_package_traverse(parent),
+                inheritable_write=_parent_inheritable_write(parent),
+                created=created_app,
+                owner_ok=True if created_app else _directory_owned_by_us(app),
+            ):
+                continue
             app.mkdir(exist_ok=True)
+            _reject_reparse_dir(app)
             jail.mkdir(exist_ok=True)
-        except OSError:
+            _reject_reparse_dir(jail)
+            # The directory we would hand back, not the parent we checked
+            # before mkdir. An adopted directory has to be ours, and its
+            # DACL must not still hand write to a new child.
+            if _parent_inheritable_write(jail) or not _directory_owned_by_us(jail):
+                continue
+            if not _directory_owned_by_us(app):
+                continue
+        except (OSError, SandboxError):
             continue
         for directory in (app, jail):
             if not any(acl_same(directory, existing) for existing in _CREATED_APP_DIRS):
@@ -1024,6 +1199,56 @@ def _child_env(work: Path) -> dict:
     return env
 
 
+def _under_tmp(path: Path) -> bool:
+    """True when ``path`` is ``/tmp`` or a directory inside it."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    try:
+        tmp = Path("/tmp").resolve()
+    except OSError:
+        tmp = Path("/tmp")
+    return resolved == tmp or tmp in resolved.parents
+
+
+def bwrap_mount_plan(roots, packages, hidden_sites, work, cache_file) -> list[str]:
+    """Mount arguments. A runtime root under ``/tmp`` is bound after the tmpfs.
+
+    ``/tmp`` itself is not a bind target: the private tmpfs would hide it,
+    and binding it back would undo the tmpfs. That launch is refused by
+    the caller. The cache file is the only bind from ``/etc``.
+    """
+    early = []
+    late = []
+    for root in roots:
+        path = Path(root)
+        if path == Path("/tmp") or _under_tmp(path) and path.resolve() == Path("/tmp").resolve():
+            raise SandboxError(f"refusing to hide the runtime at {path} under a private tmpfs")
+        if _under_tmp(path):
+            late.append(path)
+        else:
+            early.append(path)
+    cmd: list[str] = []
+    for root in early:
+        cmd.extend(["--ro-bind", str(root), str(root)])
+    for directory in hidden_sites:
+        cmd.extend(["--tmpfs", str(directory)])
+    for path in packages:
+        package = Path(path)
+        if _under_tmp(package):
+            late.append(package)
+        else:
+            cmd.extend(["--ro-bind", str(package), str(package)])
+    if cache_file:
+        cmd.extend(["--dir", "/etc", "--ro-bind", str(cache_file), str(cache_file)])
+    cmd.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+    for root in late:
+        cmd.extend(["--ro-bind", str(root), str(root)])
+    cmd.extend(["--bind", str(work), str(work)])
+    return cmd
+
+
 def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seconds: int) -> Sandbox:
     binary = _which("bwrap")
     if not binary:
@@ -1045,8 +1270,6 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
         "--cap-drop",
         "ALL",
     ]
-    for root in roots:
-        cmd.extend(["--ro-bind", str(root), str(root)])
     packages = _runtime_package_dirs()
     # A prefix mount includes site-packages. Cover that directory, then put
     # back only the package directories the parent resolved. Metadata files
@@ -1057,13 +1280,16 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
         covered = any(directory == root or root in directory.parents for root in roots)
         if covered and directory not in hidden_sites:
             hidden_sites.append(directory)
-            cmd.extend(["--tmpfs", str(directory)])
-    for path in packages:
-        cmd.extend(["--ro-bind", str(path), str(path)])
     cache = Path("/etc/ld.so.cache")
-    if cache.is_file():
-        cmd.extend(["--dir", "/etc", "--ro-bind", str(cache), str(cache)])
-    cmd.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind", str(work), str(work)])
+    cmd.extend(
+        bwrap_mount_plan(
+            roots,
+            packages,
+            hidden_sites,
+            work,
+            cache if cache.is_file() else None,
+        )
+    )
     pass_fds = []
     try:
         filt = _filter_bytes(deny=_SANDBOX_DENY, allow_threads=True)
@@ -1107,6 +1333,30 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
     return Sandbox(proc, work, "bubblewrap", _bwrap_guarantees(), _cleanup)
 
 
+def landlock_rule_plan(read_dirs, cache_file, work) -> tuple[list, list]:
+    """Directory rules and the one file rule for the dynamic linker cache.
+
+    ``/etc`` is traverse-only. The cache file is a read-file rule. The
+    directory that contains the cache is not granted read.
+    """
+    directories = []
+    for directory in read_dirs:
+        if not directory:
+            continue
+        path = str(directory)
+        if path in ("/etc", "/etc/"):
+            continue
+        directories.append([path, _LANDLOCK_READ])
+    files = []
+    if cache_file:
+        etc = str(Path(cache_file).parent)
+        if etc and not any(item[0] == etc for item in directories):
+            directories.append([etc, _LANDLOCK_EXECUTE])
+        files.append([str(cache_file), _LANDLOCK_READ_FILE])
+    directories.append([str(work), _LANDLOCK_WRITE])
+    return directories, files
+
+
 def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seconds: int) -> Sandbox:
     """Landlock, seccomp, rlimits, and a parent-death signal. No preexec fork."""
     read_dirs = [str(path) for path in _runtime_roots()]
@@ -1115,12 +1365,6 @@ def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_s
         if str(directory) not in read_dirs:
             read_dirs.append(str(directory))
     cache = Path("/etc/ld.so.cache")
-    if cache.is_file():
-        # Landlock names directories. The cache file's directory is the
-        # smallest rule that lets the linker open that one file.
-        etc = str(cache.parent)
-        if etc not in read_dirs:
-            read_dirs.append(etc)
     for directory in read_dirs:
         path = Path(directory)
         for banned in denied:
@@ -1128,17 +1372,18 @@ def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_s
                 raise SandboxError(
                     "the Python runtime is inside a denied directory; refusing to grant it"
                 )
-    rules = []
-    for directory in read_dirs:
-        if directory and os.path.isdir(directory):
-            rules.append([directory, _LANDLOCK_READ])
-    rules.append([str(work), _LANDLOCK_WRITE])
+    rules, files = landlock_rule_plan(
+        [directory for directory in read_dirs if directory and os.path.isdir(directory)],
+        str(cache) if cache.is_file() else None,
+        work,
+    )
     (work / "filter.bin").write_bytes(_filter_bytes(deny=_SANDBOX_DENY, allow_threads=True))
     (work / "jail.json").write_text(
         json.dumps(
             {
                 "handled": _LANDLOCK_HANDLED_FS,
                 "rules": rules,
+                "files": files,
                 "memory_bytes": int(memory_bytes),
                 "cpu_seconds": int(cpu_seconds),
             }
@@ -1197,6 +1442,16 @@ def main():
             if not directory or not os.path.isdir(directory):
                 continue
             raw = os.open(directory, os.O_PATH | os.O_CLOEXEC)
+            try:
+                rule = Rule(int(access), raw)
+                if libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0) != 0:
+                    _fail("landlock_add_rule failed")
+            finally:
+                os.close(raw)
+        for filename, access in spec.get("files") or []:
+            if not filename or not os.path.isfile(filename):
+                continue
+            raw = os.open(filename, os.O_PATH | os.O_CLOEXEC)
             try:
                 rule = Rule(int(access), raw)
                 if libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0) != 0:
@@ -1301,7 +1556,7 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
                 popen._process = None
         finally:
             try:
-                _win_drop_launch_aces(lease, [], [], extra_grants)
+                _drop_launch_aces_locked(lease, extra_grants)
             finally:
                 _win_lease_release()
 
@@ -1388,6 +1643,11 @@ def _grant_marker_path() -> Path:
     return local / "strategybuilderjail-grants.json"
 
 
+def _drop_launch_aces_locked(lease, extra_grants) -> None:
+    """Drop the launch ACEs while this process holds the profile mutex."""
+    _with_profile_lock(lambda: _win_drop_launch_aces(lease, [], [], extra_grants))
+
+
 def _with_profile_lock(action):
     """One grant or spawn at a time. The kernel drops the mutex if the holder dies.
 
@@ -1464,6 +1724,24 @@ def profile_lock_state() -> str:
 
 
 _WFP_ENGINE = None
+_WFP_LAYERS = {"v4": False, "v6": False}
+
+
+def wfp_connect_layers() -> tuple:
+    """ALE auth-connect layer ids for IPv4 and IPv6. Both are required."""
+    return (
+        (0xC38D57D1, 0x05A7, 0x4C33, (0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82)),
+        (0x4A72393B, 0x319F, 0x44BC, (0x84, 0xC3, 0xBA, 0x54, 0xDC, 0xB3, 0xB6, 0xB4)),
+    )
+
+
+def firewall_timeout_blocks_launch(v4_ready: bool, v6_ready: bool) -> bool:
+    """A hung firewall cmdlet fails the launch unless both WFP layers are in."""
+    return not (bool(v4_ready) and bool(v6_ready))
+
+
+def wfp_layers_confirmed() -> bool:
+    return bool(_WFP_LAYERS.get("v4")) and bool(_WFP_LAYERS.get("v6"))
 
 
 def _win_wfp_block(lease: _WinLease) -> None:
@@ -1573,32 +1851,40 @@ def _win_wfp_block(lease: _WinLease) -> None:
         raise SandboxError(f"the firewall engine did not open (winerror {status})")
     # Highest weight. The value is a pointer, and it has to outlive the add.
     weight = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
-    condition = Condition()
-    # FWPM_CONDITION_ALE_PACKAGE_ID
-    condition.fieldKey = guid(0x71BC78FA, 0xF17C, 0x4997, (0xA6, 0x02, 0x6A, 0xBB, 0x26, 0x1F, 0x35, 0x1C))
-    condition.matchType = 0  # FWP_MATCH_EQUAL
-    condition.value.type = 13  # FWP_SID
-    condition.value.ptr = lease.sid
-    filt = Filter()
-    filt.displayData.name = name
-    filt.displayData.description = name
-    # FWPM_LAYER_ALE_AUTH_CONNECT_V4
-    filt.layerKey = guid(0xC38D57D1, 0x05A7, 0x4C33, (0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82))
-    # FWPM_SUBLAYER_UNIVERSAL
-    filt.subLayerKey = guid(0xEEBECC03, 0xCED4, 0x4380, (0x81, 0x9A, 0x27, 0x34, 0x39, 0x7B, 0x2B, 0x74))
-    filt.weight.type = 4  # FWP_UINT64
-    filt.weight.ptr = ctypes.cast(ctypes.byref(weight), ctypes.c_void_p)
-    filt.numFilterConditions = 1
-    filt.filterCondition = ctypes.pointer(condition)
-    filt.action.type = 0x1001  # FWP_ACTION_BLOCK
-    added = ctypes.c_uint64()
-    status = fwpu.FwpmFilterAdd0(engine, ctypes.byref(filt), None, ctypes.byref(added))
-    if status != 0:
-        raise SandboxError(f"the connect-layer block was not added (winerror {status})")
+    # FWPM_LAYER_ALE_AUTH_CONNECT_V4 and V6. Loopback is both families.
+    layers = (
+        ("v4", guid(0xC38D57D1, 0x05A7, 0x4C33, (0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82))),
+        ("v6", guid(0x4A72393B, 0x319F, 0x44BC, (0x84, 0xC3, 0xBA, 0x54, 0xDC, 0xB3, 0xB6, 0xB4))),
+    )
+    universal = guid(0xEEBECC03, 0xCED4, 0x4380, (0x81, 0x9A, 0x27, 0x34, 0x39, 0x7B, 0x2B, 0x74))
+    kept = []
+    for label, layer in layers:
+        condition = Condition()
+        # FWPM_CONDITION_ALE_PACKAGE_ID
+        condition.fieldKey = guid(0x71BC78FA, 0xF17C, 0x4997, (0xA6, 0x02, 0x6A, 0xBB, 0x26, 0x1F, 0x35, 0x1C))
+        condition.matchType = 0  # FWP_MATCH_EQUAL
+        condition.value.type = 13  # FWP_SID
+        condition.value.ptr = lease.sid
+        filt = Filter()
+        filt.displayData.name = name
+        filt.displayData.description = name
+        filt.layerKey = layer
+        filt.subLayerKey = universal
+        filt.weight.type = 4  # FWP_UINT64
+        filt.weight.ptr = ctypes.cast(ctypes.byref(weight), ctypes.c_void_p)
+        filt.numFilterConditions = 1
+        filt.filterCondition = ctypes.pointer(condition)
+        filt.action.type = 0x1001  # FWP_ACTION_BLOCK
+        added = ctypes.c_uint64()
+        status = fwpu.FwpmFilterAdd0(engine, ctypes.byref(filt), None, ctypes.byref(added))
+        if status != 0:
+            raise SandboxError(f"the connect-layer block was not added for {label} (winerror {status})")
+        _WFP_LAYERS[label] = True
+        kept.append((condition, filt, added))
     # The session is dynamic, so closing the engine or exiting this process
-    # removes the filter. Keep the handle, the session, and the strings alive
+    # removes the filters. Keep the handle, the session, and the strings alive
     # for the life of the process. Do not close the engine between jails.
-    _WFP_ENGINE = (engine, fwpu, weight, condition, filt, name, session)
+    _WFP_ENGINE = (engine, fwpu, weight, kept, name, session)
 
 
 def _firewall_block_command(sid_text: str) -> str:
@@ -1648,14 +1934,75 @@ def _win_block_network(sid_text: str) -> bool:
     except OSError as exc:
         raise SandboxError(f"the AppContainer firewall block was not added: {exc}") from exc
     except subprocess.TimeoutExpired:
-        # The WFP connect filter is already installed. A hung cmdlet must
-        # not fail the strategy, and the caller does not try again in
-        # this process.
+        # Both dynamic WFP layers are the block. A hung cmdlet is fail-closed
+        # when either layer is missing. The caller does not try the cmdlet
+        # again in this process. Cleanup still removes a rule the cmdlet
+        # managed to add before it was killed.
+        _arm_firewall_cleanup()
+        if firewall_timeout_blocks_launch(_WFP_LAYERS.get("v4"), _WFP_LAYERS.get("v6")):
+            raise SandboxError(
+                "the firewall cmdlet timed out and the IPv4 and IPv6 connect filters are not both installed"
+            )
         return False
     if proc.returncode != 0:
         detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
         raise SandboxError(f"the AppContainer firewall block was not added: {detail[-500:]}")
+    _arm_firewall_cleanup()
     return True
+
+
+def _firewall_remove_command() -> str:
+    """Delete the package rules this process added. ``$null`` avoids Out-Null."""
+    return (
+        "$names = @('strategybuilderjail-block-out','strategybuilderjail-block-in')\n"
+        "foreach ($name in $names) {\n"
+        "  $null = Remove-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue\n"
+        "}\n"
+    )
+
+
+def _forget_firewall_marker() -> None:
+    """The on-disk marker must not skip the next install after the rules are gone."""
+    try:
+        path = _grant_marker_path()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, SandboxError):
+        return
+    if not isinstance(payload, dict) or not payload.get("firewall_blocked"):
+        return
+    payload["firewall_blocked"] = False
+    try:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _remove_firewall_rules() -> None:
+    """Drop the persistent rules when this process is finished with them."""
+    if sys.platform != "win32":
+        return
+    _forget_firewall_marker()
+    system = os.environ.get("SystemRoot", "")
+    powershell = Path(system) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe" if system else None
+    if powershell is None or not powershell.is_file():
+        return
+    try:
+        subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", _firewall_remove_command()],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+def _arm_firewall_cleanup() -> None:
+    if getattr(_arm_firewall_cleanup, "armed", False):
+        return
+    _arm_firewall_cleanup.armed = True
+    atexit.register(_remove_firewall_rules)
 
 
 def _clear_loopback(name: str, sid_text: str) -> None:
@@ -1877,24 +2224,80 @@ def _win_lease_open(lease: _WinLease) -> None:
         raise
 
 
-def _split_acl_path(path) -> tuple[str, tuple[str, ...]]:
-    """Drive plus components. Backslashes are separators even on Linux tests."""
+# 8.3 names Windows still opens as the protected directories.
+_ACL_SHORT_NAMES = {
+    "progra~1": "Program Files",
+    "progra~2": "Program Files (x86)",
+    "progra~3": "Program Files",
+}
+
+
+def canonicalize_acl_path(path) -> str | None:
+    """The path Windows will open, or None when it must not be an allow root.
+
+    ``\\\\?\\`` and ``\\\\.\\`` prefixes are stripped. UNC paths are rejected.
+    Each component loses trailing dots and spaces. ``.`` is dropped and
+    ``..`` is collapsed. Known 8.3 names of Program Files are expanded.
+    A path that climbs above its drive is rejected.
+    """
     text = str(path).strip().replace("/", "\\")
+    folded = text.upper()
+    if folded.startswith("\\\\?\\UNC\\") or folded.startswith("\\\\.\\UNC\\"):
+        return None
+    for prefix in ("\\\\?\\", "\\\\.\\", "\\??\\"):
+        if folded.startswith(prefix):
+            text = text[len(prefix) :]
+            folded = text.upper()
+            break
     if text.startswith("\\\\"):
-        body = text[2:]
-        while "\\\\" in body:
-            body = body.replace("\\\\", "\\")
-        parts = tuple(part for part in body.split("\\") if part and part != ".")
-        return "\\\\", parts
-    while "\\\\" in text:
-        text = text.replace("\\\\", "\\")
-    text = text.rstrip("\\")
+        return None
+    if len(text) >= 2 and text[1] == ":":
+        drive = text[:2].upper()
+        rest = text[2:]
+    else:
+        drive = ""
+        rest = text
+    parts: list[str] = []
+    for part in rest.split("\\"):
+        if part in ("", "."):
+            continue
+        cleaned = part.rstrip(" .")
+        if not cleaned or cleaned == ".":
+            continue
+        if cleaned == "..":
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        short = cleaned.casefold()
+        if short in _ACL_SHORT_NAMES:
+            cleaned = _ACL_SHORT_NAMES[short]
+        parts.append(cleaned)
+    if drive:
+        if not parts:
+            return drive + "\\"
+        return drive + "\\" + "\\".join(parts)
+    if not parts:
+        return None
+    return "\\".join(parts)
+
+
+def _split_acl_path(path) -> tuple[str, tuple[str, ...]]:
+    """Drive plus components. Backslashes are separators even on Linux tests.
+
+    A rejected path (UNC, or a ``..`` that climbs off the drive) is a UNC
+    sentinel so it cannot compare equal to an allow root.
+    """
+    canon = canonicalize_acl_path(path)
+    if canon is None:
+        return "\\\\", ("rejected",)
+    text = canon
     if len(text) >= 2 and text[1] == ":":
         drive = text[:2].upper()
         rest = text[2:].lstrip("\\")
-        parts = tuple(part for part in rest.split("\\") if part and part != ".")
+        parts = tuple(part for part in rest.split("\\") if part)
         return drive, parts
-    parts = tuple(part for part in text.split("\\") if part and part != ".")
+    parts = tuple(part for part in text.split("\\") if part)
     return "", parts
 
 
@@ -1941,12 +2344,46 @@ def _is_volume_acl_path(path) -> bool:
     return bool(drive) and not parts
 
 
+def _interpreter_for_acl(environ) -> str:
+    """The interpreter prefix whose toolcache ancestors stay protected."""
+    raw = (environ or {}).get("SB_PYTHON_PREFIX") or ""
+    if raw:
+        return str(raw)
+    base = str(getattr(sys, "base_prefix", "") or "")
+    if "hostedtoolcache" in base.casefold().replace("/", "\\"):
+        return base
+    return ""
+
+
+def toolcache_ancestor_paths(interpreter) -> list[str]:
+    """Ancestors of a toolcache interpreter, not the interpreter directory.
+
+    ``C:\\hostedtoolcache`` and ``...\\Python`` are protected. The version
+    directory that holds ``python.exe`` is not in this list, so it can still
+    be an allow root.
+    """
+    if not interpreter:
+        return []
+    canon = canonicalize_acl_path(interpreter)
+    if not canon:
+        return []
+    drive, parts = _split_acl_path(canon)
+    folded = [part.casefold() for part in parts]
+    if "hostedtoolcache" not in folded:
+        return []
+    index = folded.index("hostedtoolcache")
+    return [_acl_join(drive, parts[:length]) for length in range(index + 1, len(parts))]
+
+
 def protected_acl_layout(environ) -> tuple[list[str], list[str]]:
     """Exact directories that must never be edited, and trees that are off limits.
 
     Program Files is exact: the directory itself is protected, and a frozen
     bundle underneath can still be an allow root. The Windows directory and
-    System32 are trees: nothing inside them is an allow root.
+    System32 are trees: nothing inside them is an allow root. ``Packages``
+    is exact, so the profile folder created under it can still be granted.
+    Toolcache ancestors of the interpreter are exact. The interpreter
+    directory itself is not.
     """
     exact: list[str] = []
     trees: list[str] = []
@@ -1973,6 +2410,13 @@ def protected_acl_layout(environ) -> tuple[list[str], list[str]]:
     profile = environ.get("USERPROFILE")
     if profile:
         add_exact(profile)
+    local = environ.get("LOCALAPPDATA") or ""
+    if local:
+        canon = canonicalize_acl_path(local)
+        if canon:
+            add_exact(canon.rstrip("\\") + "\\Packages")
+    for ancestor in toolcache_ancestor_paths(_interpreter_for_acl(environ)):
+        add_exact(ancestor)
     return exact, trees
 
 
@@ -1985,6 +2429,9 @@ def _inside_program_files(path, environ) -> bool:
 
 
 def _can_be_allow_root(path, environ) -> bool:
+    drive, _parts = _split_acl_path(path)
+    if drive == "\\\\":
+        return False
     exact, trees = protected_acl_layout(environ)
     if any(acl_same(path, banned) for banned in exact) or _is_volume_acl_path(path):
         return False
@@ -2247,7 +2694,7 @@ def _acl_same_prefix(path: Path) -> bool:
 # The dest is an app-owned copy. The source's ancestors are not edited.
 _RUNTIME_COPIES: list[tuple[str, str]] = []
 _FIREWALL_TRIED = False
-_RUNTIME_COPY_VERSION = "1"
+_RUNTIME_COPY_VERSION = "2"
 # Set when the copy parent is the AppContainer folder. Ancestors of that
 # folder are not granted and are not required to show a package ACE.
 _CONTAINER_FOLDER_NOTE = ""
@@ -2469,10 +2916,47 @@ def _load_runtime_stamp() -> list:
     return copies if isinstance(copies, list) else []
 
 
+def runtime_tree_digest(root: Path) -> str:
+    """Hash of every file under ``root``. A changed byte changes the digest."""
+    digest = hashlib.sha256()
+    root = Path(root)
+    if not root.exists():
+        digest.update(b"missing")
+        return digest.hexdigest()
+    paths = []
+    if root.is_file():
+        paths = [root]
+    else:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for name in sorted(filenames):
+                paths.append(Path(dirpath) / name)
+    for path in paths:
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            data = path.read_bytes()
+        except OSError:
+            digest.update(b"unreadable\0")
+            continue
+        digest.update(str(len(data)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _remember_runtime_stamp() -> None:
     payload = {
         "version": _RUNTIME_COPY_VERSION,
-        "copies": [{"source": source, "dest": dest} for source, dest in _RUNTIME_COPIES],
+        "copies": [
+            {
+                "source": source,
+                "dest": dest,
+                "sha256": runtime_tree_digest(Path(dest)),
+            }
+            for source, dest in _RUNTIME_COPIES
+        ],
     }
     _runtime_stamp_path().write_text(json.dumps(payload), encoding="utf-8")
 
@@ -2485,8 +2969,11 @@ def _runtime_copy_ready(dest: Path, src: Path) -> bool:
         exe_name = "python.exe" if os.name == "nt" else "python"
         if not (dest / exe_name).is_file() or not (dest / "Lib" / "os.py").is_file():
             return False
+    digest = runtime_tree_digest(dest)
     for item in _load_runtime_stamp():
         if not isinstance(item, dict):
+            continue
+        if item.get("sha256") != digest:
             continue
         if acl_same(item.get("source", ""), src) and acl_same(item.get("dest", ""), dest):
             return True
@@ -2732,11 +3219,11 @@ def _accept_container_parent(folder: Path) -> Path | None:
     try:
         for raw in plan:
             path = Path(raw)
-            if path.is_dir():
-                continue
-            path.mkdir(exist_ok=True)
-            created.append(path)
-    except OSError as exc:
+            if not path.is_dir():
+                path.mkdir(exist_ok=True)
+                created.append(path)
+            _reject_reparse_dir(path)
+    except (OSError, SandboxError) as exc:
         _CONTAINER_FOLDER_NOTE = f"could not create the container folder: {exc}"
         for path in reversed(created):
             try:
@@ -2768,10 +3255,10 @@ def _copy_failure_note() -> str:
 def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path]:
     """Owned grant roots. An unreachable interpreter is replaced by its copy.
 
-    ProgramData, Public, a traversable ancestor, and Program Files are
-    tried first. The AppContainer folder is used only when none of those
-    already let the container through. Ancestors this process did not
-    create are not granted.
+    The per-user AppContainer folder is preferred. ProgramData, Public, a
+    traversable ancestor, and Program Files are used only when that folder
+    cannot be created and the shared parent has no inheritable write ACE.
+    Ancestors this process did not create are not granted.
     """
     global _RUNTIME_COPIES, _TRUSTED_STAGE_ROOTS, _RUNTIME_PARENT
     _TRUSTED_STAGE_ROOTS = []
@@ -2785,10 +3272,9 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
     stage_root = None
     trust = False
     if blocked:
-        parent = _owned_work_parent()
-        if parent is None and container_dir is not None:
-            parent = _accept_container_parent(container_dir)
-            trust = parent is not None
+        parent, trust = choose_copy_parent(
+            container_dir, _accept_container_parent, _owned_work_parent
+        )
         if parent is not None:
             stage_root = str((Path(parent) / "runtime").resolve())
             _RUNTIME_PARENT = str(Path(parent))
@@ -2837,12 +3323,126 @@ def _remove_tree(path: Path) -> None:
     shutil.rmtree(path, onerror=onerror)
 
 
-def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:
-    """Copy interpreter files into the app-owned dest and let new files inherit.
+def _runtime_acl_entries(lease, *, lock: bool):
+    """Explicit ACEs for the staged interpreter.
 
-    The inheritable ACE is written on the empty directory first. A file that
-    does not inherit it is granted by a tree walk. The stamp lives beside the
-    grant marker, outside the tree the child can read.
+    A locked tree grants the profile read-and-execute and denies write to
+    Users, Everyone, and both package groups. SYSTEM keeps full control so
+    the directory can still be removed by the OS. The owner keeps WRITE_DAC
+    and replaces this DACL before the next copy.
+    """
+
+    class Trustee(ctypes.Structure):
+        _fields_ = (
+            ("pMultipleTrustee", ctypes.c_void_p),
+            ("MultipleTrusteeOperation", ctypes.c_uint32),
+            ("TrusteeForm", ctypes.c_uint32),
+            ("TrusteeType", ctypes.c_uint32),
+            ("ptstrName", ctypes.c_void_p),
+        )
+
+    class ExplicitAccess(ctypes.Structure):
+        _fields_ = (
+            ("grfAccessPermissions", ctypes.c_uint32),
+            ("grfAccessMode", ctypes.c_uint32),
+            ("grfInheritance", ctypes.c_uint32),
+            ("Trustee", Trustee),
+        )
+
+    advapi = lease.advapi
+    kernel = lease.kernel
+    advapi.ConvertStringSidToSidW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.ConvertStringSidToSidW.restype = ctypes.c_int
+    sids = []
+
+    def sid_for(text: str):
+        pointer = ctypes.c_void_p()
+        if not advapi.ConvertStringSidToSidW(text, ctypes.byref(pointer)) or not pointer.value:
+            raise SandboxError(f"could not use SID {text}")
+        sids.append(pointer)
+        return pointer
+
+    specs = []
+    if lock:
+        for text in ("S-1-5-32-545", "S-1-1-0", "S-1-15-2-1", "S-1-15-2-2"):
+            specs.append((sid_for(text), _WRITE_MASK, 3))
+        specs.append((lease.sid, _RX_MASK, 1))
+        specs.append((sid_for("S-1-5-18"), _FULL_MASK, 1))
+    else:
+        user = _current_user_sid_text()
+        if not user:
+            raise SandboxError("could not read the current user SID")
+        specs.append((sid_for(user), _FULL_MASK, 1))
+        specs.append((sid_for("S-1-5-18"), _FULL_MASK, 1))
+    entries = (ExplicitAccess * len(specs))()
+    for index, (sid, mask, mode) in enumerate(specs):
+        entries[index].grfAccessPermissions = int(mask)
+        entries[index].grfAccessMode = int(mode)
+        entries[index].grfInheritance = _INHERIT_BOTH
+        entries[index].Trustee.TrusteeForm = 0
+        entries[index].Trustee.ptstrName = sid
+    return entries, sids, kernel, ExplicitAccess
+
+
+def _win_set_runtime_dacl(lease, root: Path, *, lock: bool) -> None:
+    """Replace the DACL on the copy. ``lock`` drops inherited write."""
+    if sys.platform != "win32" or not root.exists():
+        return
+    entries, sids, kernel, explicit = _runtime_acl_entries(lease, lock=lock)
+    advapi = lease.advapi
+    advapi.SetEntriesInAclW.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(explicit),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.SetEntriesInAclW.restype = ctypes.c_uint32
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    updated = ctypes.c_void_p()
+    try:
+        status = advapi.SetEntriesInAclW(len(entries), entries, None, ctypes.byref(updated))
+        if status != 0 or not updated.value:
+            raise SandboxError(f"could not build the runtime ACL (winerror {status})")
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            _win_write_dacl(kernel, advapi, current, updated, protected=True)
+            if not current.is_dir():
+                continue
+            try:
+                pending.extend(path for path in current.iterdir() if not path.is_symlink())
+            except OSError as exc:
+                raise SandboxError(f"could not lock the runtime copy at {current}: {exc}") from exc
+    finally:
+        if updated.value:
+            kernel.LocalFree(updated)
+        for sid in sids:
+            if sid.value:
+                kernel.LocalFree(sid)
+
+
+def _ensure_runtime_integrity(lease) -> None:
+    """Recheck the staged tree immediately before CreateProcessW.
+
+    A stamp that names the path is not enough. A changed file is deleted
+    and copied again. A second mismatch fails the launch.
+    """
+    if not _RUNTIME_COPIES or _runtime_copies_ready():
+        return
+    _materialize_runtime_copies(lease)
+    if not _runtime_copies_ready():
+        raise SandboxError("the staged interpreter does not match its stamp")
+
+
+def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:
+    """Copy interpreter files into the app-owned dest and lock the DACL.
+
+    An unfinished or altered tree is deleted and replaced. The stamp stores
+    a hash of the files. The protected DACL grants the package read and
+    execute and denies write to Users, Everyone, and the package groups.
+    The stamp lives beside the grant marker, outside the tree the child
+    can read.
     """
     granted: list[tuple[Path, bool]] = []
     if not _RUNTIME_COPIES:
@@ -2856,20 +3456,18 @@ def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:
             continue
         changed = True
         if target.exists():
+            if sys.platform == "win32":
+                _win_set_runtime_dacl(lease, target, lock=False)
             _remove_tree(target)
         target.mkdir(parents=True, exist_ok=True)
-        if sys.platform == "win32":
-            _win_grant(lease, target, "(OI)(CI)(RX)", recurse=False)
-            granted.append((target, False))
+        _reject_reparse_dir(target)
         note_phase(f"runtime-copy-start {target.name}")
         _copy_runtime_tree(src, target, packages, full=bool(getattr(sys, "frozen", False)))
         _rewrite_staged_pyvenv(target)
         note_phase(f"runtime-copy-done {target.name}")
         if sys.platform == "win32":
-            probe = target / "python.exe"
-            if probe.is_file() and not _win_ace_present(lease, probe, _RX_MASK, 0):
-                _win_grant_tree(lease, target, _RX_MASK, _INHERIT_BOTH)
-                granted.append((target, True))
+            _win_set_runtime_dacl(lease, target, lock=True)
+            granted.append((target, True))
     if changed:
         _remember_runtime_stamp()
     return granted
@@ -2948,6 +3546,152 @@ def _refuse_acl_write(lease: _WinLease, path: Path) -> None:
     refuse_acl_target(path, allow=_lease_allow(lease), environ=os.environ)
 
 
+# FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
+_OPEN_REPARSE = 0x00200000 | 0x02000000
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+# PROTECTED_DACL_SECURITY_INFORMATION. Inherited ACEs are not kept.
+_PROTECTED_DACL = 0x80000000
+# FILE_WRITE_DATA | APPEND | WRITE_EA | DELETE_CHILD | WRITE_ATTRIBUTES
+# | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL
+_WRITE_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x40000000 | 0x10000000
+# OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+_INHERIT_TO_CHILDREN = 0x1 | 0x2
+
+
+def reparse_point_blocks_acl(attributes: int, reparse_tag: int) -> bool:
+    """A junction or symlink is not a directory this process may grant."""
+    return bool(int(attributes) & _FILE_ATTRIBUTE_REPARSE_POINT) or bool(int(reparse_tag))
+
+
+def dacl_has_inheritable_write(entries) -> bool:
+    """True when an allow ACE would give a new child write access.
+
+    ``entries`` is ``(ace_type, ace_flags, mask)``. Inherit-only is not
+    required. Object-inherit or container-inherit on an allow is enough.
+    """
+    for ace_type, ace_flags, mask in entries:
+        if int(ace_type) not in (0, 5):
+            continue
+        if not (int(ace_flags) & _INHERIT_TO_CHILDREN):
+            continue
+        if int(mask) & _WRITE_MASK:
+            return True
+    return False
+
+
+def owner_matches(owner_sid, user_sid) -> bool:
+    """An adopted directory is usable only when this process owns it."""
+    if not owner_sid or not user_sid:
+        return False
+    return str(owner_sid) == str(user_sid)
+
+
+def shared_parent_usable(*, traversable: bool, inheritable_write: bool, created: bool, owner_ok: bool) -> bool:
+    """ProgramData or Public may hold the copy only with no inherited write.
+
+    A directory this call creates is owned by this process. A directory
+    that already existed has to be owned by this process as well.
+    """
+    if not traversable or inheritable_write:
+        return False
+    if created:
+        return True
+    return bool(owner_ok)
+
+
+def choose_copy_parent(container_dir, accept_container, owned_work):
+    """Prefer the per-user container folder. A shared parent is the fallback.
+
+    Returns ``(parent, trusted)``. ``trusted`` is true for the container
+    folder, whose ancestors are not granted.
+    """
+    if container_dir is not None:
+        parent = accept_container(container_dir)
+        if parent is not None:
+            return parent, True
+    return owned_work(), False
+
+
+def _win_open_noreparse(kernel, path: Path):
+    """Open a directory without following a junction. Reject a reparse point."""
+    kernel.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.GetFileInformationByHandleEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel.GetFileInformationByHandleEx.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    # READ_CONTROL | WRITE_DAC. Backup semantics so a directory can be opened.
+    handle = kernel.CreateFileW(
+        str(path),
+        0x20000 | 0x40000,
+        0x7,
+        None,
+        3,
+        _OPEN_REPARSE,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if not handle or int(handle) == int(invalid):
+        raise _win_fail(f"could not open {path} without following a reparse point")
+
+    class _Tag(ctypes.Structure):
+        _fields_ = (("FileAttributes", ctypes.c_uint32), ("ReparseTag", ctypes.c_uint32))
+
+    info = _Tag()
+    # FileAttributeTagInfo = 9
+    if not kernel.GetFileInformationByHandleEx(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        kernel.CloseHandle(handle)
+        raise _win_fail(f"could not read reparse information for {path}")
+    if reparse_point_blocks_acl(int(info.FileAttributes), int(info.ReparseTag)):
+        kernel.CloseHandle(handle)
+        raise SandboxError(f"refusing to edit the ACL on {path}: reparse point")
+    return handle
+
+
+def _win_write_dacl(kernel, advapi, path: Path, dacl, *, protected: bool = False) -> None:
+    """Set the DACL on a handle opened without following a reparse point."""
+    advapi.SetSecurityInfo.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi.SetSecurityInfo.restype = ctypes.c_uint32
+    handle = _win_open_noreparse(kernel, path)
+    try:
+        info = 4 | (_PROTECTED_DACL if protected else 0)
+        status = advapi.SetSecurityInfo(handle, 1, info, None, None, dacl, None)
+        if status != 0:
+            raise SandboxError(f"could not write the ACL on {path} (winerror {status})")
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _reject_reparse_dir(path: Path) -> None:
+    """After mkdir, refuse a junction that replaced the directory."""
+    if sys.platform != "win32":
+        return
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = _win_open_noreparse(kernel, path)
+    kernel.CloseHandle(handle)
+
+
 def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
     """Add a non-inherited traverse ACE without walking the directory.
 
@@ -3015,11 +3759,9 @@ def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
     status = advapi.GetNamedSecurityInfoW(str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security))
     if status != 0:
         raise SandboxError(f"could not read the ACL on {path} (winerror {status})")
-    if not dacl.value:
-        # A NULL DACL already allows traverse. Replacing it would drop that.
-        if security.value:
-            kernel.LocalFree(security)
-        return
+    # A NULL DACL is replaced. Leaving it would grant Everyone, and an
+    # AppContainer does not use that allow.
+    null_dacl = not dacl.value
     entry = ExplicitAccess()
     # FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
     entry.grfAccessPermissions = 0x20 | 0x80 | 0x100000
@@ -3029,12 +3771,12 @@ def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
     entry.Trustee.ptstrName = lease.sid
     updated = ctypes.c_void_p()
     try:
-        status = advapi.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(updated))
+        status = advapi.SetEntriesInAclW(
+            1, ctypes.byref(entry), None if null_dacl else dacl, ctypes.byref(updated)
+        )
         if status != 0:
             raise SandboxError(f"could not add a traverse ACE on {path} (winerror {status})")
-        status = advapi.SetNamedSecurityInfoW(str(path), 1, 4, None, None, updated, None)
-        if status != 0:
-            raise SandboxError(f"could not write the ACL on {path} (winerror {status})")
+        _win_write_dacl(kernel, advapi, path, updated, protected=null_dacl)
     finally:
         if security.value:
             kernel.LocalFree(security)
@@ -3122,7 +3864,8 @@ def _win_ace_present(lease: _WinLease, path: Path, mask: int, ace_type: int) -> 
         return False
     try:
         if not dacl.value:
-            return ace_type == 0
+            # A NULL DACL is not this profile's ACE. The writer replaces it.
+            return False
         header = _ACL_HEADER.from_address(int(dacl.value))
         for index in range(min(int(header.AceCount), 128)):
             ace = ctypes.c_void_p()
@@ -3176,12 +3919,7 @@ def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit:
     )
     if status != 0:
         raise SandboxError(f"could not read the ACL on {path} (winerror {status})")
-    if not dacl.value:
-        # A NULL DACL already allows everyone. Replacing it with one ACE
-        # would drop that access. A deny on a NULL DACL is the same trap.
-        if security.value:
-            kernel.LocalFree(security)
-        return
+    null_dacl = not dacl.value
     entry = ExplicitAccess()
     entry.grfAccessPermissions = int(mask)
     entry.grfAccessMode = int(mode)
@@ -3196,12 +3934,12 @@ def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit:
     ]
     updated = ctypes.c_void_p()
     try:
-        status = advapi.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(updated))
+        status = advapi.SetEntriesInAclW(
+            1, ctypes.byref(entry), None if null_dacl else dacl, ctypes.byref(updated)
+        )
         if status != 0:
             raise SandboxError(f"could not edit the ACL on {path} (winerror {status})")
-        status = advapi.SetNamedSecurityInfoW(str(path), 1, 4, None, None, updated, None)
-        if status != 0:
-            raise SandboxError(f"could not write the ACL on {path} (winerror {status})")
+        _win_write_dacl(kernel, advapi, path, updated, protected=null_dacl)
     finally:
         if security.value:
             kernel.LocalFree(security)
@@ -3209,9 +3947,9 @@ def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit:
             kernel.LocalFree(updated)
 
 
-# ALL APPLICATION PACKAGES, ALL RESTRICTED APPLICATION PACKAGES, Everyone.
-# BUILTIN\Users does not apply to an AppContainer token.
-_PACKAGE_SID_TEXTS = ("S-1-15-2-1", "S-1-15-2-2", "S-1-1-0")
+# ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES.
+# An AppContainer token does not receive Everyone (S-1-1-0) or BUILTIN\Users.
+_PACKAGE_SID_TEXTS = ("S-1-15-2-1", "S-1-15-2-2")
 _PACKAGE_SIDS: list | None = None
 _FILE_READ_DATA = 0x1
 _FILE_TRAVERSE_BIT = 0x20
@@ -3231,23 +3969,55 @@ def _mask_allows(have: int, *, read: bool, traverse: bool) -> bool:
     return True
 
 
-def ace_grants_access(entries) -> bool:
-    """Whether ACL order already allows the requested bits.
+def ace_covers_bit(have: int, bit: int) -> bool:
+    """Whether one ACE mask decides ``bit``. Generic rights cover the file bits."""
+    mask = int(have)
+    if mask & _GENERIC_ALL or (mask & _FILE_ALL) == _FILE_ALL:
+        return True
+    if bit == _FILE_TRAVERSE_BIT and mask & _GENERIC_EXECUTE:
+        return True
+    if bit == _FILE_READ_DATA and mask & _GENERIC_READ:
+        return True
+    return bool(mask & int(bit))
 
-    ``entries`` is ``(ace_type, ace_flags, mask_matches)`` in file order.
-    An inherit-only ACE does not apply to this directory. The first ACE
-    whose mask covers the bits decides, so a later deny does not revoke
-    an earlier allow. Object allow is type 5 and object deny is type 6.
+
+def _mask_bits(mask: int) -> list[int]:
+    bits = []
+    value = int(mask)
+    bit = 1
+    while value and bit <= 0x80000000:
+        if value & 1:
+            bits.append(bit)
+        value >>= 1
+        bit <<= 1
+    return bits
+
+
+def ace_grants_access(entries, requested: int = 0) -> bool:
+    """Whether ACL order grants every bit in ``requested``.
+
+    ``entries`` is ``(ace_type, ace_flags, mask)`` in file order. An
+    inherit-only ACE does not apply to this directory. Each requested bit
+    is decided on its own. A deny that overlaps any still-open bit denies
+    the check, which is what Windows does with a partial deny. A later
+    allow cannot restore that bit. Object allow is type 5 and object deny
+    is type 6.
     """
-    for ace_type, ace_flags, matches in entries:
+    remaining = set(_mask_bits(int(requested or 0)))
+    if not remaining:
+        return False
+    for ace_type, ace_flags, mask in entries:
         if int(ace_flags) & 0x08:
             continue
-        if not matches:
+        covered = {bit for bit in remaining if ace_covers_bit(int(mask), bit)}
+        if not covered:
             continue
         if int(ace_type) in (1, 6):
             return False
         if int(ace_type) in (0, 5):
-            return True
+            remaining -= covered
+            if not remaining:
+                return True
     return False
 
 
@@ -3284,7 +4054,8 @@ def _package_allow_sids(advapi) -> list:
 def _existing_package_access(path, *, read: bool, traverse: bool, extra_sid=None) -> bool:
     """True when an existing ACE already lets an AppContainer through.
 
-    This only reads the DACL. A NULL DACL allows everyone. A missing ACE
+    This only reads the DACL. A NULL DACL is not treated as package
+    traverse: an AppContainer does not receive Everyone. A missing ACE
     is not a reason to write one on a directory this app does not own.
     """
     if sys.platform != "win32":
@@ -3322,7 +4093,7 @@ def _existing_package_access(path, *, read: bool, traverse: bool, extra_sid=None
         return False
     try:
         if not dacl.value:
-            return True
+            return False
         sids = list(_package_allow_sids(advapi))
         if extra_sid is not None and getattr(extra_sid, "value", None):
             sids.append(extra_sid)
@@ -3343,10 +4114,13 @@ def _existing_package_access(path, *, read: bool, traverse: bool, extra_sid=None
             if not any(advapi.EqualSid(ace_sid, sid) for sid in sids):
                 continue
             have = int(ctypes.c_uint32.from_address(int(ace.value) + 4).value)
-            entries.append(
-                (ace_type, int(info.AceFlags), _mask_allows(have, read=read, traverse=traverse))
-            )
-        return ace_grants_access(entries)
+            entries.append((ace_type, int(info.AceFlags), have))
+        requested = 0
+        if traverse:
+            requested |= _FILE_TRAVERSE_BIT
+        if read:
+            requested |= _FILE_READ_DATA
+        return ace_grants_access(entries, requested)
     finally:
         if security.value:
             kernel.LocalFree(security)
@@ -3467,9 +4241,7 @@ def _win_revoke_ace(lease: _WinLease, path: Path) -> None:
         status = advapi.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(updated))
         if status != 0:
             raise SandboxError(f"could not revoke the ACL on {path} (winerror {status})")
-        status = advapi.SetNamedSecurityInfoW(str(path), 1, 4, None, None, updated, None)
-        if status != 0:
-            raise SandboxError(f"could not write the ACL on {path} (winerror {status})")
+        _win_write_dacl(kernel, advapi, path, updated, protected=False)
     finally:
         if security.value:
             kernel.LocalFree(security)
@@ -3794,6 +4566,7 @@ class _WinJobExtended(ctypes.Structure):
 def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: int):
     import msvcrt
 
+    _ensure_runtime_integrity(lease)
     kernel = lease.kernel
     kernel.CreatePipe.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),

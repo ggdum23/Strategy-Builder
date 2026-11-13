@@ -18,6 +18,22 @@ from backtester.sandbox import (
     _copy_runtime_tree,
     ace_grants_access,
     acl_ancestor_paths,
+    bwrap_mount_plan,
+    canonicalize_acl_path,
+    choose_copy_parent,
+    dacl_has_inheritable_write,
+    firewall_timeout_blocks_launch,
+    landlock_rule_plan,
+    owner_matches,
+    reparse_point_blocks_acl,
+    runtime_tree_digest,
+    shared_parent_usable,
+    toolcache_ancestor_paths,
+    wfp_connect_layers,
+    _PACKAGE_SID_TEXTS,
+    _RUNTIME_COPY_VERSION,
+    _drop_launch_aces_locked,
+    _firewall_remove_command,
     acl_revoke_problem,
     acl_same,
     planned_acl_targets,
@@ -445,12 +461,20 @@ def test_a_trusted_container_folder_does_not_grant_its_ancestors():
 
 
 def test_an_earlier_allow_wins_and_an_inherit_only_ace_does_not():
-    assert ace_grants_access([(0, 0, True), (1, 0, True)])
-    assert not ace_grants_access([(1, 0, True), (0, 0, True)])
-    assert not ace_grants_access([(0, 0x08, True)])
-    assert ace_grants_access([(0, 0x08, True), (5, 0, True)])
-    assert not ace_grants_access([(6, 0, True), (0, 0, True)])
-    assert not ace_grants_access([])
+    traverse = 0x20
+    assert ace_grants_access([(0, 0, traverse), (1, 0, traverse)], traverse)
+    assert not ace_grants_access([(1, 0, traverse), (0, 0, traverse)], traverse)
+    assert not ace_grants_access([(0, 0x08, traverse)], traverse)
+    assert ace_grants_access([(0, 0x08, traverse), (5, 0, traverse)], traverse)
+    assert not ace_grants_access([(6, 0, traverse), (0, 0, traverse)], traverse)
+    assert not ace_grants_access([], traverse)
+    # A deny of one still-open bit denies the whole check. A deny of an
+    # unrelated bit does not. An inherit-only deny does not apply here.
+    assert not ace_grants_access([(1, 0, traverse), (0, 0, 0x21)], 0x21)
+    assert ace_grants_access([(1, 0, 0x1), (0, 0, traverse)], traverse)
+    assert ace_grants_access([(1, 0x08, traverse), (0, 0, traverse)], traverse)
+    assert ace_grants_access([(0, 0, 0x20000000)], traverse)
+    assert "S-1-1-0" not in _PACKAGE_SID_TEXTS
 
 
 def _is_volume(path: str) -> bool:
@@ -598,3 +622,161 @@ def test_the_firewall_command_does_not_format_the_rule_object():
     assert "-Package 'S-1-15-2-1'" in command
     with pytest.raises(SandboxError):
         _firewall_block_command("S-1-15-2-1; Remove-Item")
+    removal = _firewall_remove_command()
+    assert "Out-Null" not in removal
+    assert "Remove-NetFirewallRule" in removal
+    assert firewall_timeout_blocks_launch(True, False)
+    assert firewall_timeout_blocks_launch(False, True)
+    assert not firewall_timeout_blocks_launch(True, True)
+    v4, v6 = wfp_connect_layers()
+    assert v4[0] == 0xC38D57D1
+    assert v6[0] == 0x4A72393B
+    assert v4 != v6
+
+
+def test_canonical_paths_cannot_reach_a_protected_directory():
+    refused = [
+        r"C:\Windows.",
+        r"C:\Windows...",
+        r"C:\PROGRA~1",
+        r"C:\PROGRA~2",
+        r"\\?\C:\Windows",
+        r"\\.\C:\Windows",
+        r"\\localhost\C$\Windows",
+        r"\\127.0.0.1\C$\Windows",
+        "//?/C:/Windows",
+        r"C:\Users\Jeu\..\..\Windows",
+        r"C:\ProgramData\..\Windows",
+        r"C:\ProgramData\Strategy Builder\..\..\Windows",
+        r"C:\Windows\System32\..\..\Windows",
+    ]
+    for raw in refused:
+        with pytest.raises(SandboxError, match="refusing to edit the ACL"):
+            refuse_acl_target(raw, allow=[r"C:\ok"], environ=ENV)
+    assert acl_same(canonicalize_acl_path(r"C:\PROGRA~1\Python312"), PROGRAM_FILES_PYTHON)
+    refuse_acl_target(r"C:\PROGRA~1\Python312", allow=[PROGRAM_FILES_PYTHON], environ=ENV)
+    packages = ENV["LOCALAPPDATA"] + r"\Packages"
+    with pytest.raises(SandboxError, match="refusing to edit the ACL"):
+        refuse_acl_target(packages, allow=[packages], environ=ENV)
+    child = packages + r"\strategybuilderjail\AC"
+    refuse_acl_target(child, allow=[child], environ=ENV)
+    environ = dict(ENV)
+    environ["SB_PYTHON_PREFIX"] = PREFIX
+    protected = toolcache_ancestor_paths(PREFIX)
+    assert any(acl_same(item, r"C:\hostedtoolcache") for item in protected)
+    assert any(acl_same(item, r"C:\hostedtoolcache\windows\Python") for item in protected)
+    assert not any(acl_same(item, PREFIX) for item in protected)
+    for item in protected:
+        with pytest.raises(SandboxError, match="refusing to edit the ACL"):
+            refuse_acl_target(item, allow=[item], environ=environ)
+    refuse_acl_target(PREFIX, allow=[PREFIX], environ=environ)
+
+
+def test_shared_parents_need_no_inherited_write_and_a_verified_owner():
+    assert dacl_has_inheritable_write([(0, 0x3, 0x2)])
+    assert not dacl_has_inheritable_write([(0, 0, 0x2)])
+    assert not dacl_has_inheritable_write([(1, 0x3, 0x2)])
+    assert reparse_point_blocks_acl(0x400, 0)
+    assert reparse_point_blocks_acl(0, 0xA0000003)
+    assert not reparse_point_blocks_acl(0, 0)
+    assert not owner_matches("", "S-1-5-21-1")
+    assert owner_matches("S-1-5-21-1", "S-1-5-21-1")
+    assert not shared_parent_usable(traversable=True, inheritable_write=True, created=True, owner_ok=True)
+    assert shared_parent_usable(traversable=True, inheritable_write=False, created=True, owner_ok=False)
+    assert not shared_parent_usable(traversable=True, inheritable_write=False, created=False, owner_ok=False)
+    assert shared_parent_usable(traversable=True, inheritable_write=False, created=False, owner_ok=True)
+    calls = []
+
+    def accept(folder):
+        calls.append(folder)
+        return Path(r"C:\Users\runner\AppData\Local\Packages\strategybuilderjail\AC")
+
+    def owned():
+        calls.append("shared")
+        return Path(APP)
+
+    parent, trusted = choose_copy_parent(Path(r"C:\ac"), accept, owned)
+    assert trusted is True
+    assert calls == [Path(r"C:\ac")]
+    assert acl_same(parent, ENV["LOCALAPPDATA"] + r"\Packages\strategybuilderjail\AC")
+    parent, trusted = choose_copy_parent(None, accept, owned)
+    assert trusted is False
+    assert acl_same(parent, APP)
+
+
+def test_a_changed_runtime_file_changes_the_stamp_digest(tmp_path):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    (root / "python.exe").write_bytes(b"exe")
+    nested = root / "Lib"
+    nested.mkdir()
+    (nested / "os.py").write_text("print(1)\n", encoding="utf-8")
+    first = runtime_tree_digest(root)
+    (nested / "os.py").write_text("print(2)\n", encoding="utf-8")
+    assert runtime_tree_digest(root) != first
+    assert _RUNTIME_COPY_VERSION == "2"
+
+
+def test_cleanup_drops_aces_while_holding_the_profile_lock(monkeypatch):
+    calls = []
+
+    def lock(action):
+        calls.append("lock")
+        return action()
+
+    monkeypatch.setattr("backtester.sandbox._with_profile_lock", lock)
+    monkeypatch.setattr(
+        "backtester.sandbox._win_drop_launch_aces",
+        lambda *_args: calls.append("drop"),
+    )
+    _drop_launch_aces_locked(object(), [])
+    assert calls == ["lock", "drop"]
+
+
+def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
+    from backtester.sandbox import _LANDLOCK_EXECUTE, _LANDLOCK_READ, _LANDLOCK_READ_FILE
+
+    with pytest.raises(SandboxError, match="refusing to hide the runtime"):
+        bwrap_mount_plan([Path("/tmp")], [], [], Path("/work"), "/etc/ld.so.cache")
+    cmd = bwrap_mount_plan(
+        [Path("/usr"), Path("/tmp/py")],
+        [Path("/tmp/py/site")],
+        [],
+        Path("/work"),
+        "/etc/ld.so.cache",
+    )
+    tmpfs = cmd.index("/tmp")
+    assert cmd[tmpfs - 1] == "--tmpfs"
+    assert cmd.index("/tmp/py") > tmpfs
+    assert cmd.index("/tmp/py/site") > tmpfs
+    directories, files = landlock_rule_plan(["/usr", "/etc"], "/etc/ld.so.cache", "/work")
+    etc = [item for item in directories if item[0] == "/etc"]
+    assert etc == [["/etc", _LANDLOCK_EXECUTE]]
+    assert etc[0][1] != _LANDLOCK_READ
+    assert files == [["/etc/ld.so.cache", _LANDLOCK_READ_FILE]]
+
+
+def test_the_caller_cap_is_the_jail_ceiling_and_a_long_job_fails():
+    from backtester.limits import cgroup_memory_available, member_list_overflow, sum_process_tree
+    from backtester.runner import _JAIL_MEMORY_BYTES, _watched_rss, jail_memory_bytes
+
+    assert jail_memory_bytes(None) == _JAIL_MEMORY_BYTES
+    assert jail_memory_bytes(True) == _JAIL_MEMORY_BYTES
+    assert jail_memory_bytes(100) == 100 + 32 * 1024 * 1024
+    assert jail_memory_bytes(_JAIL_MEMORY_BYTES) == _JAIL_MEMORY_BYTES
+    assert member_list_overflow(32) is None
+    assert "32-pid prefix" in member_list_overflow(33)
+
+    def children(pid):
+        return {10: [11], 11: [12]}.get(pid, [])
+
+    assert sum_process_tree(1, [10], lambda pid: pid, children) == 1 + 10 + 11 + 12
+    assert cgroup_memory_available("cpu") is False
+    assert cgroup_memory_available("cpu memory") is True
+
+    class Job:
+        def assigned_process_count(self):
+            return 33
+
+    with pytest.raises(RuntimeError, match="32-pid prefix"):
+        _watched_rss(1, Job())

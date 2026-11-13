@@ -1,10 +1,10 @@
 """Load a ``Strategy`` class from a file path.
 
 The strategy directory is put on ``sys.path`` so a parameter module that sits
-next to ``strategy.py`` can be imported. The CLI does not call this for a
-file strategy. ``run``, ``walkforward``, ``parallel``, and ``referee`` execute
-that file in the jail. This function is the in-memory path used by tests and
-by ``--unsafe-in-process``.
+next to ``strategy.py`` can be imported. The loaded class is stamped with
+``__strategy_path__``. A caller that did not ask for ``--unsafe-in-process``
+sends that path to the jail instead of calling the class here. Tests and
+``--unsafe-in-process`` strip the stamp and run the class in this process.
 """
 
 from __future__ import annotations

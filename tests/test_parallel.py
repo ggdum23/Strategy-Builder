@@ -368,6 +368,40 @@ def test_a_memory_hog_is_one_row(tmp_path):
     assert by_id["good"].status == "ok", detail
 
 
+@windows_jails(1)
+def test_an_unsleeping_allocator_is_one_memory_row(tmp_path):
+    from backtester.limits import current_rss
+
+    cap = max(current_rss(), 600 * 1024 * 1024) + 500 * 1024 * 1024
+    _strategy(
+        tmp_path / "s",
+        "bomb",
+        "class Strategy:\n"
+        "    def on_bar(self, bar, state):\n"
+        "        blobs = []\n"
+        "        for _ in range(250):\n"
+        "            chunk = bytearray(8 * 1024 * 1024)\n"
+        "            for index in range(0, len(chunk), 4096):\n"
+        "                chunk[index] = 1\n"
+        "            blobs.append(chunk)\n"
+        "        return None\n",
+    )
+    result = run_parallel(
+        discover_strategies(tmp_path / "s"),
+        [FrameMarket("book", "TEST", frame=_frame())],
+        tmp_path / "out",
+        profile="arena",
+        workers=1,
+        timeout_s=runner_timeout(1, 45),
+        memory_bytes=cap,
+        with_benchmarks=False,
+    )
+    by_id = {item.strategy_id: item for item in result.results}
+    detail = [(item.strategy_id, item.status, item.error) for item in result.results]
+    assert by_id["bomb"].status == "memory", detail
+    assert "exceeded memory limit" in by_id["bomb"].error or "MemoryError" in by_id["bomb"].error
+
+
 @windows_jails(2)
 def test_cancel_stops_the_batch(tmp_path):
     source = "import time\nclass Strategy:\n    def on_bar(self, bar, state):\n        time.sleep(60)\n        return None\n"

@@ -110,6 +110,7 @@ def test_pack_result_has_no_sidecar_fields(tmp_path):
         raise AssertionError("a sidecar with no factor MAC was accepted")
 
 
+@windows_jails(1)
 def test_named_run_display_matches_the_report_file(tmp_path):
     src = _series(tmp_path)
     strategy = write_strategy(tmp_path / "Strategy Builder" / "book" / "strategy.py", 1.0)
@@ -150,6 +151,50 @@ def test_named_run_display_matches_the_report_file(tmp_path):
     assert config["arguments"]["share_factor"] is None
     assert "Strategy Builder" in config["arguments"]["src"]
     assert "price_factor" not in json.dumps(config)
+
+
+@windows_jails(1)
+def test_execute_run_single_on_a_file_strategy_launches_the_jail(tmp_path):
+    from backtester import sandbox
+
+    src = _series(tmp_path)
+    strategy = write_strategy(tmp_path / "Strategy Builder" / "book" / "strategy.py", 1.0)
+    out = tmp_path / "Strategy Builder" / "out" / "jailed"
+    seen = []
+    previous = sandbox._LAUNCH_OBSERVER
+
+    def observer():
+        seen.append(1)
+        if previous is not None:
+            previous()
+
+    sandbox.set_launch_observer(observer)
+    try:
+        execute_run(
+            {
+                "mode": "single",
+                "profile": "arena",
+                "source": "named",
+                "strategies": [str(strategy)],
+                "src": str(src),
+                "ticker": "QQQ",
+                "out": str(out),
+                "bar_minutes": 1,
+                "initial_equity": 1_000_000,
+                "borrow_rate_annual": None,
+                "financing_rate_annual": None,
+                "fee_mult": 1,
+                "dividends": "",
+                "warmup_sessions": 0,
+                "warmup_days": 0,
+                "design_end_day": None,
+                "design_end_date": "",
+                "design_fraction": None,
+            }
+        )
+    finally:
+        sandbox.set_launch_observer(previous)
+    assert seen
 
 
 @windows_jails(2)

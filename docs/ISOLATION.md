@@ -78,11 +78,14 @@ Desk, the engine drops `share_factor` from the config before `on_bar`.
 
 A strategy file does not run in either worker, and the operator process does
 not import it. `run`, `run --pack`, `walkforward`, `parallel`, and `referee`
-pass the path through. The worker launches the same jail as `backtester
+pass the path through. A named GUI run does the same: a class that
+`load_strategy_class` stamped with `__strategy_path__` is sent to the jail
+as that path. The worker launches the same jail as `backtester
 referee`. The pipe is not given the sidecar, `factor_key`, `factor_mac`, the
 scale, the accounting record, or the dividend map. The strategy process has
-no engine frame. An in-memory class passed to the library still runs beside
-the engine. `--unsafe-in-process` prints a warning and refuses a pack.
+no engine frame. An in-memory class with no file marker still runs beside
+the engine. `--unsafe-in-process` prints a warning, loads the file in this
+process, strips the file marker, and refuses a pack.
 Benchmarks stay in the worker. The designer per-call timeout defaults to 10
 seconds, the same as the referee, and `--call-timeout` changes it.
 
@@ -260,21 +263,40 @@ The backend name is `job+appcontainer`.
   of a system interpreter and of system DLLs use the All Application
   Packages ACE already on those directories.   The GitHub toolcache version
   directory has no such ACE. The files the child opens are copied under
-  `Strategy Builder\jail\runtime` beneath the first parent whose own
-  directory and every non-volume ancestor already have that traverse ACE.
-  The order is ProgramData, then Public, then the nearest such ancestor
-  of the blocked directory, and Program Files only when nothing earlier
-  works. The blocked directory, the volume root, Windows, and System32
-  are never that parent. A missing explicit ACE on the volume root does
+  `runtime` beneath a parent this process may grant. The per-user
+  AppContainer folder is preferred. ProgramData, Public, the nearest
+  traversable ancestor, and Program Files are used only when that folder
+  cannot be created, the shared parent already has package traverse, and
+  it has no inheritable write ACE. An existing `Strategy Builder`
+  directory is used only when its owner is the current user. The blocked
+  directory, the volume root, Windows, System32, SysWOW64, Program Files
+  itself, the user-profile root, `Packages`, and every ancestor of the
+  interpreter under `hostedtoolcache` are never that parent and are never
+  granted. Paths are canonicalized before that check: `\\?\` and `\\.\`
+  prefixes are stripped, a UNC path is rejected, trailing dots and spaces
+  are stripped per component, `..` is collapsed, and `PROGRA~1`,
+  `PROGRA~2`, and `PROGRA~3` expand to the Program Files directories.
+  A missing explicit ACE on the volume root does
   not reject a parent that already has one, and the volume root is not
-  granted. The check is a read of the DACL. An inherit-only ACE does not
-  count. The first matching allow wins. Only the directories this app
-  creates (`Strategy Builder` and `jail`, then `runtime`) are granted.
-  The parent is not. An unfinished copy is deleted and replaced. A
-  finished copy is reused. The stamp is
-  `%LOCALAPPDATA%\strategybuilderjail-runtime.json`, outside the tree the
-  child can read.   When no parent already lets the container through, the
-  copy is `{AppContainer folder}\runtime`. That folder is the path
+  granted. The check reads the DACL in ACE order, one bit at a time. A
+  deny that overlaps a bit still requested denies that check. An
+  inherit-only ACE does not count. Everyone is not treated as the
+  package. A NULL DACL is not package traverse; a directory this process
+  writes gets an explicit protected ACL instead. ACL writes open the
+  directory with `FILE_FLAG_OPEN_REPARSE_POINT`, reject a reparse point,
+  and call `SetSecurityInfo` on that handle. The same open is repeated
+  after `mkdir`. Only the directories this app
+  creates (`Strategy Builder` and `jail`, then `runtime`, or the missing
+  descendants of an existing `Packages` directory) are granted.
+  The parent is not. The copy is hashed into
+  `%LOCALAPPDATA%\strategybuilderjail-runtime.json` (stamp version 2),
+  outside the tree the child can read. The hash is checked again
+  immediately before `CreateProcessW`. A mismatch deletes the tree and
+  copies it again. A second mismatch fails the launch. After the copy,
+  the tree gets a protected DACL: the profile SID may read and execute,
+  and Users, Everyone, and both All Application Packages SIDs are denied
+  write. The owner still has `WRITE_DAC` and relaxes that DACL before a
+  replacement delete.   The AppContainer folder is the path
   `GetAppContainerFolderPath` returns for this profile, normally
   `%LOCALAPPDATA%\Packages\<profile>\AC`. If that call returns
   file-not-found, the same conventional path is used. Its ancestors, including the
@@ -294,7 +316,16 @@ The backend name is `job+appcontainer`.
   seconds fails that grant. The failure is a test error. It does not
   abort the pytest session. There is no deny ACE on a directory this
   app does not own: the container token is not the user, so a directory
-  that was not granted is not readable.
+  that was not granted is not readable. The connect filter is installed
+  on both the IPv4 and the IPv6 ALE auth-connect layers. The persistent
+  firewall rules are removed when this process exits, and the on-disk
+  marker is cleared first so the next process installs them again. A
+  firewall cmdlet that times out fails the launch unless both dynamic
+  layers are already in place. The jail's job memory limit is the
+  caller's cap plus 32 MiB, and never above 2 GiB. The worker job has
+  no commit limit. The reporter reads working set and commit, and it
+  walks the children of every extra pid. A job that reports more than
+  32 processes fails the book.
   A child whose token is not an AppContainer, or whose token has a
   capability, is not resumed. Loopback exemptions for this profile are
   removed. Inbound and outbound firewall rules block the package SID, and
@@ -327,7 +358,8 @@ imported (numpy and pandas, in the parent's order, plus the libraries they
 need), then the standard library. site-packages is covered inside the
 namespace and only those package directories are bound back, so `*.pth`,
 `*.egg-link`, and `direct_url.json` are not on the child's path. `/etc/ld.so.cache`
-is bound read-only. Data and repository paths are not mounted.
+is bound read-only. The rest of `/etc` is not mounted. Data and repository
+paths are not mounted.
 
 A seccomp filter returns EPERM for `socket`, `connect`, `accept`, `accept4`,
 `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `shutdown`, `bind`, `listen`,
@@ -356,16 +388,27 @@ and no scale. The private directory path is on that command line because it
 is the child's own work directory.
 
 `RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_NPROC`, and `RLIMIT_CPU` are set
-before the strategy is loaded. The parent also enforces the wall-clock
+before the strategy is loaded. `RLIMIT_AS` and `RLIMIT_DATA` use the
+caller's memory cap plus 32 MiB, and never more than 2 GiB. When the
+cgroup memory controller is mounted, the same ceiling is written to
+`memory.max` for the jail pid. A missing controller does not fail the
+launch. The parent also enforces the wall-clock
 per-call timeout and kills the sandbox on the way out. `--die-with-parent`
-covers a referee that dies without running that cleanup.
+covers a referee that dies without running that cleanup. A runtime root
+that lives under `/tmp` is bound after `--tmpfs /tmp`, so the private
+tmpfs does not hide it. A runtime root that is `/tmp` itself is refused
+by name. The work directory is bound after the tmpfs.
 
 ### Linux without bubblewrap
 
 If `bwrap` cannot start a namespace, the launch uses landlock plus the same
 seccomp filter and `PR_SET_PDEATHSIG` set to `SIGKILL`. Landlock allows
-reading the interpreter, the staged package directories, and the directory
-that holds `/etc/ld.so.cache`, and writing the private directory. The child
+reading the interpreter and the staged package directories, traverse
+(execute) of `/etc`, and read of the file `/etc/ld.so.cache` only, and
+writing the private directory. The directory `/etc` is not granted
+read. Landlock does not mediate `stat`, and a successful `stat` is not a
+confinement check. Bubblewrap is the stronger backend: it has a pid
+namespace, and landlock does not. The child
 is still `python -I -S`, so site-packages is not on `sys.path`. Opening a
 data path returns EPERM. There is no pid namespace and no network namespace,
 so the network block is the seccomp filter alone, including `io_uring_setup`,

@@ -49,35 +49,143 @@ def process_tree_detail(pid: int) -> str:
     return " ".join(parts)
 
 
+def _valid_pid(pid) -> bool:
+    return isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+
+
+def sum_process_tree(root: int, extra_pids, read_one, children_of) -> int | None:
+    """Sum ``read_one`` over ``root``, its descendants, and ``extra_pids``.
+
+    Each extra pid is a root of its own. Its children are walked too. A pid
+    that cannot be read is skipped. A pid already counted is not added twice.
+    """
+    if not _valid_pid(root):
+        return None
+    own = read_one(root)
+    if own is None:
+        return None
+    total = int(own)
+    seen = {int(root)}
+    stack = list(children_of(root) or [])
+    for extra in extra_pids or ():
+        if _valid_pid(extra):
+            stack.append(int(extra))
+    while stack:
+        child = stack.pop()
+        if not _valid_pid(child) or child in seen:
+            continue
+        seen.add(child)
+        value = read_one(child)
+        if value is not None:
+            total += int(value)
+        stack.extend(children_of(child) or [])
+    return total
+
+
 def process_tree_rss_bytes(pid: int, extra_pids=()) -> int | None:
     """Resident set of ``pid``, the processes it has started, and ``extra_pids``.
 
     ``extra_pids`` are jailed children toolhelp did not list (an AppContainer
-    can be missing there). A pid already in the tree is not added twice.
+    can be missing there). Their children are included. A pid already in the
+    tree is not added twice.
     """
-    own = process_rss_bytes(pid)
-    if own is None:
+    return sum_process_tree(pid, extra_pids, process_rss_bytes, _child_pids)
+
+
+def process_tree_commit_bytes(pid: int, extra_pids=()) -> int | None:
+    """Commit charge of the same tree. Windows only; other platforms return None."""
+    if sys.platform != "win32":
         return None
-    total = own
-    seen = {pid}
-    stack = _child_pids(pid)
-    while stack:
-        child = stack.pop()
-        if child in seen:
-            continue
-        seen.add(child)
-        child_rss = process_rss_bytes(child)
-        if child_rss is not None:
-            total += child_rss
-        stack.extend(_child_pids(child))
-    for extra in extra_pids:
-        if not isinstance(extra, int) or isinstance(extra, bool) or extra in seen:
-            continue
-        seen.add(extra)
-        child_rss = process_rss_bytes(extra)
-        if child_rss is not None:
-            total += child_rss
-    return total
+    return sum_process_tree(pid, extra_pids, process_commit_bytes, _child_pids)
+
+
+def process_tree_watch_bytes(pid: int, extra_pids=()) -> int | None:
+    """The larger of resident set and, on Windows, commit charge.
+
+    A dirty allocation that has not been faulted into the working set is
+    still commit. The poll reports whichever number is higher.
+    """
+    rss = process_tree_rss_bytes(pid, extra_pids)
+    commit = process_tree_commit_bytes(pid, extra_pids)
+    if rss is None:
+        return commit
+    if commit is None:
+        return rss
+    return max(rss, commit)
+
+
+def member_list_overflow(assigned: int, cap: int = 32) -> str | None:
+    """Fail the book when the job reports more members than the list can hold."""
+    if isinstance(assigned, bool) or not isinstance(assigned, int):
+        return None
+    if assigned > int(cap):
+        return (
+            f"walk-forward worker job has {assigned} processes; "
+            f"refusing to sum a {int(cap)}-pid prefix"
+        )
+    return None
+
+
+def cgroup_memory_available(controllers: str) -> bool:
+    """True when this cgroup v2 mount lists the memory controller."""
+    return "memory" in str(controllers or "").split()
+
+
+def apply_cgroup_memory_max(pid: int, memory_bytes: int) -> bool:
+    """Put ``pid`` in a cgroup with ``memory.max`` when the controller is mounted.
+
+    A missing controller or a write the user cannot make returns False. The
+    rlimit and the parent poll still apply. The directory is
+    ``/sys/fs/cgroup/strategybuilder-<pid>``.
+    """
+    if sys.platform != "linux" or not _valid_pid(pid):
+        return False
+    if not isinstance(memory_bytes, int) or isinstance(memory_bytes, bool) or memory_bytes <= 0:
+        return False
+    root = Path("/sys/fs/cgroup")
+    controllers = root / "cgroup.controllers"
+    try:
+        text = controllers.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if not cgroup_memory_available(text):
+        return False
+    group = root / f"strategybuilder-{int(pid)}"
+    members = [int(pid)]
+    pending = [int(pid)]
+    while pending:
+        current = pending.pop()
+        for child in _child_pids(current):
+            if child not in members:
+                members.append(child)
+                pending.append(child)
+    try:
+        group.mkdir(exist_ok=True)
+        (group / "memory.max").write_text(str(int(memory_bytes)), encoding="utf-8")
+        (group / "cgroup.procs").write_text(str(members[0]), encoding="utf-8")
+        for child in members[1:]:
+            try:
+                (group / "cgroup.procs").write_text(str(child), encoding="utf-8")
+            except OSError:
+                continue
+    except OSError:
+        try:
+            group.rmdir()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def release_cgroup_memory(pid: int) -> None:
+    """Remove the cgroup created for ``pid``. A live member makes rmdir fail."""
+    if sys.platform != "linux" or not _valid_pid(pid):
+        return
+    group = Path("/sys/fs/cgroup") / f"strategybuilder-{int(pid)}"
+    try:
+        group.rmdir()
+    except OSError:
+        return
 
 
 def current_rss() -> int:
@@ -431,3 +539,18 @@ class _WinJob:
             return None
         count = min(int(info.NumberOfProcessIdsInList), 32)
         return [int(info.ProcessIdList[index]) for index in range(count)]
+
+    def assigned_process_count(self) -> int | None:
+        """How many processes the job says it holds, even past the 32-pid list."""
+
+        class _List(ctypes.Structure):
+            _fields_ = (
+                ("NumberOfAssignedProcesses", ctypes.c_uint32),
+                ("NumberOfProcessIdsInList", ctypes.c_uint32),
+                ("ProcessIdList", ctypes.c_size_t * 32),
+            )
+
+        info = _List()
+        if not self._handle or not self._query(3, info):
+            return None
+        return int(info.NumberOfAssignedProcesses)

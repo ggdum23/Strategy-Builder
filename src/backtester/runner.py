@@ -1055,16 +1055,40 @@ def _books_worker(queue, job):
 
 
 _JAIL_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
+# Headroom above the caller's cap so the jail can cross it by one small
+# allocation and the poll can still report the number. It is not a second
+# ceiling: the kernel limit stays this close to the caller's cap.
+_JAIL_CAP_MARGIN = 32 * 1024 * 1024
 _JAIL_CPU_SECONDS = 3600
 # Same default as the referee. A longer bar has to opt in.
 _JAIL_CALL_TIMEOUT_S = 10.0
 
+
+def jail_memory_bytes(memory_cap, *, ceiling: int = _JAIL_MEMORY_BYTES, margin: int = _JAIL_CAP_MARGIN) -> int:
+    """Kernel ceiling for the jailed strategy.
+
+    With no caller cap the ceiling stays at ``ceiling`` (2 GiB). A caller
+    cap is passed through with ``margin`` added, and it is never raised
+    above ``ceiling``. The worker job does not receive this number.
+    """
+    if memory_cap is None or isinstance(memory_cap, bool) or not isinstance(memory_cap, int):
+        return int(ceiling)
+    if memory_cap <= 0:
+        return int(ceiling)
+    limited = int(memory_cap) + int(margin)
+    if limited > int(ceiling):
+        return int(ceiling)
+    return limited
+
+
 def _bind_strategy(strategy, *, in_process: bool):
     """Return ``(class_or_none, path_or_none)``.
 
-    A path is the jail. A class object is the in-memory library path, including
-    a class a test already loaded from a file. ``in_process`` loads a path in
-    this process and strips the file marker so the worker does not jail it.
+    A path is the jail. A class stamped with ``__strategy_path__`` is a file
+    the caller already loaded, and it takes the same jail unless
+    ``in_process`` is set. ``in_process`` loads a path in this process and
+    strips the file marker so the worker does not jail it. A class with no
+    file marker stays in this process.
     """
     if in_process:
         if isinstance(strategy, (str, os.PathLike)):
@@ -1079,6 +1103,9 @@ def _bind_strategy(strategy, *, in_process: bool):
         return strategy, None
     if isinstance(strategy, (str, os.PathLike)):
         return None, str(strategy)
+    path = getattr(strategy, "__strategy_path__", None)
+    if path:
+        return None, str(path)
     return strategy, None
 
 
@@ -1098,9 +1125,10 @@ def _run_jailed_books(
     ``kwargs`` already holds the accounting record and this window's dividend
     slice. Those stay here. The pipe carries bars and decisions only, so a
     locked ex-date is not in the design strategy and the scale is not in
-    either strategy process. The parent's resident-set cap is separate from
-    the jail's ceiling: a smaller cap must be able to observe the allocation
-    before the jail's own limit kills it.
+    either strategy process. The jail's kernel ceiling is the caller's cap
+    plus a small margin, and never the 2 GiB default when a cap was set.
+    The parent's poll still reports that cap. The worker job has no commit
+    limit.
     """
     from .referee import Disqualified, jailed_strategy
     from .sandbox import lock_worker_session
@@ -1121,7 +1149,7 @@ def _run_jailed_books(
         strategy_path,
         profile,
         deny_paths=deny,
-        memory_bytes=_JAIL_MEMORY_BYTES,
+        memory_bytes=jail_memory_bytes(memory_cap),
         cpu_seconds=_JAIL_CPU_SECONDS,
         call_timeout=float(call_timeout),
         memory_cap=memory_cap,
@@ -1288,19 +1316,29 @@ def _phase_child_pids(phase_dir) -> list[int]:
 def _watched_rss(pid: int, job, phase_dir=None):
     """Resident set of the worker, its children, and any jailed pid it named.
 
-    Job members and phase-log pids that toolhelp already listed are not
-    counted twice. The larger of the two views is not used: a missed child
-    is added once.
+    On Windows the same walk also reads commit, and the larger total is
+    what the cap compares. Job members and phase-log pids that toolhelp
+    already listed are not counted twice. Children of those extra pids
+    are included. A job that reports more than 32 members fails the book
+    instead of summing the 32-pid prefix.
     """
-    from .limits import process_tree_rss_bytes
+    from .limits import member_list_overflow, process_tree_watch_bytes
 
+    if job is not None and hasattr(job, "assigned_process_count"):
+        try:
+            assigned = job.assigned_process_count()
+        except Exception:
+            assigned = None
+        problem = member_list_overflow(assigned) if assigned is not None else None
+        if problem:
+            raise RuntimeError(problem)
     extra = _phase_child_pids(phase_dir)
     if job is not None and hasattr(job, "member_pids"):
         try:
             extra = list(extra) + [int(item) for item in job.member_pids() if int(item) != int(pid)]
         except Exception:
             pass
-    return process_tree_rss_bytes(pid, extra)
+    return process_tree_watch_bytes(pid, extra)
 
 
 def _windows_hang_detail(proc, job, phase_dir) -> str:
