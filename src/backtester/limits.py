@@ -214,8 +214,9 @@ def arm_worker_job(pid: int, memory_bytes: int | None = None):
     The job is armed for every worker, including a run with no memory cap.
     ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` is set so closing the last handle
     kills the worker and the processes it spawned. ``terminate`` does that
-    immediately. A memory cap, when one was requested, is the same commit-charge
-    ceiling as before, added on top of that flag.
+    immediately. This job does not set a commit limit. ``memory_bytes`` is
+    the caller cap enforced by the sandbox job (process and job memory) and
+    by the parent poll. It is not applied to this job.
 
     Linux returns None. The runner kills the process group there. A failure to
     arm the job returns None and does not raise. On Windows the runner treats

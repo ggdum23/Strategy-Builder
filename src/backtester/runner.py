@@ -2387,6 +2387,7 @@ def run_pack(
             "anonymized": anonymized,
         },
     )
+    _write_child_surface(out_dir, books)
     # Not written to metrics.json. A test reads what the child strategy observed.
     observer = books["strategy"][0].get("observer")
     if observer is not None:

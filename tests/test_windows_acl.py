@@ -16,6 +16,8 @@ from backtester.sandbox import (
     SandboxError,
     _chain_accessible,
     _copy_runtime_tree,
+    _ensure_runtime_integrity,
+    _remove_tree,
     ace_grants_access,
     acl_ancestor_paths,
     bwrap_mount_plan,
@@ -653,6 +655,23 @@ def test_canonical_paths_cannot_reach_a_protected_directory():
     for raw in refused:
         with pytest.raises(SandboxError, match="refusing to edit the ACL"):
             refuse_acl_target(raw, allow=[r"C:\ok"], environ=ENV)
+    # The allow root contains the lexical prefix. Dropping ``..`` would leave
+    # the target inside that root. Collapsing it leaves the root and is refused.
+    desktop = r"C:\Users\Jeu\Desktop"
+    escaped = desktop + r"\..\..\Windows\System32"
+    assert canonicalize_acl_path(escaped) == r"C:\Users\Windows\System32"
+    with pytest.raises(SandboxError, match="refusing to edit the ACL"):
+        refuse_acl_target(escaped, allow=[desktop], environ=ENV)
+    climbed = desktop + r"\..\..\..\Windows\System32"
+    assert canonicalize_acl_path(climbed) == r"C:\Windows\System32"
+    with pytest.raises(SandboxError, match="refusing to edit the ACL"):
+        refuse_acl_target(climbed, allow=[desktop], environ=ENV)
+    assert canonicalize_acl_path(r"C:\WINDOW~1") == r"C:\Windows"
+    assert canonicalize_acl_path(r"C:\WINDOW~1\SYSTEM~1") == r"C:\Windows\System32"
+    assert canonicalize_acl_path(r"C:\Windows\SYSWOW~1") == r"C:\Windows\SysWOW64"
+    for raw in (r"C:\WINDOW~1", r"C:\WINDOW~1\SYSTEM~1", r"C:\WINDOW~1\SYSWOW~1"):
+        with pytest.raises(SandboxError, match="refusing to edit the ACL"):
+            refuse_acl_target(raw, allow=[r"C:\WINDOW~1"], environ=ENV)
     assert acl_same(canonicalize_acl_path(r"C:\PROGRA~1\Python312"), PROGRAM_FILES_PYTHON)
     refuse_acl_target(r"C:\PROGRA~1\Python312", allow=[PROGRAM_FILES_PYTHON], environ=ENV)
     packages = ENV["LOCALAPPDATA"] + r"\Packages"
@@ -715,6 +734,61 @@ def test_a_changed_runtime_file_changes_the_stamp_digest(tmp_path):
     (nested / "os.py").write_text("print(2)\n", encoding="utf-8")
     assert runtime_tree_digest(root) != first
     assert _RUNTIME_COPY_VERSION == "2"
+
+
+def test_an_existing_runtime_file_is_replaced_from_the_source(tmp_path):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+    (src / "python.exe").write_bytes(b"new")
+    (dest / "python.exe").write_bytes(b"old")
+    _copy_runtime_tree(src, dest, [], full=True)
+    assert (dest / "python.exe").read_bytes() == b"new"
+
+
+def test_a_runtime_tree_that_cannot_be_deleted_fails_and_is_not_stamped(tmp_path, monkeypatch):
+    import backtester.sandbox as sandbox
+
+    folder = tmp_path / "stage"
+    folder.mkdir()
+    (folder / "python.exe").write_bytes(b"left")
+    monkeypatch.setattr(sandbox.shutil, "rmtree", lambda *args, **kwargs: None)
+    with pytest.raises(SandboxError, match="could not replace the staged interpreter"):
+        _remove_tree(folder)
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+    (src / "python.exe").write_bytes(b"new")
+    (dest / "python.exe").write_bytes(b"old")
+    stamped = []
+    monkeypatch.setattr(sandbox, "_remember_runtime_stamp", lambda: stamped.append(True))
+    monkeypatch.setattr(sandbox, "_RUNTIME_COPIES", [(str(src), str(dest))])
+    monkeypatch.setattr(sandbox, "_runtime_copy_ready", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(sandbox, "_remove_tree", _remove_tree)
+    with pytest.raises(SandboxError, match="could not replace the staged interpreter"):
+        sandbox._materialize_runtime_copies(object())
+    assert stamped == []
+    assert (dest / "python.exe").read_bytes() == b"old"
+
+
+def test_a_matching_runtime_hash_still_relocks_the_dacl(monkeypatch, tmp_path):
+    import backtester.sandbox as sandbox
+
+    dest = tmp_path / "runtime"
+    dest.mkdir()
+    calls = []
+    monkeypatch.setattr(sandbox, "_RUNTIME_COPIES", [("src", str(dest))])
+    monkeypatch.setattr(sandbox, "_runtime_copies_ready", lambda: True)
+    monkeypatch.setattr(
+        sandbox,
+        "_win_set_runtime_dacl",
+        lambda lease, root, *, lock: calls.append((lock, Path(root))),
+    )
+    monkeypatch.setattr(sandbox.sys, "platform", "win32")
+    _ensure_runtime_integrity(object())
+    assert calls == [(True, dest)]
 
 
 def test_cleanup_drops_aces_while_holding_the_profile_lock(monkeypatch):

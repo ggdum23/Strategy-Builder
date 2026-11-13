@@ -2,7 +2,8 @@
 
 The worker process is the parent the runner already expects: it may read the
 sidecar, then ``run_pack`` drops that document before the strategy process
-starts. Status files receive paths and headlines only.
+starts. A file strategy is a path string. This process does not import it.
+Status files receive paths and headlines only.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ from ..registry import (
 )
 from ..report import json_ready
 from ..runner import failure_line, run_named, run_pack, walk_forward
-from ..strategy_loader import load_strategy_class
 from .backend import read_designer_manifest
 from .preferences import as_path
 from .validate import config_record, normalize, validate_config
@@ -376,7 +376,7 @@ def _run_single(config: dict, status_path) -> dict:
     out = as_path(config["out"])
     _write_record(out, config)
     _status(status_path, {"state": "running", "message": "Running the engine and the profile benchmarks"})
-    strategy = load_strategy_class(config["strategies"][0])
+    strategy = str(as_path(config["strategies"][0]))
     if config["source"] == "pack":
         payload = run_pack(
             strategy,
@@ -414,7 +414,7 @@ def _run_walk(config: dict, status_path) -> dict:
         "factor": loaded.inspection.share_factor,
     }
     del loaded
-    strategy = load_strategy_class(config["strategies"][0])
+    strategy = str(as_path(config["strategies"][0]))
     _status(status_path, {"state": "running", "message": "Design window, then the locked tail"})
     summary, _slices, _design, _locked = walk_forward(
         strategy,

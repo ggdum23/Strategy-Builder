@@ -2229,6 +2229,9 @@ _ACL_SHORT_NAMES = {
     "progra~1": "Program Files",
     "progra~2": "Program Files (x86)",
     "progra~3": "Program Files",
+    "window~1": "Windows",
+    "system~1": "System32",
+    "syswow~1": "SysWOW64",
 }
 
 
@@ -2236,9 +2239,10 @@ def canonicalize_acl_path(path) -> str | None:
     """The path Windows will open, or None when it must not be an allow root.
 
     ``\\\\?\\`` and ``\\\\.\\`` prefixes are stripped. UNC paths are rejected.
-    Each component loses trailing dots and spaces. ``.`` is dropped and
-    ``..`` is collapsed. Known 8.3 names of Program Files are expanded.
-    A path that climbs above its drive is rejected.
+    ``..`` is collapsed before trailing dots and spaces are stripped, because
+    ``"..".rstrip(" .")`` is empty and would otherwise delete the component.
+    ``.`` is dropped. Known 8.3 names of Program Files, Windows, System32,
+    and SysWOW64 are expanded. A path that climbs above its drive is rejected.
     """
     text = str(path).strip().replace("/", "\\")
     folded = text.upper()
@@ -2260,6 +2264,14 @@ def canonicalize_acl_path(path) -> str | None:
     parts: list[str] = []
     for part in rest.split("\\"):
         if part in ("", "."):
+            continue
+        # Parent references are collapsed before the trailing-dot strip.
+        # ``"..".rstrip(" .")`` is empty, so stripping first drops the component
+        # and ``C:\\Users\\Jeu\\Desktop\\..\\..\\Windows`` stays under Desktop.
+        if part.rstrip(" ") == "..":
+            if not parts:
+                return None
+            parts.pop()
             continue
         cleaned = part.rstrip(" .")
         if not cleaned or cleaned == ".":
@@ -2479,10 +2491,64 @@ def acl_revoke_problem(path, *, environ) -> str | None:
     return None
 
 
+def _resolved_acl_target(path) -> str:
+    """The path ``CreateFileW`` would open, when this process can open it.
+
+    A missing path stays lexical. ``canonicalize_acl_path`` still collapses
+    ``..`` and expands the short names. An existing path is the final DOS
+    path from ``GetFinalPathNameByHandleW``, which follows ``..`` the same
+    way the ACL write's open does.
+    """
+    text = str(path)
+    if sys.platform != "win32":
+        return text
+    try:
+        if not os.path.exists(text):
+            return text
+    except OSError:
+        return text
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = ctypes.WINFUNCTYPE(
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        use_last_error=True,
+    )(("CreateFileW", kernel))
+    final_name = ctypes.WINFUNCTYPE(
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        use_last_error=True,
+    )(("GetFinalPathNameByHandleW", kernel))
+    close = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(("CloseHandle", kernel))
+    # FILE_READ_ATTRIBUTES, share read/write/delete, OPEN_EXISTING, BACKUP_SEMANTICS.
+    handle = create(text, 0x80, 0x7, None, 3, 0x02000000, None)
+    invalid = ctypes.c_void_p(-1).value
+    if not handle or int(handle) == int(invalid):
+        return text
+    try:
+        size = 32768
+        buf = ctypes.create_unicode_buffer(size)
+        written = int(final_name(handle, buf, size, 0))
+        if written <= 0 or written >= size:
+            return text
+        return buf.value
+    finally:
+        close(handle)
+
+
 def refuse_acl_target(path, *, allow, environ) -> None:
     """Raise when a grant would edit a directory this app must not touch."""
+    checked = _resolved_acl_target(path)
     exact, trees = protected_acl_layout(environ)
-    problem = acl_write_problem(path, allow, exact, trees)
+    problem = acl_write_problem(checked, allow, exact, trees)
     if problem:
         raise SandboxError(f"refusing to edit the ACL on {path}: {problem}")
 
@@ -3050,17 +3116,24 @@ def _package_prefixes(src: Path, package_dirs) -> tuple:
     return tuple(found)
 
 
-def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set, *, full: bool) -> None:
+def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set, *, full: bool) -> tuple[int, int]:
+    """Copy every selected file, replacing one that is already there.
+
+    Returns ``(expected, copied)``. A file that could not be read or written
+    fails the copy. The caller stamps the tree only when those counts match.
+    """
     try:
         entries = list(src.iterdir())
     except OSError as exc:
         raise SandboxError(f"could not read the interpreter at {src}: {exc}") from exc
+    expected = 0
+    copied = 0
     for entry in entries:
         relative = parts + (entry.name,)
         try:
             is_dir = entry.is_dir()
-        except OSError:
-            continue
+        except OSError as exc:
+            raise SandboxError(f"could not read {entry}: {exc}") from exc
         if not runtime_relpath_is_copied(
             relative, is_dir=is_dir, package_prefixes=prefixes, full=full
         ):
@@ -3075,23 +3148,36 @@ def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set, *, ful
         target = dest / entry.name
         if is_dir:
             target.mkdir(exist_ok=True)
-            _copy_runtime_into(entry, target, relative, prefixes, seen, full=full)
+            child_expected, child_copied = _copy_runtime_into(
+                entry, target, relative, prefixes, seen, full=full
+            )
+            expected += child_expected
+            copied += child_copied
             continue
-        if target.exists():
-            continue
+        expected += 1
         try:
             shutil.copy2(entry, target)
         except OSError as exc:
             raise SandboxError(
                 f"could not copy {entry.name} into the app-owned interpreter: {exc}"
             ) from exc
+        copied += 1
+    return expected, copied
 
 
 def _copy_runtime_tree(src: Path, dest: Path, package_dirs, *, full: bool = False) -> None:
-    """Copy the interpreter files the child opens. The source tree is not granted."""
+    """Copy the interpreter files the child opens. The source tree is not granted.
+
+    An existing file is replaced. The copy fails when any selected file was
+    not written from the source, so the caller does not stamp a partial tree.
+    """
     dest.mkdir(parents=True, exist_ok=True)
     prefixes = () if full else _package_prefixes(src, package_dirs)
-    _copy_runtime_into(src, dest, (), prefixes, set(), full=full)
+    expected, copied = _copy_runtime_into(src, dest, (), prefixes, set(), full=full)
+    if copied != expected:
+        raise SandboxError(
+            f"the staged interpreter at {dest} did not replace every file from {src}"
+        )
 
 
 def _copy_dest(path) -> bool:
@@ -3345,6 +3431,8 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
 
 
 def _remove_tree(path: Path) -> None:
+    """Delete ``path``. A file that is still there fails the launch."""
+
     def onerror(func, name, _exc):
         try:
             os.chmod(name, 0o700)
@@ -3352,7 +3440,10 @@ def _remove_tree(path: Path) -> None:
         except OSError:
             pass
 
-    shutil.rmtree(path, onerror=onerror)
+    if path.exists():
+        shutil.rmtree(path, onerror=onerror)
+    if path.exists():
+        raise SandboxError(f"could not replace the staged interpreter at {path}")
 
 
 def _runtime_acl_entries(lease, *, lock: bool):
@@ -3461,17 +3552,30 @@ def _win_set_runtime_dacl(lease, root: Path, *, lock: bool) -> None:
                 kernel.LocalFree(sid)
 
 
+def _relock_runtime_copies(lease) -> None:
+    """Put the locked DACL back, including when the tree hash already matches."""
+    if sys.platform != "win32" or lease is None:
+        return
+    for _source, dest in _RUNTIME_COPIES:
+        target = Path(dest)
+        if target.exists():
+            _win_set_runtime_dacl(lease, target, lock=True)
+
+
 def _ensure_runtime_integrity(lease) -> None:
     """Recheck the staged tree immediately before CreateProcessW.
 
     A stamp that names the path is not enough. A changed file is deleted
-    and copied again. A second mismatch fails the launch.
+    and copied again. A second mismatch fails the launch. A hash that
+    already matches is not a reason to skip the locked DACL.
     """
-    if not _RUNTIME_COPIES or _runtime_copies_ready():
+    if not _RUNTIME_COPIES:
         return
-    _materialize_runtime_copies(lease)
     if not _runtime_copies_ready():
-        raise SandboxError("the staged interpreter does not match its stamp")
+        _materialize_runtime_copies(lease)
+        if not _runtime_copies_ready():
+            raise SandboxError("the staged interpreter does not match its stamp")
+    _relock_runtime_copies(lease)
 
 
 def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:

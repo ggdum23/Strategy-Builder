@@ -78,11 +78,11 @@ Desk, the engine drops `share_factor` from the config before `on_bar`.
 
 A strategy file does not run in either worker, and the operator process does
 not import it. `run`, `run --pack`, `walkforward`, `parallel`, and `referee`
-pass the path through. A named GUI run does the same: a class that
-`load_strategy_class` stamped with `__strategy_path__` is sent to the jail
-as that path. The worker launches the same jail as `backtester
-referee`. The pipe is not given the sidecar, `factor_key`, `factor_mac`, the
-scale, the accounting record, or the dividend map. The strategy process has
+pass the path through. A GUI single run, pack run, and walk-forward do the
+same: the worker passes the path string into `run_named`, `run_pack`, or
+`walk_forward` and does not call `load_strategy_class`. The worker launches
+the same jail as `backtester referee`. The pipe is not given the sidecar,
+`factor_key`, `factor_mac`, the scale, the accounting record, or the dividend map. The strategy process has
 no engine frame. An in-memory class with no file marker still runs beside
 the engine. `--unsafe-in-process` prints a warning, loads the file in this
 process, strips the file marker, and refuses a pack.
@@ -160,9 +160,9 @@ every worker is placed in a job object before the parent releases it. The job
 sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Every exit path, including a
 normal return, calls `TerminateJobObject` and then closes the handle. If the
 job cannot be assigned, the book fails. It does not fall back to signaling
-only the worker pid. A memory cap, when one was requested, is an additional
-commit-charge ceiling. The resident-set poll is separate from a `MemoryError`
-the strategy raises.
+only the worker pid. That job does not set a commit limit. The sandbox job
+and the parent poll enforce the caller's cap. The resident-set poll is
+separate from a `MemoryError` the strategy raises.
 
 The worker redirects file descriptors 1 and 2 to a file in its temp directory,
 capped at 256 KiB. Further output is discarded without blocking the writer.
@@ -189,9 +189,9 @@ engine loop into the parent is the Phase 4 one-bar referee.
 A crash, a hang, or a resident-set overrun is one failed row. The other jobs
 keep running. The Linux non-dumpable flag is not set on this path. `run_pack`
 does not set it either. The OS jail and the one-bar referee are below.
-The Windows job object on this path is the process tree and, when requested,
-the commit-charge ceiling. It is not the AppContainer sandbox. The referee
-uses that sandbox.
+The Windows job object on this path is the process tree. It does not set a
+commit limit. The sandbox job and the parent poll enforce the caller's cap.
+It is not the AppContainer sandbox. The referee uses that sandbox.
 
 ## What Phase 1 does not isolate
 
