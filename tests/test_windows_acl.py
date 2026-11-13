@@ -754,11 +754,14 @@ def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
     assert cmd[tmpfs - 1] == "--tmpfs"
     assert cmd.index(str(late_root)) > tmpfs
     assert cmd.index(str(late_site)) > tmpfs
-    directories, files = landlock_rule_plan(["/usr", "/etc"], "/etc/ld.so.cache", "/work")
-    etc = [item for item in directories if item[0] == "/etc"]
-    assert etc == [["/etc", _LANDLOCK_EXECUTE]]
+    cache = "/etc/ld.so.cache"
+    etc_name = str(Path(cache).parent)
+    directories, files = landlock_rule_plan(["/usr", "/etc"], cache, "/work")
+    etc = [item for item in directories if item[0] == etc_name]
+    assert etc == [[etc_name, _LANDLOCK_EXECUTE]]
     assert etc[0][1] != _LANDLOCK_READ
-    assert files == [["/etc/ld.so.cache", _LANDLOCK_READ_FILE]]
+    assert not any(item[1] == _LANDLOCK_READ and item[0] in {"/etc", "/etc/", etc_name} for item in directories)
+    assert files == [[cache, _LANDLOCK_READ_FILE]]
 
 
 def test_the_caller_cap_is_the_jail_ceiling_and_a_long_job_fails():
