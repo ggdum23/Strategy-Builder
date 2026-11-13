@@ -404,5 +404,58 @@
       "leaderboard.csv": "25b359013e1891138011ae09f56ffb41bb82a4f681bad2452d90b1732adc9f2b",
       "run.json": "0695206578fdbcd49a69d28b1eabc4dbcc3401ac64fd8c3ea1c4fa2a86ccead1"
     }
+  },
+  "numpy24": {
+    "python": "3.11",
+    "numpy": "2.4.6",
+    "note": "Desk reductions on NumPy 2.4 differ by one ulp from the NumPy 2.5 hashes in cases. Both are main 2b73448 on that NumPy. Equity, fills, and every other report file match either hash.",
+    "cases": {
+      "desk-inproc": {
+        "benchmarks/long_2x/metrics.json": "8aceaf64e00156a00c832898fc34658ddfa9e17dff695a653cac53a5b12a3ae0",
+        "metrics.json": "d42d40fcba7ac1636b64006085f09e48e93dcdc702adf4d5bb5f88bce1536543"
+      },
+      "desk-jailed": {
+        "benchmarks/long_2x/metrics.json": "8aceaf64e00156a00c832898fc34658ddfa9e17dff695a653cac53a5b12a3ae0",
+        "metrics.json": "d42d40fcba7ac1636b64006085f09e48e93dcdc702adf4d5bb5f88bce1536543"
+      },
+      "walk-desk": {
+        "design/benchmarks/buy_and_hold_1x/metrics.json": "3583746ef74073e74e676200770a5e4276f2452b71a7562f709f0932832ff090",
+        "design/benchmarks/long_2x/metrics.json": "931153e13b0e9848f10ab7168c32aba431861384724a48e4528f6a3ed67e848c",
+        "design/metrics.json": "3ae77a94ff35bede05c8eef644fe3e659fa3ce4bec98a87403d360446d3f56be",
+        "locked/benchmarks/buy_and_hold_1x/metrics.json": "7a4f21e8cd01e526961363a13b1ff9cc676f93585e3261eb3f17b1bbccb10a01",
+        "locked/benchmarks/long_2x/metrics.json": "dc81872940398b5fae814de6014756b3f61382539900ec54b3f8949e01b1af56",
+        "locked/metrics.json": "92cff38ff202cfc2c4a4428807f295120c3f9f984028b5f8f955b745f5132a0c",
+        "walkforward.json": "adc372b19f129eca483d152cdaad8d9db30fcc7db4db4969bb09d2ef63056253"
+      },
+      "walk-desk-inproc": {
+        "design/benchmarks/buy_and_hold_1x/metrics.json": "3583746ef74073e74e676200770a5e4276f2452b71a7562f709f0932832ff090",
+        "design/benchmarks/long_2x/metrics.json": "931153e13b0e9848f10ab7168c32aba431861384724a48e4528f6a3ed67e848c",
+        "design/metrics.json": "3ae77a94ff35bede05c8eef644fe3e659fa3ce4bec98a87403d360446d3f56be",
+        "locked/benchmarks/buy_and_hold_1x/metrics.json": "7a4f21e8cd01e526961363a13b1ff9cc676f93585e3261eb3f17b1bbccb10a01",
+        "locked/benchmarks/long_2x/metrics.json": "dc81872940398b5fae814de6014756b3f61382539900ec54b3f8949e01b1af56",
+        "locked/metrics.json": "92cff38ff202cfc2c4a4428807f295120c3f9f984028b5f8f955b745f5132a0c",
+        "walkforward.json": "adc372b19f129eca483d152cdaad8d9db30fcc7db4db4969bb09d2ef63056253"
+      },
+      "pack-desk-jailed": {
+        "run/benchmarks/long_2x/metrics.json": "8aceaf64e00156a00c832898fc34658ddfa9e17dff695a653cac53a5b12a3ae0",
+        "run/metrics.json": "34fce1162c610c57a7fa34a2e116318100ea0a3abac17fb4576f1530b7dbee2e"
+      },
+      "walk-pack-desk": {
+        "walk/design/benchmarks/buy_and_hold_1x/metrics.json": "3583746ef74073e74e676200770a5e4276f2452b71a7562f709f0932832ff090",
+        "walk/design/benchmarks/long_2x/metrics.json": "931153e13b0e9848f10ab7168c32aba431861384724a48e4528f6a3ed67e848c",
+        "walk/design/metrics.json": "3ae77a94ff35bede05c8eef644fe3e659fa3ce4bec98a87403d360446d3f56be",
+        "walk/locked/benchmarks/buy_and_hold_1x/metrics.json": "7a4f21e8cd01e526961363a13b1ff9cc676f93585e3261eb3f17b1bbccb10a01",
+        "walk/locked/benchmarks/long_2x/metrics.json": "dc81872940398b5fae814de6014756b3f61382539900ec54b3f8949e01b1af56",
+        "walk/locked/metrics.json": "92cff38ff202cfc2c4a4428807f295120c3f9f984028b5f8f955b745f5132a0c",
+        "walk/walkforward.json": "adc372b19f129eca483d152cdaad8d9db30fcc7db4db4969bb09d2ef63056253"
+      },
+      "parallel-desk": {
+        "jobs/s0/SYN/benchmarks/long_2x/metrics.json": "8aceaf64e00156a00c832898fc34658ddfa9e17dff695a653cac53a5b12a3ae0",
+        "jobs/s0/SYN/metrics.json": "cf976515e880e8f564429e5c746376c499faaeca4f1e5f50278c18efef8aba62",
+        "jobs/s1/SYN/benchmarks/long_2x/metrics.json": "8aceaf64e00156a00c832898fc34658ddfa9e17dff695a653cac53a5b12a3ae0",
+        "jobs/s1/SYN/metrics.json": "33b4453e6143b70f7687bb0543299e4e7e1c1031a33090af6e14dedb696dce89",
+        "leaderboard.csv": "19c2e8c92cfc53d7b00bbf6bea5c7b703f906ae0a19b0bea88a074b7d278dba0"
+      }
+    }
   }
 }

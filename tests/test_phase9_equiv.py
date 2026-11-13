@@ -1,11 +1,21 @@
 """Byte-identity with main 2b73448 on a synthetic 20-session series.
 
 The golden file is the normalized report tree of that commit, captured on
-this host and checked against a second run. ``sidecar.json`` drops
-``factor_key``, ``factor_mac``, and ``source_root`` (a random key and the
-operator's directory). ``run.json`` drops ``id``. PNG bytes are locked on
-Linux, where they matched main; Windows checks the PNG signature because
-the chart font is not the same file.
+this host (CPython 3.12, NumPy 2.5) and checked against a second run.
+``sidecar.json`` drops ``factor_key``, ``factor_mac``, and ``source_root``
+(a random key and the operator's directory). ``run.json`` drops ``id``.
+PNG bytes are locked on Linux, where they matched main; Windows checks the
+PNG signature because the chart font is not the same file.
+
+NumPy 2.4 (CPython 3.11) and NumPy 2.5 disagree by one unit in the last
+place on a few Desk reductions: average exposure, turnover per year,
+annualized volatility, and the Sharpe ratio that divides by that
+volatility. The same figures show up in the buy-and-hold and 2× benchmark
+files, the walk-forward summary, and the parallel leaderboard. ``numpy24``
+in the golden file is the hash ``main`` wrote for each of those files on
+NumPy 2.4.6. Equity, fills, and every other report file are one hash on
+both. The comparison accepts a file when its hash is the NumPy 2.5 hash
+or that NumPy 2.4 hash.
 
 Packs refuse ``--unsafe-in-process``. The jailed pack is the pack surface.
 """
@@ -68,6 +78,13 @@ def _hash(path: Path) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _accepted(case: str, rel: str, digest: str) -> bool:
+    if digest == GOLDEN["cases"][case][rel]:
+        return True
+    alternate = GOLDEN.get("numpy24", {}).get("cases", {}).get(case, {}).get(rel)
+    return alternate is not None and digest == alternate
+
+
 def _compare(folder: Path, case: str) -> None:
     expected = dict(GOLDEN["cases"][case])
     actual = {}
@@ -82,7 +99,9 @@ def _compare(folder: Path, case: str) -> None:
         actual[rel] = _hash(path)
     missing = sorted(set(expected) - set(actual))
     extra = sorted(set(actual) - set(expected))
-    changed = sorted(key for key in set(expected) & set(actual) if expected[key] != actual[key])
+    changed = sorted(
+        key for key in set(expected) & set(actual) if not _accepted(case, key, actual[key])
+    )
     assert not missing and not extra and not changed, (case, missing[:5], extra[:5], changed[:8])
 
 
