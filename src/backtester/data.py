@@ -2,10 +2,11 @@
 
 Files are ``<SYM>_1min_filled_YYYY-MM.csv.gz`` with columns
 ``timestamp_et,epoch_utc,open,high,low,close,volume,wap,count,filled,session``.
-Prices stay raw unless the operator declares another price kind, and a
-non-raw kind is recorded and refused for execution. ``share_factor`` for this
-loader is 1.0. A split table is configuration: a non-empty list is rejected
-rather than applied silently.
+Prices stay raw unless the operator declares another price kind. A
+total-return series is stored with ``runnable`` false. A raw run is refused.
+``--price-basis total_return`` runs it when the split list is empty. Prices
+are not rewritten. ``share_factor`` for this loader is 1.0. A split table is
+configuration: a non-empty list is rejected rather than applied silently.
 
 Session clock hours are inferred from the stamps. Nothing in this module
 fills in a 04:00–19:59 template. The engine's ``short_session`` flag is a
@@ -17,6 +18,7 @@ or two phases. A partial tail is kept and marked ``partial``.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import math
 import re
@@ -25,7 +27,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+# Bump when a successful load would not byte-match the previous loader.
+# Prepared-data keys include this, so an old cache is not reused.
+LOADER_VERSION = 2
 
 REQUIRED_COLUMNS = (
     "timestamp_et",
@@ -48,6 +55,10 @@ _PRICE_KINDS = {"raw", "total_return"}
 # contradicts the column, so the loader stops instead of renaming the zone.
 _ET_OFFSETS = {"-04:00", "-05:00"}
 _FULL_REGULAR_CLOSE_MINUTE = 15 * 60 + 59
+_TIME_TEXT = np.array(
+    [f"{minute // 60:02d}:{minute % 60:02d}" for minute in range(24 * 60)],
+    dtype=object,
+)
 
 
 def monthly_filled_filename(symbol: str, year: int, month: int) -> str:
@@ -209,6 +220,9 @@ class Inspection:
 class LoadedSeries:
     frame: pd.DataFrame
     inspection: Inspection
+    # Directory of the prepared columns, when this load was served from or
+    # written to the cache. None when the cache could not be used.
+    prepared: str | None = None
 
 
 @dataclass(frozen=True)
@@ -404,7 +418,11 @@ def _phase_mapping(original: list[str], phase_map) -> list[str]:
 
 
 def _infer_timezone(stamps: list[datetime]) -> tuple[tuple[str, ...], bool, str]:
-    offsets = sorted({_offset_text(stamp) for stamp in stamps})
+    return _timezone_from_names([_offset_text(stamp) for stamp in stamps])
+
+
+def _timezone_from_names(names) -> tuple[tuple[str, ...], bool, str]:
+    offsets = sorted(set(names))
     if not offsets:
         raise ValueError("no timestamps to infer a timezone from")
     foreign = sorted(set(offsets) - _ET_OFFSETS)
@@ -614,6 +632,110 @@ def infer_session_segments(dates, minutes, labels, phases) -> tuple[SessionSegme
     return tuple(segments)
 
 
+def _fast_clock(texts: list[str]):
+    """Components of the canonical ``YYYY-MM-DDTHH:MM:SS±HH:MM`` stamp.
+
+    Returns None when any value is a different shape. The caller then uses
+    ``datetime.fromisoformat`` so the error text stays the same.
+    """
+    count = len(texts)
+    if count == 0:
+        return None
+    raw = np.empty(count, dtype="U25")
+    for index, text in enumerate(texts):
+        if type(text) is not str or len(text) != 25:
+            return None
+        raw[index] = text
+    chars = raw.view("U1").reshape(count, 25)
+    separators = (
+        (chars[:, 4] == "-")
+        & (chars[:, 7] == "-")
+        & (chars[:, 10] == "T")
+        & (chars[:, 13] == ":")
+        & (chars[:, 16] == ":")
+        & (chars[:, 22] == ":")
+    )
+    if not bool(separators.all()):
+        return None
+    sign = chars[:, 19]
+    if not bool(((sign == "+") | (sign == "-")).all()):
+        return None
+
+    def take(start: int, stop: int):
+        acc = np.zeros(count, dtype=np.int32)
+        for col in range(start, stop):
+            code = chars[:, col].view(np.uint32)
+            if not bool(((code >= 48) & (code <= 57)).all()):
+                return None
+            acc = acc * 10 + (code.astype(np.int32) - 48)
+        return acc
+
+    year = take(0, 4)
+    month = take(5, 7)
+    day = take(8, 10)
+    hour = take(11, 13)
+    minute = take(14, 16)
+    second = take(17, 19)
+    off_hour = take(20, 22)
+    off_minute = take(23, 25)
+    parts = (year, month, day, hour, minute, second, off_hour, off_minute)
+    if any(part is None for part in parts):
+        return None
+    valid = (
+        (year >= 1)
+        & (month >= 1)
+        & (month <= 12)
+        & (day >= 1)
+        & (day <= 31)
+        & (hour <= 23)
+        & (minute <= 59)
+        & (second <= 59)
+        & (off_hour <= 23)
+        & (off_minute <= 59)
+    )
+    if not bool(valid.all()):
+        return None
+    year64 = year.astype(np.int64)
+    month64 = month.astype(np.int64)
+    day64 = day.astype(np.int64)
+    y = year64 - (month64 <= 2)
+    m = np.where(month64 <= 2, month64 + 9, month64 - 3)
+    era = np.where(y >= 0, y, y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * m + 2) // 5 + day64 - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    days = era * 146097 + doe - 719468
+    off = off_hour.astype(np.int64) * 3600 + off_minute.astype(np.int64) * 60
+    off = np.where(sign == "-", -off, off)
+    epoch = days * 86400 + hour.astype(np.int64) * 3600 + minute.astype(np.int64) * 60 + second.astype(np.int64) - off
+    return {
+        "text": raw,
+        "date": np.array([text[:10] for text in texts], dtype=object),
+        "minute": (hour.astype(np.int64) * 60 + minute.astype(np.int64)),
+        "second": second.astype(np.int64),
+        "weekday": ((days + 3) % 7).astype(np.int64),
+        "epoch": epoch,
+        "offset": np.array(
+            [("-" if sign[i] == "-" else "+") + f"{int(off_hour[i]):02d}:{int(off_minute[i]):02d}" for i in range(count)],
+            dtype=object,
+        ),
+    }
+
+
+def _finite_columns(symbol: str, columns: list[tuple[np.ndarray, str]]) -> None:
+    """Same column order as the row scan this replaced. The message names the column."""
+    for values, name in columns:
+        if not bool(np.isfinite(values).all()):
+            raise ValueError(f"{symbol} has a non-finite {name}")
+
+
+def _session_volume(dates: np.ndarray, volumes: np.ndarray) -> list[float]:
+    """One total per session, in first-seen order. Not the quadratic mask."""
+    codes, _uniques = pd.factorize(dates, sort=False)
+    totals = np.bincount(codes.astype(np.int64, copy=False), weights=np.asarray(volumes, dtype=np.float64))
+    return [float(value) for value in totals]
+
+
 def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=(), phase_map=None, price_kind: str = "raw") -> LoadedSeries:
     """Load filled months for one symbol. Does not copy or rewrite the source files."""
     assert_no_silent_splits(splits)
@@ -625,14 +747,38 @@ def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=(), phase_map=N
     if isinstance(bar_minutes, bool) or not isinstance(bar_minutes, int) or bar_minutes < 1:
         raise ValueError("bar-minutes must be a positive integer")
     paths = discover_filled_files(src, symbol)
+    cache_key = None
+    try:
+        from .prepared import lookup_named
+
+        cache_key, cached = lookup_named(
+            symbol,
+            bar_minutes=bar_minutes,
+            price_kind=price_kind,
+            phase_map=phase_map,
+            paths=paths,
+        )
+    except Exception:
+        cached = None
+    if cached is not None:
+        return cached
     frames = [_read_month(path) for path in paths]
     raw = pd.concat(frames, ignore_index=True)
+    del frames
     if raw.empty:
         raise ValueError(f"no rows in {symbol} filled files")
-    stamps = [_as_utc_stamp(value) for value in raw["timestamp_et"]]
-    epochs = [int(value) for value in raw["epoch_utc"]]
-    for index in range(1, len(epochs)):
-        if epochs[index] <= epochs[index - 1]:
+    stamp_text = [str(value) for value in raw["timestamp_et"].tolist()]
+    fast = _fast_clock(stamp_text)
+    del stamp_text
+    epochs = np.asarray(raw["epoch_utc"])
+    if not np.issubdtype(epochs.dtype, np.integer):
+        epochs = np.array([int(value) for value in raw["epoch_utc"].tolist()], dtype=np.int64)
+    else:
+        epochs = epochs.astype(np.int64, copy=False)
+    if len(epochs) > 1:
+        disorder = np.flatnonzero(epochs[1:] <= epochs[:-1])
+        if len(disorder):
+            index = int(disorder[0]) + 1
             raise ValueError(
                 f"{symbol} timestamps are not strictly increasing at row {index} ({raw['timestamp_et'].iloc[index]})"
             )
@@ -643,109 +789,148 @@ def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=(), phase_map=N
         if phase_map is None and str(exc).startswith("session labels"):
             raise ValueError(f"{symbol} has {exc}") from exc
         raise
-    opens = raw["open"].astype(float)
-    highs = raw["high"].astype(float)
-    lows = raw["low"].astype(float)
-    closes = raw["close"].astype(float)
-    volumes = raw["volume"].astype(float)
-    waps = raw["wap"].astype(float)
-    counts = raw["count"].astype(float)
-    filled_values = raw["filled"].astype(float)
-    for series, name in (
-        (opens, "open"),
-        (highs, "high"),
-        (lows, "low"),
-        (closes, "close"),
-        (volumes, "volume"),
-        (waps, "wap"),
-        (counts, "count"),
-        (filled_values, "filled"),
-    ):
-        if not all(math.isfinite(float(value)) for value in series):
-            raise ValueError(f"{symbol} has a non-finite {name}")
-    if (volumes < 0).any():
+    opens = raw["open"].to_numpy(dtype=np.float64, copy=True)
+    highs = raw["high"].to_numpy(dtype=np.float64, copy=True)
+    lows = raw["low"].to_numpy(dtype=np.float64, copy=True)
+    closes = raw["close"].to_numpy(dtype=np.float64, copy=True)
+    volumes = raw["volume"].to_numpy(dtype=np.float64, copy=True)
+    waps = raw["wap"].to_numpy(dtype=np.float64, copy=True)
+    counts = raw["count"].to_numpy(dtype=np.float64, copy=True)
+    filled_values = raw["filled"].to_numpy(dtype=np.float64, copy=True)
+    if fast is not None:
+        # The canonical path has already copied the columns it needs.
+        # Dropping the parsed months here is what keeps a long series
+        # from holding two full copies through validation and the cache write.
+        del raw
+        gc.collect()
+    _finite_columns(
+        symbol,
+        (
+            (opens, "open"),
+            (highs, "high"),
+            (lows, "low"),
+            (closes, "close"),
+            (volumes, "volume"),
+            (waps, "wap"),
+            (counts, "count"),
+            (filled_values, "filled"),
+        ),
+    )
+    if bool(np.any(volumes < 0)):
         raise ValueError(f"{symbol} has negative volume")
-    if ((volumes > 0) & (waps <= 0)).any():
+    if bool(np.any((volumes > 0) & (waps <= 0))):
         raise ValueError(f"{symbol} has positive volume and a non-positive wap")
-    if (counts < 0).any() or any(not float(value).is_integer() for value in counts):
+    if bool(np.any(counts < 0)) or bool(np.any(counts != np.floor(counts))):
         raise ValueError(f"{symbol} count must be a non-negative whole number")
-    if any(not float(value).is_integer() for value in filled_values):
+    if bool(np.any(filled_values != np.floor(filled_values))):
         raise ValueError(f"{symbol} filled flag is not a whole number")
-    bad_price = (opens <= 0) | (highs <= 0) | (lows <= 0) | (closes <= 0)
-    if bad_price.any():
+    if bool(np.any((opens <= 0) | (highs <= 0) | (lows <= 0) | (closes <= 0))):
         raise ValueError(f"{symbol} has a non-positive price")
-    inconsistent = (highs < lows) | (highs < opens) | (highs < closes) | (lows > opens) | (lows > closes)
-    if inconsistent.any():
+    if bool(np.any((highs < lows) | (highs < opens) | (highs < closes) | (lows > opens) | (lows > closes))):
         raise ValueError(f"{symbol} has an OHLC bar that does not contain its open and close")
-    for stamp in stamps:
-        if stamp.second or stamp.microsecond:
+    phases_arr = np.asarray(phases, dtype=object)
+    if fast is None:
+        stamps = [_as_utc_stamp(value) for value in raw["timestamp_et"]]
+        for stamp in stamps:
+            if stamp.second or stamp.microsecond:
+                raise ValueError(
+                    f"{symbol} timestamp {stamp.isoformat()} is not minute-aligned. "
+                    "Native bar size is ambiguous."
+                )
+        dates = [stamp.date().isoformat() for stamp in stamps]
+        minutes = [stamp.hour * 60 + stamp.minute for stamp in stamps]
+        day_of: dict[str, int] = {}
+        day_values = []
+        for date in dates:
+            if date not in day_of:
+                day_of[date] = len(day_of)
+            day_values.append(day_of[date])
+        weekday = [datetime.fromisoformat(date).weekday() for date in dates]
+        last_rth: dict[str, int] = {}
+        for date, minute, phase, stamp, epoch in zip(dates, minutes, phases, stamps, epochs.tolist()):
+            if int(stamp.timestamp()) != int(epoch):
+                raise ValueError(f"{symbol} epoch_utc does not match timestamp_et at {stamp.isoformat()}")
+            if phase == "rth":
+                last = last_rth.get(date)
+                if last is None or minute > last:
+                    last_rth[date] = minute
+        short = {
+            date: (1 if last_rth.get(date, _FULL_REGULAR_CLOSE_MINUTE) < _FULL_REGULAR_CLOSE_MINUTE else 0)
+            for date in day_of
+        }
+        timestamp_et = [stamp.isoformat() for stamp in stamps]
+        time_text = [f"{minute // 60:02d}:{minute % 60:02d}" for minute in minutes]
+        short_session = [short[date] for date in dates]
+        offsets, dst_pair, timezone_note = _infer_timezone(stamps)
+        date_values = dates
+        minute_values = minutes
+        weekday_values = weekday
+        day_column = day_values
+    else:
+        drifted = np.flatnonzero(fast["second"] != 0)
+        if len(drifted):
+            text = str(fast["text"][int(drifted[0])])
             raise ValueError(
-                f"{symbol} timestamp {stamp.isoformat()} is not minute-aligned. "
-                "Native bar size is ambiguous."
+                f"{symbol} timestamp {text} is not minute-aligned. Native bar size is ambiguous."
             )
-    dates = [stamp.date().isoformat() for stamp in stamps]
-    minutes = [stamp.hour * 60 + stamp.minute for stamp in stamps]
-    # Session index in file order. ISO dates sort with time, and the file is monotonic.
-    day_of = {}
-    day_values = []
-    for date in dates:
-        if date not in day_of:
-            day_of[date] = len(day_of)
-        day_values.append(day_of[date])
-    weekday = [datetime.fromisoformat(date).weekday() for date in dates]
-    # short_session is the engine flag from spec decision 26, measured on the
-    # 1-minute grid before resampling. It is not the inferred session window.
-    last_rth: dict[str, int] = {}
-    for date, minute, phase, stamp, epoch in zip(dates, minutes, phases, stamps, epochs):
-        if int(stamp.timestamp()) != epoch:
-            raise ValueError(f"{symbol} epoch_utc does not match timestamp_et at {stamp.isoformat()}")
-        if phase == "rth":
-            last = last_rth.get(date)
-            if last is None or minute > last:
-                last_rth[date] = minute
-    short = {
-        date: (1 if last_rth.get(date, _FULL_REGULAR_CLOSE_MINUTE) < _FULL_REGULAR_CLOSE_MINUTE else 0)
-        for date in day_of
-    }
-    filled_ints = [int(value) for value in filled_values]
+        mismatched = np.flatnonzero(fast["epoch"] != epochs)
+        if len(mismatched):
+            text = str(fast["text"][int(mismatched[0])])
+            raise ValueError(f"{symbol} epoch_utc does not match timestamp_et at {text}")
+        date_values = fast["date"]
+        minute_values = fast["minute"]
+        weekday_values = fast["weekday"]
+        codes, _unique_dates = pd.factorize(date_values, sort=False)
+        day_column = codes.astype(np.int64, copy=False)
+        rth = phases_arr == "rth"
+        last = np.full(int(codes.max()) + 1 if len(codes) else 0, -1, dtype=np.int64)
+        if bool(np.any(rth)):
+            np.maximum.at(last, codes[rth], minute_values[rth])
+        short_by_day = np.where(
+            last < 0,
+            0,
+            (last < _FULL_REGULAR_CLOSE_MINUTE).astype(np.int64),
+        )
+        short_session = short_by_day[codes] if len(codes) else np.array([], dtype=np.int64)
+        timestamp_et = fast["text"].astype(object)
+        time_text = _TIME_TEXT[minute_values]
+        offsets, dst_pair, timezone_note = _timezone_from_names(fast["offset"].tolist())
+    count_column = counts.astype(np.int64)
+    filled_column = filled_values.astype(np.int64)
     policy, n_filled, n_unfilled, stale_flag = _infer_fill_policy(
-        [float(value) for value in closes],
-        [float(value) for value in volumes],
-        filled_ints,
+        closes,
+        volumes,
+        filled_column.tolist(),
     )
     built = pd.DataFrame(
         {
-            "timestamp_et": [stamp.isoformat() for stamp in stamps],
+            "timestamp_et": timestamp_et,
             "epoch_utc": epochs,
-            "date": dates,
-            "day": day_values,
-            "weekday": weekday,
-            "minute": minutes,
-            "time": [f"{minute // 60:02d}:{minute % 60:02d}" for minute in minutes],
+            "date": date_values,
+            "day": day_column,
+            "weekday": weekday_values,
+            "minute": minute_values,
+            "time": time_text,
             "session": phases,
-            "open": opens.to_numpy(),
-            "high": highs.to_numpy(),
-            "low": lows.to_numpy(),
-            "close": closes.to_numpy(),
-            "volume": volumes.to_numpy(),
-            "wap": waps.to_numpy(),
-            "count": [int(value) for value in counts],
-            "filled": filled_ints,
-            "short_session": [short[date] for date in dates],
-            "bar_minutes": 1,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+            "wap": waps,
+            "count": count_column,
+            "filled": filled_column,
+            "short_session": short_session,
+            "bar_minutes": np.int64(1),
             "symbol": symbol,
         }
     )
     _stale_bars_are_flat(built)
     built["partial"] = 0
-    offsets, dst_pair, timezone_note = _infer_timezone(stamps)
-    segments = infer_session_segments(dates, minutes, original_labels, phases)
-    tick = _infer_tick([float(value) for value in list(opens) + list(highs) + list(lows) + list(closes)])
-    session_volume = []
-    for date in day_of:
-        mask = [item == date for item in dates]
-        session_volume.append(sum(float(volume) for volume, keep in zip(volumes, mask) if keep))
-    typical_bar = _median([float(value) for value in volumes])
+    segments = infer_session_segments(list(date_values), list(minute_values), original_labels, phases)
+    tick = _infer_tick([float(value) for value in np.concatenate((opens, highs, lows, closes)).tolist()])
+    session_volume = _session_volume(np.asarray(date_values, dtype=object), volumes)
+    typical_bar = _median([float(value) for value in volumes.tolist()])
     typical_session = _median(session_volume)
     native_rows = len(built)
     if bar_minutes != 1:
@@ -829,7 +1014,26 @@ def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=(), phase_map=N
         original_session_labels=tuple(sorted(set(original_labels))),
         runnable=runnable,
     )
-    return LoadedSeries(frame=built, inspection=inspection)
+    prepared_path = None
+    if cache_key is not None:
+        try:
+            from .prepared import save_named
+
+            stored = save_named(
+                cache_key,
+                built,
+                inspection,
+                symbol=symbol,
+                bar_minutes=bar_minutes,
+                price_kind=price_kind,
+                phase_map=phase_map,
+                source=src,
+            )
+            if stored is not None:
+                prepared_path = str(stored)
+        except Exception:
+            prepared_path = None
+    return LoadedSeries(frame=built, inspection=inspection, prepared=prepared_path)
 
 
 def resample(frame: pd.DataFrame, bar_minutes: int) -> pd.DataFrame:
@@ -1017,6 +1221,16 @@ def frame_to_desk_bars(frame: pd.DataFrame) -> list[dict]:
         )
         previous = session_id
     return rows
+
+
+def prepare_desk_bars(frame: pd.DataFrame):
+    """Normalize desk bars once. Books on the same frame share this tuple.
+
+    ``engine_desk.run`` does not copy a ``PreparedDeskBars`` again.
+    """
+    from .engine_desk import PreparedDeskBars, normalize_bars
+
+    return PreparedDeskBars(normalize_bars(frame_to_desk_bars(frame)))
 
 
 def slice_walkforward(

@@ -11,7 +11,7 @@ from __future__ import annotations
 from . import engine_arena, engine_desk
 from .accounting import stamp_accounting
 from .costs_designer import DESIGNER_INITIAL_EQUITY, flat_bps, for_profile, label
-from .data import frame_to_desk_bars
+from .data import prepare_desk_bars
 from .engine_desk import BuyAndHold as DeskBuyAndHold
 from .engine_desk import DeskConfig, TwoXLong
 from .profiles import get_profile
@@ -118,7 +118,7 @@ def _metrics(profile: str, result: dict, accounting, borrow_rate_annual):
     return metrics
 
 
-def execute(strategy, frame, profile: str, **kwargs):
+def execute(strategy, frame, profile: str, *, desk_bars=None, **kwargs):
     """One designer book. Starting equity is the canonical index."""
     from .runner import _arena_dividend_days
 
@@ -162,7 +162,7 @@ def execute(strategy, frame, profile: str, **kwargs):
         return result, _metrics(name, result, accounting, borrow)
     if name == "desk":
         desk_borrow = get_profile(name).borrow_rate_annual if borrow is None else borrow
-        rows = frame_to_desk_bars(frame)
+        rows = desk_bars if desk_bars is not None else prepare_desk_bars(frame)
         result = engine_desk.run(
             strategy,
             rows,
@@ -185,6 +185,12 @@ def execute(strategy, frame, profile: str, **kwargs):
 def run_books(strategy_cls, frame, profile: str, **kwargs):
     """Strategy and benchmarks, each a new instance, on the designer model."""
     with_benchmarks = kwargs.get("with_benchmarks", True)
+    desk_bars = kwargs.get("desk_bars")
+    if desk_bars is None and get_profile(profile).name == "desk":
+        desk_bars = prepare_desk_bars(frame)
+    if desk_bars is not None:
+        kwargs = dict(kwargs)
+        kwargs["desk_bars"] = desk_bars
     strategy = strategy_cls()
     result, metrics = execute(strategy, frame, profile, **kwargs)
     books = {"strategy": (_tag(result, strategy), metrics)}
@@ -222,6 +228,9 @@ def accept_books(profile: str, frame, child_books: dict, kwargs: dict) -> dict:
     books = {"strategy": (strategy_result, parent_metrics)}
     if not kwargs.get("with_benchmarks", True):
         return books
+    if get_profile(profile).name == "desk" and "desk_bars" not in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["desk_bars"] = prepare_desk_bars(frame)
     for label_name, cls in _benchmarks(profile):
         bench_result, bench_metrics = execute(cls(), frame, profile, **kwargs)
         child = child_books.get(label_name)

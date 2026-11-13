@@ -133,7 +133,15 @@ def assert_jailed_surface(payload: dict) -> None:
     entries = payload.get("cwd_entries")
     if not isinstance(entries, list):
         raise SystemExit(f"child cwd entries are not a list: {entries!r}")
-    allowed = {"strategy.py", "sandbox_child.py", "stdio.log", "pydeps", "deps.json", "token.json"}
+    allowed = {
+        "strategy.py",
+        "sandbox_child.py",
+        "bar_ipc.py",
+        "stdio.log",
+        "pydeps",
+        "deps.json",
+        "token.json",
+    }
     unexpected = [name for name in entries if name not in allowed]
     if unexpected:
         raise SystemExit(f"jail cwd has unexpected entries: {entries}")

@@ -317,7 +317,9 @@ def test_metadata_downgrade_cannot_skip_the_mac(tmp_path):
     with pytest.raises(ValueError, match="anonymized flag must be true"):
         load_pack(pack)
     out = tmp_path / "out"
-    with pytest.raises(ValueError, match="anonymized flag must be true"):
+    # The run reads the sidecar, including its symbol, before the pack. Deleting
+    # the factor MAC is refused there. The pack flag is still checked by load_pack.
+    with pytest.raises(ValueError, match="factor MAC"):
         run_pack(_Quiet, pack, sidecar, "arena", out, dividends={"2024-01-03": 1.25}, with_benchmarks=False)
     assert not (out / "metrics.json").exists()
 

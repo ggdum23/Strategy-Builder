@@ -138,6 +138,13 @@ def _trade_count(value, index: int) -> float:
     return count
 
 
+class PreparedDeskBars(tuple):
+    """Bars that already went through ``normalize_bars``.
+
+    ``run`` keeps the same dicts. It does not build a second copy.
+    """
+
+
 def normalize_bars(bars):
     """Copy bars into plain dicts and reject a stream that cannot be simulated."""
     if hasattr(bars, "to_dict"):
@@ -649,7 +656,12 @@ def run(strategy, bars, config=None):
         # The operator path, cost_model None, still binds it.
         cfg = _without_share_factor(cfg)
         config = cfg
-    rows = normalize_bars(bars)
+    if isinstance(bars, PreparedDeskBars):
+        if not bars:
+            raise ValueError("desk engine received no bars")
+        rows = list(bars)
+    else:
+        rows = normalize_bars(bars)
     ordinals, last_rth, last_index = _session_index(rows)
     book = _Book(cfg)
     entered_live = False

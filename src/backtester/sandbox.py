@@ -910,6 +910,43 @@ def _chain_has_package_traverse(path: Path) -> bool:
     return _chain_accessible(path, _ancestor_accessible)
 
 
+def _interpreter_venv() -> Path | None:
+    """The virtualenv prefix, when this interpreter is one."""
+    prefix = Path(sys.prefix).resolve()
+    base = Path(getattr(sys, "base_prefix", sys.prefix)).resolve()
+    if prefix == base:
+        return None
+    if not (prefix / "pyvenv.cfg").is_file():
+        return None
+    return prefix
+
+
+def runtime_overlap_error(root, denied, *, venv=None) -> str | None:
+    """None when ``root`` may be mounted. A sentence when it must be refused.
+
+    ``venv`` is the virtualenv prefix. A prefix strictly inside ``denied`` is
+    mounted on its own and does not expose the rest of that directory. A
+    prefix that is the denied directory would expose the whole tree, so that
+    mount is refused.
+    """
+    root = Path(root)
+    denied = Path(denied)
+    if root != denied and denied not in root.parents:
+        return None
+    if venv is not None:
+        prefix = Path(venv)
+        under_prefix = root == prefix or prefix in root.parents
+        if under_prefix and denied in prefix.parents:
+            return None
+        if under_prefix and prefix == denied:
+            return (
+                "the Python runtime is the denied directory itself. "
+                "Create a virtualenv inside the clone with python -m venv .venv, "
+                "or use an interpreter outside the clone."
+            )
+    return f"the Python runtime {root} is inside a denied directory; refusing to mount it"
+
+
 def _deny_roots(paths) -> list[Path]:
     roots = []
     raw = list(paths or [])
@@ -918,6 +955,12 @@ def _deny_roots(paths) -> list[Path]:
     # directory, and denying it overlaps the runtime grant.
     if not getattr(sys, "frozen", False):
         raw.append(Path(__file__).resolve().parents[2])
+    try:
+        from .prepared import default_cache_dir
+
+        raw.append(default_cache_dir())
+    except Exception:
+        pass
     for item in raw:
         if not item:
             continue
@@ -995,14 +1038,19 @@ def _write_workspace(
     capture_stdio: bool,
     nproc: int | None = None,
 ) -> None:
-    shim = Path(__file__).resolve().parent / "sandbox_child.py"
+    package = Path(__file__).resolve().parent
+    shim = package / "sandbox_child.py"
+    ipc = package / "bar_ipc.py"
     (work / "strategy.py").write_bytes(strategy.read_bytes())
     # A frozen jail is the executable itself. There is no system python and
-    # no .py shim on disk. Source runs still copy the shim.
+    # no .py shim on disk. Source runs still copy the shim and the frame codec.
     if not getattr(sys, "frozen", False):
         if not shim.is_file():
             raise SandboxError("sandbox_child.py is missing")
+        if not ipc.is_file():
+            raise SandboxError("bar_ipc.py is missing")
         (work / "sandbox_child.py").write_bytes(shim.read_bytes())
+        (work / "bar_ipc.py").write_bytes(ipc.read_bytes())
     limits = {
         "memory_bytes": int(memory_bytes),
         "cpu_seconds": int(cpu_seconds),
@@ -1075,6 +1123,7 @@ def _runtime_package_dirs() -> list[Path]:
     import importlib
 
     repo = Path(__file__).resolve().parents[2]
+    venv = _interpreter_venv()
     found: list[Path] = []
     seen: set[Path] = set()
 
@@ -1086,7 +1135,12 @@ def _runtime_package_dirs() -> list[Path]:
         if resolved in seen or not resolved.exists():
             return
         if resolved == repo or repo in resolved.parents:
-            return
+            inside_venv = venv is not None and (resolved == venv or venv in resolved.parents)
+            # The checkout itself stays unstaged. Packages that live in a
+            # virtualenv inside the checkout are the interpreter, and the
+            # jail mounts that prefix alone.
+            if not inside_venv or resolved.name == "backtester":
+                return
         seen.add(resolved)
         found.append(resolved)
 
@@ -1254,12 +1308,12 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
     if not binary:
         raise SandboxError("bubblewrap disappeared before launch")
     roots = _runtime_roots()
+    venv = _interpreter_venv()
     for root in roots:
         for banned in denied:
-            if root == banned or banned in root.parents:
-                raise SandboxError(
-                    f"the Python runtime {root} is inside a denied directory; refusing to mount it"
-                )
+            message = runtime_overlap_error(root, banned, venv=venv)
+            if message is not None:
+                raise SandboxError(message)
     cmd = [
         binary,
         "--unshare-all",
@@ -1365,13 +1419,13 @@ def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_s
         if str(directory) not in read_dirs:
             read_dirs.append(str(directory))
     cache = Path("/etc/ld.so.cache")
+    venv = _interpreter_venv()
     for directory in read_dirs:
         path = Path(directory)
         for banned in denied:
-            if path == banned or banned in path.parents:
-                raise SandboxError(
-                    "the Python runtime is inside a denied directory; refusing to grant it"
-                )
+            message = runtime_overlap_error(path, banned, venv=venv)
+            if message is not None:
+                raise SandboxError(message)
     rules, files = landlock_rule_plan(
         [directory for directory in read_dirs if directory and os.path.isdir(directory)],
         str(cache) if cache.is_file() else None,
@@ -4557,15 +4611,15 @@ def _win_remove_aces(lease: _WinLease, paths, *, recurse: bool) -> None:
 
 
 def _win_reject_overlap(grants, denied) -> None:
+    venv = _interpreter_venv()
     for banned in denied:
         if banned is None:
             continue
         banned_path = Path(banned)
         for grant, _recurse in grants:
-            if grant == banned_path or banned_path in grant.parents:
-                raise SandboxError(
-                    "a denied directory contains the Python runtime; refusing to grant and deny the same tree"
-                )
+            message = runtime_overlap_error(grant, banned_path, venv=venv)
+            if message is not None:
+                raise SandboxError(message)
 
 
 def _win_grant_work(lease: _WinLease, work: Path) -> list[tuple[Path, bool]]:

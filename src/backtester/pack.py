@@ -126,7 +126,12 @@ _LEAK_DATE_RE = re.compile(
 )
 _ALT_STREAM = "pack file has an alternate data stream"
 _STREAM_UNREADABLE = "pack file streams could not be read"
+_DIR_ALT_STREAM = "pack directory has an alternate data stream"
+_DIR_STREAM_UNREADABLE = "pack directory streams could not be read"
 _DEFAULT_STREAM = "::$DATA"
+# The filename index. FindFirstStreamW returns it for every directory.
+# It is not an alternate data stream an operator can plant.
+_DIRECTORY_INDEX_STREAM = ":$i30:$index_allocation"
 _PACK_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _INT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _PHASES = frozenset({"pre", "rth", "post"})
@@ -331,7 +336,7 @@ def validate_sidecar(document: dict, *, allow_scale_mismatch: bool = False) -> N
     if missing:
         _fail("", f"missing field {missing[0]!r}")
     if document["schema_version"] != SCHEMA_VERSION:
-        _fail("schema_version", f"{document['schema_version']!r} is not supported")
+        _fail("schema_version", "is not supported")
     if not isinstance(document["anonymized"], bool):
         _fail("anonymized", "expected true or false")
     for name in ("pack_id", "symbol", "source_root", "source_glob"):
@@ -554,10 +559,9 @@ def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
     payloads = []
     for (mtime, fname, has_comment, has_extra, has_hcrc), payload in _gzip_members(blob):
         if mtime != 0:
-            raise ValueError(f"{name} gzip mtime is {mtime}, not 0")
+            raise ValueError("gzip mtime is not 0")
         if fname:
-            shown = fname.decode("utf-8", "replace")
-            raise ValueError(f"{name} gzip file name is {shown!r}")
+            raise ValueError("gzip member has a file name")
         if has_comment:
             raise ValueError(f"{name} gzip member has an FCOMMENT")
         if has_extra:
@@ -669,7 +673,7 @@ def _validate_anonymized_manifest(document: dict) -> None:
     if extra or missing:
         raise ValueError(f"pack manifest fields are wrong (missing {missing}, unknown {extra})")
     if isinstance(document["schema_version"], bool) or document["schema_version"] != SCHEMA_VERSION:
-        raise ValueError(f"pack schema_version {document['schema_version']!r} is not supported")
+        raise ValueError("pack schema_version is not supported")
     if document.get("price_basis") not in {"raw", "total_return"}:
         raise ValueError("pack price_basis must be raw or total_return")
     if document["anonymized"] is not True:
@@ -850,9 +854,17 @@ def _stream_names(path: Path) -> list[str]:
         find_close(handle)
 
 
-def _has_nondefault_stream(path: Path) -> bool:
-    """True when ``path`` has an NTFS stream other than ``::$DATA``."""
-    return any(name.casefold() != _DEFAULT_STREAM.casefold() for name in _stream_names(path))
+def _has_nondefault_stream(path: Path, *, directory: bool = False) -> bool:
+    """True when ``path`` has an NTFS stream other than the default data stream.
+
+    A directory also carries ``:$I30:$INDEX_ALLOCATION``. That is the
+    filename index, not a stream someone attached. A named ``:$DATA``
+    stream on the directory is still an alternate and is refused.
+    """
+    allowed = {_DEFAULT_STREAM.casefold()}
+    if directory:
+        allowed.add(_DIRECTORY_INDEX_STREAM)
+    return any(name.casefold() not in allowed for name in _stream_names(path))
 
 
 def _reject_alternate_streams(path: Path) -> None:
@@ -865,6 +877,19 @@ def _reject_alternate_streams(path: Path) -> None:
         raise ValueError(_ALT_STREAM)
 
 
+def _reject_directory_streams(path: Path) -> None:
+    """Refuse an NTFS alternate stream on the pack directory itself.
+
+    The sentence is fixed. The stream name is not part of it.
+    """
+    try:
+        extra = _has_nondefault_stream(path, directory=True)
+    except OSError:
+        raise ValueError(_DIR_STREAM_UNREADABLE) from None
+    if extra:
+        raise ValueError(_DIR_ALT_STREAM)
+
+
 def _anonymized_directory(root: Path) -> list[str]:
     """scandir plus lstat. No link is followed. The error names nothing."""
     try:
@@ -873,6 +898,7 @@ def _anonymized_directory(root: Path) -> list[str]:
         raise ValueError("pack directory is missing") from None
     if not stat.S_ISDIR(info.st_mode):
         raise ValueError(_NOT_REGULAR)
+    _reject_directory_streams(root)
     names = []
     try:
         scan = os.scandir(root)
@@ -1341,7 +1367,7 @@ def _validate_manifest(document: dict) -> None:
     if extra or missing:
         raise ValueError(f"pack manifest fields are wrong (missing {missing}, unknown {extra})")
     if document["schema_version"] != SCHEMA_VERSION:
-        raise ValueError(f"pack schema_version {document['schema_version']!r} is not supported")
+        raise ValueError("pack schema_version is not supported")
     if document.get("price_basis") not in {"raw", "total_return"}:
         raise ValueError("pack price_basis must be raw or total_return")
     if not isinstance(document["anonymized"], bool):
