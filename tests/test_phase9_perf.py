@@ -16,6 +16,7 @@ import pytest
 from backtester.data import load_named, prepare_desk_bars
 from backtester.engine_desk import DeskConfig
 from backtester.prepared import (
+    default_cache_dir,
     delete_entry,
     list_entries,
     load_frame,
@@ -272,6 +273,22 @@ def test_jail_deny_list_includes_the_prepared_cache(tmp_path, monkeypatch):
     assert cache.resolve() in roots
 
 
+def test_the_default_cache_is_not_inside_the_runtime_prefix(tmp_path, monkeypatch):
+    monkeypatch.delenv("STRATEGY_BUILDER_PREPARED_DIR", raising=False)
+    inside = Path(sys.prefix) / "sb-default-cache"
+    if os.name == "nt":
+        monkeypatch.setenv("LOCALAPPDATA", str(inside))
+    else:
+        monkeypatch.setenv("XDG_CACHE_HOME", str(inside))
+    chosen = default_cache_dir().resolve()
+    prefix = Path(sys.prefix).resolve()
+    assert chosen != prefix
+    assert prefix not in chosen.parents
+    explicit = inside / "explicit"
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(explicit))
+    assert default_cache_dir() == explicit
+
+
 def _budget_entry(root: Path, name: str, size: int, atime: float) -> Path:
     path = root / name
     path.mkdir()
@@ -325,6 +342,32 @@ def test_budget_retries_a_delete_that_fails_once(_prepared_dir, monkeypatch):
     prepared._enforce_budget(_prepared_dir, keep=keep.name)
     assert calls["n"] == 2
     assert not oldest.exists()
+    assert keep.is_dir()
+
+
+def test_budget_leaves_a_directory_republished_after_a_successful_delete(_prepared_dir, monkeypatch):
+    import shutil
+
+    from backtester import prepared
+
+    oldest = _budget_entry(_prepared_dir, "f" * 64, 80, 1)
+    keep = _budget_entry(_prepared_dir, "a" * 64, 80, 2)
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_MAX_BYTES", "100")
+    real = shutil.rmtree
+    calls = {"n": 0}
+
+    def republish(path, *args, **kwargs):
+        calls["n"] += 1
+        real(path)
+        if Path(path).name == oldest.name:
+            oldest.mkdir()
+            (oldest / "blob").write_bytes(b"y" * 80)
+
+    monkeypatch.setattr(prepared.shutil, "rmtree", republish)
+    prepared._enforce_budget(_prepared_dir, keep=keep.name)
+    assert calls["n"] == 1
+    assert oldest.is_dir()
+    assert (oldest / "blob").read_bytes() == b"y" * 80
     assert keep.is_dir()
 
 

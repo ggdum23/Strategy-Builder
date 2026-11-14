@@ -808,13 +808,13 @@ def test_cleanup_drops_aces_while_holding_the_profile_lock(monkeypatch):
     assert calls == ["lock", "drop"]
 
 
-def test_a_deny_root_inside_a_runtime_bind_is_covered_and_not_granted(tmp_path):
-    """A cache nested in a mounted prefix is a tmpfs, not a landlock read."""
+def test_a_deny_root_inside_a_runtime_prefix_refuses_the_launch(tmp_path, monkeypatch):
+    """A cache inside a runtime prefix stops the launch. The mount stays whole."""
+    import backtester.sandbox as sandbox
     from backtester.sandbox import (
         _LANDLOCK_READ,
-        _LANDLOCK_READ_FILE,
-        _covered_by_deny,
-        nested_deny_roots,
+        _refuse_denied_inside_runtime,
+        nested_runtime_deny_error,
     )
 
     prefix = tmp_path / "venv"
@@ -823,63 +823,43 @@ def test_a_deny_root_inside_a_runtime_bind_is_covered_and_not_granted(tmp_path):
     nested = package / "prepared-cache"
     direct = prefix / "prepared-cache"
     visible = prefix / "visible.txt"
-    sibling = library / "other"
-    for directory in (nested, direct, sibling):
+    for directory in (nested, direct):
         directory.mkdir(parents=True)
     visible.write_text("SB-VISIBLE", encoding="utf-8")
     (direct / "marker.txt").write_text("secret", encoding="utf-8")
     (nested / "marker.txt").write_text("secret", encoding="utf-8")
-    (sibling / "keep.txt").write_text("keep", encoding="utf-8")
     work = tmp_path / "work"
     work.mkdir()
-    # An ancestor deny root is the venv-inside-a-denied-tree case. The
-    # prefix stays mounted and the cache inside it is still not granted.
-    ancestor = landlock_rule_plan(
-        [str(prefix)], None, str(work), denied=[prefix.parent, direct]
-    )[1]
-    assert any(Path(item[0]).resolve() == visible.resolve() for item in ancestor)
 
-    holes = nested_deny_roots(prefix, [direct, tmp_path / "outside"])
-    assert holes == [direct.resolve()]
-    assert _covered_by_deny(direct / "marker.txt", holes)
-    assert not _covered_by_deny(visible, holes)
-    assert not _covered_by_deny(prefix, holes)
-
-    cmd = bwrap_mount_plan([prefix], [], [], work, None, denied=[direct])
-    assert cmd[cmd.index(str(direct.resolve())) - 1] == "--tmpfs"
-    assert cmd.index(str(direct.resolve())) > cmd.index(str(prefix))
+    for hole in (direct, nested):
+        message = nested_runtime_deny_error(prefix, hole)
+        assert message is not None
+        assert "STRATEGY_BUILDER_PREPARED_DIR" in message
+        assert "virtualenv" in message
+    assert nested_runtime_deny_error(prefix, tmp_path / "outside") is None
+    assert nested_runtime_deny_error(prefix, prefix.parent) is None
+    assert nested_runtime_deny_error(prefix, prefix) is None
     missing = prefix / "missing-cache"
-    uncovered = bwrap_mount_plan([prefix], [], [], work, None, denied=[missing, prefix])
-    assert str(missing) not in uncovered
-    assert all(
-        uncovered[index] != "--tmpfs" or uncovered[index + 1] != str(prefix)
-        for index in range(len(uncovered) - 1)
-    )
+    assert not missing.exists()
+    missing_message = nested_runtime_deny_error(prefix, missing)
+    assert missing_message is not None
+    assert "STRATEGY_BUILDER_PREPARED_DIR" in missing_message
 
-    # A tmpfs on site-packages is uncovered by the later prefix bind. The
-    # package bind exposes a cache inside that package, so the cover follows it.
-    site = library
-    rebound = bwrap_mount_plan([prefix], [package], [site], work, None, denied=[nested])
-    assert rebound[rebound.index(str(nested.resolve())) - 1] == "--tmpfs"
-    assert rebound.index(str(nested.resolve())) > rebound.index(str(package))
+    monkeypatch.setattr(sandbox, "_runtime_roots", lambda: [prefix])
+    monkeypatch.setattr(sandbox, "_runtime_package_dirs", lambda: [])
+    with pytest.raises(SandboxError, match="STRATEGY_BUILDER_PREPARED_DIR"):
+        _refuse_denied_inside_runtime([direct])
+    with pytest.raises(SandboxError, match="STRATEGY_BUILDER_PREPARED_DIR"):
+        _refuse_denied_inside_runtime([missing])
 
-    directories, files = landlock_rule_plan([str(prefix)], None, str(work), denied=[direct, nested])
-    granted = [Path(item[0]).resolve() for item in directories]
-    assert prefix.resolve() not in granted
-    assert library.resolve() not in granted
-    assert package.resolve() not in granted
-    assert direct.resolve() not in granted
-    assert nested.resolve() not in granted
-    assert sibling.resolve() in granted
+    cmd = bwrap_mount_plan([prefix], [package], [library], work, None)
+    tmpfs_targets = [cmd[index + 1] for index, token in enumerate(cmd) if token == "--tmpfs"]
+    blocked = {str(direct), str(direct.resolve()), str(nested), str(nested.resolve()), str(missing)}
+    assert not blocked.intersection(tmpfs_targets)
+    assert str(prefix) in cmd
+    directories, _files = landlock_rule_plan([str(prefix)], None, str(work))
+    assert [str(prefix), _LANDLOCK_READ] in directories
     assert directories[-1][0] == str(work)
-    assert any(
-        Path(item[0]).resolve() == visible.resolve() and item[1] == _LANDLOCK_READ_FILE for item in files
-    )
-    assert not any(
-        direct.resolve() in Path(item[0]).resolve().parents or nested.resolve() in Path(item[0]).resolve().parents
-        for item in directories + files
-    )
-    assert all(item[1] != _LANDLOCK_READ or Path(item[0]).resolve() != prefix.resolve() for item in directories)
 
 
 def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
