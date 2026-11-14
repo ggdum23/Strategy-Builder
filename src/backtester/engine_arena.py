@@ -157,6 +157,87 @@ class _SessionCarry:
         return fin, interest, div
 
 
+def _phase_codes(series):
+    """Integer phase codes and the label for each code, in code order."""
+    dtype = getattr(series, "dtype", None)
+    if isinstance(dtype, pd.CategoricalDtype):
+        labels = [str(value) for value in series.cat.categories]
+        return series.cat.codes.to_numpy(copy=False), labels
+    codes, uniques = pd.factorize(series.astype(str), sort=False)
+    return codes, [str(value) for value in uniques]
+
+
+def _plain(value):
+    """A Python scalar. A mapped column indexes as a numpy scalar."""
+    if isinstance(value, (str, bool)) or value is None:
+        return value
+    if isinstance(value, (float, int)):
+        return value
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            return value
+    return value
+
+
+def _selected(series, sel):
+    """The rows ``sel`` names, without turning every value into a Python object."""
+    dtype = getattr(series, "dtype", None)
+    if isinstance(dtype, pd.CategoricalDtype):
+        codes = np.asarray(series.cat.codes.to_numpy(copy=False))[sel]
+        labels = np.asarray(list(series.cat.categories), dtype=object)
+        return np.take(labels, codes)
+    values = series.to_numpy(copy=False)
+    return values[sel]
+
+
+def _day_summary(bars, rth_idx, rth_days):
+    """Last-regular-session OHLC for ``on_day_end``. Same numbers as a groupby."""
+    if len(rth_idx) == 0:
+        return {}
+    if len(rth_days) > 1 and bool(np.any(rth_days[1:] < rth_days[:-1])):
+        rth = bars.iloc[rth_idx]
+        grouped = rth.groupby("day", sort=True)
+        table = pd.DataFrame(
+            {
+                "open": grouped["open"].first(),
+                "high": grouped["high"].max(),
+                "low": grouped["low"].min(),
+                "close": grouped["close"].last(),
+                "volume": grouped["volume"].sum(),
+                "short_session": grouped["short_session"].first(),
+                "weekday": grouped["weekday"].first(),
+            }
+        )
+        return {int(key): value for key, value in table.to_dict("index").items()}
+    opens = bars["open"].to_numpy(copy=False)
+    highs = bars["high"].to_numpy(copy=False)
+    lows = bars["low"].to_numpy(copy=False)
+    closes = bars["close"].to_numpy(copy=False)
+    volumes = bars["volume"].to_numpy(copy=False)
+    shorts = bars["short_session"].to_numpy(copy=False)
+    weekdays = bars["weekday"].to_numpy(copy=False)
+    splits = np.flatnonzero(rth_days[1:] != rth_days[:-1]) + 1 if len(rth_days) else np.array([], dtype=int)
+    starts = np.r_[0, splits]
+    ends = np.r_[splits, len(rth_idx)]
+    out = {}
+    for start, end in zip(starts.tolist(), ends.tolist()):
+        chosen = rth_idx[start:end]
+        day = int(rth_days[start])
+        out[day] = {
+            "open": float(opens[chosen[0]]),
+            "high": float(highs[chosen].max()),
+            "low": float(lows[chosen].min()),
+            "close": float(closes[chosen[-1]]),
+            "volume": float(volumes[chosen].sum()),
+            "short_session": int(shorts[chosen[0]]),
+            "weekday": int(weekdays[chosen[0]]),
+        }
+    return out
+
+
 def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month_of_day=None,
         taf_active_of_day=None, reset_day=None, period_label_of_day=None, record_fills=True,
         borrow_rate_annual=None, cash_rate_annual=0.0, financing_rate_annual=0.0,
@@ -194,25 +275,27 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
     wants_ext = bool(getattr(strategy, "WANTS_EXTENDED_HOURS", False))
     has_day_end = callable(getattr(strategy, "on_day_end", None))
 
-    bars = bars.reset_index(drop=True)
-    is_rth = (bars["session"].values == "rth")
+    # Positional arrays. reset_index would copy a mapped frame and is not
+    # required: column order is the row order, not the index labels.
+    session_codes, session_labels = _phase_codes(bars["session"])
+    try:
+        rth_code = session_labels.index("rth")
+    except ValueError:
+        rth_code = -1
+    is_rth = session_codes == rth_code
     # last regular-session bar of each day (mark-to-market point)
     rth_idx = np.flatnonzero(is_rth)
-    rth_days = bars["day"].values[rth_idx]
+    day_values = bars["day"].to_numpy(copy=False)
+    rth_days = day_values[rth_idx]
     last_rth = np.zeros(len(bars), bool)
     if len(rth_idx):
         last_rth[rth_idx[np.r_[rth_days[1:] != rth_days[:-1], True]]] = True
     deliver = np.ones(len(bars), bool) if wants_ext else is_rth
     # per-day regular-session summary for on_day_end
-    rth = bars[is_rth]
-    g = rth.groupby("day", sort=True)
-    dsum = pd.DataFrame({"open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
-                         "close": g["close"].last(), "volume": g["volume"].sum(),
-                         "short_session": g["short_session"].first(), "weekday": g["weekday"].first()})
-    dsum_rec = {int(k): v for k, v in dsum.to_dict("index").items()}
+    dsum_rec = _day_summary(bars, rth_idx, rth_days)
 
     sel = np.flatnonzero(deliver | last_rth)  # mark bars are always processed (not delivered if eth-only)
-    cols = {k: bars[k].values[sel].tolist() for k in BAR_FIELDS}
+    cols = {k: _selected(bars[k], sel) for k in BAR_FIELDS}
     dlv = deliver[sel].tolist()
     lrth = last_rth[sel].tolist()
     days = cols["day"]
@@ -259,7 +342,7 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
         carry = _SessionCarry(cash_rate_annual, financing_rate_annual, withholding_rate, dividends)
     ep_bar_count = [0]
     for j in range(n):
-        day = days[j]
+        day = int(days[j])
         if day != cur_day:
             cur_day = day
             did_reset = False
@@ -338,7 +421,7 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 if S[j] != "rth": eth_notional += notional
                 n_fills += 1
                 if record_fills:
-                    fills.append((day, cols["minute"][j], S[j], delta, o, px, fc["total"], new_sh))
+                    fills.append((day, int(cols["minute"][j]), S[j], delta, o, px, fc["total"], new_sh))
                 # episodes
                 old = shares
                 if old != 0 and (new_sh == 0 or (new_sh > 0) != (old > 0)):
@@ -389,7 +472,7 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
             carry.snap_close(shares, cash, c)
         # ---- strategy decision
         if dlv[j]:
-            bar = {k: cols[k][j] for k in keys}
+            bar = {k: _plain(cols[k][j]) for k in keys}
             state = {"equity": eq, "cash": cash, "shares": shares, "position": (shares * c / eq) if eq > 0 else 0.0,
                      "target": target if pending is None else pending, "pending_order": pending is not None}
             t = strategy.on_bar(bar, state)
@@ -406,7 +489,7 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 target = 0.0
             if has_day_end and last_dlv[j]:
                 s = dsum_rec.get(day, {})
-                summary = {"day": day, "weekday": cols["weekday"][j], "rth_open": s.get("open"), "rth_high": s.get("high"),
+                summary = {"day": day, "weekday": int(cols["weekday"][j]), "rth_open": s.get("open"), "rth_high": s.get("high"),
                            "rth_low": s.get("low"), "rth_close": s.get("close"), "rth_volume": s.get("volume"),
                            "short_session": s.get("short_session"), "equity": eq, "shares": shares,
                            "position": (shares * c / eq) if eq > 0 else 0.0}

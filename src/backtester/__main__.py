@@ -180,6 +180,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("test", help="Run the unit suite")
     sub.add_parser("gui", help="Open the desktop research terminal")
+    prepared = sub.add_parser("prepared", help="List, delete, or rebuild prepared columns")
+    prepared_sub = prepared.add_subparsers(dest="prepared_command", required=True)
+    prepared_sub.add_parser("list", help="One line per cached series")
+    prepared_delete = prepared_sub.add_parser("delete", help="Remove one cached series")
+    prepared_delete.add_argument("key", help="Cache id from prepared list")
+    prepared_rebuild = prepared_sub.add_parser("rebuild", help="Reload a named series from its source")
+    prepared_rebuild.add_argument("key", help="Cache id from prepared list")
 
     parallel = sub.add_parser("parallel", help="Score many strategies, each in its own process")
     parallel.add_argument("--strategies", required=True, help="Directory of strategy.py files")
@@ -878,6 +885,29 @@ def _cmd_referee(args) -> int:
     return 0
 
 
+def _cmd_prepared(args) -> int:
+    from .prepared import delete_entry, list_entries, rebuild_entry
+
+    if args.prepared_command == "list":
+        rows = list_entries()
+        if not rows:
+            print("no prepared series")
+            return 0
+        for row in rows:
+            print(f"{row['key']}  {row['kind']}  {row['symbol']}  rows={row['rows']}  bytes={row['bytes']}")
+        return 0
+    if args.prepared_command == "delete":
+        delete_entry(args.key)
+        print(f"deleted {args.key}")
+        return 0
+    if args.prepared_command == "rebuild":
+        loaded = rebuild_entry(args.key)
+        print(f"rebuilt {loaded.inspection.symbol} rows={loaded.inspection.n_rows}")
+        return 0
+    print(f"error: unknown prepared command {args.prepared_command}", file=sys.stderr)
+    return 2
+
+
 def _cmd_test() -> int:
     import pytest
 
@@ -913,6 +943,8 @@ def main(argv=None) -> int:
             return _cmd_pack(args)
         if args.command == "test":
             return _cmd_test()
+        if args.command == "prepared":
+            return _cmd_prepared(args)
         if args.command == "parallel":
             return _cmd_parallel(args)
         if args.command == "referee":

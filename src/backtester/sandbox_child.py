@@ -32,9 +32,43 @@ _stdio_thread = None
 _stdio_done = False
 
 
+_IPC = None
+
+
+def _ipc():
+    """The frame codec. A source jail runs with ``python -I``, which leaves the
+    script directory off ``sys.path``, so the sibling file is loaded by path.
+    A frozen child imports the package module.
+    """
+    global _IPC
+    if _IPC is not None:
+        return _IPC
+    try:
+        from . import bar_ipc
+    except ImportError:
+        import importlib.util
+
+        path = Path(__file__).resolve().parent / "bar_ipc.py"
+        spec = importlib.util.spec_from_file_location("bar_ipc", path)
+        if spec is None or spec.loader is None:
+            raise ImportError("bar_ipc.py is missing")
+        bar_ipc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bar_ipc)
+    _IPC = bar_ipc
+    return bar_ipc
+
+
 def _send(payload: dict) -> None:
-    line = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    os.write(_PROTO, line + b"\n")
+    ipc = _ipc()
+    frame = None
+    if payload.get("op") == "decision":
+        frame = ipc.pack_decision(payload.get("target"))
+    if frame is None:
+        frame = ipc.dumps(payload)
+    view = memoryview(frame)
+    while view:
+        count = os.write(_PROTO, view)
+        view = view[count:]
 
 
 def _exception_error(exc: BaseException) -> dict:
@@ -122,24 +156,32 @@ _stdin_buf = b""
 
 
 def _recv() -> dict | None:
-    """Read one JSON line. Bytes past the newline stay for the next request."""
+    """Read one length-prefixed frame. Bytes past that frame stay buffered."""
     global _stdin_buf
-    while b"\n" not in _stdin_buf:
+    ipc = _ipc()
+    while len(_stdin_buf) < 4:
         chunk = os.read(0, 65536)
         if not chunk:
             if not _stdin_buf:
                 return None
-            break
-        _stdin_buf += chunk
-        if len(_stdin_buf) > 1_000_000 and b"\n" not in _stdin_buf:
             raise ValueError("request is too large")
-    if b"\n" not in _stdin_buf:
-        line, _stdin_buf = _stdin_buf, b""
-    else:
-        line, _stdin_buf = _stdin_buf.split(b"\n", 1)
-    if not line and not _stdin_buf:
-        return None
-    return json.loads(line.decode("utf-8"))
+        _stdin_buf += chunk
+        if len(_stdin_buf) > ipc.MAX_FRAME + 4:
+            raise ValueError("request is too large")
+    length = int.from_bytes(_stdin_buf[:4], "little")
+    if length > ipc.MAX_FRAME:
+        raise ValueError("request is too large")
+    need = 4 + length
+    while len(_stdin_buf) < need:
+        chunk = os.read(0, 65536)
+        if not chunk:
+            raise ValueError("request is too large")
+        _stdin_buf += chunk
+        if len(_stdin_buf) > ipc.MAX_FRAME + 4:
+            raise ValueError("request is too large")
+    body = _stdin_buf[4:need]
+    _stdin_buf = _stdin_buf[need:]
+    return ipc.loads(body)
 
 
 def _apply_limits() -> bool:

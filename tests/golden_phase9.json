@@ -1,0 +1,23 @@
+{
+  "sessions": 3,
+  "symbol": "SYN",
+  "frame_sha256": "5aa55b96e3bc4c7c7a6566f7f46e7a24f3ea9132d424c3b7be69e893c7489a3d",
+  "n_rows": 2880,
+  "n_sessions": 3,
+  "native_tick": 0.01,
+  "typical_volume_bar": 125.0,
+  "typical_volume_session": 119720.0,
+  "short_sessions": 0,
+  "timezone_offsets": [
+    "-05:00"
+  ],
+  "fill_policy": "flag_present_none_set",
+  "arena_fees": 66.988669275,
+  "arena_n_fills": 1,
+  "arena_final_equity": 1001631.2114307251,
+  "arena_total_return": 0.001631211430725088,
+  "desk_fees": 66.988669275,
+  "desk_n_fills": 1,
+  "desk_final_equity": 1001631.1192020455,
+  "desk_total_return": 0.0016311192020455056
+}

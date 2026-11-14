@@ -57,9 +57,18 @@ class DataPage(QWidget):
         record.clicked.connect(self.record)
         reload_registry = QPushButton("Reload registry")
         reload_registry.clicked.connect(self.reload_registry)
+        refresh_prepared = QPushButton("Refresh prepared")
+        refresh_prepared.clicked.connect(self.refresh_prepared)
+        delete_prepared = QPushButton("Delete prepared")
+        delete_prepared.clicked.connect(self.delete_prepared)
+        rebuild_prepared = QPushButton("Rebuild prepared")
+        rebuild_prepared.clicked.connect(self.rebuild_prepared)
         buttons.addWidget(inspect)
         buttons.addWidget(record)
         buttons.addWidget(reload_registry)
+        buttons.addWidget(refresh_prepared)
+        buttons.addWidget(delete_prepared)
+        buttons.addWidget(rebuild_prepared)
         buttons.addStretch(1)
         root.addLayout(buttons)
         splitter = QSplitter()
@@ -117,6 +126,9 @@ class DataPage(QWidget):
         self.notes.setMinimumHeight(120)
         self.registry_table = DictTable()
         self.registry_table.setMinimumHeight(140)
+        self.prepared_table = DictTable()
+        self.prepared_table.setMinimumHeight(140)
+        self.prepared_table.setObjectName("preparedTable")
         self.results_layout.addLayout(self.banners)
         self.results_layout.addWidget(Section("Inspection"))
         self.results_layout.addWidget(self.summary)
@@ -125,6 +137,8 @@ class DataPage(QWidget):
         self.results_layout.addWidget(self.notes)
         self.results_layout.addWidget(Section("Registry"))
         self.results_layout.addWidget(self.registry_table)
+        self.results_layout.addWidget(Section("Prepared data"))
+        self.results_layout.addWidget(self.prepared_table)
         splitter.addWidget(form)
         splitter.addWidget(self.results)
         splitter.setStretchFactor(0, 0)
@@ -231,6 +245,57 @@ class DataPage(QWidget):
 
         self.host.start_task(work, self.show_registry, self._failed)
 
+    def refresh_prepared(self) -> None:
+        from ...prepared import list_entries
+
+        def work():
+            return list_entries()
+
+        self.host.start_task(work, self.show_prepared, self._failed)
+
+    def _selected_prepared_key(self) -> str:
+        index = self.prepared_table.currentIndex()
+        position = self.prepared_table.source_row(index)
+        rows = self.prepared_table.raw_rows()
+        if position < 0 or position >= len(rows):
+            return ""
+        return str(rows[position].get("key") or "")
+
+    def delete_prepared(self) -> None:
+        from ...prepared import delete_entry
+
+        key = self._selected_prepared_key()
+        if not key:
+            self._failed("Select a prepared series first.")
+            return
+
+        def work():
+            delete_entry(key)
+            return key
+
+        self.host.start_task(work, lambda _key: self.refresh_prepared(), self._failed)
+
+    def rebuild_prepared(self) -> None:
+        from ...prepared import rebuild_entry
+
+        key = self._selected_prepared_key()
+        if not key:
+            self._failed("Select a prepared series first.")
+            return
+
+        def work():
+            rebuild_entry(key)
+            return key
+
+        self.host.start_task(work, lambda _key: self.refresh_prepared(), self._failed)
+
+    def show_prepared(self, rows: list) -> None:
+        self.prepared_table.set_records(
+            ("key", "kind", "symbol", "rows", "bytes"),
+            list(rows),
+        )
+        self.host.set_status(f"Prepared series: {len(rows)}")
+
     def _recorded(self, payload: dict) -> None:
         self.host.set_status(f"Recorded {payload['entry']['symbol']} in {payload['registry']}")
         if payload.get("document"):
@@ -266,7 +331,11 @@ class DataPage(QWidget):
             if payload.get("declared_splits"):
                 reason = "declared splits are recorded and not applied, so the series is not runnable"
             elif info.get("price_adjustment") != "raw":
-                reason = f"price kind is {info.get('price_adjustment')}, which this phase does not execute"
+                reason = (
+                    f"price kind is {info.get('price_adjustment')}. "
+                    "The raw price basis was refused. "
+                    "Pass --price-basis total_return to run this series when the split list is empty."
+                )
             self.banners.addWidget(Banner("error", f"NOT RUNNABLE. {info.get('symbol')}: {reason}."))
         for gap in payload.get("gaps") or []:
             self.banners.addWidget(Banner("error", f"GAP. {gap}."))

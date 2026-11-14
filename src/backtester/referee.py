@@ -23,13 +23,16 @@ import gc
 import json
 import math
 import os
+import selectors
+import struct
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import engine_arena, engine_desk
-from .data import frame_to_desk_bars, load_dividends, load_named
+from . import bar_ipc, engine_arena, engine_desk
+from .accounting import price_basis_refusal
+from .data import load_dividends, load_named, prepare_desk_bars
 from .engine_desk import DeskConfig
 from .profiles import get_profile
 from .report import enrich_arena_metrics, require_anonymizable_symbol, write_json
@@ -575,7 +578,17 @@ def _designer_score(strategy, prepared: Prepared, *, borrow_rate, financing_rate
         kwargs["reset_day"] = prepared.reset_day
     elif name == "desk":
         kwargs["warmup_sessions"] = prepared.live_start
+        kwargs["desk_bars"] = _desk_rows(prepared)
     return designer_execute(strategy, prepared.frame, name, **kwargs)
+
+
+def _desk_rows(prepared: Prepared):
+    """One normalized bar tuple per prepared book. Benchmarks reuse it."""
+    rows = getattr(prepared, "desk_bars", None)
+    if rows is None:
+        rows = prepare_desk_bars(prepared.frame)
+        prepared.desk_bars = rows
+    return rows
 
 
 def _score(
@@ -634,7 +647,7 @@ def _score(
     if name == "desk":
         rate = engine_desk.D.FINANCING_RATE_ANNUAL if financing_rate is None else financing_rate
         borrow = get_profile(name).borrow_rate_annual if borrow_rate is None else borrow_rate
-        rows = frame_to_desk_bars(prepared.frame)
+        rows = _desk_rows(prepared)
         result = engine_desk.run(
             strategy,
             rows,
@@ -723,10 +736,44 @@ class _Pipe:
         self._memory_cap = None
         self._rss_mark = None
         self._noted_byte = False
-        self._stdout_thread = threading.Thread(target=self._read_fd, args=(box.stdout_fd, False), daemon=True)
-        self._stderr_thread = threading.Thread(target=self._read_fd, args=(box.stderr_fd, True), daemon=True)
-        self._stdout_thread.start()
-        self._stderr_thread.start()
+        # Windows anonymous pipes are not selectable. POSIX reads the pipe
+        # directly so a helper thread is not on the bar path.
+        self._direct = os.name != "nt"
+        self._selector = None
+        if self._direct:
+            import fcntl
+
+            for fd in (box.stdout_fd, box.stderr_fd):
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            self._selector = selectors.DefaultSelector()
+            self._selector.register(box.stdout_fd, selectors.EVENT_READ, False)
+            self._selector.register(box.stderr_fd, selectors.EVENT_READ, True)
+        else:
+            self._stdout_thread = threading.Thread(target=self._read_fd, args=(box.stdout_fd, False), daemon=True)
+            self._stderr_thread = threading.Thread(target=self._read_fd, args=(box.stderr_fd, True), daemon=True)
+            self._stdout_thread.start()
+            self._stderr_thread.start()
+
+    def _absorb(self, chunk: bytes, *, stderr: bool) -> None:
+        if stderr:
+            self._err.extend(chunk)
+            if len(self._err) > 8000:
+                del self._err[:-8000]
+            return
+        if not chunk:
+            self._stdout_eof = True
+            return
+        if not self._awaiting:
+            self._protocol = "child wrote when no request was outstanding"
+        if not self._noted_byte:
+            self._noted_byte = True
+            from .sandbox import note_phase
+
+            note_phase("first-byte")
+        self._buf.extend(chunk)
+        if len(self._buf) > 1_000_000:
+            self._protocol = "child wrote more than 1 MB"
 
     def _read_fd(self, fd: int, stderr: bool) -> None:
         while True:
@@ -737,31 +784,40 @@ class _Pipe:
             with self._cv:
                 if self._closed:
                     return
-                if stderr:
-                    self._err.extend(chunk)
-                    if len(self._err) > 8000:
-                        del self._err[:-8000]
-                else:
-                    if not chunk:
-                        self._stdout_eof = True
-                    else:
-                        if not self._awaiting:
-                            self._protocol = "child wrote when no request was outstanding"
-                        if not self._noted_byte:
-                            self._noted_byte = True
-                            from .sandbox import note_phase
-
-                            note_phase("first-byte")
-                        self._buf.extend(chunk)
-                        if len(self._buf) > 1_000_000:
-                            self._protocol = "child wrote more than 1 MB"
+                self._absorb(chunk, stderr=stderr)
                 self._cv.notify_all()
                 if not chunk:
                     return
 
+    def _drain(self, timeout: float) -> None:
+        """Read what the child has already written. POSIX only."""
+        if self._selector is None:
+            return
+        try:
+            ready = self._selector.select(timeout)
+        except (OSError, ValueError):
+            self._stdout_eof = True
+            return
+        for key, _mask in ready:
+            while True:
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    chunk = b""
+                self._absorb(chunk, stderr=key.data)
+                if not chunk:
+                    try:
+                        self._selector.unregister(key.fd)
+                    except Exception:
+                        pass
+                    break
+
     def _write(self, payload: dict) -> None:
-        line = json.dumps(_jsonable(payload), separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
-        view = memoryview(line)
+        packed = bar_ipc.pack_bar(payload) if payload.get("op") == "bar" else None
+        frame = packed if packed is not None else bar_ipc.dumps(_jsonable(payload))
+        view = memoryview(frame)
         try:
             while view:
                 count = os.write(self.box.stdin_fd, view)
@@ -778,29 +834,52 @@ class _Pipe:
             return
         self._memory_cap = int(memory_bytes)
 
+    def _take_frame(self) -> bytes | None:
+        """One complete frame, or None when the length prefix is still short.
+
+        Bytes after that frame are a second message. The decision is one
+        frame, so those bytes are the same failure as a second JSON line.
+        """
+        if len(self._buf) < 4:
+            return None
+        (length,) = struct.unpack_from("<I", self._buf)
+        if length > bar_ipc.MAX_FRAME or len(self._buf) > 1_000_000:
+            self._protocol = "child wrote more than 1 MB"
+            raise Disqualified("protocol", self._protocol)
+        if len(self._buf) < 4 + length:
+            return None
+        body = bytes(self._buf[4 : 4 + length])
+        del self._buf[: 4 + length]
+        self._awaiting = False
+        if self._direct:
+            self._drain(0)
+        if self._buf:
+            self._protocol = "child wrote past the one-line decision"
+            raise Disqualified("protocol", self._protocol)
+        return body
+
     def _read_line(self, timeout: float, *, extend: bool = True) -> bytes:
         deadline = time.monotonic() + timeout
         while True:
+            if self._direct:
+                remaining = deadline - time.monotonic()
+                self._drain(max(0.0, remaining) if remaining > 0 else 0)
             with self._cv:
                 if self._protocol:
                     raise Disqualified("protocol", self._protocol)
-                newline = self._buf.find(b"\n")
-                if newline >= 0:
-                    line = bytes(self._buf[:newline])
-                    del self._buf[: newline + 1]
-                    if self._buf:
-                        self._protocol = "child wrote past the one-line decision"
-                        raise Disqualified("protocol", self._protocol)
-                    self._awaiting = False
-                    return line
+                body = self._take_frame()
+                if body is not None:
+                    return body
                 if self._stdout_eof:
                     detail = self._err.decode("utf-8", "replace").strip()
                     self._raise_if_jail(detail)
                     raise Disqualified("crash", detail or "strategy process closed the pipe")
                 remaining = deadline - time.monotonic()
-                if remaining > 0:
+                if not self._direct and remaining > 0:
                     self._cv.wait(remaining)
                     continue
+            if self._direct and deadline - time.monotonic() > 0:
+                continue
             # Hello is not the allocation. Extending it once doubled the
             # ready-wait to the parent's whole budget, so a child that never
             # wrote ready was reported as an empty pipe.
@@ -842,6 +921,8 @@ class _Pipe:
             raise SandboxError(detail or "the sandbox exited before the strategy started")
 
     def stderr_text(self) -> str:
+        if self._direct:
+            self._drain(0)
         with self._cv:
             return self._err.decode("utf-8", "replace").strip()
 
@@ -862,6 +943,8 @@ class _Pipe:
         return payload
 
     def decision(self, payload: dict, timeout: float):
+        if self._direct:
+            self._drain(0)
         with self._cv:
             if self._protocol:
                 raise Disqualified("protocol", self._protocol)
@@ -882,6 +965,8 @@ class _Pipe:
 
     def state(self, timeout: float) -> dict:
         """JSON-safe attributes the strategy stored on itself. Not a bar."""
+        if self._direct:
+            self._drain(0)
         with self._cv:
             if self._protocol:
                 raise Disqualified("protocol", self._protocol)
@@ -903,8 +988,8 @@ class _Pipe:
 
     def _message(self, line: bytes) -> dict:
         try:
-            payload = json.loads(line.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
+            payload = bar_ipc.loads(line)
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise Disqualified("protocol", "decision was not JSON") from exc
         if not isinstance(payload, dict):
             raise Disqualified("protocol", "decision was not an object")
@@ -914,6 +999,11 @@ class _Pipe:
         with self._cv:
             self._closed = True
             self._cv.notify_all()
+        if self._selector is not None:
+            try:
+                self._selector.close()
+            except Exception:
+                pass
 
 
 class _Remote:
@@ -1038,18 +1128,20 @@ def _load_side(
             raise ValueError(
                 "--share-factor is refused on a pack run. The sidecar holds the scale."
             )
-        from .pack import load_pack, load_sidecar, require_build_price_factor
+        from .pack import assert_anonymized_pack_clean, load_pack, load_sidecar, require_build_price_factor
 
-        loaded = load_pack(source)
         secret = load_sidecar(sidecar)
+        if bool(secret["anonymized"]):
+            require_anonymizable_symbol(str(secret["symbol"]))
         try:
+            symbol = str(secret["symbol"])
+            loaded = load_pack(source, symbol=symbol)
             if secret["pack_id"] != loaded.pack_id:
                 raise ValueError("sidecar does not match this pack")
             if bool(secret["anonymized"]) != loaded.anonymized:
                 raise ValueError("sidecar anonymized flag does not match the pack")
             price_factor = require_build_price_factor(secret)
             scale = float(secret["share_scale"])
-            symbol = str(secret["symbol"])
             anonymized = bool(secret["anonymized"])
             date_map = {str(key): str(value) for key, value in secret["date_map"].items()}
             if secret.get("borrow_rate_source") == "explicit":
@@ -1062,6 +1154,8 @@ def _load_side(
             gc.collect()
         if require_same_scale is not None and scale != require_same_scale:
             raise ValueError("train and hidden packs do not use the same share scale")
+        if anonymized:
+            assert_anonymized_pack_clean(source, symbol=symbol)
         frame = loaded.frame.copy()
         calendar = []
         for day in frame["day"].tolist():
@@ -1097,7 +1191,13 @@ def _load_side(
         raise ValueError("named data needs --ticker")
     loaded = load_named(source, ticker, bar_minutes=bar_minutes)
     if not loaded.inspection.runnable:
-        raise ValueError(f"{ticker} is not runnable. This phase executes raw prices only.")
+        raise ValueError(
+            price_basis_refusal(
+                str(ticker),
+                splits=bool(loaded.inspection.splits),
+                declared=str(loaded.inspection.price_adjustment),
+            )
+        )
     if loaded.inspection.share_factor != 1.0:
         raise ValueError("share_factor is not 1.0. Raw runs use 1.0. 0.9 is not a kit constant.")
     if require_same_scale not in (None, 1.0):

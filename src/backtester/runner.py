@@ -31,8 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import engine_arena, engine_desk
-from .accounting import normalize_price_basis, resolve_accounting, stamp_accounting
-from .data import WalkSlices, frame_to_desk_bars, load_named, slice_walkforward
+from .accounting import normalize_price_basis, price_basis_refusal, resolve_accounting, stamp_accounting
+from .data import WalkSlices, load_named, prepare_desk_bars, slice_walkforward
 from .engine_desk import BuyAndHold as DeskBuyAndHold
 from .engine_desk import DeskConfig, TwoXLong
 from .profiles import get_profile
@@ -330,25 +330,22 @@ def load_run_series(src, symbol: str, *, bar_minutes: int = 1, price_basis: str 
         entry = get_series(load_registry(registry_path), symbol)
         declared = str(entry["price_adjustment"])
         if entry.get("splits"):
-            raise ValueError(
-                f"{symbol} is {declared} and is not runnable. This phase executes raw prices only."
-            )
+            raise ValueError(price_basis_refusal(symbol, splits=True, declared=declared))
         if declared == "total_return" and basis != "total_return":
-            raise ValueError(
-                f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
-            )
+            raise ValueError(price_basis_refusal(symbol, splits=False, declared="total_return"))
     kind = "total_return" if declared == "total_return" and basis == "total_return" else "raw"
     loaded = load_named(src, symbol, bar_minutes=bar_minutes, splits=splits, price_kind=kind)
     if kind == "total_return":
         if loaded.inspection.splits:
-            raise ValueError(
-                f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
-            )
+            raise ValueError(price_basis_refusal(symbol, splits=True, declared="total_return"))
         return loaded, "total_return"
     if not loaded.inspection.runnable:
         raise ValueError(
-            f"{symbol} is {loaded.inspection.price_adjustment} and is not runnable. "
-            "This phase executes raw prices only."
+            price_basis_refusal(
+                symbol,
+                splits=bool(loaded.inspection.splits),
+                declared=str(loaded.inspection.price_adjustment),
+            )
         )
     return loaded, "raw"
 
@@ -373,6 +370,7 @@ def execute(
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
     accounting=None,
+    desk_bars=None,
 ):
     """Run one strategy instance on ``frame``.
 
@@ -440,7 +438,7 @@ def execute(
         return result, metrics
     if name == "desk":
         borrow = get_profile(name).borrow_rate_annual if borrow_rate_annual is None else borrow_rate_annual
-        rows = frame_to_desk_bars(frame)
+        rows = desk_bars if desk_bars is not None else prepare_desk_bars(frame)
         result = engine_desk.run(
             strategy,
             rows,
@@ -990,13 +988,19 @@ def _books_worker(queue, job):
 
                 note_phase("worker-released")
         spec = job["strategy"]
-        frame = job["frame"]
+        series = job.get("series")
+        frame = job.get("frame")
         profile = job["profile"]
         audience = job.get("audience") or "operator"
         kwargs = job["kwargs"]
         call_timeout = float(job.get("call_timeout", _JAIL_CALL_TIMEOUT_S))
         memory_cap = job.get("memory_bytes")
         job.clear()
+        if series:
+            from .prepared import load_frame
+
+            frame = load_frame(series)
+            del series
         if audience == "designer":
             _refuse_keys(kwargs, _DESIGNER_BANNED, "designer child")
         if spec.get("kind") == "path":
@@ -1105,10 +1109,12 @@ def _bind_strategy(strategy, *, in_process: bool):
                 strategy.__strategy_path__ = None
         return strategy, None
     if isinstance(strategy, (str, os.PathLike)):
-        return None, str(strategy)
+        # Absolute before any worker changes directory. A relative path
+        # resolved after that chdir points at the empty temp directory.
+        return None, os.path.abspath(strategy)
     path = getattr(strategy, "__strategy_path__", None)
     if path:
-        return None, str(path)
+        return None, os.path.abspath(path)
     return strategy, None
 
 
@@ -1569,9 +1575,10 @@ def _accept_child_books(profile: str, frame, child_books: dict, kwargs: dict) ->
         accounting=kwargs.get("accounting"),
     )
     billing = [float(kwargs.get("share_factor", 1.0))]
+    desk_bars = prepare_desk_bars(frame) if get_profile(profile).name == "desk" else None
     for label, cls in _benchmarks(get_profile(profile).name):
         bench_result, bench_metrics = execute(
-            cls(), frame, profile, share_factor=_release(billing), **common
+            cls(), frame, profile, share_factor=_release(billing), desk_bars=desk_bars, **common
         )
         billing.append(bench_metrics["share_factor"])
         child = child_books.get(label)
@@ -1605,6 +1612,26 @@ def _failure_from_message(message) -> WorkerFailure:
     return WorkerFailure(str(detail), tail=tail)
 
 
+def _series_for_child(frame, audience: str) -> str | None:
+    """Store ``frame`` and return its directory. The job does not carry the bars.
+
+    A designer audience only accepts a designer artifact. A failed write falls
+    back to pickling for an operator run. A designer frame that still contains
+    operator data is refused.
+    """
+    from .prepared import store_frame
+
+    kind = "designer" if audience == "designer" else "window"
+    try:
+        return str(store_frame(frame, kind=kind))
+    except ValueError:
+        if audience == "designer":
+            raise
+        return None
+    except Exception:
+        return None
+
+
 def _isolated_books(
     strategy_cls,
     frame,
@@ -1615,6 +1642,7 @@ def _isolated_books(
     memory_bytes=None,
     stop=None,
     strategy_path=None,
+    series_path=None,
     **kwargs,
 ):
     """Run ``run_books`` in a fresh spawned interpreter.
@@ -1665,9 +1693,16 @@ def _isolated_books(
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     gate = {"started": ctx.Event(), "release": ctx.Event()}
+    if frame is None and series_path is None:
+        raise ValueError("a jailed book needs a frame or a prepared series")
+    if series_path is not None and audience == "designer":
+        from .prepared import read_manifest
+
+        if read_manifest(series_path).get("kind") != "designer":
+            raise RuntimeError("designer child was given an operator series")
+    published = series_path if series_path is not None else _series_for_child(frame, audience)
     job = {
         "strategy": spec,
-        "frame": _standalone_frame(frame),
         "profile": profile,
         "audience": audience,
         "kwargs": _plain_kwargs(run_kwargs),
@@ -1675,6 +1710,10 @@ def _isolated_books(
         "memory_bytes": None if memory_bytes is None else int(memory_bytes),
         "gate": gate,
     }
+    if published is not None:
+        job["series"] = str(published)
+    else:
+        job["frame"] = _standalone_frame(frame)
     proc = None
     cwd = None
     guard = None
@@ -1725,11 +1764,26 @@ def _isolated_books(
             raise failure
         if proc.exitcode not in (0, None):
             raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n")
+        # The child has exited. Load the artifact only when this process still
+        # has to recompute benchmarks or accept a designer book. Until then the
+        # parent does not keep a second copy of the series.
+        wants_frame = audience == "designer" or bool(run_kwargs.get("with_benchmarks", True))
+        if frame is None:
+            if wants_frame:
+                from .prepared import load_frame
+
+                held = load_frame(published)
+            else:
+                held = None
+        elif series_path is not None and audience != "designer":
+            held = frame
+        else:
+            held = _standalone_frame(frame)
         if audience == "designer":
             from .designer_run import accept_books
 
-            return accept_books(profile, _standalone_frame(frame), message[1], run_kwargs)
-        return _accept_child_books(profile, _standalone_frame(frame), message[1], run_kwargs)
+            return accept_books(profile, held, message[1], run_kwargs)
+        return _accept_child_books(profile, held, message[1], run_kwargs)
     finally:
         # Success, a strategy exception, and a parent-side failure all come
         # through here. The group is signaled even when the worker has exited.
@@ -1784,15 +1838,18 @@ def run_books(
         withholding_rate=withholding_rate,
         accounting=accounting,
     )
+    desk_bars = prepare_desk_bars(frame) if get_profile(profile).name == "desk" else None
     strategy = strategy_cls()
-    result, metrics = execute(strategy, frame, profile, share_factor=_release(billing), **common)
+    result, metrics = execute(
+        strategy, frame, profile, share_factor=_release(billing), desk_bars=desk_bars, **common
+    )
     billing.append(metrics["share_factor"])
     books = {"strategy": (_tag_observer(result, strategy), metrics)}
     if with_benchmarks:
         for label, cls in _benchmarks(profile):
             bench = cls()
             bench_result, bench_metrics = execute(
-                bench, frame, profile, share_factor=_release(billing), **common
+                bench, frame, profile, share_factor=_release(billing), desk_bars=desk_bars, **common
             )
             billing.append(bench_metrics["share_factor"])
             books[label] = (_tag_observer(bench_result, bench), bench_metrics)
@@ -1944,20 +2001,41 @@ def run_named(
         cash_rate_annual=cash_rate_annual,
         withholding_rate=withholding_rate,
     )
+    inspection = loaded.inspection
+    series_path = loaded.prepared
     if bound_path is not None:
         if call_timeout is not None:
             book_kwargs["call_timeout"] = float(call_timeout)
-        books = _isolated_books(bound_cls, loaded.frame, profile, strategy_path=bound_path, **book_kwargs)
+        if series_path:
+            # The worker maps this artifact. Drop the parent's frame for the
+            # duration of the jail, then map it again to write the report.
+            loaded = None
+            gc.collect()
+            books = _isolated_books(
+                bound_cls,
+                None,
+                profile,
+                strategy_path=bound_path,
+                series_path=series_path,
+                **book_kwargs,
+            )
+            from .prepared import load_frame
+
+            report_frame = load_frame(series_path)
+        else:
+            report_frame = loaded.frame
+            books = _isolated_books(bound_cls, report_frame, profile, strategy_path=bound_path, **book_kwargs)
     else:
-        books = run_books(bound_cls, loaded.frame, profile, **book_kwargs)
+        report_frame = loaded.frame
+        books = run_books(bound_cls, report_frame, profile, **book_kwargs)
     payload = write_books(
         out_dir,
         profile,
         symbol,
         bar_minutes,
-        loaded.frame,
+        report_frame,
         books,
-        extra={"warnings": warnings, "inspection": loaded.inspection.as_dict()},
+        extra={"warnings": warnings, "inspection": inspection.as_dict()},
     )
     _write_child_surface(out_dir, books)
     return payload
@@ -2289,8 +2367,12 @@ def run_pack(
 
     if _report_inside_pack(pack_dir, out_dir):
         raise ValueError("the report must not live inside the pack directory")
-    loaded = load_pack(pack_dir)
     secret = load_sidecar(sidecar_path, allow_scale_mismatch=allow_scale_mismatch)
+    if bool(secret["anonymized"]):
+        from .report import require_anonymizable_symbol
+
+        require_anonymizable_symbol(str(secret["symbol"]))
+    loaded = load_pack(pack_dir, symbol=str(secret["symbol"]))
     if secret["pack_id"] != loaded.pack_id:
         raise ValueError("sidecar does not match this pack")
     if bool(secret["anonymized"]) != loaded.anonymized:
@@ -2303,7 +2385,7 @@ def run_pack(
     basis = normalize_price_basis(price_basis)
     if series_kind == "total_return" and basis != "total_return":
         raise ValueError(
-            f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
+            price_basis_refusal(symbol, splits=False, declared="total_return")
         )
     if anonymized:
         from .pack import assert_anonymized_pack_clean
@@ -2432,8 +2514,12 @@ def walk_pack(
         raise ValueError("the report must not live inside the pack directory")
     strategy, strategy_path = _bind_strategy(strategy_cls, in_process=False)
     strategy_cls = strategy
-    loaded = load_pack(pack_dir)
     secret = load_sidecar(sidecar_path)
+    if bool(secret["anonymized"]):
+        from .report import require_anonymizable_symbol
+
+        require_anonymizable_symbol(str(secret["symbol"]))
+    loaded = load_pack(pack_dir, symbol=str(secret["symbol"]))
     if secret["pack_id"] != loaded.pack_id:
         raise ValueError("sidecar does not match this pack")
     if bool(secret["anonymized"]) != loaded.anonymized:
@@ -2446,7 +2532,7 @@ def walk_pack(
     basis = normalize_price_basis(price_basis)
     if series_kind == "total_return" and basis != "total_return":
         raise ValueError(
-            f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
+            price_basis_refusal(symbol, splits=False, declared="total_return")
         )
     if anonymized:
         from .pack import assert_anonymized_pack_clean

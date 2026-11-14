@@ -13,7 +13,11 @@ import math
 from dataclasses import dataclass, fields
 from types import SimpleNamespace
 
+import numpy as np
+import pandas as pd
+
 from . import costs_desk as D
+from .frame_columns import CLOCK_TEXT, categorical_codes
 from .accounting import dividend_cash, idle_base, require_annual_rate, require_withholding_rate, session_accrual
 
 
@@ -136,6 +140,97 @@ def _trade_count(value, index: int) -> float:
     if not math.isfinite(count):
         raise ValueError(f"bar {index} count is not finite")
     return count
+
+
+class _DeskTable:
+    """Columnar desk bars. One strategy view is built per call, not per row stored."""
+
+    def __init__(self, session_codes, session_labels, phase_codes, phase_labels, minute, open_, high, low, close, volume, wap, count, filled):
+        self.session_codes = np.asarray(session_codes)
+        self.session_labels = tuple(session_labels)
+        self.phase_codes = np.asarray(phase_codes)
+        self.phase_labels = tuple(phase_labels)
+        self.minute = np.asarray(minute)
+        self.open = np.asarray(open_, dtype=np.float64)
+        self.high = np.asarray(high, dtype=np.float64)
+        self.low = np.asarray(low, dtype=np.float64)
+        self.close = np.asarray(close, dtype=np.float64)
+        self.volume = np.asarray(volume, dtype=np.float64)
+        self.wap = np.asarray(wap, dtype=np.float64)
+        self.count = np.asarray(count, dtype=np.float64)
+        self.filled = np.asarray(filled)
+        self.n = int(len(self.close))
+
+    def session_str(self, index: int) -> str:
+        return self.session_labels[int(self.session_codes[index])]
+
+    def phase_str(self, index: int) -> str:
+        return self.phase_labels[int(self.phase_codes[index])]
+
+    def time_str(self, index: int) -> str:
+        return CLOCK_TEXT[int(self.minute[index])]
+
+    def field(self, index: int, key: str):
+        if key == "session":
+            return self.session_str(index)
+        if key == "phase":
+            return self.phase_str(index)
+        if key == "minute":
+            return int(self.minute[index])
+        if key == "time":
+            return self.time_str(index)
+        if key == "open":
+            return float(self.open[index])
+        if key == "high":
+            return float(self.high[index])
+        if key == "low":
+            return float(self.low[index])
+        if key == "close":
+            return float(self.close[index])
+        if key == "volume":
+            return float(self.volume[index])
+        if key == "wap":
+            return float(self.wap[index])
+        if key == "count":
+            return float(self.count[index])
+        if key == "filled":
+            return int(self.filled[index])
+        raise KeyError(key)
+
+
+class _DeskRow:
+    """One bar. The table is shared; only the index changes between calls."""
+
+    __slots__ = ("table", "index")
+
+    def __init__(self, table: _DeskTable):
+        self.table = table
+        self.index = 0
+
+    def __getitem__(self, key):
+        try:
+            return self.table.field(self.index, key)
+        except KeyError:
+            raise KeyError(key) from None
+
+    def get(self, key, default=None):
+        try:
+            return self.table.field(self.index, key)
+        except KeyError:
+            return default
+
+
+class PreparedDeskBars:
+    """Bars validated once. ``run`` does not copy them into a dict per row."""
+
+    def __init__(self, table: _DeskTable):
+        self.table = table
+
+    def __len__(self):
+        return self.table.n
+
+    def __bool__(self):
+        return self.table.n > 0
 
 
 def normalize_bars(bars):
@@ -638,6 +733,220 @@ def _reported_config(cfg) -> dict:
     return reported
 
 
+def _first_index(mask) -> int | None:
+    found = np.flatnonzero(mask)
+    if len(found) == 0:
+        return None
+    return int(found[0])
+
+
+def _reject_frame(index: int, kind: str, session, phase, minute) -> None:
+    if kind == "phase":
+        raise ValueError(f"bar {index} phase {phase!r} is not pre, rth, or post")
+    if kind == "price":
+        raise ValueError(f"bar {index} has a non-positive price")
+    if kind == "ohlc":
+        raise ValueError(f"bar {index} OHLC is inconsistent")
+    if kind == "volume":
+        raise ValueError(f"bar {index} has negative volume")
+    if kind == "count":
+        raise ValueError(f"bar {index} count is not a number")
+    if kind == "count-finite":
+        raise ValueError(f"bar {index} count is not finite")
+    if kind == "filled":
+        raise ValueError(f"bar {index} filled flag must be 0 or 1")
+    if kind == "session":
+        raise ValueError(f"session {session} is not contiguous")
+    if kind == "minute":
+        raise ValueError(f"session {session} minute {minute} is not increasing")
+    raise ValueError(f"bar {index} is missing {kind}")
+
+
+def table_from_frame(frame) -> _DeskTable:
+    """Validate a frame the way ``normalize_bars`` does, without a dict per bar."""
+    if frame is None or len(frame) == 0:
+        raise ValueError("desk engine received no bars")
+    required = ("session", "date", "minute", "open", "high", "low", "close")
+    missing = [name for name in required if name not in frame.columns]
+    if missing:
+        raise ValueError(f"bar 0 is missing '{missing[0]}'")
+    session_codes, session_labels = categorical_codes(frame["date"])
+    phase_codes, phase_labels = categorical_codes(frame["session"])
+    minute = frame["minute"].to_numpy(copy=False)
+    open_ = frame["open"].to_numpy(dtype=np.float64, copy=False)
+    high = frame["high"].to_numpy(dtype=np.float64, copy=False)
+    low = frame["low"].to_numpy(dtype=np.float64, copy=False)
+    close = frame["close"].to_numpy(dtype=np.float64, copy=False)
+    volume = frame["volume"].to_numpy(dtype=np.float64, copy=False) if "volume" in frame.columns else np.zeros(len(frame))
+    if "wap" in frame.columns:
+        wap = frame["wap"].to_numpy(dtype=np.float64, copy=False)
+    else:
+        wap = close
+    if "count" in frame.columns:
+        count = frame["count"].to_numpy(dtype=np.float64, copy=False)
+    else:
+        count = np.zeros(len(frame), dtype=np.float64)
+    if "filled" in frame.columns:
+        filled = frame["filled"].to_numpy(copy=False)
+    else:
+        filled = np.zeros(len(frame), dtype=np.int64)
+    phase_ok = np.ones(len(frame), dtype=bool)
+    for code, label in enumerate(phase_labels):
+        if label not in {"pre", "rth", "post"}:
+            phase_ok &= phase_codes != code
+    price_ok = np.isfinite(open_) & np.isfinite(high) & np.isfinite(low) & np.isfinite(close)
+    price_ok &= (open_ > 0.0) & (high > 0.0) & (low > 0.0) & (close > 0.0)
+    ohlc_bad = (high < low) | (high < open_) | (high < close) | (low > open_) | (low > close)
+    volume_bad = volume < 0.0
+    count_bad = ~np.isfinite(count)
+    filled_num = filled.astype(np.float64, copy=False)
+    filled_bad = (filled_num != 0.0) & (filled_num != 1.0)
+    session_bad_at = None
+    if len(session_codes):
+        changes = np.flatnonzero(np.diff(session_codes)) + 1
+        run_codes = session_codes[np.r_[0, changes]]
+        _, run_counts = np.unique(run_codes, return_counts=True)
+        if bool(np.any(run_counts > 1)):
+            seen = set()
+            previous = None
+            for index, code in enumerate(session_codes.tolist()):
+                if code == previous:
+                    continue
+                if code in seen:
+                    session_bad_at = index
+                    break
+                seen.add(code)
+                previous = code
+    minute_bad = None
+    if len(minute) > 1:
+        same = session_codes[1:] == session_codes[:-1]
+        stalled = same & (minute[1:] <= minute[:-1])
+        found = _first_index(stalled)
+        if found is not None:
+            minute_bad = found + 1
+    checks = (
+        ("phase", _first_index(~phase_ok)),
+        ("price", _first_index(~price_ok)),
+        ("ohlc", _first_index(ohlc_bad)),
+        ("volume", _first_index(volume_bad)),
+        ("count-finite", _first_index(count_bad)),
+        ("filled", _first_index(filled_bad)),
+        ("session", session_bad_at),
+        ("minute", minute_bad),
+    )
+    ranked = [(index, order, kind) for order, (kind, index) in enumerate(checks) if index is not None]
+    if ranked:
+        index, _order, kind = min(ranked)
+        _reject_frame(
+            index,
+            kind,
+            session_labels[int(session_codes[index])],
+            phase_labels[int(phase_codes[index])] if int(phase_codes[index]) >= 0 else "",
+            int(minute[index]),
+        )
+    return _DeskTable(
+        session_codes,
+        session_labels,
+        phase_codes,
+        phase_labels,
+        minute,
+        open_,
+        high,
+        low,
+        close,
+        volume,
+        wap,
+        count,
+        filled,
+    )
+
+
+def table_from_rows(rows) -> _DeskTable:
+    """Arrays from bars ``normalize_bars`` already accepted."""
+    if not rows:
+        raise ValueError("desk engine received no bars")
+    session_labels = []
+    session_of = {}
+    phase_labels = []
+    phase_of = {}
+    session_codes = np.empty(len(rows), dtype=np.int32)
+    phase_codes = np.empty(len(rows), dtype=np.int8)
+    minute = np.empty(len(rows), dtype=np.int32)
+    open_ = np.empty(len(rows), dtype=np.float64)
+    high = np.empty(len(rows), dtype=np.float64)
+    low = np.empty(len(rows), dtype=np.float64)
+    close = np.empty(len(rows), dtype=np.float64)
+    volume = np.empty(len(rows), dtype=np.float64)
+    wap = np.empty(len(rows), dtype=np.float64)
+    count = np.empty(len(rows), dtype=np.float64)
+    filled = np.empty(len(rows), dtype=np.int8)
+    for index, row in enumerate(rows):
+        session = row["session"]
+        phase = row["phase"]
+        if session not in session_of:
+            session_of[session] = len(session_labels)
+            session_labels.append(session)
+        if phase not in phase_of:
+            phase_of[phase] = len(phase_labels)
+            phase_labels.append(phase)
+        session_codes[index] = session_of[session]
+        phase_codes[index] = phase_of[phase]
+        minute[index] = row["minute"]
+        open_[index] = row["open"]
+        high[index] = row["high"]
+        low[index] = row["low"]
+        close[index] = row["close"]
+        volume[index] = row["volume"]
+        wap[index] = row["wap"]
+        count[index] = row["count"]
+        filled[index] = row["filled"]
+    return _DeskTable(
+        session_codes,
+        session_labels,
+        phase_codes,
+        phase_labels,
+        minute,
+        open_,
+        high,
+        low,
+        close,
+        volume,
+        wap,
+        count,
+        filled,
+    )
+
+
+def _session_index_table(table: _DeskTable):
+    """Per-bar session ordinal, last RTH index, and last bar index."""
+    codes = table.session_codes
+    n = table.n
+    ordinals = np.zeros(n, dtype=np.int32)
+    if n > 1:
+        changes = np.flatnonzero(np.diff(codes)) + 1
+        ordinals[changes] = 1
+        np.cumsum(ordinals, out=ordinals)
+    else:
+        changes = np.array([], dtype=int)
+    starts = np.r_[0, changes]
+    ends = np.r_[changes, n]
+    last_rth = {}
+    last_index = {}
+    rth_codes = {index for index, label in enumerate(table.phase_labels) if label == "rth"}
+    for start, end in zip(starts.tolist(), ends.tolist()):
+        label = table.session_labels[int(codes[start])]
+        last = end - 1
+        last_index[label] = last
+        if not rth_codes:
+            continue
+        phase = table.phase_codes[start:end]
+        for code in rth_codes:
+            hits = np.flatnonzero(phase == code)
+            if len(hits):
+                last_rth[label] = start + int(hits[-1])
+    return ordinals, last_rth, last_index
+
+
 def run(strategy, bars, config=None):
     """Simulate `strategy` on desk rules. `bars` is a frame or a sequence of mappings."""
     cfg = config if config is not None else DeskConfig()
@@ -649,8 +958,16 @@ def run(strategy, bars, config=None):
         # The operator path, cost_model None, still binds it.
         cfg = _without_share_factor(cfg)
         config = cfg
-    rows = normalize_bars(bars)
-    ordinals, last_rth, last_index = _session_index(rows)
+    if isinstance(bars, PreparedDeskBars):
+        if not bars:
+            raise ValueError("desk engine received no bars")
+        table = bars.table
+    elif isinstance(bars, pd.DataFrame) and "date" in getattr(bars, "columns", ()) and "phase" not in bars.columns:
+        table = table_from_frame(bars)
+    else:
+        table = table_from_rows(normalize_bars(bars))
+    ordinals, last_rth, last_index = _session_index_table(table)
+    row = _DeskRow(table)
     book = _Book(cfg)
     entered_live = False
     warmup_account = {
@@ -665,9 +982,10 @@ def run(strategy, bars, config=None):
         "liquidated": False,
     }
 
-    for index, row in enumerate(rows):
-        ordinal = ordinals[index]
-        new_session = index == 0 or rows[index - 1]["session"] != row["session"]
+    for index in range(table.n):
+        row.index = index
+        ordinal = int(ordinals[index])
+        new_session = index == 0 or table.session_codes[index] != table.session_codes[index - 1]
         live = ordinal >= cfg.live_start_ordinal
         view = _strategy_bar(row, new_session)
         if not live:

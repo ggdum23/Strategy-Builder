@@ -225,6 +225,32 @@ def dividend_cash(shares, amount, withholding_rate: float) -> float:
     return shares * amount
 
 
+def price_basis_refusal(symbol: str | None, *, splits: bool, declared: str | None = None) -> str:
+    """The raw price basis was refused.
+
+    An empty split list names ``--price-basis total_return``. A declared
+    split list says that opt-in does not run the series. Prices are not
+    rewritten on either path. ``declared`` is the stored adjustment
+    (``raw`` or ``total_return``).
+    """
+    kind = "total_return" if declared is None else str(declared)
+    who = f"{symbol} is {kind}" if symbol else f"series is {kind}"
+    head = f"{who} and is not runnable. "
+    if splits:
+        return (
+            head
+            + "A declared split list is not applied. "
+            + "--price-basis total_return does not run a series with splits. "
+            + "Prices are not rewritten."
+        )
+    return (
+        head
+        + "The raw price basis was refused. "
+        + "Pass --price-basis total_return to run this series. "
+        + "Prices are not rewritten."
+    )
+
+
 def resolve_accounting(
     profile: str,
     *,
@@ -259,9 +285,7 @@ def resolve_accounting(
     )
     has_dividends = bool(dividends)
     if kind == "total_return" and basis != "total_return":
-        raise ValueError(
-            f"series is total_return and is not runnable. This phase executes raw prices only."
-        )
+        raise ValueError(price_basis_refusal(None, splits=False))
     if kind == "total_return":
         if has_dividends:
             raise ValueError(

@@ -38,7 +38,14 @@ from concurrent.futures import FIRST_COMPLETED
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .accounting import normalize_price_basis, normalize_series_kind, require_annual_rate, require_withholding_rate, resolve_accounting
+from .accounting import (
+    normalize_price_basis,
+    normalize_series_kind,
+    price_basis_refusal,
+    require_annual_rate,
+    require_withholding_rate,
+    resolve_accounting,
+)
 from .designer_allow import designer_source_id
 from .designer_ids import strategy_id_has_calendar
 from .profiles import get_profile
@@ -164,6 +171,7 @@ class _Prepared:
     inspection: dict | None
     series_kind: str = "raw"
     designer_dividends: dict | None = None
+    prepared_path: str | None = None
 
 
 class _Stop:
@@ -223,13 +231,12 @@ def _both_books(frame, *, anonymized: bool, designer, operator):
     """
     if not anonymized:
         return None, operator(frame)
-    designer_frame = frame.copy(deep=True)
     designer_books = None
     books = None
     designer_error = None
     operator_error = None
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="bt-designer") as pool:
-        pending = pool.submit(designer, designer_frame)
+        pending = pool.submit(designer, frame)
         try:
             books = operator(frame)
         except Exception as exc:
@@ -347,13 +354,36 @@ def run_parallel(
             require_anonymizable_symbol(market.symbol)
 
     out.mkdir(parents=True, exist_ok=True)
+    from .prepared import store_frame
+
+    shared_series: dict[int, str | None] = {}
+    for market in prepared:
+        try:
+            if market.anonymized:
+                shared_series[id(market)] = str(
+                    store_frame(market.frame, kind="designer", symbol=str(market.symbol))
+                )
+            elif market.prepared_path:
+                # The named artifact is already the series. Mapping it again
+                # shares the file pages. A window copy would be a second set.
+                shared_series[id(market)] = str(market.prepared_path)
+            else:
+                shared_series[id(market)] = str(store_frame(market.frame, kind="window"))
+        except Exception:
+            shared_series[id(market)] = None
+        if shared_series[id(market)] is not None:
+            # Workers map this artifact. The parent thread reloads it after
+            # the child exits, to write the report.
+            market.frame = None
+    gc.collect()
     assignments = []
     for ref, market in pairs:
         if isinstance(market, _Prepared):
-            frame = runner_mod._standalone_frame(market.frame)
+            series = shared_series.get(id(market))
+            carried = series if series is not None else runner_mod._standalone_frame(market.frame)
         else:
-            frame = None
-        assignments.append((ref, market, frame))
+            carried = None
+        assignments.append((ref, market, carried))
     # Windows folds ZzZx and zzzx onto one directory. Reserve names before the
     # workers start so two threads never write the same equity.png.
     job_dirs = _job_directories(out, assignments)
@@ -391,7 +421,14 @@ def run_parallel(
             )
 
     def one(assignment):
-        ref, market, frame = assignment
+        ref, market, carried = assignment
+        series_path = carried if isinstance(carried, str) else None
+        if isinstance(market, _Prepared) and series_path is not None:
+            # The worker maps the artifact. This thread does not keep a copy
+            # while that child is running.
+            frame = None
+        else:
+            frame = carried
         source_id = _pair_source(market)
         directory = job_dirs[(ref.strategy_id, source_id)]
         if stop.cancelled():
@@ -454,6 +491,7 @@ def run_parallel(
                     memory_bytes=memory_bytes,
                     stop=stop,
                     strategy_path=ref.path,
+                    series_path=series_path,
                 )
 
             def operator_call(operator_frame):
@@ -467,6 +505,7 @@ def run_parallel(
                     dividends=market.dividends,
                     initial_equity=initial_equity,
                     anonymized=market.anonymized,
+                    series_path=series_path,
                     **common,
                 )
 
@@ -476,6 +515,10 @@ def run_parallel(
                 designer=designer_call,
                 operator=operator_call,
             )
+            if frame is None:
+                from .prepared import load_frame
+
+                frame = load_frame(series_path)
             extra = {
                 "warnings": [],
                 "anonymized": market.anonymized,
@@ -729,6 +772,11 @@ def _prepare_markets(markets, dividends, borrow_rate_annual, runner_mod, *, pric
             )
         except Exception as exc:
             if isinstance(market, PackMarket):
+                # A reserved ticker aborts the batch before any report directory
+                # exists. Other pack failures stay per-job so one bad pack
+                # does not drop the rest of the batch.
+                if "reserved report name" in str(exc):
+                    raise
                 source_id = market.source_id or _path_source_id(market.pack_dir)
                 try:
                     _safe_component(source_id)
@@ -783,6 +831,7 @@ def _prepare_one(market, dividends, borrow_rate_annual, runner_mod, *, price_bas
             pack_id=None,
             inspection=loaded.inspection.as_dict(),
             series_kind=series_kind,
+            prepared_path=loaded.prepared,
         )
     if isinstance(market, PackMarket):
         return _prepare_pack(
@@ -798,9 +847,11 @@ def _prepare_one(market, dividends, borrow_rate_annual, runner_mod, *, price_bas
 def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod, *, price_basis) -> _Prepared:
     from .pack import load_pack, load_sidecar, require_build_price_factor
 
-    loaded = load_pack(market.pack_dir)
     secret = load_sidecar(market.sidecar_path)
+    if bool(secret["anonymized"]):
+        require_anonymizable_symbol(str(secret["symbol"]))
     try:
+        loaded = load_pack(market.pack_dir, symbol=str(secret["symbol"]))
         if secret["pack_id"] != loaded.pack_id:
             raise ValueError("sidecar does not match this pack")
         if bool(secret["anonymized"]) != loaded.anonymized:
@@ -830,9 +881,7 @@ def _prepare_pack(market: PackMarket, dividends, borrow_rate_annual, runner_mod,
         pack_id = str(loaded.pack_id)
         series_kind = str(loaded.manifest["price_basis"])
         if series_kind == "total_return" and price_basis != "total_return":
-            raise ValueError(
-                f"{symbol} is total_return and is not runnable. This phase executes raw prices only."
-            )
+            raise ValueError(price_basis_refusal(symbol, splits=False, declared="total_return"))
         if anonymized:
             source_id = f"pack_{pack_id[:12]}"
         else:

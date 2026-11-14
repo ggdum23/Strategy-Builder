@@ -12,7 +12,7 @@ The file is JSON, `schema_version` 1. JSON is the registry format because the re
 | `columns` | The required filled-file columns only. Any other column is an error. The loader reads those columns by name, so their order in the file does not matter. |
 | `timezone` | Offsets actually observed on `timestamp_et`. A daylight-time pair is the two US Eastern offsets one hour apart. Any other offset contradicts the column name and the ingest fails. |
 | `session_segments` | Clock window inferred for each label: modal first minute, last minute, and bar count, plus variants, gaps, and the engine phase. `hours_assumed` is always false. |
-| `price_adjustment` | `raw` or `total_return`. Total-return is recorded and is not runnable in this phase. Prices are not rewritten. |
+| `price_adjustment` | `raw` or `total_return`. Total-return is stored with `runnable: false`. A raw run is refused. `run --price-basis total_return` runs it when the split list is empty. Prices are not rewritten. |
 | `splits` | Declared `YYYY-MM-DD` and ratio. Recorded, not applied. A non-empty list is not runnable. |
 | `fill_policy` | `flag_present_none_set` when every `filled` flag is 0, or `stale_forward_fill` when `filled=1` bars are flat, zero-volume, and equal to the previous close. Anything else fails. |
 | `native_tick` | Greatest common grid of the trade prices (open, high, low, close), not of WAP. Fewer than two distinct prices fails. |
