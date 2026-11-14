@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -729,6 +730,67 @@ class Strategy:
 """,
     )
     assert probe(path, deny_paths=[tmp_path], call_timeout=5, startup_timeout=20) == 0.0
+
+
+def test_a_cache_inside_the_runtime_prefix_is_refused(tmp_path, monkeypatch):
+    """A prefix that contains the cache is not mounted.
+
+    The prefix root holds a symlink to a file outside the tree and a
+    hardlink of the cache marker. Both backends refuse before a child
+    starts, so neither name is granted.
+    """
+    _needs_jail()
+    import backtester.sandbox as sandbox
+
+    parent = tmp_path / "denied_probe"
+    prefix = parent / ".venv"
+    cache = prefix / "prepared-cache"
+    cache.mkdir(parents=True)
+    marker = cache / "marker.txt"
+    marker.write_text("SB-NESTED-CACHE", encoding="utf-8")
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("OUTSIDE", encoding="utf-8")
+    link = prefix / "link-outside"
+    try:
+        os.symlink(outside, link)
+    except OSError:
+        if sys.platform != "win32":
+            raise
+    else:
+        assert link.is_symlink()
+    hard = prefix / "hard-cache"
+    os.link(marker, hard)
+    assert hard.stat().st_ino == marker.stat().st_ino
+    (prefix / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(cache))
+    monkeypatch.setattr(sandbox, "_interpreter_venv", lambda: prefix.resolve())
+    real_roots = sandbox._runtime_roots
+
+    def roots():
+        found = real_roots()
+        extra = prefix.resolve()
+        if extra not in found:
+            found.append(extra)
+        return found
+
+    monkeypatch.setattr(sandbox, "_runtime_roots", roots)
+    path = _write(
+        tmp_path / "read_nested.py",
+        """
+class Strategy:
+    def on_bar(self, bar, state):
+        return 0.0
+""",
+    )
+
+    def expect_refusal() -> None:
+        with pytest.raises(SandboxError, match="STRATEGY_BUILDER_PREPARED_DIR"):
+            probe(path, deny_paths=[parent], call_timeout=30)
+
+    expect_refusal()
+    if sys.platform == "linux" and sandbox._landlock_available():
+        monkeypatch.setattr(sandbox, "_bwrap_available", lambda: False)
+        expect_refusal()
 
 
 def test_windows_environment_block_is_sorted_and_terminated(monkeypatch):

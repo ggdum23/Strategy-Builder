@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -56,21 +57,75 @@ _ISO_DATE = __import__("re").compile(r"\d{4}-\d{2}-\d{2}")
 LAST_CACHE_ERROR: BaseException | None = None
 
 
+def _runtime_prefixes() -> list[Path]:
+    """Interpreter locations. The default cache is not placed inside them."""
+    found: list[Path] = []
+    for raw in (sys.prefix, getattr(sys, "base_prefix", ""), os.path.dirname(sys.executable)):
+        if not raw:
+            continue
+        try:
+            path = Path(raw).resolve()
+        except OSError:
+            path = Path(os.path.abspath(raw))
+        if path not in found:
+            found.append(path)
+    return found
+
+
+def _inside_any(path: Path, roots: list[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = Path(os.path.abspath(path))
+    return any(resolved == root or root in resolved.parents for root in roots)
+
+
+def _default_cache_outside_runtime(path: Path) -> Path:
+    """Move a computed default that landed inside the interpreter.
+
+    An explicit ``STRATEGY_BUILDER_PREPARED_DIR`` is not passed here. That
+    path stays where the operator put it, and the launch refuses it.
+    """
+    prefixes = _runtime_prefixes()
+    if not _inside_any(path, prefixes):
+        return path
+    try:
+        current = path.resolve()
+    except OSError:
+        current = Path(os.path.abspath(path))
+    while _inside_any(current, prefixes):
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    anchor = Path(current.anchor) if current.anchor else current
+    if current == anchor or _inside_any(current, prefixes):
+        fallback = Path(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp")
+        if _inside_any(fallback, prefixes):
+            fallback = fallback.parent
+        return fallback / "strategy-builder" / "prepared"
+    return current / "strategy-builder" / "prepared"
+
+
 def default_cache_dir() -> Path:
     """The prepared-data directory for this machine.
 
-    ``STRATEGY_BUILDER_PREPARED_DIR`` wins. Windows uses LOCALAPPDATA.
-    Everywhere else uses ``$XDG_CACHE_HOME`` or ``~/.cache``.
+    ``STRATEGY_BUILDER_PREPARED_DIR`` wins, including a path inside the
+    interpreter. The computed default never sits inside the interpreter
+    prefix. Windows uses LOCALAPPDATA. Everywhere else uses
+    ``$XDG_CACHE_HOME`` or ``~/.cache``.
     """
     override = os.environ.get("STRATEGY_BUILDER_PREPARED_DIR")
     if override:
         return Path(override)
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        return Path(base) / "strategy-builder" / "prepared"
-    xdg = os.environ.get("XDG_CACHE_HOME")
-    root = Path(xdg) if xdg else Path.home() / ".cache"
-    return root / "strategy-builder" / "prepared"
+        chosen = Path(base) / "strategy-builder" / "prepared"
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME")
+        root = Path(xdg) if xdg else Path.home() / ".cache"
+        chosen = root / "strategy-builder" / "prepared"
+    return _default_cache_outside_runtime(chosen)
 
 
 def max_bytes() -> int:
@@ -786,7 +841,38 @@ def _sweep_partials(root: Path) -> None:
             shutil.rmtree(child, ignore_errors=True)
 
 
+def _drop_cache_entry(child: Path) -> bool:
+    """Remove one cache directory. True only when this delete finished.
+
+    A Windows sharing violation leaves the directory in place. Retry only
+    when the delete raises and the directory is still there. A delete that
+    returns has finished; a directory published again under the same name
+    is a new entry and is not removed by this pass.
+    """
+    for _attempt in range(2):
+        if not child.exists():
+            return True
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            continue
+        return True
+    return not child.exists()
+
+
 def _enforce_budget(root: Path, *, keep: str) -> None:
+    """Drop oldest entries until the directory is within ``max_bytes``.
+
+    The size is subtracted only after the directory is confirmed gone. A
+    delete that raises is retried once and then skipped, so an open handle
+    does not free budget that is still on disk. A delete that returns is
+    finished, and a directory published again under that name stays.
+
+    An entry that is already mapped stays readable until that mapping is
+    dropped. Unlinking the directory does not unmap it. The published files
+    are immutable after the rename. The next open hashes them again and
+    deletes the directory when the BLAKE2b or the row count does not match.
+    """
     cap = max_bytes()
     entries = []
     total = 0
@@ -806,7 +892,8 @@ def _enforce_budget(root: Path, *, keep: str) -> None:
             break
         if child.name == keep:
             continue
-        shutil.rmtree(child, ignore_errors=True)
+        if not _drop_cache_entry(child):
+            continue
         total -= size
 
 

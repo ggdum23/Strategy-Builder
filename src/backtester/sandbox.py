@@ -598,6 +598,10 @@ def launch(
         for banned in denied:
             if work == banned or banned in work.parents or work in banned.parents:
                 raise SandboxError("the private directory overlaps a denied directory")
+        # A runtime mount covers every name under it. A denied directory
+        # there would be readable, including through a second hardlink, so
+        # the launch stops before either backend builds a rule.
+        _refuse_denied_inside_runtime(denied)
         if sys.platform == "win32":
             backend = "windows"
         elif sys.platform == "linux" and _bwrap_available():
@@ -1264,6 +1268,69 @@ def _under_tmp(path: Path) -> bool:
     except OSError:
         tmp = Path("/tmp")
     return resolved == tmp or tmp in resolved.parents
+
+
+def _abs_path(path) -> Path:
+    try:
+        return Path(path).resolve()
+    except OSError:
+        return Path(os.path.abspath(path))
+
+
+def nested_runtime_deny_error(root, denied) -> str | None:
+    """None when ``denied`` is not strictly inside ``root``.
+
+    A mount of ``root`` would expose ``denied``. The launch refuses instead
+    of trying to hide one child. The sentence names the setting that moves
+    the prepared cache.
+    """
+    if not root or not denied:
+        return None
+    root_path = _abs_path(root)
+    denied_path = _abs_path(denied)
+    if denied_path == root_path or root_path not in denied_path.parents:
+        return None
+    return (
+        "a denied directory is inside the Python runtime "
+        f"{root_path}. Move the cache with STRATEGY_BUILDER_PREPARED_DIR, "
+        "or use a virtualenv that does not contain it."
+    )
+
+
+def _runtime_mounts() -> list[Path]:
+    """Directories a jail would mount or grant."""
+    mounts: list[Path] = []
+
+    def add(path) -> None:
+        if not path:
+            return
+        candidate = Path(path)
+        if candidate not in mounts:
+            mounts.append(candidate)
+
+    for path in _runtime_roots():
+        add(path)
+    for package in _runtime_package_dirs():
+        add(package if package.is_dir() else package.parent)
+    lease = _WIN_LEASE
+    if lease is not None:
+        for path, _recurse in lease.grant_paths:
+            add(path)
+    return mounts
+
+
+def _refuse_denied_inside_runtime(denied) -> None:
+    """Stop when a deny root lies inside a runtime prefix.
+
+    The directory does not have to exist yet. A cache created under the
+    prefix while the jail is running would otherwise be readable, and a
+    hardlink of a cache file planted in the prefix is the same tree.
+    """
+    for mount in _runtime_mounts():
+        for banned in denied:
+            message = nested_runtime_deny_error(mount, banned)
+            if message is not None:
+                raise SandboxError(message)
 
 
 def bwrap_mount_plan(roots, packages, hidden_sites, work, cache_file) -> list[str]:
@@ -4618,6 +4685,9 @@ def _win_reject_overlap(grants, denied) -> None:
         banned_path = Path(banned)
         for grant, _recurse in grants:
             message = runtime_overlap_error(grant, banned_path, venv=venv)
+            if message is not None:
+                raise SandboxError(message)
+            message = nested_runtime_deny_error(grant, banned_path)
             if message is not None:
                 raise SandboxError(message)
 

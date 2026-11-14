@@ -808,6 +808,60 @@ def test_cleanup_drops_aces_while_holding_the_profile_lock(monkeypatch):
     assert calls == ["lock", "drop"]
 
 
+def test_a_deny_root_inside_a_runtime_prefix_refuses_the_launch(tmp_path, monkeypatch):
+    """A cache inside a runtime prefix stops the launch. The mount stays whole."""
+    import backtester.sandbox as sandbox
+    from backtester.sandbox import (
+        _LANDLOCK_READ,
+        _refuse_denied_inside_runtime,
+        nested_runtime_deny_error,
+    )
+
+    prefix = tmp_path / "venv"
+    library = prefix / "lib"
+    package = library / "pkg"
+    nested = package / "prepared-cache"
+    direct = prefix / "prepared-cache"
+    visible = prefix / "visible.txt"
+    for directory in (nested, direct):
+        directory.mkdir(parents=True)
+    visible.write_text("SB-VISIBLE", encoding="utf-8")
+    (direct / "marker.txt").write_text("secret", encoding="utf-8")
+    (nested / "marker.txt").write_text("secret", encoding="utf-8")
+    work = tmp_path / "work"
+    work.mkdir()
+
+    for hole in (direct, nested):
+        message = nested_runtime_deny_error(prefix, hole)
+        assert message is not None
+        assert "STRATEGY_BUILDER_PREPARED_DIR" in message
+        assert "virtualenv" in message
+    assert nested_runtime_deny_error(prefix, tmp_path / "outside") is None
+    assert nested_runtime_deny_error(prefix, prefix.parent) is None
+    assert nested_runtime_deny_error(prefix, prefix) is None
+    missing = prefix / "missing-cache"
+    assert not missing.exists()
+    missing_message = nested_runtime_deny_error(prefix, missing)
+    assert missing_message is not None
+    assert "STRATEGY_BUILDER_PREPARED_DIR" in missing_message
+
+    monkeypatch.setattr(sandbox, "_runtime_roots", lambda: [prefix])
+    monkeypatch.setattr(sandbox, "_runtime_package_dirs", lambda: [])
+    with pytest.raises(SandboxError, match="STRATEGY_BUILDER_PREPARED_DIR"):
+        _refuse_denied_inside_runtime([direct])
+    with pytest.raises(SandboxError, match="STRATEGY_BUILDER_PREPARED_DIR"):
+        _refuse_denied_inside_runtime([missing])
+
+    cmd = bwrap_mount_plan([prefix], [package], [library], work, None)
+    tmpfs_targets = [cmd[index + 1] for index, token in enumerate(cmd) if token == "--tmpfs"]
+    blocked = {str(direct), str(direct.resolve()), str(nested), str(nested.resolve()), str(missing)}
+    assert not blocked.intersection(tmpfs_targets)
+    assert str(prefix) in cmd
+    directories, _files = landlock_rule_plan([str(prefix)], None, str(work))
+    assert [str(prefix), _LANDLOCK_READ] in directories
+    assert directories[-1][0] == str(work)
+
+
 def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
     from backtester.sandbox import _LANDLOCK_EXECUTE, _LANDLOCK_READ, _LANDLOCK_READ_FILE
 
