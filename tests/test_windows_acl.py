@@ -808,6 +808,80 @@ def test_cleanup_drops_aces_while_holding_the_profile_lock(monkeypatch):
     assert calls == ["lock", "drop"]
 
 
+def test_a_deny_root_inside_a_runtime_bind_is_covered_and_not_granted(tmp_path):
+    """A cache nested in a mounted prefix is a tmpfs, not a landlock read."""
+    from backtester.sandbox import (
+        _LANDLOCK_READ,
+        _LANDLOCK_READ_FILE,
+        _covered_by_deny,
+        nested_deny_roots,
+    )
+
+    prefix = tmp_path / "venv"
+    library = prefix / "lib"
+    package = library / "pkg"
+    nested = package / "prepared-cache"
+    direct = prefix / "prepared-cache"
+    visible = prefix / "visible.txt"
+    sibling = library / "other"
+    for directory in (nested, direct, sibling):
+        directory.mkdir(parents=True)
+    visible.write_text("SB-VISIBLE", encoding="utf-8")
+    (direct / "marker.txt").write_text("secret", encoding="utf-8")
+    (nested / "marker.txt").write_text("secret", encoding="utf-8")
+    (sibling / "keep.txt").write_text("keep", encoding="utf-8")
+    work = tmp_path / "work"
+    work.mkdir()
+    # An ancestor deny root is the venv-inside-a-denied-tree case. The
+    # prefix stays mounted and the cache inside it is still not granted.
+    ancestor = landlock_rule_plan(
+        [str(prefix)], None, str(work), denied=[prefix.parent, direct]
+    )[1]
+    assert any(Path(item[0]).resolve() == visible.resolve() for item in ancestor)
+
+    holes = nested_deny_roots(prefix, [direct, tmp_path / "outside"])
+    assert holes == [direct.resolve()]
+    assert _covered_by_deny(direct / "marker.txt", holes)
+    assert not _covered_by_deny(visible, holes)
+    assert not _covered_by_deny(prefix, holes)
+
+    cmd = bwrap_mount_plan([prefix], [], [], work, None, denied=[direct])
+    assert cmd[cmd.index(str(direct.resolve())) - 1] == "--tmpfs"
+    assert cmd.index(str(direct.resolve())) > cmd.index(str(prefix))
+    missing = prefix / "missing-cache"
+    uncovered = bwrap_mount_plan([prefix], [], [], work, None, denied=[missing, prefix])
+    assert str(missing) not in uncovered
+    assert all(
+        uncovered[index] != "--tmpfs" or uncovered[index + 1] != str(prefix)
+        for index in range(len(uncovered) - 1)
+    )
+
+    # A tmpfs on site-packages is uncovered by the later prefix bind. The
+    # package bind exposes a cache inside that package, so the cover follows it.
+    site = library
+    rebound = bwrap_mount_plan([prefix], [package], [site], work, None, denied=[nested])
+    assert rebound[rebound.index(str(nested.resolve())) - 1] == "--tmpfs"
+    assert rebound.index(str(nested.resolve())) > rebound.index(str(package))
+
+    directories, files = landlock_rule_plan([str(prefix)], None, str(work), denied=[direct, nested])
+    granted = [Path(item[0]).resolve() for item in directories]
+    assert prefix.resolve() not in granted
+    assert library.resolve() not in granted
+    assert package.resolve() not in granted
+    assert direct.resolve() not in granted
+    assert nested.resolve() not in granted
+    assert sibling.resolve() in granted
+    assert directories[-1][0] == str(work)
+    assert any(
+        Path(item[0]).resolve() == visible.resolve() and item[1] == _LANDLOCK_READ_FILE for item in files
+    )
+    assert not any(
+        direct.resolve() in Path(item[0]).resolve().parents or nested.resolve() in Path(item[0]).resolve().parents
+        for item in directories + files
+    )
+    assert all(item[1] != _LANDLOCK_READ or Path(item[0]).resolve() != prefix.resolve() for item in directories)
+
+
 def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
     from backtester.sandbox import _LANDLOCK_EXECUTE, _LANDLOCK_READ, _LANDLOCK_READ_FILE
 

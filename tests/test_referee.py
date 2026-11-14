@@ -731,6 +731,84 @@ class Strategy:
     assert probe(path, deny_paths=[tmp_path], call_timeout=5, startup_timeout=20) == 0.0
 
 
+@windows_jails(2)
+def test_a_cache_inside_the_runtime_prefix_is_not_readable(tmp_path, monkeypatch):
+    """A prepared cache nested in a mounted prefix is not readable in the jail."""
+    _needs_jail()
+    import backtester.sandbox as sandbox
+
+    created: list[Path] = []
+    visible_marker = "SB-VISIBLE"
+    if sys.platform == "win32":
+        prefix = Path(sys.prefix)
+        cache = prefix / "sb-nested-deny-cache"
+        visible = prefix / "python.exe"
+        if not visible.is_file():
+            visible = prefix / "Lib" / "os.py"
+        visible_marker = ""
+        denied = []
+    else:
+        parent = tmp_path / "denied_probe"
+        prefix = parent / ".venv"
+        cache = prefix / "prepared-cache"
+        visible = prefix / "visible.txt"
+        denied = [parent]
+        monkeypatch.setattr(sandbox, "_interpreter_venv", lambda: prefix.resolve())
+        real_roots = sandbox._runtime_roots
+
+        def roots():
+            found = real_roots()
+            extra = prefix.resolve()
+            if extra not in found:
+                found.append(extra)
+            return found
+
+        monkeypatch.setattr(sandbox, "_runtime_roots", roots)
+    cache.mkdir(parents=True, exist_ok=True)
+    created.append(cache)
+    marker = cache / "marker.txt"
+    marker.write_text("SB-NESTED-CACHE", encoding="utf-8")
+    if sys.platform != "win32":
+        (prefix / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+        visible.write_text("SB-VISIBLE", encoding="utf-8")
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(cache))
+    path = _write(
+        tmp_path / "read_nested.py",
+        f"""
+from pathlib import Path
+
+class Strategy:
+    def on_bar(self, bar, state):
+        try:
+            with Path({str(visible)!r}).open("rb") as handle:
+                text = handle.read(64)
+        except OSError:
+            return 2.0
+        marker_text = {visible_marker!r}
+        if marker_text and marker_text.encode("utf-8") not in text:
+            return 2.0
+        try:
+            secret = Path({str(marker)!r}).read_text(encoding="utf-8")
+        except OSError:
+            return 0.0
+        return 1.0 if "SB-NESTED-CACHE" in secret else 0.0
+""",
+    )
+    try:
+        assert probe(path, deny_paths=denied, call_timeout=30) == 0.0
+        if sys.platform == "linux" and sandbox._landlock_available():
+            monkeypatch.setattr(sandbox, "_bwrap_available", lambda: False)
+            assert probe(path, deny_paths=denied, call_timeout=30) == 0.0
+    finally:
+        for leftover in created:
+            if leftover.is_file():
+                leftover.unlink(missing_ok=True)
+            else:
+                import shutil
+
+                shutil.rmtree(leftover, ignore_errors=True)
+
+
 def test_windows_environment_block_is_sorted_and_terminated(monkeypatch):
     from backtester.sandbox import (
         SandboxError,

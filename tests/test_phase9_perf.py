@@ -272,6 +272,107 @@ def test_jail_deny_list_includes_the_prepared_cache(tmp_path, monkeypatch):
     assert cache.resolve() in roots
 
 
+def _budget_entry(root: Path, name: str, size: int, atime: float) -> Path:
+    path = root / name
+    path.mkdir()
+    (path / "blob").write_bytes(b"x" * size)
+    os.utime(path, (atime, atime))
+    return path
+
+
+def test_budget_subtracts_only_after_the_directory_is_gone(_prepared_dir, monkeypatch):
+    import shutil
+
+    from backtester import prepared
+
+    oldest = _budget_entry(_prepared_dir, "a" * 64, 80, 1)
+    middle = _budget_entry(_prepared_dir, "b" * 64, 80, 2)
+    keep = _budget_entry(_prepared_dir, "c" * 64, 80, 3)
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_MAX_BYTES", "100")
+    real = shutil.rmtree
+
+    def refuse_oldest(path, *args, **kwargs):
+        if Path(path).name == oldest.name:
+            raise OSError("sharing violation")
+        real(path)
+
+    monkeypatch.setattr(prepared.shutil, "rmtree", refuse_oldest)
+    prepared._enforce_budget(_prepared_dir, keep=keep.name)
+    assert oldest.is_dir()
+    assert not middle.exists()
+    assert keep.is_dir()
+
+
+def test_budget_retries_a_delete_that_fails_once(_prepared_dir, monkeypatch):
+    import shutil
+
+    from backtester import prepared
+
+    oldest = _budget_entry(_prepared_dir, "d" * 64, 80, 1)
+    keep = _budget_entry(_prepared_dir, "e" * 64, 80, 2)
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_MAX_BYTES", "100")
+    real = shutil.rmtree
+    calls = {"n": 0}
+
+    def fail_once(path, *args, **kwargs):
+        if Path(path).name == oldest.name:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("sharing violation")
+        real(path)
+
+    monkeypatch.setattr(prepared.shutil, "rmtree", fail_once)
+    prepared._enforce_budget(_prepared_dir, keep=keep.name)
+    assert calls["n"] == 2
+    assert not oldest.exists()
+    assert keep.is_dir()
+
+
+def test_a_mapped_entry_stays_readable_and_open_rechecks_the_digest(tmp_path, monkeypatch):
+    import gc
+
+    write_series(tmp_path / "src", "SYN", sessions=3)
+    load_named(tmp_path / "src", "SYN")
+    first = load_named(tmp_path / "src", "SYN")
+    column = first.frame["close"].to_numpy()
+    mapped = _memmap(column)
+    assert mapped is not None
+    value = float(column[0])
+    first_dir = Path(first.prepared)
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_MAX_BYTES", "1")
+    write_series(tmp_path / "other", "SYN", sessions=4)
+    second = load_named(tmp_path / "other", "SYN")
+    assert second.prepared
+    # The directory may already be unlinked. The mapping stays readable.
+    assert float(mapped[0]) == value
+    removed = not first_dir.exists()
+    second_value = float(second.frame["close"].iloc[0])
+    second_dir = Path(second.prepared)
+    del column, mapped, first, second
+    gc.collect()
+    if removed:
+        rebuilt = load_named(tmp_path / "src", "SYN")
+        assert float(rebuilt.frame["close"].iloc[0]) == value
+        published = Path(rebuilt.prepared)
+        expect = value
+        source = tmp_path / "src"
+        del rebuilt
+    else:
+        published = second_dir
+        expect = second_value
+        source = tmp_path / "other"
+    gc.collect()
+    target = next(published.glob("*close.npy"))
+    blob = bytearray(target.read_bytes())
+    blob[-1] ^= 0x5A
+    target.write_bytes(blob)
+    checked = load_named(source, "SYN")
+    assert checked.prepared
+    assert float(checked.frame["close"].iloc[0]) == expect
+    current = next(Path(checked.prepared).glob("*close.npy")).read_bytes()
+    assert current != bytes(blob)
+
+
 def test_length_prefixed_decisions_keep_bool_int_and_nan(tmp_path):
     from backtester.referee import _Pipe
 

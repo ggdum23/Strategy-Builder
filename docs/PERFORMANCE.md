@@ -136,7 +136,7 @@ CI scale (20 sessions, 18,781 rows), same earlier run: cold load 0.122 s, warm l
 
 Writes go to `.partial-<key>-<pid>-<ns>`, fsync the files and the directory, then `rename`. A reader checks the BLAKE2b of each file and the row count. A mismatch deletes the directory and the caller rebuilds it. A lock file is `O_EXCL`; a lock older than 15 minutes is stolen. A cache write that fails is recorded and the run keeps the frame it already built.
 
-The directory is `STRATEGY_BUILDER_PREPARED_DIR`, or `%LOCALAPPDATA%\strategy-builder\prepared` on Windows, or `$XDG_CACHE_HOME/strategy-builder/prepared` otherwise. The cap is `STRATEGY_BUILDER_PREPARED_MAX_BYTES`, default 8 GiB. Eviction is oldest access first, and the entry just written is kept even when it alone exceeds the cap.
+The directory is `STRATEGY_BUILDER_PREPARED_DIR`, or `%LOCALAPPDATA%\strategy-builder\prepared` on Windows, or `$XDG_CACHE_HOME/strategy-builder/prepared` otherwise. The cap is `STRATEGY_BUILDER_PREPARED_MAX_BYTES`, default 8 GiB. Eviction is oldest access first, and the entry just written is kept even when it alone exceeds the cap. A directory's size leaves the budget only after the directory is gone. A delete that fails, including a Windows sharing violation on an open file, is retried once and then skipped. The next pass tries it again, so the cap does not count bytes that are still on disk as free. An entry that is already mapped stays readable until that mapping is dropped; unlinking the directory does not unmap it. The published files do not change after the rename. The next open hashes each file and deletes the directory when the BLAKE2b or the row count does not match.
 
 Numeric columns are mapped `mmap_mode="c"` (copy-on-write). A categorical column is integer codes plus the category labels. A stamp column is five integer arrays (year, month, day, minute, offset minutes). A constant symbol is one string in the manifest. Workers that map the same artifact share those pages. The public values match the pre-cache frame. Dtypes for the coded columns are categorical and stamp, which is what the golden frame hash locks.
 
@@ -156,7 +156,7 @@ The parent writes one bar and reads one decision before it writes the next. A ba
 
 A named jailed run drops the parent's frame while the book worker maps the artifact, then maps it again for the report. The strategy jail does not receive the prepared directory and does not inherit the memmap handles (`close_fds`, and the Windows handle list is the three stdio handles).
 
-A relative `--strategy` path is made absolute in the parent, before a worker changes directory. A virtualenv whose prefix sits strictly inside a denied directory is mounted on its own; the rest of that directory is not. A prefix that is the denied directory itself is refused with the sentence that tells the operator to create `.venv` inside the clone or to use an interpreter outside it.
+A relative `--strategy` path is made absolute in the parent, before a worker changes directory. A virtualenv whose prefix sits strictly inside a denied directory is mounted on its own; the rest of that directory is not. A prefix that is the denied directory itself is refused with the sentence that tells the operator to create `.venv` inside the clone or to use an interpreter outside it. A deny root that sits strictly inside a mounted runtime prefix, including the prepared cache, is covered after that bind. Bubblewrap mounts a tmpfs on it. Landlock does not grant that subtree. Windows does not leave the profile allow ACE on it.
 
 ## Equivalence
 
@@ -176,4 +176,4 @@ A single 23-year run on this host stays under 1.6 GB PSS: cold load 1,570 MB, Ar
 
 Arena in-process wall time on this series is 13.0 s. The earlier columnar-string run was 4.5 s and 3.8 GB. The bytes moved into the per-bar call.
 
-A jailed strategy cannot read the cache. A class strategy is not jailed, and a class that already knows the cache path can read it. That is the same boundary as the rest of the in-process opt-in.
+A jailed strategy cannot read the cache, including a cache directory nested inside the mounted interpreter prefix. A class strategy is not jailed, and a class that already knows the cache path can read it. That is the same boundary as the rest of the in-process opt-in.

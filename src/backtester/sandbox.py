@@ -1266,12 +1266,126 @@ def _under_tmp(path: Path) -> bool:
     return resolved == tmp or tmp in resolved.parents
 
 
-def bwrap_mount_plan(roots, packages, hidden_sites, work, cache_file) -> list[str]:
+def _resolved_path(path) -> Path:
+    try:
+        return Path(path).resolve()
+    except OSError:
+        return Path(os.path.abspath(path))
+
+
+def _strictly_inside(child, parent) -> bool:
+    """True when ``child`` is below ``parent``. The parent itself is not."""
+    nested = _resolved_path(child)
+    root = _resolved_path(parent)
+    if nested == root:
+        return False
+    try:
+        nested.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def nested_deny_roots(bind, denied) -> list[Path]:
+    """Deny roots that sit strictly inside ``bind``.
+
+    A nested root is dropped when another deny root already covers it.
+    The bind itself is not a hole: covering it would hide the runtime.
+    """
+    found: list[Path] = []
+    for item in denied or []:
+        if not item:
+            continue
+        hole = _resolved_path(item)
+        if not _strictly_inside(hole, bind):
+            continue
+        if hole not in found:
+            found.append(hole)
+    return [hole for hole in found if not any(_strictly_inside(hole, other) for other in found)]
+
+
+def _covered_by_deny(path, holes) -> bool:
+    """True when ``path`` is a deny root or sits inside one."""
+    resolved = _resolved_path(path)
+    return any(resolved == hole or _strictly_inside(resolved, hole) for hole in holes)
+
+
+def _bwrap_cover_holes(events, denied) -> list[Path]:
+    """Deny directories a bind still exposes after the mount list.
+
+    A later bind uncovers an earlier tmpfs. Only a directory that exists
+    is returned: bubblewrap cannot mount a tmpfs on a missing path inside
+    a read-only bind.
+    """
+    holes: list[Path] = []
+    for item in denied or []:
+        if not item:
+            continue
+        hole = _resolved_path(item)
+        try:
+            exists = hole.is_dir()
+        except OSError:
+            exists = False
+        if exists and hole not in holes:
+            holes.append(hole)
+    visible: list[Path] = []
+    for kind, raw in events:
+        path = _resolved_path(raw)
+        if kind == "bind":
+            for hole in holes:
+                if _strictly_inside(hole, path) and hole not in visible:
+                    visible.append(hole)
+            continue
+        visible = [hole for hole in visible if hole != path and not _strictly_inside(hole, path)]
+    return [hole for hole in visible if not any(_strictly_inside(hole, other) for other in visible)]
+
+
+def _landlock_split(directory: Path, holes: list[Path]) -> tuple[list, list]:
+    """Read rules for ``directory`` that do not cover ``holes``.
+
+    A read rule on a directory covers everything under it, and landlock
+    has no way to punch a hole. The directory itself is not granted.
+    Children that do not contain a deny root are granted. A child that
+    contains one is split the same way. A symlink that resolves into a
+    deny root is not granted.
+    """
+    directories: list = []
+    files: list = []
+    try:
+        children = list(Path(directory).iterdir())
+    except OSError:
+        return directories, files
+    for child in children:
+        try:
+            resolved = child.resolve()
+        except OSError:
+            continue
+        if any(resolved == hole or _strictly_inside(resolved, hole) for hole in holes):
+            continue
+        if any(_strictly_inside(hole, resolved) for hole in holes):
+            if child.is_symlink() or not resolved.is_dir():
+                continue
+            contained = [hole for hole in holes if _strictly_inside(hole, resolved)]
+            sub_dirs, sub_files = _landlock_split(child, contained)
+            directories.extend(sub_dirs)
+            files.extend(sub_files)
+            continue
+        if resolved.is_dir():
+            directories.append([str(child), _LANDLOCK_READ])
+        elif resolved.is_file():
+            files.append([str(child), _LANDLOCK_READ_FILE])
+    return directories, files
+
+
+def bwrap_mount_plan(roots, packages, hidden_sites, work, cache_file, denied=()) -> list[str]:
     """Mount arguments. A runtime root under ``/tmp`` is bound after the tmpfs.
 
     ``/tmp`` itself is not a bind target: the private tmpfs would hide it,
     and binding it back would undo the tmpfs. That launch is refused by
     the caller. The cache file is the only bind from ``/etc``.
+
+    A deny root strictly inside a bind is covered with a tmpfs after every
+    bind, so a later bind cannot uncover it. The bind itself stays.
     """
     early = []
     late = []
@@ -1284,22 +1398,36 @@ def bwrap_mount_plan(roots, packages, hidden_sites, work, cache_file) -> list[st
         else:
             early.append(path)
     cmd: list[str] = []
+    events: list[tuple[str, Path]] = []
+
+    def bind(path: Path) -> None:
+        cmd.extend(["--ro-bind", str(path), str(path)])
+        events.append(("bind", path))
+
+    def cover(path) -> None:
+        cmd.extend(["--tmpfs", str(path)])
+        events.append(("tmpfs", Path(path)))
+
     for root in early:
-        cmd.extend(["--ro-bind", str(root), str(root)])
+        bind(root)
     for directory in hidden_sites:
-        cmd.extend(["--tmpfs", str(directory)])
+        cover(directory)
     for path in packages:
         package = Path(path)
         if _under_tmp(package):
             late.append(package)
         else:
-            cmd.extend(["--ro-bind", str(package), str(package)])
+            bind(package)
     if cache_file:
         cmd.extend(["--dir", "/etc", "--ro-bind", str(cache_file), str(cache_file)])
     cmd.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+    events.append(("tmpfs", Path("/tmp")))
     for root in late:
-        cmd.extend(["--ro-bind", str(root), str(root)])
+        bind(root)
     cmd.extend(["--bind", str(work), str(work)])
+    events.append(("bind", Path(work)))
+    for hole in _bwrap_cover_holes(events, denied):
+        cover(hole)
     return cmd
 
 
@@ -1342,6 +1470,7 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
             hidden_sites,
             work,
             cache if cache.is_file() else None,
+            denied,
         )
     )
     pass_fds = []
@@ -1387,21 +1516,44 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
     return Sandbox(proc, work, "bubblewrap", _bwrap_guarantees(), _cleanup)
 
 
-def landlock_rule_plan(read_dirs, cache_file, work) -> tuple[list, list]:
+def landlock_rule_plan(read_dirs, cache_file, work, denied=()) -> tuple[list, list]:
     """Directory rules and the one file rule for the dynamic linker cache.
 
     ``/etc`` is traverse-only. The cache file is a read-file rule. The
-    directory that contains the cache is not granted read.
+    directory that contains the cache is not granted read. A read directory
+    that strictly contains a deny root is not granted as one rule: that
+    rule would cover the deny root. Its other children are granted instead.
     """
     directories = []
+    files = []
+    readable = []
     for directory in read_dirs:
         if not directory:
             continue
         path = str(directory)
         if path in ("/etc", "/etc/"):
             continue
-        directories.append([path, _LANDLOCK_READ])
-    files = []
+        readable.append(path)
+    # Holes are deny roots strictly inside a directory this jail mounts.
+    # An ancestor of that directory (a venv inside a denied tree) is not a
+    # hole: the mount does not expose the ancestor. A read directory that
+    # is itself inside a hole is not granted.
+    holes: list[Path] = []
+    for path in readable:
+        for hole in nested_deny_roots(path, denied):
+            if hole not in holes:
+                holes.append(hole)
+    holes = [hole for hole in holes if not any(_strictly_inside(hole, other) for other in holes)]
+    for path in readable:
+        if any(_resolved_path(path) == hole or _strictly_inside(path, hole) for hole in holes):
+            continue
+        inner = [hole for hole in holes if _strictly_inside(hole, path)]
+        if not inner:
+            directories.append([path, _LANDLOCK_READ])
+            continue
+        sub_dirs, sub_files = _landlock_split(Path(path), inner)
+        directories.extend(sub_dirs)
+        files.extend(sub_files)
     if cache_file:
         etc = str(Path(cache_file).parent)
         if etc and not any(item[0] == etc for item in directories):
@@ -1430,6 +1582,7 @@ def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_s
         [directory for directory in read_dirs if directory and os.path.isdir(directory)],
         str(cache) if cache.is_file() else None,
         work,
+        denied,
     )
     (work / "filter.bin").write_bytes(_filter_bytes(deny=_SANDBOX_DENY, allow_threads=True))
     (work / "jail.json").write_text(
@@ -1580,6 +1733,9 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
                 nonlocal extra_grants, popen
                 try:
                     extra_grants = _win_grant_work(lease, work)
+                    # A cache created inside an already-granted prefix inherits
+                    # the prefix ACE. Drop that ACE before the child starts.
+                    _win_revoke_nested_denies(lease, denied)
                     popen = _win_spawn(work, lease, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
                 except Exception:
                     # Drop the ACEs before the next waiter starts. A drop
@@ -4364,10 +4520,15 @@ def _win_grant_tree(lease: _WinLease, root: Path, mask: int, inherit: int) -> No
     deadline = time.monotonic() + 180
     pending = [root]
     seen = 0
+    # The prepared cache (and any other deny root) may sit inside this
+    # prefix. Do not copy the package ACE onto that subtree.
+    holes = nested_deny_roots(root, _deny_roots(()))
     while pending:
         if time.monotonic() > deadline:
             raise SandboxError(f"ACL grant on {root} did not finish in 180s ({seen} entries)")
         current = pending.pop()
+        if holes and _covered_by_deny(current, holes):
+            continue
         try:
             is_dir = current.is_dir()
         except OSError:
@@ -4479,6 +4640,36 @@ def _win_revoke_tree(lease: _WinLease, root: Path) -> None:
             pending.extend(current.iterdir())
         except OSError:
             continue
+
+
+def _win_revoke_nested_denies(lease, denied) -> None:
+    """Remove the profile ACE from a deny root inside an already-granted prefix.
+
+    The grant walk skips that subtree. A directory created after the grant
+    still inherits the prefix ACE, and a grant recorded before this check
+    already wrote one. Revoke only when this profile's allow ACE is there,
+    so a cache that was never granted is not rewritten on every launch.
+    """
+    if sys.platform != "win32":
+        return
+    holes: list[Path] = []
+    for grant, _recurse in lease.grant_paths:
+        for hole in nested_deny_roots(grant, denied):
+            if hole not in holes:
+                holes.append(hole)
+    for hole in holes:
+        if any(_strictly_inside(hole, other) for other in holes):
+            continue
+        try:
+            if not hole.is_dir():
+                continue
+        except OSError:
+            continue
+        if acl_revoke_problem(hole, environ=os.environ):
+            continue
+        if not _win_ace_present(lease, hole, _FILE_READ_DATA, 0):
+            continue
+        _win_revoke_tree(lease, hole)
 
 
 def _win_grant(lease: _WinLease, path: Path, rights: str, *, recurse: bool) -> None:

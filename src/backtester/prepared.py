@@ -786,7 +786,34 @@ def _sweep_partials(root: Path) -> None:
             shutil.rmtree(child, ignore_errors=True)
 
 
+def _drop_cache_entry(child: Path) -> bool:
+    """Remove one cache directory. True only when it is gone.
+
+    A Windows sharing violation leaves the directory in place. The caller
+    retries once, then skips the entry. The next budget pass tries it again.
+    """
+    for _attempt in range(2):
+        if not child.exists():
+            return True
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            continue
+    return not child.exists()
+
+
 def _enforce_budget(root: Path, *, keep: str) -> None:
+    """Drop oldest entries until the directory is within ``max_bytes``.
+
+    The size is subtracted only after the directory is confirmed gone. A
+    delete that fails is skipped, so an open handle does not free budget
+    that is still on disk.
+
+    An entry that is already mapped stays readable until that mapping is
+    dropped. Unlinking the directory does not unmap it. The published files
+    are immutable after the rename. The next open hashes them again and
+    deletes the directory when the BLAKE2b or the row count does not match.
+    """
     cap = max_bytes()
     entries = []
     total = 0
@@ -806,7 +833,8 @@ def _enforce_budget(root: Path, *, keep: str) -> None:
             break
         if child.name == keep:
             continue
-        shutil.rmtree(child, ignore_errors=True)
+        if not _drop_cache_entry(child):
+            continue
         total -= size
 
 
