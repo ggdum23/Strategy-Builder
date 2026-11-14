@@ -7,6 +7,7 @@ icacls list. On a GitHub runner the interpreter is under
 writing it.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -733,7 +734,173 @@ def test_a_changed_runtime_file_changes_the_stamp_digest(tmp_path):
     first = runtime_tree_digest(root)
     (nested / "os.py").write_text("print(2)\n", encoding="utf-8")
     assert runtime_tree_digest(root) != first
-    assert _RUNTIME_COPY_VERSION == "2"
+    assert _RUNTIME_COPY_VERSION == "3"
+
+
+def _strategy(path: Path) -> Path:
+    path.write_text("class Strategy:\n    def on_bar(self, bar, state):\n        return 0.0\n", encoding="utf-8")
+    return path
+
+
+def test_a_refused_launch_does_not_stage_the_runtime(tmp_path, monkeypatch):
+    """The interpreter roots are checked before the profile copies anything."""
+    import backtester.sandbox as sandbox
+
+    prefix = tmp_path / "py"
+    cache = prefix / "Lib" / "prepared-cache"
+    cache.mkdir(parents=True)
+    (cache / "marker.txt").write_text("secret", encoding="utf-8")
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(cache))
+    monkeypatch.setattr(sandbox, "_runtime_roots", lambda: [prefix.resolve()])
+    calls = []
+
+    def warm():
+        calls.append("warm")
+
+    def private():
+        calls.append("private")
+        return str(tmp_path / "work")
+
+    class Boom:
+        @property
+        def grant_paths(self):
+            raise AssertionError("the lease is not consulted before the profile exists")
+
+    monkeypatch.setattr(sandbox, "warm_windows_profile", warm)
+    monkeypatch.setattr(sandbox, "_private_dir", private)
+    monkeypatch.setattr(sandbox, "_WIN_LEASE", Boom())
+    with pytest.raises(SandboxError, match="STRATEGY_BUILDER_PREPARED_DIR"):
+        sandbox.launch(
+            _strategy(tmp_path / "strategy.py"),
+            memory_bytes=128 * 1024 * 1024,
+            cpu_seconds=5,
+            deny_paths=[],
+        )
+    assert calls == []
+
+
+def test_a_staged_grant_is_still_refused_after_the_profile_is_warm(tmp_path, monkeypatch):
+    """Moving the check earlier still covers the copy Windows would grant."""
+    import backtester.sandbox as sandbox
+
+    prefix = tmp_path / "py"
+    prefix.mkdir()
+    stage = tmp_path / "stage"
+    cache = stage / "prepared-cache"
+    cache.mkdir(parents=True)
+    (cache / "marker.txt").write_text("secret", encoding="utf-8")
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(cache))
+    monkeypatch.setattr(sandbox, "_runtime_roots", lambda: [prefix.resolve()])
+    monkeypatch.setattr(sandbox, "_runtime_package_dirs", lambda: [])
+    calls = []
+
+    def warm():
+        calls.append("warm")
+        lease = sandbox._WinLease()
+        lease.grant_paths = [(stage.resolve(), True)]
+        sandbox._WIN_LEASE = lease
+
+    monkeypatch.setattr(sandbox, "warm_windows_profile", warm)
+    monkeypatch.setattr(sandbox, "_WIN_LEASE", None)
+    with pytest.raises(SandboxError, match="STRATEGY_BUILDER_PREPARED_DIR"):
+        sandbox.launch(
+            _strategy(tmp_path / "strategy.py"),
+            memory_bytes=128 * 1024 * 1024,
+            cpu_seconds=5,
+            deny_paths=[],
+        )
+    assert calls == ["warm"]
+
+
+def test_a_runtime_copy_skips_a_deny_root(tmp_path, monkeypatch):
+    import backtester.sandbox as sandbox
+
+    prefix = tmp_path / "x64"
+    cache = prefix / "Lib" / "prepared-cache"
+    cache.mkdir(parents=True)
+    (cache / "marker.txt").write_text("secret", encoding="utf-8")
+    (prefix / "Lib" / "os.py").write_text("os", encoding="utf-8")
+    (prefix / "python.exe").write_bytes(b"exe")
+    secret = prefix / "DLLs" / "secret.pyd"
+    secret.parent.mkdir()
+    secret.write_bytes(b"nope")
+    (prefix / "DLLs" / "_ctypes.pyd").write_bytes(b"dll")
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(cache))
+    monkeypatch.setattr(sandbox, "_LAUNCH_DENIED", [secret.resolve()])
+    stage = tmp_path / "runtime"
+    _copy_runtime_tree(prefix, stage, [])
+    assert (stage / "Lib" / "os.py").read_text(encoding="utf-8") == "os"
+    assert (stage / "DLLs" / "_ctypes.pyd").read_bytes() == b"dll"
+    assert not (stage / "Lib" / "prepared-cache").exists()
+    assert not (stage / "DLLs" / "secret.pyd").exists()
+    assert not runtime_relpath_is_copied(
+        ("Lib", "prepared-cache"),
+        is_dir=True,
+        package_prefixes=(),
+        full=True,
+        blocked=(("lib", "prepared-cache"),),
+    )
+
+    bundle = tmp_path / "app"
+    nested = bundle / "prepared-cache"
+    nested.mkdir(parents=True)
+    (nested / "marker.txt").write_text("secret", encoding="utf-8")
+    (bundle / "backtester.exe").write_bytes(b"exe")
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(nested))
+    frozen = tmp_path / "frozen"
+    _copy_runtime_tree(bundle, frozen, [], full=True)
+    assert (frozen / "backtester.exe").read_bytes() == b"exe"
+    assert not (frozen / "prepared-cache").exists()
+
+
+def test_removing_a_source_directory_rebuilds_the_staged_runtime(tmp_path, monkeypatch):
+    import shutil
+
+    import backtester.sandbox as sandbox
+
+    src = tmp_path / "src"
+    cache = src / "Lib" / "prepared-cache"
+    cache.mkdir(parents=True)
+    (cache / "marker.txt").write_text("secret", encoding="utf-8")
+    (src / "Lib" / "os.py").write_text("os", encoding="utf-8")
+    (src / "python.exe").write_bytes(b"exe")
+    (src / "python").write_bytes(b"exe")
+    dest = tmp_path / "dest"
+    shutil.copytree(src, dest)
+    monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(cache))
+    monkeypatch.setattr(sandbox, "_RUNTIME_COPIES", [(str(src), str(dest))])
+    monkeypatch.setattr(sandbox, "_runtime_stamp_path", lambda: tmp_path / "stamp.json")
+    monkeypatch.setattr(sandbox, "_win_set_runtime_dacl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sandbox, "_reject_reparse_dir", lambda *_args, **_kwargs: None)
+    stale = {
+        "version": "2",
+        "copies": [
+            {
+                "source": str(src),
+                "dest": str(dest),
+                "sha256": runtime_tree_digest(dest),
+            }
+        ],
+    }
+    (tmp_path / "stamp.json").write_text(json.dumps(stale), encoding="utf-8")
+    assert not sandbox._runtime_copy_ready(dest, src)
+    sandbox._remember_runtime_stamp()
+    saved = json.loads((tmp_path / "stamp.json").read_text(encoding="utf-8"))
+    assert saved["version"] == "3"
+    assert saved["copies"][0]["source_sha256"]
+    assert sandbox._runtime_copy_ready(dest, src)
+    original = (dest / "Lib" / "os.py").read_text(encoding="utf-8")
+    (dest / "Lib" / "os.py").write_text("changed", encoding="utf-8")
+    assert not sandbox._runtime_copy_ready(dest, src)
+    (dest / "Lib" / "os.py").write_text(original, encoding="utf-8")
+    assert sandbox._runtime_copy_ready(dest, src)
+    shutil.rmtree(cache)
+    assert not sandbox._runtime_copy_ready(dest, src)
+    sandbox._materialize_runtime_copies(object())
+    assert (dest / "Lib" / "os.py").read_text(encoding="utf-8") == "os"
+    assert (dest / "python.exe").read_bytes() == b"exe"
+    assert not (dest / "Lib" / "prepared-cache").exists()
+    assert sandbox._runtime_copy_ready(dest, src)
 
 
 def test_an_existing_runtime_file_is_replaced_from_the_source(tmp_path):

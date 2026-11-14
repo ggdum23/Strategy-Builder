@@ -585,22 +585,29 @@ def launch(
         raise ValueError("memory cap must be a positive number of bytes")
     if not isinstance(cpu_seconds, int) or isinstance(cpu_seconds, bool) or cpu_seconds <= 0:
         raise ValueError("cpu cap must be a positive number of seconds")
-    # The workspace junctions have to point at the staged interpreter. On
-    # Windows that copy is decided while the profile is granted, which is
-    # before the private directory is written.
-    warm_windows_profile()
     strategy = Path(strategy_path).resolve()
     if not strategy.is_file():
         raise FileNotFoundError(f"strategy file not found: {strategy}")
     denied = _deny_roots(deny_paths)
+    # A refused launch must not copy the interpreter. The profile lease does
+    # not exist yet, so this check uses the interpreter roots only. The
+    # staged grant paths are checked again after the profile is warm.
+    global _LAUNCH_DENIED
+    _LAUNCH_DENIED = list(denied)
+    _refuse_denied_inside_runtime(denied, _runtime_roots())
+    # The workspace junctions have to point at the staged interpreter. On
+    # Windows that copy is decided while the profile is granted, which is
+    # before the private directory is written.
+    warm_windows_profile()
     work = Path(_private_dir())
     try:
         for banned in denied:
             if work == banned or banned in work.parents or work in banned.parents:
                 raise SandboxError("the private directory overlaps a denied directory")
-        # A runtime mount covers every name under it. A denied directory
-        # there would be readable, including through a second hardlink, so
-        # the launch stops before either backend builds a rule.
+        # A runtime mount covers every name under it, including a staged
+        # copy. A denied directory there would be readable, including
+        # through a second hardlink, so the launch stops before either
+        # backend builds a rule.
         _refuse_denied_inside_runtime(denied)
         if sys.platform == "win32":
             backend = "windows"
@@ -1319,14 +1326,18 @@ def _runtime_mounts() -> list[Path]:
     return mounts
 
 
-def _refuse_denied_inside_runtime(denied) -> None:
+def _refuse_denied_inside_runtime(denied, mounts=None) -> None:
     """Stop when a deny root lies inside a runtime prefix.
 
     The directory does not have to exist yet. A cache created under the
     prefix while the jail is running would otherwise be readable, and a
     hardlink of a cache file planted in the prefix is the same tree.
+    ``mounts`` defaults to every directory the jail would grant, including
+    a staged copy. The check before the profile is built passes the
+    interpreter roots, because the lease does not exist yet.
     """
-    for mount in _runtime_mounts():
+    chosen = _runtime_mounts() if mounts is None else mounts
+    for mount in chosen:
         for banned in denied:
             message = nested_runtime_deny_error(mount, banned)
             if message is not None:
@@ -2880,8 +2891,13 @@ def _acl_same_prefix(path: Path) -> bool:
 # (source, dest) for an interpreter the container cannot walk to.
 # The dest is an app-owned copy. The source's ancestors are not edited.
 _RUNTIME_COPIES: list[tuple[str, str]] = []
+# Deny roots for the launch that is starting. The runtime copy reads this
+# so a prepared cache inside the source tree is not written into the dest.
+_LAUNCH_DENIED: list[Path] = []
 _FIREWALL_TRIED = False
-_RUNTIME_COPY_VERSION = "2"
+# 3 records a source identity beside the destination hash. A stamp from
+# version 2 is rebuilt, including a copy that still holds a nested cache.
+_RUNTIME_COPY_VERSION = "3"
 # Set when the copy parent is the AppContainer folder. Ancestors of that
 # folder are not granted and are not required to show a package ACE.
 _CONTAINER_FOLDER_NOTE = ""
@@ -3034,16 +3050,30 @@ def rewrite_pyvenv_home(text: str, translate) -> str:
     return "".join(lines)
 
 
-def runtime_relpath_is_copied(parts, *, is_dir: bool, package_prefixes, full: bool = False) -> bool:
+def _relpath_is_blocked(folded, blocked) -> bool:
+    """True when ``folded`` is a deny root or sits inside one."""
+    for prefix in blocked:
+        if prefix and folded[: len(prefix)] == prefix:
+            return True
+    return False
+
+
+def runtime_relpath_is_copied(
+    parts, *, is_dir: bool, package_prefixes, full: bool = False, blocked=()
+) -> bool:
     """Files the child interpreter opens, not the whole site-packages tree.
 
     ``package_prefixes`` are casefolded relative paths of imported packages,
     such as ``Lib/site-packages/numpy``. A ``._pth`` file is left behind so
     the copy does not redirect the child at the original prefix. ``full``
     keeps a frozen bundle's layout, including directories other than Lib
-    and DLLs, and still drops caches and path files.
+    and DLLs, and still drops caches and path files. ``blocked`` is the
+    casefolded relative path of each deny root inside this source, including
+    the prepared cache. Those directories are not copied.
     """
     folded = tuple(part.casefold() for part in parts)
+    if _relpath_is_blocked(folded, blocked):
+        return False
     if any(
         part.casefold() == "__pycache__"
         or part.casefold().endswith(".dist-info")
@@ -3138,6 +3168,125 @@ def runtime_tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _copy_deny_roots() -> list[Path]:
+    """Deny roots the runtime copy must leave behind.
+
+    The launch list includes caller paths. The default list still includes
+    the prepared cache when the copy runs outside ``launch``.
+    """
+    roots: list[Path] = []
+    for path in list(_LAUNCH_DENIED) + _deny_roots(()):
+        if path and path not in roots:
+            roots.append(path)
+    return roots
+
+
+def _blocked_copy_relpaths(src: Path) -> tuple:
+    """Casefolded relative paths of deny roots inside ``src``."""
+    try:
+        base = Path(src).resolve()
+    except OSError:
+        base = Path(src)
+    found = []
+    for item in _copy_deny_roots():
+        try:
+            resolved = Path(item).resolve()
+        except OSError:
+            resolved = Path(item)
+        try:
+            relative = resolved.relative_to(base)
+        except ValueError:
+            continue
+        if not relative.parts:
+            continue
+        folded = tuple(part.casefold() for part in relative.parts)
+        if folded not in found:
+            found.append(folded)
+    return tuple(found)
+
+
+def runtime_source_identity(root: Path, *, package_dirs=(), full: bool = False, blocked=()) -> str:
+    """Names, sizes, and mtimes of the files a copy would take from ``root``.
+
+    File bytes stay out of this digest. Removing a directory, including a
+    nested cache, changes the list. A deny root that is present is recorded
+    so deleting it changes the digest even though the copy leaves it out.
+    """
+    digest = hashlib.sha256()
+    root = Path(root)
+    if not root.exists():
+        digest.update(b"missing")
+        return digest.hexdigest()
+    prefixes = () if full else _package_prefixes(root, package_dirs)
+
+    def note(kind: bytes, relative: tuple) -> None:
+        digest.update(kind)
+        digest.update("/".join(part.casefold() for part in relative).encode("utf-8"))
+        digest.update(b"\0")
+
+    def walk(directory: Path, parts: tuple) -> None:
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            note(b"unreadable\0", parts)
+            return
+        for entry in sorted(entries, key=lambda item: item.name.casefold()):
+            relative = parts + (entry.name,)
+            folded = tuple(part.casefold() for part in relative)
+            if _relpath_is_blocked(folded, blocked):
+                note(b"blocked\0", relative)
+                continue
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                note(b"unreadable\0", relative)
+                continue
+            if not runtime_relpath_is_copied(
+                relative, is_dir=is_dir, package_prefixes=prefixes, full=full, blocked=blocked
+            ):
+                continue
+            if is_dir:
+                note(b"dir\0", relative)
+                walk(entry, relative)
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                note(b"unreadable\0", relative)
+                continue
+            note(b"file\0", relative)
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(getattr(stat, "st_mtime_ns", stat.st_mtime)).encode("ascii"))
+            digest.update(b"\0")
+
+    if root.is_file():
+        try:
+            stat = root.stat()
+        except OSError:
+            note(b"unreadable\0", (root.name,))
+        else:
+            note(b"file\0", (root.name,))
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(getattr(stat, "st_mtime_ns", stat.st_mtime)).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+    walk(root, ())
+    return digest.hexdigest()
+
+
+def _source_identity(src: Path) -> str:
+    full = bool(getattr(sys, "frozen", False))
+    packages = () if full else _runtime_package_dirs()
+    return runtime_source_identity(
+        src,
+        package_dirs=packages,
+        full=full,
+        blocked=_blocked_copy_relpaths(src),
+    )
+
+
 def _remember_runtime_stamp() -> None:
     payload = {
         "version": _RUNTIME_COPY_VERSION,
@@ -3146,6 +3295,7 @@ def _remember_runtime_stamp() -> None:
                 "source": source,
                 "dest": dest,
                 "sha256": runtime_tree_digest(Path(dest)),
+                "source_sha256": _source_identity(Path(source)),
             }
             for source, dest in _RUNTIME_COPIES
         ],
@@ -3177,11 +3327,13 @@ def _runtime_tree_present(dest: Path, src: Path) -> bool:
     return True
 
 
-def _stamp_matches(dest: Path, src: Path, digest: str) -> bool:
+def _stamp_matches(dest: Path, src: Path) -> bool:
+    digest = runtime_tree_digest(dest)
+    source_digest = _source_identity(src)
     for item in _load_runtime_stamp():
         if not isinstance(item, dict):
             continue
-        if item.get("sha256") != digest:
+        if item.get("sha256") != digest or item.get("source_sha256") != source_digest:
             continue
         if acl_same(item.get("source", ""), src) and acl_same(item.get("dest", ""), dest):
             return True
@@ -3191,12 +3343,10 @@ def _stamp_matches(dest: Path, src: Path, digest: str) -> bool:
 def _runtime_copy_ready(dest: Path, src: Path) -> bool:
     if not _runtime_tree_present(dest, src):
         return False
-    digest = runtime_tree_digest(dest)
-    if _stamp_matches(dest, src, digest):
+    if _stamp_matches(dest, src):
         return True
     # A file can be unreadable for one pass while a scanner holds it.
-    digest = runtime_tree_digest(dest)
-    return _stamp_matches(dest, src, digest)
+    return _stamp_matches(dest, src)
 
 
 def _runtime_copies_ready() -> bool:
@@ -3237,11 +3387,14 @@ def _package_prefixes(src: Path, package_dirs) -> tuple:
     return tuple(found)
 
 
-def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set, *, full: bool) -> tuple[int, int]:
+def _copy_runtime_into(
+    src: Path, dest: Path, parts, prefixes, seen: set, *, full: bool, blocked
+) -> tuple[int, int]:
     """Copy every selected file, replacing one that is already there.
 
     Returns ``(expected, copied)``. A file that could not be read or written
     fails the copy. The caller stamps the tree only when those counts match.
+    A deny root, including the prepared cache, is not created in the dest.
     """
     try:
         entries = list(src.iterdir())
@@ -3256,7 +3409,7 @@ def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set, *, ful
         except OSError as exc:
             raise SandboxError(f"could not read {entry}: {exc}") from exc
         if not runtime_relpath_is_copied(
-            relative, is_dir=is_dir, package_prefixes=prefixes, full=full
+            relative, is_dir=is_dir, package_prefixes=prefixes, full=full, blocked=blocked
         ):
             continue
         try:
@@ -3270,7 +3423,7 @@ def _copy_runtime_into(src: Path, dest: Path, parts, prefixes, seen: set, *, ful
         if is_dir:
             target.mkdir(exist_ok=True)
             child_expected, child_copied = _copy_runtime_into(
-                entry, target, relative, prefixes, seen, full=full
+                entry, target, relative, prefixes, seen, full=full, blocked=blocked
             )
             expected += child_expected
             copied += child_copied
@@ -3294,7 +3447,8 @@ def _copy_runtime_tree(src: Path, dest: Path, package_dirs, *, full: bool = Fals
     """
     dest.mkdir(parents=True, exist_ok=True)
     prefixes = () if full else _package_prefixes(src, package_dirs)
-    expected, copied = _copy_runtime_into(src, dest, (), prefixes, set(), full=full)
+    blocked = _blocked_copy_relpaths(src)
+    expected, copied = _copy_runtime_into(src, dest, (), prefixes, set(), full=full, blocked=blocked)
     if copied != expected:
         raise SandboxError(
             f"the staged interpreter at {dest} did not replace every file from {src}"
@@ -3703,10 +3857,12 @@ def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:
     """Copy interpreter files into the app-owned dest and lock the DACL.
 
     An unfinished or altered tree is deleted and replaced. The stamp stores
-    a hash of the files. The protected DACL grants the package read and
-    execute and denies write to Users, Everyone, and the package groups.
-    The stamp lives beside the grant marker, outside the tree the child
-    can read.
+    a hash of the destination bytes and an identity of the source names,
+    sizes, and mtimes. Removing a source directory changes that identity,
+    so the old copy, including a nested cache, is deleted and written
+    again. The protected DACL grants the package read and execute and
+    denies write to Users, Everyone, and the package groups. The stamp
+    lives beside the grant marker, outside the tree the child can read.
     """
     granted: list[tuple[Path, bool]] = []
     if not _RUNTIME_COPIES:
