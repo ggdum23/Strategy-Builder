@@ -733,7 +733,12 @@ class Strategy:
 
 @windows_jails(2)
 def test_a_cache_inside_the_runtime_prefix_is_not_readable(tmp_path, monkeypatch):
-    """A prepared cache nested in a mounted prefix is not readable in the jail."""
+    """A prepared cache nested in a mounted prefix is not readable in the jail.
+
+    Linux mounts the prefix and must still fail to read the cache. Windows
+    often stages a copy of the interpreter and does not grant the original
+    prefix, so neither the runtime file nor the cache is in that jail.
+    """
     _needs_jail()
     import backtester.sandbox as sandbox
 
@@ -780,6 +785,12 @@ from pathlib import Path
 class Strategy:
     def on_bar(self, bar, state):
         try:
+            secret = Path({str(marker)!r}).read_text(encoding="utf-8")
+        except OSError:
+            secret = ""
+        if "SB-NESTED-CACHE" in secret:
+            return 1.0
+        try:
             with Path({str(visible)!r}).open("rb") as handle:
                 text = handle.read(64)
         except OSError:
@@ -787,18 +798,20 @@ class Strategy:
         marker_text = {visible_marker!r}
         if marker_text and marker_text.encode("utf-8") not in text:
             return 2.0
-        try:
-            secret = Path({str(marker)!r}).read_text(encoding="utf-8")
-        except OSError:
-            return 0.0
-        return 1.0 if "SB-NESTED-CACHE" in secret else 0.0
+        return 0.0
 """,
     )
+    def _hidden(backend_result: float) -> None:
+        if sys.platform == "win32":
+            assert backend_result in (0.0, 2.0)
+            return
+        assert backend_result == 0.0
+
     try:
-        assert probe(path, deny_paths=denied, call_timeout=30) == 0.0
+        _hidden(probe(path, deny_paths=denied, call_timeout=30))
         if sys.platform == "linux" and sandbox._landlock_available():
             monkeypatch.setattr(sandbox, "_bwrap_available", lambda: False)
-            assert probe(path, deny_paths=denied, call_timeout=30) == 0.0
+            _hidden(probe(path, deny_paths=denied, call_timeout=30))
     finally:
         for leftover in created:
             if leftover.is_file():
