@@ -13,6 +13,17 @@ PINNED_COSTS_SHA256 = "a3b0a522d8bf469001e75aaf274b0c5d3cbef624a68ed9fb94d292981
 PINNED_COSTS_DESK_SHA256 = "07b0d25ceeebe292f03a2b7b6ca0d76d76fa8d6a59f21d60103abfceeab0ebbd"
 
 
+def test_threat_model_rejects_unused_commentary_and_unmodeled_syntax():
+    assert comment_guard.THREAT_MODEL == (
+        "reject any construct that stores unused commentary text in tracked files",
+        "treat every unmodeled file type, key, executable or syntax as a finding",
+    )
+    assert comment_guard.EXECUTABLE_ALLOWLIST == ("apt-get", "python", "sudo")
+    assert "script" not in comment_guard.KNOWN_KEYS["with"]
+    assert "entrypoint" not in comment_guard.KNOWN_KEYS["step"]
+    assert "args" not in comment_guard.KNOWN_KEYS["step"]
+
+
 def test_comment_file_allowlist_is_exactly_the_two_pinned_cost_files():
     assert comment_guard.FILE_ALLOWLIST == (
         "src/backtester/costs.py",
@@ -145,7 +156,7 @@ def test_workflow_run_blocks_scan_embedded_python_docstrings():
     assert _has_kind(heredoc, "inline-python")
     python_shell = "- shell: python\n  run: |\n    \"\"\"hidden\"\"\"\n    x = 1\n"
     assert _has_kind(python_shell, "inline-python")
-    bash = "run: |\n  echo hello\n"
+    bash = "run: |\n  python -m backtester test\n"
     assert comment_guard.yaml_issue_lines(bash) == []
 
 
@@ -364,8 +375,8 @@ def test_workflow_inline_python_and_yaml_comments_fail_closed():
     data = "run: |\n  cat <<'EOF'\n  # not a comment\n  EOF\n"
     assert _has_kind(data, "inline-python") or _has_kind(data, "comment")
     assert comment_guard.yaml_issue_lines("name: ci # hidden\n") == [(1, "comment")]
-    assert comment_guard.yaml_issue_lines('title: "echo # no"\n') == []
-    assert comment_guard.yaml_issue_lines("run: |\n  echo hello # hidden\n") == [(2, "comment")]
+    assert comment_guard.yaml_issue_lines('name: "echo # no"\n') == []
+    assert comment_guard.yaml_issue_lines("run: |\n  echo hello # hidden\n") == [(2, "comment"), (2, "inline-python")]
     assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines("a: &anchor 1\n"))
 
 
@@ -455,15 +466,17 @@ def test_workflow_grammar_blocks_the_review_bypasses():
     assert _has_kind("steps:\n  - shell: python3.12\n    run: echo ok\n", "inline-python")
     assert _has_kind("defaults:\n  run:\n    shell: python3.12\n", "inline-python")
     assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines("run: {echo: ok, echo: hidden}\n"))
-    assert comment_guard.yaml_issue_lines("run: echo hello\n") == []
+    assert comment_guard.yaml_issue_lines("run: echo hello\n")
     assert comment_guard.yaml_issue_lines("run: python -m backtester test\n") == []
-    assert comment_guard.yaml_issue_lines("run: python3 script.py\n") == []
+    assert comment_guard.yaml_issue_lines("run: python3 script.py\n")
     assert comment_guard.yaml_issue_lines("shell: pwsh\nrun: python packaging/build_windows.py\n") == []
-    assert comment_guard.yaml_issue_lines("shell: bash\nrun: echo hello\n") == []
+    assert comment_guard.yaml_issue_lines("shell: Bash\nrun: python -m backtester test\n") == []
     assert comment_guard.yaml_issue_lines("shell: cmd\nrun: python script.py\n") == []
     assert comment_guard.yaml_issue_lines('run: echo "hello # world"\n')
     assert comment_guard.yaml_issue_lines('run: python -m pip install -e ".[dev]"\n') == []
-    assert comment_guard.yaml_issue_lines("run: echo a,b\n") == []
+    assert comment_guard.yaml_issue_lines('run: python -m pip install -e ".[dev,gui]"\n') == []
+    assert comment_guard.yaml_issue_lines("run: sudo apt-get update && sudo apt-get install -y bubblewrap\n") == []
+    assert comment_guard.yaml_issue_lines("run: echo a,b\n")
 
 
 def test_generated_run_lines_outside_the_grammar_are_flagged():
@@ -484,7 +497,146 @@ def test_generated_run_lines_outside_the_grammar_are_flagged():
         else:
             assert findings, line
             flagged += 1
-    assert flagged >= 20
+    executables = ["node", "bun", "php", "osascript", "true", "rem", "cmd", "env", "echo", "bash", "perl", "ruby", "deno", "pwsh"]
+    for _index in range(20):
+        executable = rng.choice(executables)
+        assert executable not in comment_guard.EXECUTABLE_ALLOWLIST
+        assert comment_guard.yaml_issue_lines("run: " + executable + " hidden\n"), executable
+        flagged += 1
+    for _index in range(20):
+        key = "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(4, 9)))
+        if key in comment_guard.KNOWN_KEYS["root"]:
+            continue
+        assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(key + ": hidden\n")), key
+        flagged += 1
+    assert flagged >= 40
+
+
+def test_review4_finite_allowlist_closes_the_filed_rows():
+    script = "steps:\n  - uses: actions/github-script@v7\n    with:\n      script: |\n        // hidden comment\n"
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(script))
+    script_hash = "steps:\n  - with:\n      script: |\n        # hidden\n"
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(script_hash))
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines('script: "x = 1 # hidden"\n'))
+    entrypoint = "entrypoint: |\n  # hidden\n  python app.py\n"
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(entrypoint))
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines("args: echo hi\n"))
+    path = "steps:\n  - with:\n      path: |\n        # hidden\n"
+    assert any(kind == "comment" for _line, kind in comment_guard.yaml_issue_lines(path))
+    cache = "steps:\n  - with:\n      cache-dependency-path: |\n        # hidden\n"
+    assert any(kind == "comment" for _line, kind in comment_guard.yaml_issue_lines(cache))
+    for command in (
+        "rem hidden comment",
+        "REM hidden comment",
+        ":: hidden comment",
+        "echo ok && rem hidden comment",
+        "cmd /c rem hidden comment",
+        "cmd.exe /c rem hidden comment",
+        "node -e 'console.log(1) // hidden'",
+        "node --eval '// hidden'",
+        "node -p '1 // hidden'",
+        "node -e 'console.log(1) /* hidden */'",
+        "env node -e '// hidden'",
+        "bun -e 'console.log(1) // hidden'",
+        "php -r 'echo 1; // hidden'",
+        "php -r 'echo 1; /* hidden */'",
+        "osascript -e '1 -- hidden'",
+        ": this is a hidden comment",
+        "echo ok && : hidden comment",
+        "true this is a hidden comment",
+        "false this is a hidden comment",
+        "python -e 'code'",
+        "python --eval 'code'",
+        "python -p 'code'",
+        "python -r 'code'",
+        "python -c 'x = 1'",
+    ):
+        document = "shell: cmd\nrun: " + command + "\n"
+        assert comment_guard.yaml_issue_lines(document), command
+    assert comment_guard.yaml_issue_lines("shell: bash\nrun: cmd /c rem hidden comment\n")
+    assert comment_guard.yaml_issue_lines("shell: pwsh\nrun: cmd.exe /c rem hidden comment\n")
+    assert comment_guard.yaml_issue_lines("run: python packaging/tool.py -e code\n")
+    assert comment_guard.yaml_issue_lines("run: python -m pytest -r code\n")
+    assert comment_guard.yaml_issue_lines("run: python -m pip install -r packaging/requirements-build.txt\n") == []
+    assert comment_guard.yaml_issue_lines("run: python -m pip install --upgrade pip\n") == []
+    assert comment_guard.yaml_issue_lines("run: python -m pip install .\n") == []
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines("description: |\n  # heading\n"))
+    branches = "on:\n  push:\n    branches:\n      - |\n        # hidden\n"
+    assert any(kind == "comment" for _line, kind in comment_guard.yaml_issue_lines(branches))
+    assert comment_guard.python_issue_lines('__doc__ = """hidden docstring"""\n')
+    assert comment_guard.python_issue_lines('class A:\n    __doc__ = "hidden"\n')
+    assert comment_guard.python_issue_lines('def f():\n    f.__doc__ = "hidden"\n')
+    assert comment_guard.python_issue_lines('globals()["__doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('setattr(sys, "__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('setattr(sys, name="__doc__", value="hidden")\n')
+    assert comment_guard.python_issue_lines('__doc__ += "hidden"\n')
+    assert comment_guard.python_issue_lines('_ += b"hidden"\n')
+    assert comment_guard.python_issue_lines('_ = """hidden"""\n')
+    assert comment_guard.python_issue_lines('_ = f"""hidden {1}"""\n')
+    assert comment_guard.python_issue_lines('_ = b"""hidden"""\n')
+    assert comment_guard.python_issue_lines('_: str = "hidden"\n')
+    assert comment_guard.python_issue_lines('(_,) = ("hidden",)\n')
+    assert comment_guard.python_issue_lines("_ = print(1)\n") == []
+    assert comment_guard.python_issue_lines('for _ in ("hidden",):\n    pass\n') == []
+    assert comment_guard.python_issue_lines('exec("x = 1 # hidden")\n') == []
+    assert comment_guard.python_issue_lines('exec("""hidden""")\n') == []
+    assert comment_guard.python_issue_lines('compile("x = 1", "<s>", "exec")\n') == []
+    assert comment_guard.python_issue_lines('x: """hidden""" = 1\n') == []
+    assert comment_guard.python_issue_lines('async def f():\n    await "hidden"\n') == []
+    assert comment_guard.python_issue_lines('def f():\n    yield "hidden"\n') == []
+    assert comment_guard.python_issue_lines('"""hidden"""()\n') == []
+    toml = 'key = "unterminated\n# hidden comment\n'
+    assert any(kind == "unscanned" for _line, kind in comment_guard.hash_config_issue_lines(toml))
+    requirements = 'pkg = "unterminated\n# hidden comment\n'
+    assert any(item.kind == "unscanned" for item in comment_guard.issues_for("requirements.txt", requirements))
+    cfg = 'key = "unterminated\n; hidden\n'
+    assert any(kind == "unscanned" for _line, kind in comment_guard.ini_issue_lines(cfg))
+    assert comment_guard.hash_config_issue_lines("key = '# not a comment'\n# real\n") == [(2, "comment")]
+    manifest = (ROOT / "tests" / "reference" / "arena" / "ENGINE_SHA256.txt").read_text(encoding="utf-8")
+    assert comment_guard.issues_for("tests/reference/arena/ENGINE_SHA256.txt", manifest) == []
+    assert any(item.kind == "comment" for item in comment_guard.issues_for("ENGINE_SHA256.txt", manifest + "# hidden\n"))
+    assert comment_guard.issues_for("ENGINE_SHA256.txt", "not a hash\n")
+    digest = "a" * 64
+    assert comment_guard.hash_manifest_issue_lines(digest + " file.py\n") == []
+    assert comment_guard.hash_manifest_issue_lines(digest + "  file.py\n") == []
+    assert comment_guard.hash_manifest_issue_lines(digest + "   file.py\n")
+    assert comment_guard.hash_manifest_issue_lines(digest + "  #hidden\n")
+    assert comment_guard.issues_for("LICENSE.txt", "# prose\n") == []
+    assert comment_guard.issues_for("data.csv", "# hidden\n") == []
+    package = '{"scripts": {"t": "echo hi # hidden"}}\n'
+    assert comment_guard.issues_for("package.json", package) == [
+        comment_guard.Finding("package.json", 1, "unscanned")
+    ]
+    assert comment_guard.json_issue_lines('{"name": "ok"}\n') == []
+    assert comment_guard.issues_for("book.json", '{"scripts": {"t": "echo"}}\n')
+
+
+def test_generated_executables_and_keys_outside_the_allowlist_are_flagged():
+    rng = random.Random(15)
+    executables = ["node", "bun", "php", "osascript", "true", "rem", "cmd", "env", "echo", "bash", "perl", "ruby", "deno", "pwsh"]
+    flagged = 0
+    for _index in range(20):
+        executable = rng.choice(executables)
+        line = executable + " hidden"
+        assert executable not in comment_guard.EXECUTABLE_ALLOWLIST
+        assert comment_guard.yaml_issue_lines("run: " + line + "\n"), line
+        flagged += 1
+    keys = ["script", "entrypoint", "args", "title", "description", "command", "workdir"]
+    for _index in range(20):
+        key = rng.choice(keys)
+        assert key not in comment_guard.KNOWN_KEYS["root"]
+        assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(key + ": hidden\n"))
+        flagged += 1
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
+    produced = 0
+    while produced < 20:
+        key = "".join(rng.choice(alphabet) for _ in range(rng.randint(3, 8)))
+        if key in comment_guard.KNOWN_KEYS["root"]:
+            continue
+        assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(key + ": hidden\n")), key
+        produced += 1
+        flagged += 1
+    assert flagged >= 40
 
 
 def test_decode_failures_are_findings(tmp_path: Path):

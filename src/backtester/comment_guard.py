@@ -16,12 +16,70 @@ FILE_ALLOWLIST = (
 
 DIRECTIVE_ALLOWLIST: tuple[tuple[str, str], ...] = ()
 
+THREAT_MODEL = (
+    "reject any construct that stores unused commentary text in tracked files",
+    "treat every unmodeled file type, key, executable or syntax as a finding",
+)
+
+EXECUTABLE_ALLOWLIST = ("apt-get", "python", "sudo")
+
+PYTHON_MODULES = ("backtester", "pip", "pytest")
+
+KNOWN_KEYS = {
+    "root": ("concurrency", "defaults", "env", "jobs", "name", "on", "permissions", "run", "shell", "steps"),
+    "on": ("pull_request", "push", "workflow_dispatch"),
+    "push": ("branches", "tags"),
+    "event": (),
+    "concurrency": ("cancel-in-progress", "group"),
+    "job": ("defaults", "env", "if", "name", "needs", "outputs", "permissions", "runs-on", "steps", "strategy", "timeout-minutes"),
+    "strategy": ("fail-fast", "matrix"),
+    "matrix": ("os", "python", "shard"),
+    "step": ("env", "id", "if", "name", "run", "shell", "uses", "with"),
+    "with": ("cache", "cache-dependency-path", "fail_on_unmatched_files", "files", "if-no-files-found", "name", "path", "python-version"),
+    "defaults": ("run",),
+    "defaults-run": ("shell",),
+    "permissions": ("contents",),
+    "outputs": ("shards",),
+    "env": ("CI_SHARD", "MPLBACKEND", "PYTEST_QT_API", "QT_QPA_PLATFORM", "SB_INSTALL_DIR", "SB_SMOKE_DIR", "STRATEGY_BUILDER_HEADLESS"),
+}
+
+_KEY_NEST = {
+    ("root", "on"): "on",
+    ("root", "jobs"): "jobs",
+    ("root", "concurrency"): "concurrency",
+    ("root", "permissions"): "permissions",
+    ("root", "env"): "env",
+    ("root", "defaults"): "defaults",
+    ("root", "steps"): "steps",
+    ("root", "run"): "run",
+    ("root", "shell"): "shell",
+    ("on", "push"): "push",
+    ("on", "pull_request"): "event",
+    ("on", "workflow_dispatch"): "event",
+    ("job", "strategy"): "strategy",
+    ("job", "steps"): "steps",
+    ("job", "env"): "env",
+    ("job", "outputs"): "outputs",
+    ("job", "permissions"): "permissions",
+    ("job", "defaults"): "defaults",
+    ("job", "run"): "run",
+    ("job", "shell"): "shell",
+    ("strategy", "matrix"): "matrix",
+    ("step", "with"): "with",
+    ("step", "env"): "env",
+    ("step", "run"): "run",
+    ("step", "shell"): "shell",
+    ("defaults", "run"): "defaults-run",
+    ("defaults-run", "shell"): "shell",
+}
+
 _HASH_SUFFIXES = {".toml"}
 _PY_SUFFIXES = {".py", ".pyw", ".spec"}
 _DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico"}
 _DATA_SUFFIXES = {".csv", ".gif", ".gz", ".ico", ".jpeg", ".jpg", ".png", ".webp", ".xz", ".zip"}
 _PROSE_TEXT_NAMES = {"license.txt", "install_before.txt"}
-_DATA_TEXT_NAMES = {"engine_sha256.txt"}
+_HASH_MANIFEST_NAMES = {"engine_sha256.txt", "sha256sums"}
+HASH_MANIFEST_LINE = re.compile(r"^[0-9a-f]{64}[ ]{1,2}\S+$")
 _HTML_ACTIVE = re.compile(r"(?i)(?:<script|<style|(?:^|[\s<])style\s*=|(?<![A-Za-z0-9])on[a-z0-9:-]*\s*=)")
 _KEY_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:(.*)$")
 _BLOCK_STYLE = re.compile(r"[|>](?:[+-][1-9]?|[1-9][+-]?)?$")
@@ -187,6 +245,94 @@ def _no_effect_spans(text: str, starts: list[int], tree: ast.AST) -> list[tuple[
     return spans
 
 
+def _const_text(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _contains_call(node: ast.AST) -> bool:
+    return any(isinstance(item, ast.Call) for item in ast.walk(node))
+
+
+def _commentary_constant(node: ast.AST) -> bool:
+    if _contains_call(node):
+        return False
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (str, bytes))
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return bool(node.elts) and all(_commentary_constant(item) for item in node.elts)
+    return False
+
+
+def _underscore_name(name: str) -> bool:
+    return bool(name) and set(name) == {"_"}
+
+
+def _target_is_doc(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "__doc__"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "__doc__"
+    if isinstance(node, ast.Subscript):
+        return _const_text(node.slice) == "__doc__"
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return any(_target_is_doc(item) for item in node.elts)
+    return False
+
+
+def _target_is_only_underscores(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return _underscore_name(node.id)
+    if isinstance(node, ast.Attribute):
+        return _underscore_name(node.attr)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return bool(node.elts) and all(_target_is_only_underscores(item) for item in node.elts)
+    return False
+
+
+def _assignment_targets(statement: ast.AST) -> list[ast.AST] | None:
+    if isinstance(statement, ast.Assign):
+        return list(statement.targets)
+    if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+        return [statement.target]
+    return None
+
+
+def _commentary_assignment(statement: ast.AST) -> bool:
+    targets = _assignment_targets(statement)
+    if targets is None:
+        return False
+    value = getattr(statement, "value", None)
+    if value is None or not _commentary_constant(value):
+        return False
+    if any(_target_is_doc(target) for target in targets):
+        return True
+    return all(_target_is_only_underscores(target) for target in targets)
+
+
+def _call_argument(node: ast.Call, index: int, keyword: str) -> ast.AST | None:
+    if len(node.args) > index:
+        return node.args[index]
+    for item in node.keywords:
+        if item.arg == keyword:
+            return item.value
+    return None
+
+
+def _setattr_doc_constant(node: ast.Call) -> bool:
+    func = node.func
+    if not isinstance(func, ast.Name) or func.id != "setattr":
+        return False
+    name = _call_argument(node, 1, "name")
+    value = _call_argument(node, 2, "value")
+    if name is None or value is None or _const_text(name) != "__doc__":
+        return False
+    return _commentary_constant(value)
+
+
 def _body_no_effect_spans(
     text: str,
     starts: list[int],
@@ -197,9 +343,15 @@ def _body_no_effect_spans(
 ) -> list[tuple[int, int, str]]:
     discarded = []
     for statement in body:
+        if _commentary_assignment(statement):
+            discarded.append(statement)
+            continue
         if not isinstance(statement, ast.Expr):
             continue
         if stub_ok and len(body) == 1 and _bare_ellipsis(statement, text, starts):
+            continue
+        if isinstance(statement.value, ast.Call) and _setattr_doc_constant(statement.value):
+            discarded.append(statement)
             continue
         if _expression_is_allowed(statement.value):
             continue
@@ -278,8 +430,9 @@ def _unique_lines(found: list[tuple[int, str]]) -> list[tuple[int, str]]:
     return ordered
 
 
-def _hash_comment_spans(text: str, markers: str = "#") -> list[tuple[int, int]]:
+def _scan_hash_config(text: str, markers: str = "#") -> tuple[list[tuple[int, int]], list[int]]:
     spans: list[tuple[int, int]] = []
+    unclosed: list[int] = []
     index = 0
     size = len(text)
     while index < size:
@@ -296,15 +449,22 @@ def _hash_comment_spans(text: str, markers: str = "#") -> list[tuple[int, int]]:
         char = text[index]
         if char in "'\"":
             quote = char
+            opened = index
             index += 1
+            closed = False
             while index < size:
+                if text[index] == "\n":
+                    break
                 if quote == '"' and text[index] == "\\":
                     index += 2
                     continue
                 if text[index] == quote:
                     index += 1
+                    closed = True
                     break
                 index += 1
+            if not closed:
+                unclosed.append(opened)
             continue
         if char in markers:
             start = index
@@ -313,14 +473,25 @@ def _hash_comment_spans(text: str, markers: str = "#") -> list[tuple[int, int]]:
             spans.append((start, index))
             continue
         index += 1
+    return spans, unclosed
+
+
+def _hash_comment_spans(text: str, markers: str = "#") -> list[tuple[int, int]]:
+    spans, _unclosed = _scan_hash_config(text, markers)
     return spans
 
 
-def hash_config_issue_lines(text: str) -> list[tuple[int, str]]:
+def _config_issue_lines(text: str, markers: str = "#") -> list[tuple[int, str]]:
     normalized = _normalize_newlines(text)
     starts = _line_starts(normalized)
-    found = [(_line_number(starts, start), "comment") for start, _end in _hash_comment_spans(normalized)]
-    return found
+    spans, unclosed = _scan_hash_config(normalized, markers)
+    found = [(_line_number(starts, offset), "unscanned") for offset in unclosed]
+    found.extend((_line_number(starts, start), "comment") for start, _end in spans)
+    return _unique_lines(found)
+
+
+def hash_config_issue_lines(text: str) -> list[tuple[int, str]]:
+    return _config_issue_lines(text)
 
 
 def gitignore_issue_lines(text: str) -> list[tuple[int, str]]:
@@ -635,7 +806,7 @@ def _split_yaml_comment(line: str) -> tuple[str, str | None]:
 _RUN_TOKEN = re.compile(r"[-A-Za-z0-9_./:=,@+,]+")
 _ALLOWED_SHELLS = {"bash", "pwsh", "cmd"}
 _BANNED_COMMANDS = {"eval", "bash", "sh", "dash", "pwsh", "powershell", "bash.exe", "sh.exe", "pwsh.exe", "powershell.exe"}
-_INTERPRETER_PREFIXES = ("python", "pypy", "node", "perl", "ruby", "php")
+_APT_SHAPES = {("update",), ("install", "-y", "bubblewrap")}
 
 
 def _split_run_commands(line: str) -> list[list[str]] | None:
@@ -685,13 +856,45 @@ def _split_run_commands(line: str) -> list[list[str]] | None:
     return commands
 
 
-def _is_inline_interpreter(token: str) -> bool:
-    base = token.casefold().rsplit("/", 1)[-1]
-    if base.endswith(".exe"):
-        base = base[:-4]
-    for prefix in _INTERPRETER_PREFIXES:
-        if base == prefix or base.startswith(prefix):
-            return True
+def _base_name(token: str) -> str:
+    return token.casefold().replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _python_shape_allowed(tokens: list[str]) -> bool:
+    if len(tokens) < 2:
+        return False
+    if tokens[1] == "-m":
+        return len(tokens) >= 3 and _base_name(tokens[2]) in PYTHON_MODULES
+    script = tokens[1]
+    return not script.startswith("-") and script.endswith(".py")
+
+
+def _command_shape_allowed(tokens: list[str]) -> bool:
+    executable = _base_name(tokens[0])
+    if executable == "python":
+        return _python_shape_allowed(tokens)
+    if executable == "apt-get":
+        return tuple(tokens[1:]) in _APT_SHAPES
+    return False
+
+
+def _subject_command(tokens: list[str]) -> list[str]:
+    if tokens and _base_name(tokens[0]) == "sudo":
+        return tokens[1:]
+    return tokens
+
+
+def _pip_command(tokens: list[str]) -> bool:
+    command = _subject_command(tokens)
+    return len(command) >= 3 and _base_name(command[0]) == "python" and command[1] == "-m" and _base_name(command[2]) == "pip"
+
+
+def _interpreter_flag(token: str, tokens: list[str]) -> bool:
+    folded = token.casefold()
+    if folded.startswith("-c") or folded in {"--eval", "-command", "-p"}:
+        return True
+    if folded in {"-e", "-r"}:
+        return not _pip_command(tokens)
     return False
 
 
@@ -700,12 +903,16 @@ def _command_allowed(tokens: list[str]) -> bool:
         return False
     for token in tokens:
         folded = token.casefold()
-        base = folded.rsplit("/", 1)[-1]
-        if folded.startswith("-c") or folded in _BANNED_COMMANDS or base in _BANNED_COMMANDS:
+        if _interpreter_flag(token, tokens) or folded in _BANNED_COMMANDS or _base_name(token) in _BANNED_COMMANDS:
             return False
-    if _is_inline_interpreter(tokens[0]) and "-" in tokens:
+    executable = _base_name(tokens[0])
+    if executable not in EXECUTABLE_ALLOWLIST:
         return False
-    return True
+    if executable == "sudo":
+        if len(tokens) < 2 or _base_name(tokens[1]) not in EXECUTABLE_ALLOWLIST or _base_name(tokens[1]) == "sudo":
+            return False
+        return _command_shape_allowed(tokens[1:])
+    return _command_shape_allowed(tokens)
 
 
 def _run_line_allowed(line: str) -> bool:
@@ -751,27 +958,71 @@ def _check_run(scalar: _YamlScalar, findings: list[tuple[int, str]]) -> None:
             findings.append((source, "inline-python"))
 
 
-def _visit_yaml(node: object, findings: list[tuple[int, str]]) -> None:
+def _child_context(context: str, key: str) -> str | None:
+    if context == "jobs":
+        return "job"
+    allowed = KNOWN_KEYS.get(context)
+    if allowed is None or key not in allowed:
+        return None
+    return _KEY_NEST.get((context, key), "scalar")
+
+
+def _check_leading_hash(scalar: _YamlScalar, findings: list[tuple[int, str]]) -> None:
+    if "\n" not in scalar.text:
+        return
+    lines = scalar.text.split("\n")
+    for offset, line in enumerate(lines):
+        if not line.lstrip(" \t").startswith("#"):
+            continue
+        source = scalar.line_map[offset] if offset < len(scalar.line_map) else scalar.line
+        findings.append((source, "comment"))
+
+
+def _visit_yaml(node: object, findings: list[tuple[int, str]], context: str) -> None:
+    if node is None:
+        return
+    if isinstance(node, _YamlScalar):
+        if context != "rejected":
+            _check_leading_hash(node, findings)
+        return
     if isinstance(node, _YamlSeq):
+        if context == "steps":
+            item_context = "step"
+        elif context == "rejected":
+            item_context = "rejected"
+        else:
+            item_context = "scalar"
         for item in node.items:
-            _visit_yaml(item, findings)
+            _visit_yaml(item, findings, item_context)
         return
     if not isinstance(node, _YamlMap):
+        findings.append((1, "unscanned"))
         return
     seen: set[str] = set()
     for key, line, child in node.entries:
         if key in seen:
             findings.append((line, "unscanned"))
         seen.add(key)
-        if key == "shell":
+        child_context = _child_context(context, key)
+        if child_context is None:
+            findings.append((line, "unscanned"))
+            _visit_yaml(child, findings, "rejected")
+            continue
+        if child_context == "shell":
             if not isinstance(child, _YamlScalar) or child.text.strip().casefold() not in _ALLOWED_SHELLS:
                 findings.append((child.line if isinstance(child, _YamlScalar) else line, "inline-python"))
-        elif key == "run":
+            continue
+        if child_context == "run":
             if not isinstance(child, _YamlScalar):
                 findings.append((line, "unscanned"))
             else:
                 _check_run(child, findings)
-        _visit_yaml(child, findings)
+                _check_leading_hash(child, findings)
+            continue
+        if child_context == "job" and not isinstance(child, _YamlMap):
+            findings.append((line, "unscanned"))
+            continue
+        _visit_yaml(child, findings, child_context)
 
 
 def yaml_issue_lines(text: str) -> list[tuple[int, str]]:
@@ -780,15 +1031,17 @@ def yaml_issue_lines(text: str) -> list[tuple[int, str]]:
     normalized = _normalize_newlines(text)
     document = _YamlDocument(normalized.split("\n"))
     document.parse()
-    if document.root is not None:
-        _visit_yaml(document.root, document.findings)
+    if isinstance(document.root, _YamlSeq):
+        _visit_yaml(document.root, document.findings, "steps")
+    elif isinstance(document.root, _YamlMap):
+        _visit_yaml(document.root, document.findings, "root")
+    elif document.root is not None:
+        document.findings.append((1, "unscanned"))
     return _unique_lines(document.findings)
 
 
 def ini_issue_lines(text: str) -> list[tuple[int, str]]:
-    normalized = _normalize_newlines(text)
-    starts = _line_starts(normalized)
-    return [(_line_number(starts, start), "comment") for start, _end in _hash_comment_spans(normalized, markers="#;")]
+    return _config_issue_lines(text, markers="#;")
 
 def html_issue_lines(text: str) -> list[tuple[int, str]]:
     if _rejected_text(text):
@@ -811,9 +1064,20 @@ def html_issue_lines(text: str) -> list[tuple[int, str]]:
     return _unique_lines(found)
 
 
-def json_issue_lines(text: str) -> list[tuple[int, str]]:
+def _json_executes_strings(node: object) -> bool:
+    if isinstance(node, dict):
+        if "scripts" in node:
+            return True
+        return any(_json_executes_strings(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_json_executes_strings(value) for value in node)
+    return False
+
+
+def json_issue_lines(text: str, path: str = "") -> list[tuple[int, str]]:
     if _rejected_text(text):
         return [(1, "unscanned")]
+    name = _normalized_path(path).rsplit("/", 1)[-1]
 
     def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
         seen: set[str] = set()
@@ -826,10 +1090,28 @@ def json_issue_lines(text: str) -> list[tuple[int, str]]:
         return document
 
     try:
-        json.loads(text, object_pairs_hook=pairs)
+        loaded = json.loads(text, object_pairs_hook=pairs)
     except (json.JSONDecodeError, ValueError, UnicodeError):
         return [(1, "unscanned")]
+    if name == "package.json" or _json_executes_strings(loaded):
+        return [(1, "unscanned")]
     return []
+
+
+def hash_manifest_issue_lines(text: str) -> list[tuple[int, str]]:
+    normalized = _normalize_newlines(text)
+    lines = normalized.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    found: list[tuple[int, str]] = []
+    for number, line in enumerate(lines, 1):
+        if "#" in line:
+            found.append((number, "comment"))
+            continue
+        if HASH_MANIFEST_LINE.fullmatch(line):
+            continue
+        found.append((number, "unscanned"))
+    return found
 
 
 def _requirement_text(name: str) -> bool:
@@ -863,14 +1145,16 @@ def _kind(path: str) -> str | None:
         return "html"
     if _requirement_text(name):
         return "hashconfig"
-    if suffix == ".txt" and name in _PROSE_TEXT_NAMES | _DATA_TEXT_NAMES:
+    if name in _HASH_MANIFEST_NAMES:
+        return "manifest"
+    if suffix == ".txt" and name in _PROSE_TEXT_NAMES:
         return None
     if suffix in _DATA_SUFFIXES:
         return None
     return "unscanned"
 
 
-def _issue_lines(kind: str, text: str) -> list[tuple[int, str]]:
+def _issue_lines(kind: str, text: str, path: str = "") -> list[tuple[int, str]]:
     if kind == "python":
         return python_issue_lines(text)
     if kind == "inno":
@@ -886,7 +1170,9 @@ def _issue_lines(kind: str, text: str) -> list[tuple[int, str]]:
     if kind == "html":
         return html_issue_lines(text)
     if kind == "json":
-        return json_issue_lines(text)
+        return json_issue_lines(text, path)
+    if kind == "manifest":
+        return hash_manifest_issue_lines(text)
     return [(1, "unscanned")]
 
 
@@ -1000,7 +1286,7 @@ def issues_for(path: str, text: str) -> list[Finding]:
     if _rejected_text(text):
         return [Finding(path, 1, "unscanned")]
     try:
-        parsed = _issue_lines(kind, text)
+        parsed = _issue_lines(kind, text, path)
     except Exception:
         return [Finding(path, 1, "unscanned")]
     findings: list[Finding] = []
