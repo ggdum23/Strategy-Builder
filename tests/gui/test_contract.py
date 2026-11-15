@@ -1,4 +1,3 @@
-"""Report adapter, validation, and paths. No Qt."""
 
 from __future__ import annotations
 

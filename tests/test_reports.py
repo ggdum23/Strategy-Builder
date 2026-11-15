@@ -1,4 +1,3 @@
-"""Report files: curves, the chart, liquidation, and the designer copy."""
 
 from __future__ import annotations
 
@@ -368,7 +367,6 @@ def test_token_match_is_casefolded_and_bounded_for_one_character(tmp_path):
 
 
 def test_redact_metrics_uses_the_random_stand_in():
-    """Designer failure text and ids use RANDOM. The ticker does not survive."""
     from backtester.report import TICKER_STAND_IN, redact_metrics, ticker_token_spans
 
     cleaned = redact_metrics(
@@ -383,7 +381,6 @@ def test_redact_metrics_uses_the_random_stand_in():
 
 
 def test_a_per_job_stand_in_keeps_the_directory_suffix(tmp_path):
-    """``my_RANDOM_v2`` is this row's id. The file must gain the directory's ``-N``."""
     from backtester.report import scrub_designer_tree, write_json
 
     folder = tmp_path / "my_RANDOM_v2-2"

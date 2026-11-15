@@ -1,4 +1,3 @@
-"""Loader, resampling, and the October 2026 sample."""
 
 from __future__ import annotations
 
@@ -112,7 +111,6 @@ def test_short_session_is_measured_before_resample(tmp_path):
     flags = loaded.frame.groupby("date")["short_session"].first()
     assert int(flags["2026-10-01"]) == 1
     assert int(flags["2026-10-02"]) == 0
-    # The early day's last RTH minute is 779. A 30-minute bucket must not relabel the day.
     assert int(loaded.frame.loc[loaded.frame["date"] == "2026-10-01", "short_session"].max()) == 1
 
 
@@ -141,7 +139,6 @@ def test_resample_anchor_partial_tail_and_session_walls():
                 "symbol": "QQQ",
             }
         )
-    # A post segment that a midnight grid would have glued onto the last RTH bucket.
     for minute in range(960, 964):
         rows.append(
             {
@@ -176,7 +173,6 @@ def test_resample_anchor_partial_tail_and_session_walls():
     assert float(rth.iloc[0]["close"]) == 10.5 + 4
     assert int(rth.iloc[0]["filled"]) == 0
     assert int(rth.iloc[1]["filled"]) == 1
-    # First bucket volumes 10 then 30*4, wap 10 then 20.
     assert float(rth.iloc[0]["wap"]) == (10 * 10 + 20 * 30 * 4) / (10 + 120)
     assert list(out.loc[out["session"] == "post", "minute"]) == [960]
     copied = resample(frame, 1)
@@ -278,7 +274,6 @@ def test_fractional_count_survives_the_desk_conversion():
 def test_missing_month_is_named_and_a_gap_inside_a_file_is_kept(tmp_path, capsys):
     from backtester.__main__ import main
 
-    # 2025-11-03 and 2025-11-06, with 2025-11-05 absent inside the file.
     november = [
         minute_row(datetime(2025, 11, 3), 570, "rth", 10),
         minute_row(datetime(2025, 11, 3), 571, "rth", 10),
@@ -343,7 +338,6 @@ def test_filename_rejects_a_path_separator():
 
 
 def test_partial_bucket_is_not_padded_and_does_not_take_the_next_session(tmp_path):
-    """A short session keeps its tail. The next day's price stays in the next day."""
     day = datetime(2026, 6, 1)
     nxt = datetime(2026, 6, 2)
     rows = []
@@ -524,7 +518,6 @@ def test_extra_columns_are_named_and_rejected(tmp_path):
 
 
 def test_columns_are_read_by_name_when_the_file_order_changes(tmp_path):
-    """A position-based read would put the close into another field."""
     row = minute_row(datetime(2024, 6, 3), 9 * 60 + 30, "rth", 10.0)
     row["open"] = 10
     row["high"] = 12

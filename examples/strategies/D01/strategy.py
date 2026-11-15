@@ -1,22 +1,3 @@
-"""Long-only inverse-volatility overlay for ASSET.
-
-Decision frequency: once per regular session, on the last RTH bar (15:59, or
-12:59 on a shortened session). The order fills at the next delivered bar's
-open, which is the next session's open. No extended-hours trading.
-
-After 63 close-to-close returns exist, the target fraction of equity is
-
-    raw = 0.22 / max(0.05, 0.5 * (rv21 + rv63))
-    target = clip(round_half_up(raw, step=0.25), 0, 1.5)
-
-where rv21 and rv63 are the annualized sample standard deviations of the last
-21 and 63 close-to-close returns. The position is always long after warm-up
-(it never shorts). Quantizing to quarter-turns is what keeps turnover low:
-an unchanged bucket does not rebalance, and price drift is left alone.
-
-The 0.22 vol budget, 63/21 blend, 1.5 cap and 0.25 step are frozen constants
-from the design-window study. Nothing here reads files, the clock, or the network.
-"""
 import math
 
 
@@ -29,7 +10,6 @@ class Strategy:
     STEP = 0.25
     FAST = 21
     SLOW = 63
-    # Last regular-session bar start: 15:59, or 12:59 when the session ends at 13:00.
     LAST_MINUTE = 15 * 60 + 59
     LAST_MINUTE_SHORT = 12 * 60 + 59
 
@@ -77,12 +57,10 @@ class Strategy:
 
     def _append(self, close):
         self.closes.append(close)
-        # 64 closes cover the 63-return window with one extra bar of slack.
         if len(self.closes) > 80:
             del self.closes[:-80]
 
     def _sample_std(self, n_returns):
-        """Sample std (ddof=1) of the last n_returns close-to-close returns."""
         need = n_returns + 1
         w = self.closes[-need:]
         if len(w) < need:

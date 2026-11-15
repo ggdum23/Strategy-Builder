@@ -1,15 +1,3 @@
-"""Allow-list for every designer-facing artifact.
-
-``publish_designer`` and the desktop window both import this module. A
-designer surface keeps these names and drops every other key. There is no
-second designer path that still shows share counts, prices, notionals,
-per-component fees, or accounting dollars.
-
-Exact equity stays. Fees are a cost drag in basis points of that equity,
-rounded to 0.1 bp, because a dollar fee total divided by the public
-per-share schedule recovers the share count. ``docs/PACK.md`` records that
-residual.
-"""
 
 from __future__ import annotations
 
@@ -19,9 +7,6 @@ import re
 import zlib
 from decimal import Decimal, ROUND_HALF_UP
 
-# Returns, ratios, exposure, drawdowns, counts, bar and session indices, and
-# the settings that cannot be inverted into a price. No share counts, prices,
-# notionals, per-component fees, dollar fee totals, or accounting dollars.
 REDACTED_KEYS = frozenset(
     {
         "total_return",
@@ -127,18 +112,12 @@ REDACTED_KEYS = frozenset(
     }
 )
 
-# Engine block labels are zero-padded: Arena ``S01`` and Desk ``B01``, one
-# block per 252 sessions. Sixty blocks is about sixty years. The month and
-# year stand-ins are the ``M1`` / ``Y1`` labels the window writes when it
-# relabels a monthly or yearly map. ``S99`` is outside this schema.
 _BLOCK_KEY = re.compile(r"[SB](?:0[1-9]|[1-5][0-9]|60)\Z")
 _MONTH_KEY = re.compile(r"M([1-9][0-9]{0,2})\Z")
 _YEAR_KEY = re.compile(r"Y([1-9][0-9]{0,1})\Z")
 _MONTH_LIMIT = 600
 _YEAR_LIMIT = 60
 
-# One clock token. Hours may be one or two digits. Minutes and seconds are two.
-# The screen, the export, and ``publish_designer`` all use this spelling.
 CLOCK_BODY = r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?"
 CLOCK_TEXT = re.compile(CLOCK_BODY + r"\Z")
 _SESSION_TEXT = re.compile(r"(?:[SB]\d+|pre|rth|post|eth)\Z")
@@ -173,7 +152,6 @@ _BOOL_KEYS = frozenset(
     }
 )
 _BOOL_TEXT = frozenset({"true", "false"})
-# Sentences the report itself writes. Anything else on those keys is free text.
 _FIXED_TEXT = frozenset(
     {
         "withheld",
@@ -188,7 +166,6 @@ _DROP = object()
 
 
 def period_key_allowed(name: str) -> bool:
-    """True for an engine block label or a month/year stand-in in the schema."""
     key = str(name)
     if _BLOCK_KEY.fullmatch(key):
         return True
@@ -200,17 +177,11 @@ def period_key_allowed(name: str) -> bool:
 
 
 def redacted_key_allowed(name: str) -> bool:
-    """True when a designer surface may keep this field name.
-
-    The screen, the export, and ``publish_designer`` all call this. A key
-    that is not listed is dropped.
-    """
     key = str(name)
     return key in REDACTED_KEYS or period_key_allowed(key)
 
 
 def equity_base(metrics: dict):
-    """Initial equity when it is a non-zero finite number, otherwise final equity."""
     if not isinstance(metrics, dict):
         return None
     for key in ("initial_equity", "final_equity"):
@@ -223,11 +194,6 @@ def equity_base(metrics: dict):
 
 
 def cost_drag_bps(fees, equity) -> float | None:
-    """``fees / equity * 10000``, rounded half-up to 0.1 bp.
-
-    The dollar fee total is not returned. A missing or zero equity leaves
-    the drag absent rather than inventing a zero.
-    """
     if isinstance(fees, bool) or isinstance(equity, bool):
         return None
     if fees is None or equity is None:
@@ -244,11 +210,6 @@ def cost_drag_bps(fees, equity) -> float | None:
 
 
 def with_cost_drag(value):
-    """Copy ``value`` and add ``cost_drag_bps`` wherever ``fees_total`` sits.
-
-    The dollar total stays on the copy so a later allow-list pass can drop
-    it. Nested benchmark books get their own drag from their own equity.
-    """
     if isinstance(value, list):
         return [with_cost_drag(item) for item in value]
     if not isinstance(value, dict):
@@ -261,33 +222,18 @@ def with_cost_drag(value):
 
 
 def project_designer(value):
-    """Allow-listed copy of a metrics, fill, trade, liquidation, or benchmark tree.
-
-    Fee dollars become ``cost_drag_bps``. Share counts, prices, notionals,
-    per-component fees, and accounting dollars are absent. A string is kept
-    only when the key's schema allows it. Free text such as ``message`` is
-    dropped, so a price or a scale cannot ride along in a caption.
-    """
     return _keep(with_cost_drag(value))
 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-# Chunks a renderer needs. Text and unknown ancillary chunks are not in this set.
 _PNG_KEEP = frozenset(
     {b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"gAMA", b"sRGB", b"pHYs"}
 )
 _PACK_HEX = re.compile(r"pack_([0-9a-fA-F]{8,64})\Z")
-# 0-9 then a-f. The result has no digits, so it cannot be read as a number.
 _NIBBLE_LETTER = "abcdefghijklmnop"
 
 
 def designer_source_id(source_id: str) -> str:
-    """Opaque id for a ``pack_`` plus hex source id. Anything else is unchanged.
-
-    The designer tree stores this form. The operator tree keeps the original
-    id. Hex such as ``185e2`` is scientific notation to a scale check; the
-    mapped id is letters only.
-    """
     match = _PACK_HEX.fullmatch(str(source_id))
     if match is None:
         return str(source_id)
@@ -299,13 +245,6 @@ def designer_source_id(source_id: str) -> str:
 
 
 def canonical_png(data: bytes) -> bytes:
-    """A PNG with only the chunks a renderer needs, and nothing after IEND.
-
-    ``tEXt``, ``zTXt``, ``iTXt``, ``eXIf``, and any other ancillary chunk are
-    dropped. An unknown critical chunk, a bad checksum, or a file that is not
-    a PNG raises ``ValueError``. Kept chunks are copied unchanged, so the
-    decoded pixels stay the same.
-    """
     if isinstance(data, bytearray):
         data = bytes(data)
     if not isinstance(data, bytes) or not data.startswith(_PNG_SIGNATURE):
@@ -352,11 +291,6 @@ def canonical_png(data: bytes) -> bytes:
 
 
 def designer_csv_cell(key: str, cell: str) -> str:
-    """The cell ``publish_designer`` may write, or empty when it is free text.
-
-    A numeric cell keeps its original spelling. A clock, a session label, an
-    enum, and a safe id stay. Anything else is blank.
-    """
     if cell == "":
         return ""
     if _numeric_text(cell):
@@ -370,11 +304,6 @@ def designer_csv_cell(key: str, cell: str) -> str:
 
 
 def accept_string(key: str, text: str):
-    """A schema string, a number parsed from text, or None when the text is free.
-
-    None means the key is dropped. Numbers stay numbers. Period-key values
-    have to be numeric. ``message`` and ``error`` keep a fixed code only.
-    """
     if text == "":
         return ""
     if key == "cost_model":

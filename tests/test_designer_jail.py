@@ -1,8 +1,3 @@
-"""File-backed design, pack, and parallel runs execute the strategy in the jail.
-
-The worker keeps the engine, the accounting record, and that window's
-dividends. The strategy process does not.
-"""
 
 from __future__ import annotations
 

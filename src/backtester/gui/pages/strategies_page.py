@@ -1,4 +1,3 @@
-"""Pick strategy files and read the profile rules before anything runs."""
 
 from __future__ import annotations
 

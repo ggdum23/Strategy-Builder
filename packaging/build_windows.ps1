@@ -1,8 +1,3 @@
-# Build the one-folder bundle and the Inno Setup installer.
-# Run on Windows from any working directory. Requires the repo, Python 3.12,
-# and PyInstaller 6.22.3. The compiler is always the pinned Inno Setup 6.7.4
-# installer. A copy already on the machine is not used. The download is
-# hash-checked before it runs.
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -14,16 +9,12 @@ $Python = if ($env:PYTHON) { $env:PYTHON } else { "python" }
 $PyInstallerPin = "6.22.3"
 $InnoVersion = "6.7.4"
 $InnoUrl = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-$InnoVersion.exe"
-# SHA256 of the official GitHub release asset innosetup-6.7.4.exe (10,604,576 bytes).
 $InnoSha256 = "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c"
 
 . (Join-Path $PSScriptRoot "ci_process.ps1")
 
 function Get-IsccVersionText {
     param([Parameter(Mandatory = $true)][string]$Path)
-    # ISCC.exe and ISCmplr.dll ship with a 0.0.0.0 version resource. The
-    # compiler prints the real number, from SetupVersion, before it compiles:
-    # "Compiler engine version: Inno Setup 6.7.4".
     $probe = Join-Path $env:TEMP "strategy-builder-iscc-probe.iss"
     Set-Content -LiteralPath $probe -Value "; version probe`r`n" -Encoding ascii
     $ErrorActionPreference = "Continue"
@@ -63,7 +54,6 @@ function Install-InnoSetup {
         Remove-Item -LiteralPath $dest -Recurse -Force
     }
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    # Verify the hash before this process starts. A GUI installer does not set $LASTEXITCODE.
     $arguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=""$dest"""
     $code = Wait-GuiProcess -File $installer -Arguments $arguments
     if (($code -ne 0) -and ($code -ne 3010)) {
@@ -74,7 +64,6 @@ function Install-InnoSetup {
     if ($found) {
         return $found.FullName
     }
-    # Some Inno installers ignore /DIR and upgrade the copy already on the machine.
     foreach ($fallback in @(
             "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
             "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
@@ -88,7 +77,6 @@ function Install-InnoSetup {
 }
 
 function Resolve-Iscc {
-    # Preinstalled compilers are not used, even when the banner says 6.7.4.
     Write-Host "Installing pinned Inno Setup $InnoVersion (preinstalled compilers are not used)"
     return Install-InnoSetup
 }
@@ -97,8 +85,6 @@ function Resolve-Iscc {
 if ($LASTEXITCODE -ne 0) { throw "version check failed" }
 
 $project = (& $Python (Join-Path $Root "packaging\versions.py") --print project).Trim()
-# PowerShell variable names are not case-sensitive. Keep this distinct from
-# $InnoVersion, which is the required compiler pin above.
 $AppVersion = (& $Python (Join-Path $Root "packaging\versions.py") --print inno).Trim()
 $versionInfo = (& $Python (Join-Path $Root "packaging\versions.py") --print version-info).Trim()
 $pyi = (& $Python -c "import PyInstaller; print(PyInstaller.__version__)").Trim()

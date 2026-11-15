@@ -1,21 +1,3 @@
-"""Long/flat trend strategy for ASSET.
-
-Decision: once per regular session, on the last RTH bar (minute 959, or 779 on a
-shortened session). The order fills at the next session's open. No extended hours.
-
-Rule (all inputs are regular-session closes already known at that bar):
-- Let C be the close history, including today.
-- Until 253 closes exist, stay flat.
-- A horizon h in {63, 126, 252} is ON when C[-1] > C[-1-h].
-- If fewer than 2 horizons are ON, desired exposure is 0.
-- Otherwise annualized volatility is the sample standard deviation (ddof=1) of the
-  last 60 close-to-close returns, times sqrt(252).
-  Raw exposure = min(1.0, 0.15 / volatility), rounded half-up to a 0.25 step.
-- The target changes only when the new desired exposure differs from the current
-  target by at least 0.25. Otherwise the previous target is kept.
-
-Long or flat only. Gross exposure is in {0, 0.25, 0.5, 0.75, 1.0}.
-"""
 import math
 
 
@@ -28,7 +10,7 @@ class Strategy:
     MAX_LEV = 1.0
     STEP = 0.25
     BAND = 0.25
-    MIN_CLOSES = 252 + 1  # need C[t] and C[t-252]
+    MIN_CLOSES = 252 + 1
 
     def __init__(self):
         self.closes = []
@@ -47,7 +29,6 @@ class Strategy:
         if self.cur_day is None:
             self.cur_day = day
         elif day != self.cur_day:
-            # Session rolled without a terminal bar: keep one close per session.
             if not self.pushed_today and self.last_close is not None:
                 self._push(self.last_close)
             self.pushed_today = False

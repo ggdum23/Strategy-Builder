@@ -1,4 +1,3 @@
-# Silent per-user install into a directory whose path contains a space.
 
 param(
     [Parameter(Mandatory = $true)][string]$SetupExe,

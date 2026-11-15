@@ -1,4 +1,3 @@
-"""Fifth review of ef0efdf, plus the RANDOM stand-in. Each test fails when its fix is reverted."""
 
 from __future__ import annotations
 

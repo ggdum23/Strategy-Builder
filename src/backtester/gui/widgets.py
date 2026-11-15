@@ -1,4 +1,3 @@
-"""Shared controls. Layout and labels only."""
 
 from __future__ import annotations
 
@@ -62,7 +61,6 @@ class Banner(QFrame):
 
 
 class PathField(QWidget):
-    """A single path. Browse dialogs return one string; spaces are not split."""
 
     def __init__(self, label: str, placeholder: str = "", *, kind: str = "dir"):
         super().__init__()
@@ -151,7 +149,6 @@ def clear_layout(layout) -> None:
 
 
 class DictTable(QTableView):
-    """Sortable table. Display text is formatted; sorting uses the raw value."""
 
     def __init__(self):
         super().__init__()
@@ -202,7 +199,6 @@ class DictTable(QTableView):
 
 
 class DictModel(QAbstractTableModel):
-    """Filter and sort in Python. Qt's proxy compared the sort tuples and crashed on Windows."""
 
     def __init__(self, columns, rows, titles, kinds=None, row_kinds=None):
         super().__init__()
@@ -222,7 +218,6 @@ class DictModel(QAbstractTableModel):
         self._recompute()
 
     def _build_cache(self) -> None:
-        """Format each cell once. Filtering a large fill list must not format it again."""
         cache = []
         tokens = []
         blobs = []
@@ -333,7 +328,6 @@ _YEAR = re.compile(r"\d{4}")
 
 
 def period_sections(payload) -> list[tuple[str, dict]]:
-    """Split a stored ``period_returns`` object into blocks, months, and years."""
     monthly: dict = {}
     yearly: dict = {}
     blocks: dict = {}
@@ -366,7 +360,6 @@ def period_sections(payload) -> list[tuple[str, dict]]:
 
 
 class PeriodHeat(QWidget):
-    """Color is the sign of the stored return. It is not a new metric."""
 
     def __init__(self):
         super().__init__()

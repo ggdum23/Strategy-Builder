@@ -1,14 +1,3 @@
-"""Equity and drawdown charts.
-
-PyQtGraph draws the series it is given. It does not read a run directory and
-it does not calculate a performance statistic. The drawdown series is passed
-in already labeled as a picture of the equity column.
-
-Ranges are taken from the finite min and max of every series on that plot,
-with padding, and then locked. ``setClipToView`` and downsampling are off:
-both drop points the autorange then fails to see, which clips a buy-and-hold
-line or a drawdown trough that sits outside the first guess.
-"""
 
 from __future__ import annotations
 
@@ -30,7 +19,6 @@ class _DateAxis(pg.AxisItem):
         self.enableAutoSIPrefix(False)
 
     def tickValues(self, minVal, maxVal, size):
-        """One level of integer session indexes. A tick at 1.5 is not a session."""
         lo, hi = sorted((float(minVal), float(maxVal)))
         if not math.isfinite(lo) or not math.isfinite(hi):
             return []
@@ -72,7 +60,6 @@ class _DateAxis(pg.AxisItem):
 
 
 class _NumberAxis(pg.AxisItem):
-    """Display scale for a series that is already in dollars or a fraction."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -80,7 +67,6 @@ class _NumberAxis(pg.AxisItem):
         self.enableAutoSIPrefix(False)
 
     def tickValues(self, minVal, maxVal, size):
-        """Several dollar ticks when a log span sits inside one power of ten."""
         if not self.logMode or self.percent:
             return super().tickValues(minVal, maxVal, size)
         lo, hi = sorted((float(minVal), float(maxVal)))
@@ -156,7 +142,6 @@ def _nice_dollar_step(span: float, count: int) -> float:
 
 
 def _dollar_ticks(low: float, high: float) -> tuple[float, list[float]]:
-    """1-2-5 steps across a dollar span. Tight log ranges still get several."""
     span = high - low
     chosen_step = 1.0
     chosen: list[float] = []
@@ -188,7 +173,6 @@ def _finite_pairs(xs, ys) -> list[tuple[float, float]]:
 
 
 def _padded(low: float, high: float, *, log: bool) -> tuple[float, float]:
-    """View limits. In log mode these are log10 coordinates, padded in log space."""
     if log:
         low = max(float(low), 1e-300)
         high = max(float(high), low)
@@ -305,7 +289,6 @@ class ChartPanel(QWidget):
                 self._legend.setLabelTextColor(theme.chart_fg)
 
     def set_lines(self, lines, ylabel: str, sessions: list[str] | None, note: str, *, percent: bool = False) -> None:
-        """Older single-plot call. Draws on the equity panel and leaves drawdown empty."""
         equity = []
         drawdown = []
         for name, xs, ys, color in lines:
@@ -334,7 +317,6 @@ class ChartPanel(QWidget):
         exposure=None,
         equity_percent: bool = False,
     ) -> None:
-        """``equity`` and ``drawdown`` are ``(name, x, y, color)``."""
         self._study = {
             "equity": list(equity or []),
             "drawdown": list(drawdown or []),
@@ -454,8 +436,6 @@ class ChartPanel(QWidget):
         log = self.log_box.isChecked() and not self.exposure_box.isChecked()
         self._fit_plot(self.equity_plot, top, log=log)
         self._fit_plot(self.dd_plot, drawdown, log=False)
-        # The drawdown x axis is linked. Fit x from every series so a longer
-        # benchmark cannot sit outside the linked range.
         xs = []
         for series in (top, drawdown):
             for _name, x_values, y_values, _color in series:
@@ -483,7 +463,6 @@ class ChartPanel(QWidget):
         plot.disableAutoRange()
 
     def covered(self) -> list[str]:
-        """Human-readable misses. Empty means every finite extremum is inside the view."""
         problems = []
         top, _ylabel, _percent = self._series_for_top()
         problems.extend(self._coverage(self.equity_plot, top, "equity"))
@@ -492,11 +471,6 @@ class ChartPanel(QWidget):
         return problems
 
     def _coverage(self, plot, series, label: str) -> list[str]:
-        """Compare extrema in the ViewBox coordinate system.
-
-        With a log axis that system is log10. Comparing raw dollars to a log
-        range reports a false pass while the line sits outside the plot.
-        """
         problems = []
         log_y = bool(plot.getViewBox().state.get("logMode", [False, False])[1])
         x_range, y_range = plot.viewRange()
@@ -527,7 +501,6 @@ class ChartPanel(QWidget):
         return problems
 
     def show_readout_at(self, index: int) -> None:
-        """Place the crosshair on one session. The screenshot uses this."""
         self._vline_equity.setPos(float(index))
         self._vline_drawdown.setPos(float(index))
         self.readout.setText(self._readout(index))

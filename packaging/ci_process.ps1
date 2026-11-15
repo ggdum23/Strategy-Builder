@@ -1,7 +1,3 @@
-# Wait for a Windows GUI executable.
-# The call operator does not wait for a GUI-subsystem program and does not
-# set $LASTEXITCODE. StrictMode then fails the step. Inno Setup's setup.exe
-# and unins000.exe are GUI programs.
 
 function Wait-GuiProcess {
     param(

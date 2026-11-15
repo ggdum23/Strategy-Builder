@@ -1,9 +1,3 @@
-"""Read a run directory. Display only.
-
-Every number on the results page comes from a report file. A missing file or a
-missing field stays missing. Chart drawdown is the one derived series, and it
-is labeled as a picture of the equity column, not as a second max-drawdown.
-"""
 
 from __future__ import annotations
 
@@ -56,7 +50,6 @@ _SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv", "venv"})
 
 @dataclass
 class Curve:
-    """One equity file, ready to plot. Drawdown is a display transform."""
 
     name: str
     source: str
@@ -76,7 +69,6 @@ class TableData:
 
 @dataclass
 class RunReport:
-    """What the window is allowed to show for one directory."""
 
     directory: Path
     kind: str
@@ -112,7 +104,6 @@ def _read_json(path: Path):
 
 
 def _report_file(directory: Path, name: str) -> Path | None:
-    """The one canonical file, or nothing. A different spelling is not a substitute."""
     candidate = directory / name
     return candidate if candidate.is_file() else None
 
@@ -126,7 +117,6 @@ def _pick(columns, candidates: tuple[str, ...]) -> str | None:
 
 
 def _withhold(payload, withheld: list[str]):
-    """Drop operator-only keys if a report ever contains them."""
     if isinstance(payload, dict):
         clean = {}
         for key, value in payload.items():
@@ -197,7 +187,6 @@ def _floats(values) -> list[float]:
 
 
 def _drawdown(equity: list[float], initial) -> tuple[list[float], str]:
-    """Picture of the equity column. Not the official max drawdown."""
     series = list(equity)
     note = "Drawdown is equity / running peak − 1."
     if not is_missing(initial):
@@ -208,7 +197,7 @@ def _drawdown(equity: list[float], initial) -> tuple[list[float], str]:
     peak = None
     points = []
     for value in series:
-        if value != value:  # NaN
+        if value != value:
             points.append(float("nan"))
             continue
         if peak is None or value > peak:
@@ -229,8 +218,6 @@ def _curve(path: Path, name: str, initial, *, designer: bool = False) -> Curve |
     equity_col = _pick(table.columns, EQUITY_COLUMNS)
     if equity_col is None:
         return None
-    # A designer chart must not prefer the calendar column. ``day`` and
-    # ``session`` are the anonymized index. A missing one becomes the row index.
     session_col = _pick(table.columns, ("day", "session") if designer else SESSION_COLUMNS)
     exposure_col = _pick(table.columns, EXPOSURE_COLUMNS)
     sessions = []
@@ -264,7 +251,6 @@ def _session_label(row: dict, column: str | None, index: int, *, designer: bool)
 
 
 def _align_note(strategy: Curve, other: Curve) -> tuple[list[float], list[float], str]:
-    """Place a benchmark on the strategy's session index. No interpolation."""
     if strategy.sessions and other.sessions and any(strategy.sessions) and any(other.sessions):
         lookup = {}
         for index, label in enumerate(other.sessions):
@@ -548,7 +534,6 @@ def _load_batch(directory: Path, withheld: list[str]) -> RunReport:
 
 
 def _nested_job_dirs(folder: Path) -> list[tuple[str, str, Path]]:
-    """``jobs/<strategy>/<source>/`` or a designer bundle ``<strategy>/<source>/``."""
     found = []
     try:
         strategies = sorted(path for path in folder.iterdir() if path.is_dir() and path.name not in _SKIP_DIRS)
@@ -614,7 +599,6 @@ def _status_word(value) -> str | None:
 
 
 def _prefer_status(current: str | None, incoming: str | None) -> str | None:
-    """A non-ok word from either record wins. ``run.json`` is read first."""
     if current and current.casefold() != "ok":
         return current
     if incoming and incoming.casefold() != "ok":
@@ -630,18 +614,12 @@ def _note_text(value) -> str | None:
 
 
 def _remember_note(found: dict[tuple[str, str], str], key: tuple[str, str], status: str, note: str | None) -> None:
-    """Keep a message that says more than the status word."""
     if not note or note.casefold() == status.casefold():
         return
     found.setdefault(key, note)
 
 
 def _status_by_job(directory: Path) -> dict[tuple[str, str], str]:
-    """Status words from ``run.json`` jobs and a leaderboard ``status`` column.
-
-    ``metrics.json`` is not a status. A later reader uses it only when neither
-    record names the job.
-    """
     found: dict[tuple[str, str], str] = {}
     info = directory / "run.json"
     if info.is_file():
@@ -676,11 +654,6 @@ def _status_by_job(directory: Path) -> dict[tuple[str, str], str]:
 
 
 def _error_by_job(directory: Path) -> dict[tuple[str, str], str]:
-    """Operator sentences from ``run.json`` and the leaderboard ``error`` column.
-
-    A cell that only repeats the status word is not a message. ``error.json``
-    is read separately and wins when it has text.
-    """
     found: dict[tuple[str, str], str] = {}
     info = directory / "run.json"
     if info.is_file():
@@ -711,7 +684,6 @@ def _error_by_job(directory: Path) -> dict[tuple[str, str], str]:
 
 
 def _record_keys(directory: Path) -> list[tuple[str, str]]:
-    """Job ids from ``run.json``, then any leaderboard row not already listed."""
     keys: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -749,11 +721,6 @@ _CASE_SUFFIX = re.compile(r"^(.+)-([1-9]\d*)$")
 
 
 def _reserved_folder_map(keys: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[str, str]]:
-    """On-disk folder names back to the ids ``_reserve_case_component`` reserved.
-
-    The engine sorts jobs by strategy id, then source id, and suffixes the
-    second case-colliding name (``momentum`` becomes ``momentum-2``).
-    """
     from ..parallel import _reserve_case_component
 
     mapping: dict[tuple[str, str], tuple[str, str]] = {}
@@ -771,10 +738,6 @@ def _reserved_folder_map(keys: list[tuple[str, str]]) -> dict[tuple[str, str], t
 
 
 def _unsuffix_id(name: str, known: set[str]) -> str:
-    """``momentum-2`` is the reserved folder for recorded id ``momentum``.
-
-    A recorded id that is already ``momentum-2`` keeps that folder.
-    """
     if name in known:
         return name
     match = _CASE_SUFFIX.fullmatch(name)
@@ -814,14 +777,6 @@ def _child_state(status: str | None, error: str | None, *, metrics: bool) -> tup
 
 
 def _load_parallel(directory: Path, withheld: list[str]) -> RunReport:
-    """Phase 3 tree: ``jobs/<id>/<source>/`` plus ``designer/`` and ``error.json``.
-
-    The Jobs table takes its word from ``run.json`` and the leaderboard.
-    A case-suffixed folder uses the id the reserver started from. A recorded
-    row with no directory is still a row. With no recorded word, ``error.json``
-    wins over ``metrics.json``. A metrics file alone is ok. The error cell is
-    ``error.json`` when it has text, then a run or leaderboard message.
-    """
     report = RunReport(directory=directory, kind="batch")
     jobs_root = directory / "jobs"
     pairs = _nested_job_dirs(jobs_root) if jobs_root.is_dir() else []
@@ -906,11 +861,6 @@ def _dispatch(folder: Path, withheld: list[str], *, designer: bool = False) -> R
 
 
 def load_run(directory, *, audience: str = "auto") -> RunReport:
-    """Classify ``directory`` and read the report files that audience may see.
-
-    ``auto`` opens an anonymized book, or any folder that published ``designer/``,
-    as a designer view. Pass ``operator`` to read the operator files on purpose.
-    """
     folder = Path(directory)
     if not folder.is_dir():
         report = RunReport(directory=folder, kind="incomplete", audience="operator", opened=folder)
@@ -933,7 +883,6 @@ def load_run(directory, *, audience: str = "auto") -> RunReport:
 
 
 def chart_overlay(report: RunReport) -> tuple[list[tuple[str, list[float], list[float]]], str]:
-    """Strategy equity plus benchmark equity, aligned for the picture only."""
     if not report.curves:
         return [], "No equity file in this run."
     strategy = report.curves[0]
@@ -995,7 +944,6 @@ class HistoryRow:
 
 
 def _history_hides_symbol(metrics: dict) -> bool:
-    """An anonymized book does not contribute its ticker to the history list."""
     return book_is_anonymized(metrics)
 
 
@@ -1064,7 +1012,6 @@ def _history_from_metrics(folder: Path, kind: str) -> HistoryRow:
 
 
 def scan_history(root, limit: int = 500) -> list[HistoryRow]:
-    """Find run directories. Does not open market-data files."""
     folder = Path(root)
     if not folder.is_dir():
         return []
@@ -1110,7 +1057,6 @@ def os_walk(root: Path):
 
 
 def read_designer_manifest(pack_dir) -> dict:
-    """Manifest fields a designer is allowed to see. The sidecar is not opened."""
     path = Path(pack_dir) / "manifest.json"
     document = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):

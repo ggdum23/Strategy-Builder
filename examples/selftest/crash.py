@@ -1,4 +1,3 @@
-"""Raise on the first bar. The referee disqualifies the run."""
 
 
 class Strategy:

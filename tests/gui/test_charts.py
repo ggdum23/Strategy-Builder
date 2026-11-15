@@ -1,4 +1,3 @@
-"""Chart ranges. The view has to contain every series, including the trough."""
 
 from __future__ import annotations
 

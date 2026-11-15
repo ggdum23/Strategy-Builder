@@ -1,11 +1,3 @@
-"""The five Lows from the full-range review of main 2b73448.
-
-Refusal text does not echo a planted gzip header or schema version.
-The known symbol is passed into ``load_pack``, and the referee audits the
-pack before it returns the frame. The anonymized pack directory is scanned
-for an NTFS alternate stream. The pack doc names the kept PNG chunks. A raw
-run of a total-return series names ``--price-basis total_return``.
-"""
 
 from __future__ import annotations
 
@@ -184,7 +176,6 @@ def _names_for(directory: Path, names: list[str]):
 
 
 def _stream_info(*names: str) -> bytes:
-    """A ``FileStreamInformation`` buffer. Offsets are 8-byte aligned."""
     parts = []
     for name in names:
         encoded = name.encode("utf-16-le")

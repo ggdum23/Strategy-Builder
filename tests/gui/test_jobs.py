@@ -1,4 +1,3 @@
-"""The worker calls the public runner and does not return sidecar fields."""
 
 from __future__ import annotations
 
@@ -334,11 +333,6 @@ def test_batch_calls_run_parallel_with_progress_and_cancel(tmp_path, monkeypatch
 
 
 def _write_probe(path: Path, out: Path) -> Path:
-    """Module-level code writes a pid marker beside the file it actually executed.
-
-    The GUI worker passes the source path into the jail. The jail copies the
-    file, so a marker beside this path exists only when the caller imported it.
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
     out_literal = json.dumps(str(out))
     path.write_text(
@@ -420,7 +414,6 @@ def _run_config(**overrides) -> dict:
 
 
 def _assert_caller_did_not_exec(strategy: Path, *surfaces: Path) -> None:
-    """The caller's pid is not the process that executed the strategy file."""
     caller = os.getpid()
     marker = strategy.with_name("import-marker.json")
     assert not marker.is_file()
@@ -434,7 +427,6 @@ def _assert_caller_did_not_exec(strategy: Path, *surfaces: Path) -> None:
 
 
 def test_an_in_process_load_writes_the_caller_pid_and_drops_sys_path(tmp_path):
-    """The marker mechanism sees this process. The GUI tests require that it does not."""
     out = tmp_path / "out"
     out.mkdir()
     sidecar = tmp_path / "sidecar.json"
@@ -497,7 +489,6 @@ def test_pack_run_does_not_execute_the_strategy_in_the_caller(tmp_path):
         )
     )
     _assert_caller_did_not_exec(strategy, out / "child_surface.json")
-    # Import-time code that ran here could open the sidecar. The caller did not.
     secret = sidecar.read_text(encoding="utf-8")
     assert "QQQ" in secret
     marker = strategy.with_name("import-marker.json")

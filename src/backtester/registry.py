@@ -1,9 +1,3 @@
-"""Versioned series registry.
-
-A ticker is a registry entry plus an ingest. The file is JSON, schema_version 1,
-and a reader rejects a version, a key, or a type it does not know. Session hours
-are whatever the inspection inferred. This module does not print.
-"""
 
 from __future__ import annotations
 
@@ -83,7 +77,6 @@ def empty_registry() -> dict:
 
 
 def parse_phase_map(text: str | None) -> dict[str, str] | None:
-    """``label=pre,label=rth``. Empty means the file already uses engine labels."""
     if text is None or str(text).strip() == "":
         return None
     mapping: dict[str, str] = {}
@@ -106,10 +99,6 @@ def parse_phase_map(text: str | None) -> dict[str, str] | None:
 
 
 def parse_splits(text: str | None) -> tuple[dict, ...]:
-    """``YYYY-MM-DD:ratio`` pairs, or ``none``.
-
-    A declared split is recorded and not applied. ``none`` records an empty list.
-    """
     if text is None or str(text).strip() == "" or str(text).strip().lower() == "none":
         return ()
     splits = []
@@ -185,7 +174,6 @@ def _nonneg_int(value, path: str) -> int:
 
 
 def validate_entry(entry: dict) -> None:
-    """Raise if ``entry`` is not one schema-1 series."""
     _keys(entry, _SERIES_KEYS, "series")
     symbol = _string(entry["symbol"], "series.symbol")
     if "/" in symbol or "\\" in symbol:
@@ -361,7 +349,6 @@ def _clock(minute: int) -> str:
 
 
 def validate_registry(document: dict) -> None:
-    """Raise unless ``document`` is a schema-1 registry."""
     if not isinstance(document, dict):
         _fail("", "the file is not an object")
     _keys(document, _DOCUMENT_KEYS, "")
@@ -394,7 +381,6 @@ def entry_from_inspection(
     borrow_rate_source: str | None = None,
     splits: tuple | list | None = None,
 ) -> dict:
-    """Build one series entry. Hours and tick come from ``inspection`` only."""
     profile_name = get_profile(profile).name
     if borrow_rate_annual is None:
         rate = get_profile(profile_name).borrow_rate_annual
@@ -402,8 +388,6 @@ def entry_from_inspection(
     else:
         rate = float(borrow_rate_annual)
         source = "explicit" if borrow_rate_source is None else borrow_rate_source
-    # load_named rejects a non-empty split list, so a declaration arrives here
-    # from the operator and is stored without being applied to prices.
     declared = [] if splits is None else [dict(item) for item in splits]
     runnable = inspection.runnable and not declared and inspection.price_adjustment == "raw"
     entry = {
@@ -458,7 +442,6 @@ def entry_from_inspection(
 
 
 def _json_pairs(pairs):
-    """Object hook that refuses a repeated key. ``json.loads`` would keep the last one."""
     document = {}
     for key, value in pairs:
         if key in document:
@@ -524,7 +507,6 @@ def hours_text(entry: dict) -> str:
 
 
 def format_list(document: dict) -> str:
-    """Plain-text table for the operator. No market data, no secrets."""
     validate_registry(document)
     if not document["series"]:
         return "Registry is empty. Ingest a ticker to add one."
@@ -540,7 +522,6 @@ def format_list(document: dict) -> str:
 
 
 def format_show(entry: dict) -> str:
-    """Plain-text description of one series. Hours are the inferred ones."""
     validate_entry(entry)
     borrow_note = "profile default" if entry["borrow_rate_source"] == "profile_default" else "set by the operator"
     lines = [
@@ -602,10 +583,6 @@ def format_show(entry: dict) -> str:
 
 
 def same_series(entry: dict, inspection) -> None:
-    """Fail when the files no longer match the registry entry.
-
-    Compared facts are the native series, not a resampled delivery.
-    """
     validate_entry(entry)
     problems = []
     if entry["symbol"] != inspection.symbol:

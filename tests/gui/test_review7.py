@@ -1,4 +1,3 @@
-"""Seventh review. Redacted designer surfaces are an allow-list."""
 
 from __future__ import annotations
 
@@ -279,8 +278,6 @@ def _assert_redacted(qtbot, tmp_path: Path, folder: Path, targets: list[float], 
     leaked = sorted(key for key in exported_keys if not redacted_key_allowed(key))
     assert leaked == [], leaked
     numbers = _surface_numbers(report)
-    # The rounded cost drag is a coarse bps figure. Pairing it with a public
-    # annual rate can land on an unrelated price, which is not the fee inversion.
     drag = report.metrics.get("cost_drag_bps") if isinstance(report.metrics, dict) else None
     ratio_numbers = numbers
     if isinstance(drag, (int, float)) and not isinstance(drag, bool):
@@ -362,7 +359,6 @@ def test_redacted_repro_cannot_rebuild_close_or_shares(qtbot, tmp_path):
     )
     _assert_redacted(qtbot, tmp_path, folder, [_CLOSE, _SHARES], keep_operator="final_shares")
     loaded = load_run(folder, audience="designer")
-    # The two published inversions have no inputs left on the redacted book.
     assert "final_shares" not in loaded.metrics
     fees = loaded.fees_breakdown or {}
     assert "sec" not in fees and "exchange" not in fees
@@ -444,12 +440,6 @@ def _cell_text(table) -> list[str]:
 
 
 def test_accounting_dollars_are_dropped_and_operator_shows_them(qtbot, tmp_path):
-    """Interest, financing, and a per-share dividend invert; the settings do not.
-
-    Idle cash is ``cash_interest * 252 / cash_rate``. Borrowed notional is
-    ``financing_cost * 252 / financing_rate``. Shares are
-    ``dividends_net / (per_share * (1 - withholding))`` for a positive long.
-    """
     shares = 2000.0
     close = 500.0
     equity = 1_500_000.0
@@ -584,14 +574,6 @@ def _designer_keys(root: Path) -> set[str]:
 
 
 def test_published_designer_books_use_the_allow_list(qtbot, tmp_path):
-    """Anonymized Desk and Arena books go through run_books and publish_designer.
-
-    Desk at price 777.7 and share factor 7.777 recovers that factor from
-    ``exchange / (0.003 * final_shares)`` on the operator book. The designer
-    tree has neither input. A planted ``S99`` does not survive the screen or
-    the export. A normal designer metrics file still exports at the scales
-    whose digits collide with ordinary rates.
-    """
     from backtester.gui.audience import export_allowed
     from backtester.runner import run_books, write_books
 

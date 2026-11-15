@@ -1,4 +1,3 @@
-"""Second review of ef4b7c4. Each test fails on that tree."""
 
 from __future__ import annotations
 
@@ -32,11 +31,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _png_itxt(secret: bytes) -> bytes:
-    """1×1 PNG whose iTXt text is zlib-compressed."""
     raw = b"\x00\x00\x00\x00\x00"
     compressed = zlib.compress(raw)
     payload = zlib.compress(secret)
-    # keyword, flag=1, method=0, language, translated keyword, text
     data = b"Comment\x00\x01\x00en\x00\x00" + payload
 
     def chunk(kind: bytes, body: bytes) -> bytes:

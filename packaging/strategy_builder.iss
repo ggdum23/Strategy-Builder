@@ -1,7 +1,3 @@
-; Strategy Builder per-user installer.
-; Compile with ISCC and the /D defines the build script passes.
-; The default market-data folder is a setting written to JSON. The installer
-; does not create that folder and does not copy files into it.
 
 #ifndef AppVersion
   #error AppVersion is required (numeric, from pyproject.toml).
@@ -134,7 +130,7 @@ end;
 procedure InitializeWizard;
 begin
   DataRootChosen := '{#DefaultDataRoot}';
-  // A silent install has no wizard page. /DATA= and the default still apply.
+
   if WizardSilent then
     Exit;
   DataPage := CreateInputDirPage(
@@ -170,7 +166,7 @@ begin
   ForceDirectories(ExtractFilePath(Path));
   SetArrayLength(Lines, 1);
   Lines[0] := Contents;
-  // UTF-8 without a BOM. The application reads these files as UTF-8.
+
   if not SaveStringsToUTF8FileWithoutBOM(Path, Lines, False) then
     RaiseException('Could not write ' + Path);
 end;
@@ -221,8 +217,8 @@ begin
   if CurStep = ssPostInstall then
   begin
     WriteDefaults;
-    // All-users installs must not write into one person's profile.
-    // The application creates that profile's config on first launch.
+
+
     if not IsAdminInstallMode then
       WriteInitialUserConfig;
   end;

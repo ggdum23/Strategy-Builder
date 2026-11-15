@@ -19,8 +19,6 @@ jobs:
     permissions:
       contents: read
     env:
-      # runner.temp is not available in a job-level env block. The install and
-      # smoke steps set the paths, and both paths contain a space on purpose.
       STRATEGY_BUILDER_HEADLESS: "1"
     steps:
       - uses: actions/checkout@v4

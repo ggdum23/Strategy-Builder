@@ -1,4 +1,3 @@
-"""Tiny filled files and report directories. Not market data."""
 
 from __future__ import annotations
 
@@ -11,7 +10,6 @@ import pandas as pd
 
 
 def write_filled(root, symbol: str = "QQQ", *, gap: bool = False) -> Path:
-    """Two January 2024 sessions, a handful of minutes each, under ``root``."""
     et = ZoneInfo("America/New_York")
     rows = []
     price = 100.0
@@ -199,7 +197,6 @@ DESK_METRICS = {
 
 
 def write_parallel_run(directory: Path, *, anonymized: bool = False) -> Path:
-    """A Phase 3 output tree: jobs/, error.json, run.json, and an optional designer/."""
     directory.mkdir(parents=True, exist_ok=True)
     ok_metrics = {
         "profile": "arena",

@@ -1,5 +1,3 @@
-# Optional Authenticode signing. Off unless SIGN_PFX_PATH is set.
-# See docs/INSTALLER.md.
 
 param(
     [Parameter(Mandatory = $true)][string]$SetupExe

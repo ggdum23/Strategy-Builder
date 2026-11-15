@@ -1,20 +1,3 @@
-"""OS jail for the referee child.
-
-Windows: a job object (kill on close, one active process, a memory cap, a CPU
-cap) and an AppContainer with no network capability. File ACLs are edited
-only on directories this app owns or creates. The private temp directory is
-the only writable location. A directory that was not granted is not readable,
-because the token is not the user. If any of that cannot be applied, the
-launch raises and the strategy is not started.
-
-Linux: bubblewrap when ``bwrap`` can start a throwaway namespace. Otherwise
-landlock plus a seccomp filter, rlimits, and ``PR_SET_PDEATHSIG``. The report
-from ``describe_isolation`` is the guarantee that was actually applied.
-
-``lock_worker_session`` is the smaller filter used by the walk-forward and
-parallel workers after they become session leaders. It denies ``setsid`` and
-``setpgid`` so a grandchild cannot leave the process group.
-"""
 
 from __future__ import annotations
 
@@ -35,16 +18,11 @@ from pathlib import Path
 
 
 class SandboxError(RuntimeError):
-    """The jail could not be applied. The strategy was not started."""
+    pass
 
 
-# GitHub-hosted AppContainer startup is about 16–20 seconds before the
-# child writes a ready line. The Windows hello wait is this long so that
-# cost is not the strategy's call timeout. Tests use the same number.
 WINDOWS_JAIL_STARTUP_S = 90
 
-# The pytest process registers this. A spawned worker does not, so a jail
-# the worker starts is counted by the parent that decided to start it.
 _LAUNCH_OBSERVER = None
 _PHASE_PATH = None
 _PHASE_LOCK = threading.Lock()
@@ -52,7 +30,6 @@ _LOCK_DEPTH = threading.local()
 
 
 def set_launch_observer(observer) -> None:
-    """Count successful jails. The observer runs in this process only."""
     global _LAUNCH_OBSERVER
     _LAUNCH_OBSERVER = observer
 
@@ -64,7 +41,6 @@ def note_launch() -> None:
 
 
 def watch_phase(path) -> None:
-    """Append phase lines to this file. The parent reads them on a hang."""
     global _PHASE_PATH
     _PHASE_PATH = None if path is None else str(path)
 
@@ -82,7 +58,6 @@ def note_phase(name: str) -> None:
             pass
 
 
-# seccomp / BPF
 _BPF_LD = 0x00
 _BPF_W = 0x00
 _BPF_ABS = 0x20
@@ -107,15 +82,8 @@ _PR_SET_NO_NEW_PRIVS = 38
 _PR_SET_SECCOMP = 22
 _SECCOMP_MODE_FILTER = 2
 _CLONE_THREAD = 0x00010000
-# x32 reuses the x86_64 audit architecture and sets this bit on the number.
-# A denylist of native numbers does not match those calls, so they would
-# fall through to ALLOW. The filter kills them.
 _X32_SYSCALL_BIT = 0x40000000
 
-# x86_64 syscall numbers. Other machines fail closed rather than guess.
-# aarch64 uses the generic table for io_uring_setup, io_uring_enter, and
-# io_uring_register (425, 426, 427). Its other numbers differ, so there is
-# no aarch64 map: an unknown machine refuses the launch instead of guessing.
 _X86_64_NR = {
     "socket": 41,
     "connect": 42,
@@ -179,7 +147,7 @@ _SANDBOX_DENY = (
 _LANDLOCK_HANDLED_FS = 0xFFFF
 _LANDLOCK_EXECUTE = 1 << 0
 _LANDLOCK_READ_FILE = 1 << 2
-_LANDLOCK_READ = _LANDLOCK_EXECUTE | _LANDLOCK_READ_FILE | (1 << 3)  # execute, read file, read dir
+_LANDLOCK_READ = _LANDLOCK_EXECUTE | _LANDLOCK_READ_FILE | (1 << 3)
 _LANDLOCK_WRITE = _LANDLOCK_READ | (1 << 1) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 13) | (1 << 14)
 
 
@@ -219,8 +187,6 @@ def _filter_bytes(*, deny: tuple[str, ...], allow_threads: bool) -> bytes:
         _insn(_JMP_JEQ, 1, 0, arch),
         _insn(_RET_K, 0, 0, _SECCOMP_RET_KILL),
         _insn(_LD_W_ABS, 0, 0, 0),
-        # Kill x32 numbers before the native compare. AND clears the
-        # accumulator, so the native number is loaded again afterwards.
         _insn(_ALU_AND, 0, 0, _X32_SYSCALL_BIT),
         _insn(_JMP_JEQ, 0, 1, _X32_SYSCALL_BIT),
         _insn(_RET_K, 0, 0, _SECCOMP_RET_KILL),
@@ -230,10 +196,6 @@ def _filter_bytes(*, deny: tuple[str, ...], allow_threads: bool) -> bytes:
         program.append(_insn(_JMP_JEQ, 0, 1, numbers[name]))
         program.append(_insn(_RET_K, 0, 0, _SECCOMP_RET_ERRNO | _EPERM))
     if allow_threads:
-        # clone is allowed only when CLONE_THREAD is set, so a thread can
-        # start and a process cannot. clone3's flag pointer is not visible to
-        # classic BPF, so the whole call returns ENOSYS and glibc falls back
-        # to clone. A fork bomb cannot use clone3 to skip that check.
         program.extend(
             (
                 _insn(_JMP_JEQ, 0, 1, numbers["clone3"]),
@@ -260,18 +222,10 @@ def _install_filter(blob: bytes) -> None:
     if libc.prctl(_PR_SET_SECCOMP, _SECCOMP_MODE_FILTER, ctypes.byref(prog)) != 0:
         err = ctypes.get_errno()
         raise SandboxError(f"seccomp filter failed (errno {err})")
-    # Keep the buffer alive until prctl has copied it.
     del filters, prog
 
 
 def lock_worker_session() -> None:
-    """Deny setsid and setpgid in this process and every process it starts.
-
-    The caller has already called ``setsid``. A later ``setsid`` returns
-    EPERM, so a double fork cannot leave the process group. Windows does
-    nothing here: the worker job object is the group. Non-Linux does nothing
-    because there is no seccomp.
-    """
     if sys.platform != "linux":
         return
     _install_filter(_filter_bytes(deny=("setsid", "setpgid"), allow_threads=False))
@@ -321,7 +275,6 @@ def _landlock_available() -> bool:
 
 
 def describe_isolation() -> dict:
-    """What a launch on this machine will apply. Nothing is started."""
     if sys.platform == "win32":
         return _windows_guarantees()
     if sys.platform == "linux" and _bwrap_available():
@@ -456,12 +409,6 @@ def _host_children(pid: int) -> list[int]:
 
 
 def _kill_tree(pid: int) -> None:
-    """SIGKILL a process and the host-visible processes under it.
-
-    The inner sandbox calls setsid, so it is not in the launcher's group.
-    die-with-parent covers that case. Walking the children covers a process
-    that is still alive when the launcher has just been signaled.
-    """
     seen = set()
 
     def walk(current: int) -> None:
@@ -487,7 +434,6 @@ def _kill_tree(pid: int) -> None:
 
 
 class Sandbox:
-    """A running jailed interpreter. ``close`` kills it and removes the temp dir."""
 
     def __init__(self, process, workdir: Path, backend: str, guarantees: dict, cleanup):
         self.process = process
@@ -550,14 +496,6 @@ class Sandbox:
 
 
 def _interpreter_command(script: Path, *, child: bool = False) -> list[str]:
-    """How to execute a jail script with this interpreter.
-
-    A source child is ``python -I -S -B``. ``-S`` skips site.py, so the
-    editable install and dist-packages are not added to ``sys.path``. The
-    parent then inserts only the staged package directories. A frozen child
-    is this executable again, with ``--sandbox-child`` and the private
-    directory as its cwd. No strategy path is put on that command line.
-    """
     executable = _child_executable()
     if child and getattr(sys, "frozen", False):
         return [executable, "--sandbox-child"]
@@ -576,11 +514,6 @@ def launch(
     deny_paths,
     capture_stdio: bool = False,
 ) -> Sandbox:
-    """Copy the strategy into a private directory and start it inside the jail.
-
-    ``deny_paths`` are host directories the child must not open. They are not
-    passed on the command line of the child.
-    """
     if not isinstance(memory_bytes, int) or isinstance(memory_bytes, bool) or memory_bytes <= 0:
         raise ValueError("memory cap must be a positive number of bytes")
     if not isinstance(cpu_seconds, int) or isinstance(cpu_seconds, bool) or cpu_seconds <= 0:
@@ -589,25 +522,15 @@ def launch(
     if not strategy.is_file():
         raise FileNotFoundError(f"strategy file not found: {strategy}")
     denied = _deny_roots(deny_paths)
-    # A refused launch must not copy the interpreter. The profile lease does
-    # not exist yet, so this check uses the interpreter roots only. The
-    # staged grant paths are checked again after the profile is warm.
     global _LAUNCH_DENIED
     _LAUNCH_DENIED = list(denied)
     _refuse_denied_inside_runtime(denied, _runtime_roots())
-    # The workspace junctions have to point at the staged interpreter. On
-    # Windows that copy is decided while the profile is granted, which is
-    # before the private directory is written.
     warm_windows_profile()
     work = Path(_private_dir())
     try:
         for banned in denied:
             if work == banned or banned in work.parents or work in banned.parents:
                 raise SandboxError("the private directory overlaps a denied directory")
-        # A runtime mount covers every name under it, including a staged
-        # copy. A denied directory there would be readable, including
-        # through a second hardlink, so the launch stops before either
-        # backend builds a rule.
         _refuse_denied_inside_runtime(denied)
         if sys.platform == "win32":
             backend = "windows"
@@ -648,17 +571,10 @@ def launch(
         raise
 
 
-# Directories this process created for the jail (app data, not the user profile).
 _CREATED_APP_DIRS: list[Path] = []
 
 
 def _private_dir() -> str:
-    """A directory the container can already reach.
-
-    The default user Temp directory is not that parent on the GitHub
-    runner. The runtime copy's parent is: ProgramData or Public when
-    those already have traverse, otherwise the AppContainer folder.
-    """
     import tempfile
 
     parent = _owned_work_parent()
@@ -670,11 +586,6 @@ def _private_dir() -> str:
 
 
 def _chain_accessible(path, accessible) -> bool:
-    """True when ``path`` and every non-root ancestor already pass ``accessible``.
-
-    This does not write an ACL. The volume root is not required to show an
-    explicit ACE and is never a grant target.
-    """
     if _is_volume_acl_path(path) or not accessible(path):
         return False
     return all(
@@ -685,15 +596,6 @@ def _chain_accessible(path, accessible) -> bool:
 
 
 def copy_parent_candidates(environ, roots, accessible) -> list[str]:
-    """Directories an app-owned runtime copy may be created under.
-
-    ProgramData and Public come first, when that directory and every
-    ancestor already let the container through. Otherwise each blocked
-    runtime contributes its traversable ancestors, nearest first. The
-    blocked directory, the volume root, and anything inside Windows or
-    System32 are not candidates. Program Files is last, and only as a
-    parent: the directory itself is not a grant target.
-    """
     found: list[str] = []
     _exact, trees = protected_acl_layout(environ)
 
@@ -724,7 +626,6 @@ def copy_parent_candidates(environ, roots, accessible) -> list[str]:
 
 
 def _read_dacl_entries(path: Path):
-    """``(type, flags, mask)`` for every ACE, or None when the DACL cannot be read."""
     if sys.platform != "win32":
         return []
     try:
@@ -774,7 +675,6 @@ def _read_dacl_entries(path: Path):
 
 
 def _parent_inheritable_write(path: Path) -> bool:
-    """Fail closed when the DACL cannot be read."""
     entries = _read_dacl_entries(path)
     if entries is None:
         return True
@@ -848,7 +748,6 @@ def _owner_sid_text(path: Path) -> str:
     kernel.LocalFree.restype = ctypes.c_void_p
     owner = ctypes.c_void_p()
     security = ctypes.c_void_p()
-    # OWNER_SECURITY_INFORMATION = 1
     status = advapi.GetNamedSecurityInfoW(
         str(path), 1, 1, ctypes.byref(owner), None, None, None, ctypes.byref(security)
     )
@@ -867,15 +766,6 @@ def _directory_owned_by_us(path: Path) -> bool:
 
 
 def _owned_work_parent() -> Path | None:
-    """An app-created folder whose parents already allow package traverse.
-
-    The DACL of the parent is not modified. This is the fallback used when
-    the per-user container folder cannot be created. ProgramData and Public
-    are tried only when they already let the package through, have no
-    inheritable write ACE, and an existing child is owned by this user.
-    The volume root, Windows, and System32 are never used. Only the
-    directories this function creates are later granted.
-    """
     if sys.platform != "win32":
         return None
     roots = [str(path) for path in _interpreter_candidates()]
@@ -900,9 +790,6 @@ def _owned_work_parent() -> Path | None:
             _reject_reparse_dir(app)
             jail.mkdir(exist_ok=True)
             _reject_reparse_dir(jail)
-            # The directory we would hand back, not the parent we checked
-            # before mkdir. An adopted directory has to be ours, and its
-            # DACL must not still hand write to a new child.
             if _parent_inheritable_write(jail) or not _directory_owned_by_us(jail):
                 continue
             if not _directory_owned_by_us(app):
@@ -917,12 +804,10 @@ def _owned_work_parent() -> Path | None:
 
 
 def _chain_has_package_traverse(path: Path) -> bool:
-    """Read-only. The volume root is not required to show an explicit ACE."""
     return _chain_accessible(path, _ancestor_accessible)
 
 
 def _interpreter_venv() -> Path | None:
-    """The virtualenv prefix, when this interpreter is one."""
     prefix = Path(sys.prefix).resolve()
     base = Path(getattr(sys, "base_prefix", sys.prefix)).resolve()
     if prefix == base:
@@ -933,13 +818,6 @@ def _interpreter_venv() -> Path | None:
 
 
 def runtime_overlap_error(root, denied, *, venv=None) -> str | None:
-    """None when ``root`` may be mounted. A sentence when it must be refused.
-
-    ``venv`` is the virtualenv prefix. A prefix strictly inside ``denied`` is
-    mounted on its own and does not expose the rest of that directory. A
-    prefix that is the denied directory would expose the whole tree, so that
-    mount is refused.
-    """
     root = Path(root)
     denied = Path(denied)
     if root != denied and denied not in root.parents:
@@ -961,9 +839,6 @@ def runtime_overlap_error(root, denied, *, venv=None) -> str | None:
 def _deny_roots(paths) -> list[Path]:
     roots = []
     raw = list(paths or [])
-    # A source tree sits outside the interpreter, so the child must not read
-    # it. A frozen bundle is the interpreter: ``parents[2]`` is the install
-    # directory, and denying it overlaps the runtime grant.
     if not getattr(sys, "frozen", False):
         raw.append(Path(__file__).resolve().parents[2])
     try:
@@ -981,18 +856,10 @@ def _deny_roots(paths) -> list[Path]:
     return roots
 
 
-# Tasks a jail may create beyond the ones that already exist. Bubblewrap
-# counts only its user namespace, so 64 is the whole jail. Landlock counts
-# the host uid, so the same 64 is headroom on top of that count.
 _NPROC_HEADROOM = 64
 
 
 def _uid_task_count() -> int:
-    """Threads on this uid. RLIMIT_NPROC counts tasks, not thread groups.
-
-    Landlock does not hide ``/proc``, but the child cannot read it after the
-    ruleset is applied. The parent counts first and writes the ceiling down.
-    """
     uid = os.getuid()
     total = 0
     proc = Path("/proc")
@@ -1032,7 +899,6 @@ def _uid_task_count() -> int:
 
 
 def _nproc_ceiling(backend: str | None) -> int | None:
-    """The RLIMIT_NPROC hard cap for this backend, or None off Linux."""
     if backend == "bubblewrap":
         return _NPROC_HEADROOM
     if backend == "landlock":
@@ -1053,8 +919,6 @@ def _write_workspace(
     shim = package / "sandbox_child.py"
     ipc = package / "bar_ipc.py"
     (work / "strategy.py").write_bytes(strategy.read_bytes())
-    # A frozen jail is the executable itself. There is no system python and
-    # no .py shim on disk. Source runs still copy the shim and the frame codec.
     if not getattr(sys, "frozen", False):
         if not shim.is_file():
             raise SandboxError("sandbox_child.py is missing")
@@ -1074,11 +938,6 @@ def _write_workspace(
 
 
 def _runtime_roots() -> list[Path]:
-    """Directories the dynamic linker and the interpreter open.
-
-    ``/lib`` and ``/lib64`` stay even when they are symlinks into ``/usr``.
-    The sandbox has to have those paths, not only the directory they point at.
-    """
     roots: list[Path] = []
 
     def add(path: Path, *, fold: bool) -> None:
@@ -1118,19 +977,10 @@ def _site_dirs() -> list[Path]:
     return found
 
 
-# Imported in the parent so the staged copy is the one this process uses,
-# in this order. A name that is not installed is skipped.
 _STAGED_IMPORTS = ("numpy", "pandas", "dateutil", "pytz", "tzdata", "six")
 
 
 def _runtime_package_dirs() -> list[Path]:
-    """Directories and modules this process actually imported.
-
-    Each path is the package directory (or a single-file module), never the
-    site-packages directory that holds ``*.pth`` and ``direct_url.json``.
-    A sibling ``*.libs`` directory is included so a wheel's OpenBLAS loads.
-    Anything inside this repository is not staged.
-    """
     import importlib
 
     repo = Path(__file__).resolve().parents[2]
@@ -1147,9 +997,6 @@ def _runtime_package_dirs() -> list[Path]:
             return
         if resolved == repo or repo in resolved.parents:
             inside_venv = venv is not None and (resolved == venv or venv in resolved.parents)
-            # The checkout itself stays unstaged. Packages that live in a
-            # virtualenv inside the checkout are the interpreter, and the
-            # jail mounts that prefix alone.
             if not inside_venv or resolved.name == "backtester":
                 return
         seen.add(resolved)
@@ -1176,7 +1023,6 @@ def _runtime_package_dirs() -> list[Path]:
 
 
 def _link_into(src: Path, dest: Path) -> None:
-    """Point ``dest`` at ``src`` without copying a package tree."""
     if dest.exists() or dest.is_symlink():
         return
     if src.is_file() or os.name != "nt":
@@ -1200,14 +1046,6 @@ def _link_into(src: Path, dest: Path) -> None:
 
 
 def _stage_packages(work: Path) -> list[Path]:
-    """Build ``pydeps/NN`` slots in parent import order and write ``deps.json``.
-
-    The slot holds one package. Its parent is what goes on ``sys.path``, so a
-    scan of that path cannot see a sibling ``dist-info`` or ``.pth``. A
-    ``*.libs`` directory is not linked into the slot. On Windows the child
-    adds the real directory with ``os.add_dll_directory``; a junction there
-    makes that call fail.
-    """
     packages = _runtime_package_dirs()
     stage = work / "pydeps"
     stage.mkdir()
@@ -1220,10 +1058,6 @@ def _stage_packages(work: Path) -> list[Path]:
         if path.name.endswith(".libs"):
             owner = path.parent / path.name[: -len(".libs")]
             if slots.get(owner) is not None:
-                # Not linked into the slot. os.add_dll_directory rejects that
-                # junction on Windows, and the loader raises before the import.
-                # The path is the staged copy when the original prefix cannot
-                # be traversed. A junction back to that prefix would not open.
                 dlls.append(str(source))
                 continue
         slot = stage / f"{index:02d}"
@@ -1255,8 +1089,6 @@ def _child_env(work: Path) -> dict:
         "PYTHONUTF8": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
-        # One BLAS thread. The process ceiling still has to leave room for a
-        # strategy thread; this only stops the default pool from taking it.
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
@@ -1265,7 +1097,6 @@ def _child_env(work: Path) -> dict:
 
 
 def _under_tmp(path: Path) -> bool:
-    """True when ``path`` is ``/tmp`` or a directory inside it."""
     try:
         resolved = path.resolve()
     except OSError:
@@ -1285,12 +1116,6 @@ def _abs_path(path) -> Path:
 
 
 def nested_runtime_deny_error(root, denied) -> str | None:
-    """None when ``denied`` is not strictly inside ``root``.
-
-    A mount of ``root`` would expose ``denied``. The launch refuses instead
-    of trying to hide one child. The sentence names the setting that moves
-    the prepared cache.
-    """
     if not root or not denied:
         return None
     root_path = _abs_path(root)
@@ -1305,7 +1130,6 @@ def nested_runtime_deny_error(root, denied) -> str | None:
 
 
 def _runtime_mounts() -> list[Path]:
-    """Directories a jail would mount or grant."""
     mounts: list[Path] = []
 
     def add(path) -> None:
@@ -1327,15 +1151,6 @@ def _runtime_mounts() -> list[Path]:
 
 
 def _refuse_denied_inside_runtime(denied, mounts=None) -> None:
-    """Stop when a deny root lies inside a runtime prefix.
-
-    The directory does not have to exist yet. A cache created under the
-    prefix while the jail is running would otherwise be readable, and a
-    hardlink of a cache file planted in the prefix is the same tree.
-    ``mounts`` defaults to every directory the jail would grant, including
-    a staged copy. The check before the profile is built passes the
-    interpreter roots, because the lease does not exist yet.
-    """
     chosen = _runtime_mounts() if mounts is None else mounts
     for mount in chosen:
         for banned in denied:
@@ -1345,12 +1160,6 @@ def _refuse_denied_inside_runtime(denied, mounts=None) -> None:
 
 
 def bwrap_mount_plan(roots, packages, hidden_sites, work, cache_file) -> list[str]:
-    """Mount arguments. A runtime root under ``/tmp`` is bound after the tmpfs.
-
-    ``/tmp`` itself is not a bind target: the private tmpfs would hide it,
-    and binding it back would undo the tmpfs. That launch is refused by
-    the caller. The cache file is the only bind from ``/etc``.
-    """
     early = []
     late = []
     for root in roots:
@@ -1403,10 +1212,6 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
         "ALL",
     ]
     packages = _runtime_package_dirs()
-    # A prefix mount includes site-packages. Cover that directory, then put
-    # back only the package directories the parent resolved. Metadata files
-    # that sit beside them are not mounted. A package outside the prefix is
-    # bound on its own path, so its parent in the jail contains only that bind.
     hidden_sites = []
     for directory in _site_dirs():
         covered = any(directory == root or root in directory.parents for root in roots)
@@ -1466,11 +1271,6 @@ def _launch_bwrap(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seco
 
 
 def landlock_rule_plan(read_dirs, cache_file, work) -> tuple[list, list]:
-    """Directory rules and the one file rule for the dynamic linker cache.
-
-    ``/etc`` is traverse-only. The cache file is a read-file rule. The
-    directory that contains the cache is not granted read.
-    """
     directories = []
     for directory in read_dirs:
         if not directory:
@@ -1490,7 +1290,6 @@ def landlock_rule_plan(read_dirs, cache_file, work) -> tuple[list, list]:
 
 
 def _launch_landlock(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seconds: int) -> Sandbox:
-    """Landlock, seccomp, rlimits, and a parent-death signal. No preexec fork."""
     read_dirs = [str(path) for path in _runtime_roots()]
     for package in _runtime_package_dirs():
         directory = package if package.is_dir() else package.parent
@@ -1639,7 +1438,6 @@ if __name__ == "__main__":
 
 
 def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_seconds: int) -> Sandbox:
-    """Job object, AppContainer with no capabilities, and file ACLs. Fail closed."""
     if sys.platform != "win32":
         raise SandboxError("the Windows jail is only applied on Windows")
     lease = _win_lease_acquire()
@@ -1648,21 +1446,12 @@ def _launch_windows(work: Path, denied: list[Path], *, memory_bytes: int, cpu_se
     try:
         try:
             _win_reject_overlap(lease.grant_paths, denied)
-            # The AppContainer token is the file boundary. A directory that
-            # was not granted is not readable, so the repository is not
-            # given a deny ACE. The private directory is the only grant that
-            # changes per launch. Ancestors this app does not own are not
-            # rewritten; the launch fails if one of them lacks traverse.
-            # The profile lock still serializes the grant and the spawn.
             def _grant_and_spawn():
                 nonlocal extra_grants, popen
                 try:
                     extra_grants = _win_grant_work(lease, work)
                     popen = _win_spawn(work, lease, memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
                 except Exception:
-                    # Drop the ACEs before the next waiter starts. A drop
-                    # after the lock is released can remove the traverse ACE
-                    # that waiter just inherited.
                     _win_drop_launch_aces(lease, [], [], extra_grants)
                     extra_grants = []
                     raise
@@ -1733,11 +1522,6 @@ def _win_lease_acquire() -> _WinLease:
 
 
 def _win_lease_release() -> None:
-    """Drop one launch. The profile and the runtime grants stay until exit.
-
-    Releasing them here made every test walk the Python tree with icacls
-    again. Orphaned profiles from a dead process are removed on the next start.
-    """
     with _WIN_LOCK:
         lease = _WIN_LEASE
         if lease is None or lease.refs <= 0:
@@ -1755,12 +1539,6 @@ _ALREADY_EXISTS = 0x800700B7
 
 
 def warm_windows_profile() -> None:
-    """Create the AppContainer and its runtime ACLs once per machine.
-
-    The first jail in a process pays for the Win32 ACL walk of the
-    interpreter. Later launches, including workers spawned after this
-    returns, reuse the marker and only grant their private directory.
-    """
     if sys.platform != "win32":
         return
     lease = _win_lease_acquire()
@@ -1776,19 +1554,10 @@ def _grant_marker_path() -> Path:
 
 
 def _drop_launch_aces_locked(lease, extra_grants) -> None:
-    """Drop the launch ACEs while this process holds the profile mutex."""
     _with_profile_lock(lambda: _win_drop_launch_aces(lease, [], [], extra_grants))
 
 
 def _with_profile_lock(action):
-    """One grant or spawn at a time. The kernel drops the mutex if the holder dies.
-
-    A file lock in ``LOCALAPPDATA`` survived ``TerminateProcess`` for the
-    stale window, and the next jail then sat on it until its own timeout.
-    ``icacls`` on that same directory also blocked behind the open file.
-    A named mutex is released on process exit, including an abandoned one
-    left by a killed holder. Nested calls on this thread reuse it.
-    """
     if sys.platform != "win32":
         return action()
     depth = getattr(_LOCK_DEPTH, "n", 0)
@@ -1807,8 +1576,6 @@ def _with_profile_lock(action):
     if not handle:
         raise _win_fail("CreateMutexW failed")
     note_phase("lock-wait")
-    # WAIT_OBJECT_0 is 0. WAIT_ABANDONED is 0x80: the previous holder died
-    # and this thread now owns the mutex.
     result = kernel.WaitForSingleObject(handle, 300_000)
     if result not in (0, 0x80):
         kernel.CloseHandle(handle)
@@ -1825,7 +1592,6 @@ def _with_profile_lock(action):
 
 
 def profile_lock_state() -> str:
-    """``free``, ``held``, or ``abandoned``. Used on the Windows hang path."""
     if sys.platform != "win32":
         return "n/a"
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1860,7 +1626,6 @@ _WFP_LAYERS = {"v4": False, "v6": False}
 
 
 def wfp_connect_layers() -> tuple:
-    """ALE auth-connect layer ids for IPv4 and IPv6. Both are required."""
     return (
         (0xC38D57D1, 0x05A7, 0x4C33, (0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82)),
         (0x4A72393B, 0x319F, 0x44BC, (0x84, 0xC3, 0xBA, 0x54, 0xDC, 0xB3, 0xB6, 0xB4)),
@@ -1868,7 +1633,6 @@ def wfp_connect_layers() -> tuple:
 
 
 def firewall_timeout_blocks_launch(v4_ready: bool, v6_ready: bool) -> bool:
-    """A hung firewall cmdlet fails the launch unless both WFP layers are in."""
     return not (bool(v4_ready) and bool(v6_ready))
 
 
@@ -1877,13 +1641,6 @@ def wfp_layers_confirmed() -> bool:
 
 
 def _win_wfp_block(lease: _WinLease) -> None:
-    """Block this package at the connect layer, including loopback.
-
-    Windows drops an AppContainer's loopback handshake in the receive layer,
-    so ``connect`` waits until it times out. A connect-layer block for the
-    package SID fails that call with access denied before the handshake.
-    The filter is dynamic and lives as long as this process holds the engine.
-    """
     global _WFP_ENGINE
     if _WFP_ENGINE is not None:
         return
@@ -1969,21 +1726,14 @@ def _win_wfp_block(lease: _WinLease) -> None:
     fwpu.FwpmFilterAdd0.restype = ctypes.c_uint32
     engine = ctypes.c_void_p()
     name = "strategybuilderjail block connect"
-    # FWPM_SESSION_FLAG_DYNAMIC. A null session is static: the filter stays
-    # installed after this process exits, and every worker adds another one.
-    # A dynamic session removes the filter when the process exits. The handle
-    # is kept below so the filter lasts for every jail this process starts.
     session = Session()
     session.displayData.name = name
     session.displayData.description = name
     session.flags = 0x1
-    # RPC_C_AUTHN_WINNT
     status = fwpu.FwpmEngineOpen0(None, 10, None, ctypes.byref(session), ctypes.byref(engine))
     if status != 0 or not engine.value:
         raise SandboxError(f"the firewall engine did not open (winerror {status})")
-    # Highest weight. The value is a pointer, and it has to outlive the add.
     weight = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
-    # FWPM_LAYER_ALE_AUTH_CONNECT_V4 and V6. Loopback is both families.
     layers = (
         ("v4", guid(0xC38D57D1, 0x05A7, 0x4C33, (0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82))),
         ("v6", guid(0x4A72393B, 0x319F, 0x44BC, (0x84, 0xC3, 0xBA, 0x54, 0xDC, 0xB3, 0xB6, 0xB4))),
@@ -1992,41 +1742,30 @@ def _win_wfp_block(lease: _WinLease) -> None:
     kept = []
     for label, layer in layers:
         condition = Condition()
-        # FWPM_CONDITION_ALE_PACKAGE_ID
         condition.fieldKey = guid(0x71BC78FA, 0xF17C, 0x4997, (0xA6, 0x02, 0x6A, 0xBB, 0x26, 0x1F, 0x35, 0x1C))
-        condition.matchType = 0  # FWP_MATCH_EQUAL
-        condition.value.type = 13  # FWP_SID
+        condition.matchType = 0
+        condition.value.type = 13
         condition.value.ptr = lease.sid
         filt = Filter()
         filt.displayData.name = name
         filt.displayData.description = name
         filt.layerKey = layer
         filt.subLayerKey = universal
-        filt.weight.type = 4  # FWP_UINT64
+        filt.weight.type = 4
         filt.weight.ptr = ctypes.cast(ctypes.byref(weight), ctypes.c_void_p)
         filt.numFilterConditions = 1
         filt.filterCondition = ctypes.pointer(condition)
-        filt.action.type = 0x1001  # FWP_ACTION_BLOCK
+        filt.action.type = 0x1001
         added = ctypes.c_uint64()
         status = fwpu.FwpmFilterAdd0(engine, ctypes.byref(filt), None, ctypes.byref(added))
         if status != 0:
             raise SandboxError(f"the connect-layer block was not added for {label} (winerror {status})")
         _WFP_LAYERS[label] = True
         kept.append((condition, filt, added))
-    # The session is dynamic, so closing the engine or exiting this process
-    # removes the filters. Keep the handle, the session, and the strings alive
-    # for the life of the process. Do not close the engine between jails.
     _WFP_ENGINE = (engine, fwpu, weight, kept, name, session)
 
 
 def _firewall_block_command(sid_text: str) -> str:
-    """PowerShell that installs the package-SID block.
-
-    Windows PowerShell 5.1 formats an object piped to ``Out-Null``. The
-    firewall rule object is large enough that two of those pipes run past
-    the 60 second limit and the launch fails. Assigning to ``$null`` does
-    not format the object.
-    """
     if not sid_text.startswith("S-1-") or any(ch in sid_text for ch in "\"'$`;\r\n"):
         raise SandboxError("the AppContainer SID is not a form the firewall rule can use")
     return (
@@ -2042,14 +1781,6 @@ def _firewall_block_command(sid_text: str) -> str:
 
 
 def _win_block_network(sid_text: str) -> bool:
-    """Block every inbound and outbound connection for this package SID.
-
-    An AppContainer with no capabilities still reaches loopback far enough
-    for a connect to time out instead of failing with access denied. A
-    firewall block on the package SID fails that connect with 10013.
-    ``netsh`` on current Windows rejects ``package=``, so this uses the
-    firewall cmdlet.
-    """
     command = _firewall_block_command(sid_text)
     system = os.environ.get("SystemRoot", "")
     powershell = Path(system) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe" if system else None
@@ -2066,10 +1797,6 @@ def _win_block_network(sid_text: str) -> bool:
     except OSError as exc:
         raise SandboxError(f"the AppContainer firewall block was not added: {exc}") from exc
     except subprocess.TimeoutExpired:
-        # Both dynamic WFP layers are the block. A hung cmdlet is fail-closed
-        # when either layer is missing. The caller does not try the cmdlet
-        # again in this process. Cleanup still removes a rule the cmdlet
-        # managed to add before it was killed.
         _arm_firewall_cleanup()
         if firewall_timeout_blocks_launch(_WFP_LAYERS.get("v4"), _WFP_LAYERS.get("v6")):
             raise SandboxError(
@@ -2084,7 +1811,6 @@ def _win_block_network(sid_text: str) -> bool:
 
 
 def _firewall_remove_command() -> str:
-    """Delete the package rules this process added. ``$null`` avoids Out-Null."""
     return (
         "$names = @('strategybuilderjail-block-out','strategybuilderjail-block-in')\n"
         "foreach ($name in $names) {\n"
@@ -2094,7 +1820,6 @@ def _firewall_remove_command() -> str:
 
 
 def _forget_firewall_marker() -> None:
-    """The on-disk marker must not skip the next install after the rules are gone."""
     try:
         path = _grant_marker_path()
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -2110,7 +1835,6 @@ def _forget_firewall_marker() -> None:
 
 
 def _remove_firewall_rules() -> None:
-    """Drop the persistent rules when this process is finished with them."""
     if sys.platform != "win32":
         return
     _forget_firewall_marker()
@@ -2138,7 +1862,6 @@ def _arm_firewall_cleanup() -> None:
 
 
 def _clear_loopback(name: str, sid_text: str) -> None:
-    """Drop a loopback exemption for this profile. Missing entries are fine."""
     system = os.environ.get("SystemRoot", "")
     if not system:
         return
@@ -2189,12 +1912,6 @@ def _recorded_grants(sid_text: str, roots):
 
 
 def firewall_block_is_current(marker, sid: str) -> bool:
-    """True when this machine already has the package firewall rules.
-
-    A runtime copy refresh must not run ``New-NetFirewallRule`` again.
-    That cmdlet holds the profile mutex, and on a GitHub runner it can
-    sit until the 60 second limit.
-    """
     return (
         isinstance(marker, dict)
         and marker.get("firewall_blocked") is True
@@ -2276,10 +1993,6 @@ def _win_lease_open(lease: _WinLease) -> None:
         lease.acl_allow = _dedupe_acl(
             [str(path) for path in roots] + [str(path) for path in _CREATED_APP_DIRS]
         )
-        # Read-only. A missing package ACE fails the grant before any write,
-        # including on the marker fast path. An interpreter the container
-        # cannot walk to is copied into the container's own folder. The
-        # user profile and the toolcache are not edited.
         _require_unowned_runtime_access(roots)
         for root in roots:
             if _trusted_runtime_root(root):
@@ -2309,9 +2022,6 @@ def _win_lease_open(lease: _WinLease) -> None:
         ):
             lease.grant_paths = recorded
             return
-        # Once per machine when the marker says the rules exist. A copy
-        # refresh must not call the cmdlet again. A hung cmdlet is not
-        # retried in this process; the WFP filter is already in place.
         global _FIREWALL_TRIED
         if firewall_block_is_current(marker, sid_text) or _FIREWALL_TRIED:
             firewall_blocked = firewall_block_is_current(marker, sid_text)
@@ -2345,8 +2055,6 @@ def _win_lease_open(lease: _WinLease) -> None:
         )
 
     try:
-        # Every process that launches a jail holds this filter. A scrubbed
-        # worker is a new process, so the grant marker cannot stand in for it.
         _win_wfp_block(lease)
         _with_profile_lock(ensure_grants)
     except Exception:
@@ -2356,7 +2064,6 @@ def _win_lease_open(lease: _WinLease) -> None:
         raise
 
 
-# 8.3 names Windows still opens as the protected directories.
 _ACL_SHORT_NAMES = {
     "progra~1": "Program Files",
     "progra~2": "Program Files (x86)",
@@ -2368,14 +2075,6 @@ _ACL_SHORT_NAMES = {
 
 
 def canonicalize_acl_path(path) -> str | None:
-    """The path Windows will open, or None when it must not be an allow root.
-
-    ``\\\\?\\`` and ``\\\\.\\`` prefixes are stripped. UNC paths are rejected.
-    ``..`` is collapsed before trailing dots and spaces are stripped, because
-    ``"..".rstrip(" .")`` is empty and would otherwise delete the component.
-    ``.`` is dropped. Known 8.3 names of Program Files, Windows, System32,
-    and SysWOW64 are expanded. A path that climbs above its drive is rejected.
-    """
     text = str(path).strip().replace("/", "\\")
     folded = text.upper()
     if folded.startswith("\\\\?\\UNC\\") or folded.startswith("\\\\.\\UNC\\"):
@@ -2397,9 +2096,6 @@ def canonicalize_acl_path(path) -> str | None:
     for part in rest.split("\\"):
         if part in ("", "."):
             continue
-        # Parent references are collapsed before the trailing-dot strip.
-        # ``"..".rstrip(" .")`` is empty, so stripping first drops the component
-        # and ``C:\\Users\\Jeu\\Desktop\\..\\..\\Windows`` stays under Desktop.
         if part.rstrip(" ") == "..":
             if not parts:
                 return None
@@ -2427,11 +2123,6 @@ def canonicalize_acl_path(path) -> str | None:
 
 
 def _split_acl_path(path) -> tuple[str, tuple[str, ...]]:
-    """Drive plus components. Backslashes are separators even on Linux tests.
-
-    A rejected path (UNC, or a ``..`` that climbs off the drive) is a UNC
-    sentinel so it cannot compare equal to an allow root.
-    """
     canon = canonicalize_acl_path(path)
     if canon is None:
         return "\\\\", ("rejected",)
@@ -2473,7 +2164,6 @@ def _acl_join(drive: str, parts: tuple[str, ...]) -> str:
 
 
 def acl_ancestor_paths(path) -> list[str]:
-    """Parents of ``path``, including the volume root. Does not include ``path``."""
     drive, parts = _split_acl_path(path)
     found = []
     for length in range(len(parts) - 1, 0, -1):
@@ -2489,7 +2179,6 @@ def _is_volume_acl_path(path) -> bool:
 
 
 def _interpreter_for_acl(environ) -> str:
-    """The interpreter prefix whose toolcache ancestors stay protected."""
     raw = (environ or {}).get("SB_PYTHON_PREFIX") or ""
     if raw:
         return str(raw)
@@ -2500,12 +2189,6 @@ def _interpreter_for_acl(environ) -> str:
 
 
 def toolcache_ancestor_paths(interpreter) -> list[str]:
-    """Ancestors of a toolcache interpreter, not the interpreter directory.
-
-    ``C:\\hostedtoolcache`` and ``...\\Python`` are protected. The version
-    directory that holds ``python.exe`` is not in this list, so it can still
-    be an allow root.
-    """
     if not interpreter:
         return []
     canon = canonicalize_acl_path(interpreter)
@@ -2520,15 +2203,6 @@ def toolcache_ancestor_paths(interpreter) -> list[str]:
 
 
 def protected_acl_layout(environ) -> tuple[list[str], list[str]]:
-    """Exact directories that must never be edited, and trees that are off limits.
-
-    Program Files is exact: the directory itself is protected, and a frozen
-    bundle underneath can still be an allow root. The Windows directory and
-    System32 are trees: nothing inside them is an allow root. ``Packages``
-    is exact, so the profile folder created under it can still be granted.
-    Toolcache ancestors of the interpreter are exact. The interpreter
-    directory itself is not.
-    """
     exact: list[str] = []
     trees: list[str] = []
 
@@ -2585,16 +2259,6 @@ def _can_be_allow_root(path, environ) -> bool:
 
 
 def runtime_root_is_app_owned(path, *, environ, venv: bool = False, frozen: bool = False, active: bool = False) -> bool:
-    """True when this process may edit the DACL of an interpreter directory.
-
-    ``C:\\Windows`` is not owned, including when a candidate equals
-    ``SystemRoot`` or sits inside it. An interpreter under Program Files is
-    not owned either: those directories already carry All Application
-    Packages. A virtualenv, a frozen bundle outside the Windows tree, and
-    the running interpreter when it lives somewhere else (the GitHub
-    toolcache, a user install, a venv) are the copies the old icacls grant
-    edited and that this process still may edit.
-    """
     if not _can_be_allow_root(path, environ):
         return False
     if _inside_program_files(path, environ):
@@ -2603,7 +2267,6 @@ def runtime_root_is_app_owned(path, *, environ, venv: bool = False, frozen: bool
 
 
 def acl_write_problem(path, allow_roots, exact, trees) -> str | None:
-    """None when ``path`` may be edited. Otherwise a short reason."""
     if any(acl_same(path, banned) for banned in exact) or _is_volume_acl_path(path):
         return "protected directory"
     if any(acl_same(path, tree) or _acl_inside(path, tree) for tree in trees):
@@ -2614,7 +2277,6 @@ def acl_write_problem(path, allow_roots, exact, trees) -> str | None:
 
 
 def acl_revoke_problem(path, *, environ) -> str | None:
-    """A cleanup write is still a write. System directories are never edited."""
     exact, trees = protected_acl_layout(environ)
     if any(acl_same(path, banned) for banned in exact) or _is_volume_acl_path(path):
         return "protected directory"
@@ -2624,13 +2286,6 @@ def acl_revoke_problem(path, *, environ) -> str | None:
 
 
 def _resolved_acl_target(path) -> str:
-    """The path ``CreateFileW`` would open, when this process can open it.
-
-    A missing path stays lexical. ``canonicalize_acl_path`` still collapses
-    ``..`` and expands the short names. An existing path is the final DOS
-    path from ``GetFinalPathNameByHandleW``, which follows ``..`` the same
-    way the ACL write's open does.
-    """
     text = str(path)
     if sys.platform != "win32":
         return text
@@ -2660,7 +2315,6 @@ def _resolved_acl_target(path) -> str:
         use_last_error=True,
     )(("GetFinalPathNameByHandleW", kernel))
     close = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(("CloseHandle", kernel))
-    # FILE_READ_ATTRIBUTES, share read/write/delete, OPEN_EXISTING, BACKUP_SEMANTICS.
     handle = create(text, 0x80, 0x7, None, 3, 0x02000000, None)
     invalid = ctypes.c_void_p(-1).value
     if not handle or int(handle) == int(invalid):
@@ -2677,7 +2331,6 @@ def _resolved_acl_target(path) -> str:
 
 
 def refuse_acl_target(path, *, allow, environ) -> None:
-    """Raise when a grant would edit a directory this app must not touch."""
     checked = _resolved_acl_target(path)
     exact, trees = protected_acl_layout(environ)
     problem = acl_write_problem(checked, allow, exact, trees)
@@ -2686,7 +2339,6 @@ def refuse_acl_target(path, *, allow, environ) -> None:
 
 
 def should_write_ace(already_present: bool) -> bool:
-    """An allow ACE that already covers the mask is not written again."""
     return not already_present
 
 
@@ -2718,7 +2370,6 @@ def acl_allow_roots(
     frozen=(),
     app_data=(),
 ) -> list[str]:
-    """App-owned grant roots from the historical icacls candidate list."""
     allow: list[str] = []
     for raw in candidates:
         if not runtime_root_is_app_owned(
@@ -2748,11 +2399,6 @@ def planned_acl_targets(
     frozen=(),
     app_data=(),
 ) -> list[str]:
-    """Historical icacls targets (candidates and their ancestors) after the filter.
-
-    Ancestors are considered and then dropped. A protected directory that
-    was an explicit candidate, including ``SystemRoot``, is dropped too.
-    """
     allow = acl_allow_roots(
         candidates,
         environ=environ,
@@ -2782,7 +2428,6 @@ def planned_acl_targets(
 
 
 def _is_volume_root(path: Path) -> bool:
-    """True for ``/`` or ``C:\\``. A volume root is never an ACL target."""
     try:
         resolved = path.resolve()
     except OSError:
@@ -2825,14 +2470,6 @@ def _interpreter_candidates() -> list[Path]:
 
 
 def _grant_candidates() -> list[str]:
-    """Historical icacls targets, before the app-owned filter.
-
-    ``SystemRoot`` (``C:\\Windows`` on a normal install) is appended here
-    as its own candidate. It is not produced by walking parents of the
-    interpreter. On a GitHub runner ``sys.base_prefix`` is under
-    ``C:\\hostedtoolcache``, and that walk never reaches ``C:\\Windows``.
-    The filter drops ``SystemRoot``, so the DACL write is not attempted.
-    """
     found = [str(path) for path in _interpreter_candidates()]
     system = _system_root()
     if system is not None:
@@ -2854,13 +2491,6 @@ def _grant_candidates() -> list[str]:
 
 
 def _windows_grant_roots() -> list[Path]:
-    """Interpreter directories whose DACLs this process may edit.
-
-    User-site is not a root. It depends on the process environment, so a
-    scrubbed worker would miss the marker and walk the tree again. A
-    package directory inside an owned prefix is covered by that grant and
-    is not a separate target.
-    """
     interpreters = _interpreter_candidates()
     active = {str(path) for path in interpreters}
     frozen_raw = getattr(sys, "_MEIPASS", None)
@@ -2888,47 +2518,22 @@ def _acl_same_prefix(path: Path) -> bool:
     return acl_same(path, sys.prefix) and not acl_same(sys.prefix, sys.base_prefix)
 
 
-# (source, dest) for an interpreter the container cannot walk to.
-# The dest is an app-owned copy. The source's ancestors are not edited.
 _RUNTIME_COPIES: list[tuple[str, str]] = []
-# Deny roots for the launch that is starting. The runtime copy reads this
-# so a prepared cache inside the source tree is not written into the dest.
 _LAUNCH_DENIED: list[Path] = []
 _FIREWALL_TRIED = False
-# 3 records a source identity beside the destination hash. A stamp from
-# version 2 is rebuilt, including a copy that still holds a nested cache.
 _RUNTIME_COPY_VERSION = "3"
-# Set when the copy parent is the AppContainer folder. Ancestors of that
-# folder are not granted and are not required to show a package ACE.
 _CONTAINER_FOLDER_NOTE = ""
 _TRUSTED_STAGE_ROOTS: list[str] = []
-# Parent of the staged runtime. The private directory is created here when
-# ProgramData and Public are not already traversable.
 _RUNTIME_PARENT = ""
 
 
 def _child_executable() -> str:
-    """Interpreter the AppContainer starts.
-
-    A copy under an app-owned directory replaces an interpreter whose
-    ancestors the container cannot traverse. Those ancestors are not edited.
-    The string is not passed through ``Path``. On Windows that rewrites a
-    POSIX path, including when a runtime copy exists and this executable
-    is not one of the copied prefixes.
-    """
     if not _RUNTIME_COPIES:
         return sys.executable
     return translate_staged_path(sys.executable, _RUNTIME_COPIES)
 
 
 def first_blocked_ancestor(path, allow, accessible) -> str | None:
-    """Nearest unowned ancestor ``accessible`` rejects, or None.
-
-    Ancestors that are an allow root, or that sit inside one, are skipped.
-    The volume root is skipped too: it is never granted, and a missing
-    explicit ACE there is not a reason to refuse a copy whose other
-    ancestors already let the container through. This does not write an ACL.
-    """
     for parent in acl_ancestor_paths(path):
         if _is_volume_acl_path(parent):
             continue
@@ -2941,14 +2546,6 @@ def first_blocked_ancestor(path, allow, accessible) -> str | None:
 
 
 def stage_unreachable_runtimes(roots, *, allow, accessible, stage_root, trust_stage: bool = False):
-    """Grant roots after an unreachable interpreter is replaced by a copy.
-
-    ``copies`` is ``(source, dest)``. A reachable root stays. An unreachable
-    root is omitted and its dest, under ``stage_root``, is granted instead.
-    ``stage_root`` itself is granted when several copies sit under it.
-    When no parent is available for the copy, the error names the blocked
-    ancestor and that ancestor is not added as a target.
-    """
     blocked = []
     grant = []
     for root in roots:
@@ -2990,7 +2587,6 @@ def stage_unreachable_runtimes(roots, *, allow, accessible, stage_root, trust_st
 
 
 def traverse_trace(path, accessible) -> str:
-    """Short read-only note of which ancestors already allow traverse."""
     notes = []
     for item in acl_ancestor_paths(path):
         if _is_volume_acl_path(item):
@@ -3006,7 +2602,6 @@ def traverse_trace(path, accessible) -> str:
 
 
 def translate_staged_path(path, copies) -> str:
-    """Map a path through the longest staged interpreter prefix."""
     text = str(path)
     best = None
     best_len = -1
@@ -3028,7 +2623,6 @@ def translate_staged_path(path, copies) -> str:
 
 
 def rewrite_pyvenv_home(text: str, translate) -> str:
-    """Point a copied virtualenv at the staged base prefix."""
     lines = []
     for line in text.splitlines(keepends=True):
         newline = ""
@@ -3051,7 +2645,6 @@ def rewrite_pyvenv_home(text: str, translate) -> str:
 
 
 def _relpath_is_blocked(folded, blocked) -> bool:
-    """True when ``folded`` is a deny root or sits inside one."""
     for prefix in blocked:
         if prefix and folded[: len(prefix)] == prefix:
             return True
@@ -3061,16 +2654,6 @@ def _relpath_is_blocked(folded, blocked) -> bool:
 def runtime_relpath_is_copied(
     parts, *, is_dir: bool, package_prefixes, full: bool = False, blocked=()
 ) -> bool:
-    """Files the child interpreter opens, not the whole site-packages tree.
-
-    ``package_prefixes`` are casefolded relative paths of imported packages,
-    such as ``Lib/site-packages/numpy``. A ``._pth`` file is left behind so
-    the copy does not redirect the child at the original prefix. ``full``
-    keeps a frozen bundle's layout, including directories other than Lib
-    and DLLs, and still drops caches and path files. ``blocked`` is the
-    casefolded relative path of each deny root inside this source, including
-    the prepared cache. Those directories are not copied.
-    """
     folded = tuple(part.casefold() for part in parts)
     if _relpath_is_blocked(folded, blocked):
         return False
@@ -3087,8 +2670,6 @@ def runtime_relpath_is_copied(
         return True
     if not folded:
         return True
-    # The CPython regression suite is not opened by the child. Copying it
-    # dominates the time and is not granted as a separate tree.
     if len(folded) >= 2 and folded[0] == "lib" and folded[1] in {"test", "idlelib", "turtledemo"}:
         return False
     if len(folded) >= 2 and folded[0] == "lib" and folded[1] == "site-packages":
@@ -3134,7 +2715,6 @@ def _load_runtime_stamp() -> list:
 
 
 def runtime_tree_digest(root: Path) -> str:
-    """Hash of every file under ``root``. A changed byte changes the digest."""
     digest = hashlib.sha256()
     root = Path(root)
     if not root.exists():
@@ -3169,11 +2749,6 @@ def runtime_tree_digest(root: Path) -> str:
 
 
 def _copy_deny_roots() -> list[Path]:
-    """Deny roots the runtime copy must leave behind.
-
-    The launch list includes caller paths. The default list still includes
-    the prepared cache when the copy runs outside ``launch``.
-    """
     roots: list[Path] = []
     for path in list(_LAUNCH_DENIED) + _deny_roots(()):
         if path and path not in roots:
@@ -3182,7 +2757,6 @@ def _copy_deny_roots() -> list[Path]:
 
 
 def _blocked_copy_relpaths(src: Path) -> tuple:
-    """Casefolded relative paths of deny roots inside ``src``."""
     try:
         base = Path(src).resolve()
     except OSError:
@@ -3206,12 +2780,6 @@ def _blocked_copy_relpaths(src: Path) -> tuple:
 
 
 def runtime_source_identity(root: Path, *, package_dirs=(), full: bool = False, blocked=()) -> str:
-    """Names, sizes, and mtimes of the files a copy would take from ``root``.
-
-    File bytes stay out of this digest. Removing a directory, including a
-    nested cache, changes the list. A deny root that is present is recorded
-    so deleting it changes the digest even though the copy leaves it out.
-    """
     digest = hashlib.sha256()
     root = Path(root)
     if not root.exists():
@@ -3304,12 +2872,6 @@ def _remember_runtime_stamp() -> None:
 
 
 def _runtime_tree_present(dest: Path, src: Path) -> bool:
-    """The files that identify this source are in the copy.
-
-    A frozen launch copies every blocked root, and only the root that
-    holds the executable has that executable. A second root is still a
-    copy that the hash has to cover.
-    """
     dest = Path(dest)
     src = Path(src)
     if not dest.exists():
@@ -3345,7 +2907,6 @@ def _runtime_copy_ready(dest: Path, src: Path) -> bool:
         return False
     if _stamp_matches(dest, src):
         return True
-    # A file can be unreadable for one pass while a scanner holds it.
     return _stamp_matches(dest, src)
 
 
@@ -3390,12 +2951,6 @@ def _package_prefixes(src: Path, package_dirs) -> tuple:
 def _copy_runtime_into(
     src: Path, dest: Path, parts, prefixes, seen: set, *, full: bool, blocked
 ) -> tuple[int, int]:
-    """Copy every selected file, replacing one that is already there.
-
-    Returns ``(expected, copied)``. A file that could not be read or written
-    fails the copy. The caller stamps the tree only when those counts match.
-    A deny root, including the prepared cache, is not created in the dest.
-    """
     try:
         entries = list(src.iterdir())
     except OSError as exc:
@@ -3440,11 +2995,6 @@ def _copy_runtime_into(
 
 
 def _copy_runtime_tree(src: Path, dest: Path, package_dirs, *, full: bool = False) -> None:
-    """Copy the interpreter files the child opens. The source tree is not granted.
-
-    An existing file is replaced. The copy fails when any selected file was
-    not written from the source, so the caller does not stamp a partial tree.
-    """
     dest.mkdir(parents=True, exist_ok=True)
     prefixes = () if full else _package_prefixes(src, package_dirs)
     blocked = _blocked_copy_relpaths(src)
@@ -3463,24 +3013,15 @@ def _copy_dest(path) -> bool:
 
 
 def _trusted_runtime_root(path) -> bool:
-    """A copy dest, or the container folder that holds it. Ancestors are not."""
     if _copy_dest(path):
         return True
     return any(acl_same(path, root) or _acl_inside(path, root) for root in _TRUSTED_STAGE_ROOTS)
 
 
-# GetAppContainerFolderPath returns this when the profile folder is not
-# created yet. Win32 ERROR_FILE_NOT_FOUND, as an HRESULT.
 _FOLDER_NOT_FOUND = 0x80070002
 
 
 def conventional_container_folder(environ, profile: str):
-    """``%LOCALAPPDATA%\\Packages\\<profile>\\AC``, or None when unset.
-
-    This is the path ``GetAppContainerFolderPath`` returns once the folder
-    exists. The caller creates only the missing descendants of an existing
-    Packages directory. Packages itself is not created here.
-    """
     local = (environ or {}).get("LOCALAPPDATA") or ""
     if not local or not profile:
         return None
@@ -3488,13 +3029,6 @@ def conventional_container_folder(environ, profile: str):
 
 
 def _container_runtime_parent(lease) -> Path | None:
-    """Path from ``GetAppContainerFolderPath``. This does not create or grant it.
-
-    The directory is this profile's own folder. ProgramData, Public, the
-    toolcache, and the user-profile root are not this path, and none of
-    them is granted here. A file-not-found result uses the conventional
-    Packages path so the caller can create the missing profile folder.
-    """
     global _CONTAINER_FOLDER_NOTE
     userenv = lease.userenv
     get_path = getattr(userenv, "GetAppContainerFolderPath", None)
@@ -3527,14 +3061,6 @@ def _container_runtime_parent(lease) -> Path | None:
 
 
 def container_mkdir_plan(folder, packages, exists) -> list[str] | None:
-    """Missing directories to create so ``folder`` exists under ``packages``.
-
-    ``packages`` must already exist. The plan lists only descendants that
-    do not, outermost first. ``packages`` itself, the user-profile root,
-    and the volume are never included. None means fail closed: the path
-    is not inside ``packages``, or reaching it would create ``packages``
-    or something above it.
-    """
     if not folder or not packages:
         return None
     folder_text = str(folder)
@@ -3572,16 +3098,6 @@ def _dir_exists(path) -> bool:
 
 
 def _accept_container_parent(folder: Path) -> Path | None:
-    """Use the AppContainer folder ``GetAppContainerFolderPath`` returned.
-
-    The usual path is ``%LOCALAPPDATA%\\Packages\\<profile>\\AC``. When
-    ``<profile>`` or ``AC`` is missing and ``Packages`` already exists,
-    only those missing descendants are created. ``Packages``, the
-    user-profile root, and the volume are not created and are not granted.
-    Only directories this call created are granted later. ``Packages``,
-    the user-profile root, and the volume are not. A directory that
-    already existed is left alone.
-    """
     global _CONTAINER_FOLDER_NOTE
     runtime = folder / "runtime"
     if not _can_be_allow_root(folder, os.environ) or not _can_be_allow_root(runtime, os.environ):
@@ -3646,13 +3162,6 @@ def _copy_failure_note() -> str:
 
 
 def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path]:
-    """Owned grant roots. An unreachable interpreter is replaced by its copy.
-
-    The per-user AppContainer folder is preferred. ProgramData, Public, a
-    traversable ancestor, and Program Files are used only when that folder
-    cannot be created and the shared parent has no inheritable write ACE.
-    Ancestors this process did not create are not granted.
-    """
     global _RUNTIME_COPIES, _TRUSTED_STAGE_ROOTS, _RUNTIME_PARENT
     _TRUSTED_STAGE_ROOTS = []
     _RUNTIME_PARENT = ""
@@ -3672,10 +3181,6 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
             stage_root = str((Path(parent) / "runtime").resolve())
             _RUNTIME_PARENT = str(Path(parent))
             if trust:
-                # The profile directory created under Packages is reachable
-                # for the same reason the container folder is: this process
-                # owns it. Its ancestors are not granted and are not required
-                # to show a package ACE.
                 trusted = [str(Path(parent)), stage_root]
                 trusted.extend(str(directory) for directory in _CREATED_APP_DIRS)
                 _TRUSTED_STAGE_ROOTS = _dedupe_acl(trusted)
@@ -3694,10 +3199,6 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
             raise SandboxError(f"{exc} ({extra})") from exc
         raise
     _RUNTIME_COPIES = [(source, dest) for source, dest in copies]
-    # The copy sits under directories this process just created. Those
-    # directories do not inherit the ancestor's traverse ACE, so the
-    # container cannot reach the copy unless they are granted too.
-    # The ancestor itself is not in this list.
     if copies:
         for directory in _CREATED_APP_DIRS:
             if not any(acl_same(directory, path) for path in grant):
@@ -3706,7 +3207,6 @@ def _prepare_runtime_grant_roots(container_dir: Path | None = None) -> list[Path
 
 
 def _remove_tree(path: Path) -> None:
-    """Delete ``path``. A file that is still there fails the launch."""
 
     def onerror(func, name, _exc):
         try:
@@ -3722,13 +3222,6 @@ def _remove_tree(path: Path) -> None:
 
 
 def _runtime_acl_entries(lease, *, lock: bool):
-    """Explicit ACEs for the staged interpreter.
-
-    A locked tree grants the profile read-and-execute and denies write to
-    Users, Everyone, and both package groups. SYSTEM keeps full control so
-    the directory can still be removed by the OS. The owner keeps WRITE_DAC
-    and replaces this DACL before the next copy.
-    """
 
     class Trustee(ctypes.Structure):
         _fields_ = (
@@ -3764,9 +3257,6 @@ def _runtime_acl_entries(lease, *, lock: bool):
     if lock:
         for text in ("S-1-5-32-545", "S-1-1-0", "S-1-15-2-1", "S-1-15-2-2"):
             specs.append((sid_for(text), _WRITE_DENY_MASK, 3))
-        # The user who hashes the tree and owns it. Write stays denied
-        # because this SID is also in Users, and that deny is checked
-        # against the write bits. Read and execute are not those bits.
         user = _current_user_sid_text()
         if not user:
             raise SandboxError("could not read the current user SID")
@@ -3790,7 +3280,6 @@ def _runtime_acl_entries(lease, *, lock: bool):
 
 
 def _win_set_runtime_dacl(lease, root: Path, *, lock: bool) -> None:
-    """Replace the DACL on the copy. ``lock`` drops inherited write."""
     if sys.platform != "win32" or not root.exists():
         return
     entries, sids, kernel, explicit = _runtime_acl_entries(lease, lock=lock)
@@ -3828,7 +3317,6 @@ def _win_set_runtime_dacl(lease, root: Path, *, lock: bool) -> None:
 
 
 def _relock_runtime_copies(lease) -> None:
-    """Put the locked DACL back, including when the tree hash already matches."""
     if sys.platform != "win32" or lease is None:
         return
     for _source, dest in _RUNTIME_COPIES:
@@ -3838,12 +3326,6 @@ def _relock_runtime_copies(lease) -> None:
 
 
 def _ensure_runtime_integrity(lease) -> None:
-    """Recheck the staged tree immediately before CreateProcessW.
-
-    A stamp that names the path is not enough. A changed file is deleted
-    and copied again. A second mismatch fails the launch. A hash that
-    already matches is not a reason to skip the locked DACL.
-    """
     if not _RUNTIME_COPIES:
         return
     if not _runtime_copies_ready():
@@ -3854,16 +3336,6 @@ def _ensure_runtime_integrity(lease) -> None:
 
 
 def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:
-    """Copy interpreter files into the app-owned dest and lock the DACL.
-
-    An unfinished or altered tree is deleted and replaced. The stamp stores
-    a hash of the destination bytes and an identity of the source names,
-    sizes, and mtimes. Removing a source directory changes that identity,
-    so the old copy, including a nested cache, is deleted and written
-    again. The protected DACL grants the package read and execute and
-    denies write to Users, Everyone, and the package groups. The stamp
-    lives beside the grant marker, outside the tree the child can read.
-    """
     granted: list[tuple[Path, bool]] = []
     if not _RUNTIME_COPIES:
         return granted
@@ -3894,7 +3366,6 @@ def _materialize_runtime_copies(lease) -> list[tuple[Path, bool]]:
 
 
 def _runtime_grant_recurse(root: Path) -> bool:
-    """A directory that only holds staged copies is not walked."""
     text = str(root)
     dests = [dest for _source, dest in _RUNTIME_COPIES]
     if any(acl_same(text, dest) for dest in dests):
@@ -3905,7 +3376,6 @@ def _runtime_grant_recurse(root: Path) -> bool:
 
 
 def _require_existing_ancestor_traverse(path, allow) -> None:
-    """Fail when an unowned ancestor has no package traverse ACE. Never writes."""
     blocked = first_blocked_ancestor(str(path), allow, _ancestor_accessible)
     if blocked is not None:
         raise SandboxError(
@@ -3914,7 +3384,6 @@ def _require_existing_ancestor_traverse(path, allow) -> None:
 
 
 def _require_unowned_runtime_access(owned: list[Path]) -> None:
-    """System interpreters stay readable only through ACEs Windows already has."""
     paths = list(_interpreter_candidates())
     for package in _runtime_package_dirs():
         directory = package if package.is_dir() else package.parent
@@ -3966,33 +3435,19 @@ def _refuse_acl_write(lease: _WinLease, path: Path) -> None:
     refuse_acl_target(path, allow=_lease_allow(lease), environ=os.environ)
 
 
-# FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
 _OPEN_REPARSE = 0x00200000 | 0x02000000
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-# PROTECTED_DACL_SECURITY_INFORMATION. Inherited ACEs are not kept.
 _PROTECTED_DACL = 0x80000000
-# FILE_WRITE_DATA | APPEND | WRITE_EA | DELETE_CHILD | WRITE_ATTRIBUTES
-# | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL
-# The generic bits are for detecting an inheritable write. They are not
-# put on a deny ACE: a GENERIC_ALL deny also denies read and the owner
-# can no longer hash or list the tree.
 _WRITE_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x40000000 | 0x10000000
 _WRITE_DENY_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
-# OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
 _INHERIT_TO_CHILDREN = 0x1 | 0x2
 
 
 def reparse_point_blocks_acl(attributes: int, reparse_tag: int) -> bool:
-    """A junction or symlink is not a directory this process may grant."""
     return bool(int(attributes) & _FILE_ATTRIBUTE_REPARSE_POINT) or bool(int(reparse_tag))
 
 
 def dacl_has_inheritable_write(entries) -> bool:
-    """True when an allow ACE would give a new child write access.
-
-    ``entries`` is ``(ace_type, ace_flags, mask)``. Inherit-only is not
-    required. Object-inherit or container-inherit on an allow is enough.
-    """
     for ace_type, ace_flags, mask in entries:
         if int(ace_type) not in (0, 5):
             continue
@@ -4004,18 +3459,12 @@ def dacl_has_inheritable_write(entries) -> bool:
 
 
 def owner_matches(owner_sid, user_sid) -> bool:
-    """An adopted directory is usable only when this process owns it."""
     if not owner_sid or not user_sid:
         return False
     return str(owner_sid) == str(user_sid)
 
 
 def shared_parent_usable(*, traversable: bool, inheritable_write: bool, created: bool, owner_ok: bool) -> bool:
-    """ProgramData or Public may hold the copy only with no inherited write.
-
-    A directory this call creates is owned by this process. A directory
-    that already existed has to be owned by this process as well.
-    """
     if not traversable or inheritable_write:
         return False
     if created:
@@ -4024,11 +3473,6 @@ def shared_parent_usable(*, traversable: bool, inheritable_write: bool, created:
 
 
 def choose_copy_parent(container_dir, accept_container, owned_work):
-    """Prefer the per-user container folder. A shared parent is the fallback.
-
-    Returns ``(parent, trusted)``. ``trusted`` is true for the container
-    folder, whose ancestors are not granted.
-    """
     if container_dir is not None:
         parent = accept_container(container_dir)
         if parent is not None:
@@ -4037,7 +3481,6 @@ def choose_copy_parent(container_dir, accept_container, owned_work):
 
 
 def _win_open_noreparse(kernel, path: Path):
-    """Open a directory without following a junction. Reject a reparse point."""
     kernel.CreateFileW.argtypes = [
         ctypes.c_wchar_p,
         ctypes.c_uint32,
@@ -4057,7 +3500,6 @@ def _win_open_noreparse(kernel, path: Path):
     kernel.GetFileInformationByHandleEx.restype = ctypes.c_int
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel.CloseHandle.restype = ctypes.c_int
-    # READ_CONTROL | WRITE_DAC. Backup semantics so a directory can be opened.
     handle = kernel.CreateFileW(
         str(path),
         0x20000 | 0x40000,
@@ -4075,7 +3517,6 @@ def _win_open_noreparse(kernel, path: Path):
         _fields_ = (("FileAttributes", ctypes.c_uint32), ("ReparseTag", ctypes.c_uint32))
 
     info = _Tag()
-    # FileAttributeTagInfo = 9
     if not kernel.GetFileInformationByHandleEx(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
         kernel.CloseHandle(handle)
         raise _win_fail(f"could not read reparse information for {path}")
@@ -4086,7 +3527,6 @@ def _win_open_noreparse(kernel, path: Path):
 
 
 def _win_write_dacl(kernel, advapi, path: Path, dacl, *, protected: bool = False) -> None:
-    """Set the DACL on a handle opened without following a reparse point."""
     advapi.SetSecurityInfo.argtypes = [
         ctypes.c_void_p,
         ctypes.c_uint32,
@@ -4108,7 +3548,6 @@ def _win_write_dacl(kernel, advapi, path: Path, dacl, *, protected: bool = False
 
 
 def _reject_reparse_dir(path: Path) -> None:
-    """After mkdir, refuse a junction that replaced the directory."""
     if sys.platform != "win32":
         return
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -4117,13 +3556,6 @@ def _reject_reparse_dir(path: Path) -> None:
 
 
 def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
-    """Add a non-inherited traverse ACE without walking the directory.
-
-    Only an app-owned directory is edited. An ancestor this app does not
-    own is never passed here. ``icacls`` on ``C:\\hostedtoolcache`` does
-    not return, so this uses the Win32 ACL API and skips a write when
-    traverse is already allowed.
-    """
     _refuse_acl_write(lease, path)
     if not path.exists():
         return
@@ -4179,19 +3611,15 @@ def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
     advapi.SetNamedSecurityInfoW.restype = ctypes.c_uint32
     dacl = ctypes.c_void_p()
     security = ctypes.c_void_p()
-    # SE_FILE_OBJECT = 1, DACL_SECURITY_INFORMATION = 4
     status = advapi.GetNamedSecurityInfoW(str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security))
     if status != 0:
         raise SandboxError(f"could not read the ACL on {path} (winerror {status})")
-    # A NULL DACL is replaced. Leaving it would grant Everyone, and an
-    # AppContainer does not use that allow.
     null_dacl = not dacl.value
     entry = ExplicitAccess()
-    # FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
     entry.grfAccessPermissions = 0x20 | 0x80 | 0x100000
-    entry.grfAccessMode = 1  # GRANT_ACCESS
+    entry.grfAccessMode = 1
     entry.grfInheritance = 0
-    entry.Trustee.TrusteeForm = 0  # TRUSTEE_IS_SID
+    entry.Trustee.TrusteeForm = 0
     entry.Trustee.ptstrName = lease.sid
     updated = ctypes.c_void_p()
     try:
@@ -4208,11 +3636,9 @@ def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
             kernel.LocalFree(updated)
 
 
-# FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, and FILE_ALL_ACCESS.
 _RX_MASK = 0x1200A9
 _FULL_MASK = 0x1F01FF
 _READ_MASK = 0x120089
-# OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
 _INHERIT_BOTH = 0x3
 
 
@@ -4271,11 +3697,6 @@ def _win_bind_acl(lease: _WinLease) -> None:
 
 
 def _win_ace_present(lease: _WinLease, path: Path, mask: int, ace_type: int) -> bool:
-    """True when this SID already has the allow bits, or a NULL DACL allows them.
-
-    A NULL DACL grants everyone. Replacing it with only our ACE would lock
-    the user out of the file. A deny is not implied by a NULL DACL.
-    """
     advapi = lease.advapi
     kernel = lease.kernel
     _win_bind_acl(lease)
@@ -4288,7 +3709,6 @@ def _win_ace_present(lease: _WinLease, path: Path, mask: int, ace_type: int) -> 
         return False
     try:
         if not dacl.value:
-            # A NULL DACL is not this profile's ACE. The writer replaces it.
             return False
         header = _ACL_HEADER.from_address(int(dacl.value))
         for index in range(min(int(header.AceCount), 128)):
@@ -4312,7 +3732,6 @@ def _win_ace_present(lease: _WinLease, path: Path, mask: int, ace_type: int) -> 
 
 
 def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit: int) -> None:
-    """Merge one ACE. ``mode`` 1 grants and 3 denies. An existing match is left."""
     _refuse_acl_write(lease, path)
     if not should_write_ace(_win_ace_present(lease, path, mask, 0 if mode == 1 else 1)):
         return
@@ -4371,8 +3790,6 @@ def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit:
             kernel.LocalFree(updated)
 
 
-# ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES.
-# An AppContainer token does not receive Everyone (S-1-1-0) or BUILTIN\Users.
 _PACKAGE_SID_TEXTS = ("S-1-15-2-1", "S-1-15-2-2")
 _PACKAGE_SIDS: list | None = None
 _FILE_READ_DATA = 0x1
@@ -4394,7 +3811,6 @@ def _mask_allows(have: int, *, read: bool, traverse: bool) -> bool:
 
 
 def ace_covers_bit(have: int, bit: int) -> bool:
-    """Whether one ACE mask decides ``bit``. Generic rights cover the file bits."""
     mask = int(have)
     if mask & _GENERIC_ALL or (mask & _FILE_ALL) == _FILE_ALL:
         return True
@@ -4418,15 +3834,6 @@ def _mask_bits(mask: int) -> list[int]:
 
 
 def ace_grants_access(entries, requested: int = 0) -> bool:
-    """Whether ACL order grants every bit in ``requested``.
-
-    ``entries`` is ``(ace_type, ace_flags, mask)`` in file order. An
-    inherit-only ACE does not apply to this directory. Each requested bit
-    is decided on its own. A deny that overlaps any still-open bit denies
-    the check, which is what Windows does with a partial deny. A later
-    allow cannot restore that bit. Object allow is type 5 and object deny
-    is type 6.
-    """
     remaining = set(_mask_bits(int(requested or 0)))
     if not remaining:
         return False
@@ -4446,7 +3853,6 @@ def ace_grants_access(entries, requested: int = 0) -> bool:
 
 
 def _ace_sid_offset(ace_type: int, ace_address: int) -> int | None:
-    """Byte offset of the SID. Object ACEs carry GUIDs before it."""
     if ace_type in (0, 1):
         return 8
     if ace_type not in (5, 6):
@@ -4476,12 +3882,6 @@ def _package_allow_sids(advapi) -> list:
 
 
 def _existing_package_access(path, *, read: bool, traverse: bool, extra_sid=None) -> bool:
-    """True when an existing ACE already lets an AppContainer through.
-
-    This only reads the DACL. A NULL DACL is not treated as package
-    traverse: an AppContainer does not receive Everyone. A missing ACE
-    is not a reason to write one on a directory this app does not own.
-    """
     if sys.platform != "win32":
         return False
     try:
@@ -4558,7 +3958,6 @@ def _traverse_already_allowed(lease: _WinLease, path: Path) -> bool:
 
 
 def _grant_already_present(lease: _WinLease, root: Path, mask: int) -> bool:
-    """The tree was granted before, or Windows already allows the package in."""
     probes = [root]
     if root.is_dir():
         for relative in (Path("python.exe"), Path("Lib") / "os.py"):
@@ -4577,13 +3976,6 @@ def _grant_already_present(lease: _WinLease, root: Path, mask: int) -> bool:
 
 
 def _win_grant_tree(lease: _WinLease, root: Path, mask: int, inherit: int) -> None:
-    """Propagate an allow ACE. ``icacls /T`` on the Python prefix exceeds 45s.
-
-    The walk is in-process and stops at 180s with the directory named.
-    ``__pycache__`` and distribution metadata are not read by the child.
-    A file that cannot be edited is skipped, matching ``icacls /C``. The
-    root itself must succeed.
-    """
     deadline = time.monotonic() + 180
     pending = [root]
     seen = 0
@@ -4615,7 +4007,6 @@ def _win_grant_tree(lease: _WinLease, root: Path, mask: int, inherit: int) -> No
 
 
 def _win_revoke_ace(lease: _WinLease, path: Path) -> None:
-    """Drop this profile's ACEs from one file. Does not walk children."""
     if acl_revoke_problem(path, environ=os.environ):
         return
     if not path.exists():
@@ -4651,7 +4042,7 @@ def _win_revoke_ace(lease: _WinLease, path: Path) -> None:
             kernel.LocalFree(security)
         return
     entry = ExplicitAccess()
-    entry.grfAccessMode = 4  # REVOKE_ACCESS
+    entry.grfAccessMode = 4
     entry.Trustee.TrusteeForm = 0
     entry.Trustee.ptstrName = lease.sid
     advapi.SetEntriesInAclW.argtypes = [
@@ -4674,7 +4065,6 @@ def _win_revoke_ace(lease: _WinLease, path: Path) -> None:
 
 
 def _win_revoke_tree(lease: _WinLease, root: Path) -> None:
-    """Revoke one tree. ``icacls`` on ``C:\\hostedtoolcache`` does not return."""
     if acl_revoke_problem(root, environ=os.environ):
         return
     deadline = time.monotonic() + 180
@@ -4735,11 +4125,6 @@ def _win_deny(lease: _WinLease, path: Path) -> None:
 
 
 def _win_deny_shallow(lease: _WinLease, path: Path) -> None:
-    """Deny reading one app-owned directory. Children keep the ACEs they have.
-
-    The ACE is skipped when it is already present. A directory this app
-    does not own is not edited: the AppContainer cannot read it anyway.
-    """
     _refuse_acl_write(lease, path)
     if not path.exists():
         return
@@ -4749,11 +4134,6 @@ def _win_deny_shallow(lease: _WinLease, path: Path) -> None:
 
 
 def _win_sweep_orphans() -> None:
-    """Delete sb* AppContainer profiles left by a process that did not exit cleanly.
-
-    A failure here does not open the jail. The new profile is still created,
-    and a profile that cannot be deleted is unused once its process is gone.
-    """
     if sys.platform != "win32":
         return
     try:
@@ -4804,9 +4184,6 @@ def _win_sweep_orphans() -> None:
         userenv.DeleteAppContainerProfile.restype = ctypes.c_long
     except OSError:
         return
-    # Removing ACEs with icacls /T walks the Python tree once per leftover
-    # profile. The SIDs are unused once the profile is deleted. Leave the
-    # ACEs; they do not grant a live process.
     for name, _sid_text in orphans:
         try:
             userenv.DeleteAppContainerProfile(name)
@@ -4815,12 +4192,6 @@ def _win_sweep_orphans() -> None:
 
 
 def _win_remove_aces(lease: _WinLease, paths, *, recurse: bool) -> None:
-    """Drop ACEs this grant added. Never calls ``icacls``.
-
-    ``icacls`` without ``/T`` on ``C:\\hostedtoolcache`` still does not
-    return. A failed grant used to spend 45 seconds there and every test
-    then reported that timeout instead of the grant error.
-    """
     if lease is None or not lease.sid_text:
         return
     for path in paths:
@@ -4849,15 +4220,10 @@ def _win_reject_overlap(grants, denied) -> None:
 
 
 def _win_grant_work(lease: _WinLease, work: Path) -> list[tuple[Path, bool]]:
-    """Grant the private directory. Ancestors this app did not create are read, not written."""
     allow = [str(path) for path, _flag in lease.grant_paths]
     allow.extend(str(path) for path in _CREATED_APP_DIRS)
     allow.append(str(work))
     lease.acl_allow = _dedupe_acl(allow)
-    # A private directory under the AppContainer folder is reachable because
-    # that folder is the profile's own directory. Its ancestors, including
-    # the user-profile root and Temp, are not granted and are not required
-    # to show a package ACE.
     if not _trusted_runtime_root(work):
         _require_existing_ancestor_traverse(work, lease.acl_allow)
     for parent in acl_ancestor_paths(str(work)):
@@ -5102,18 +4468,7 @@ def _win_spawn(work: Path, lease: _WinLease, *, memory_bytes: int, cpu_seconds: 
         command_buf = ctypes.create_unicode_buffer(command)
         env_buf = _windows_env_block(_windows_env(work))
         created = _WinProcessInformation()
-        # CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
         flags = 0x00000004 | 0x00080000 | 0x08000000 | 0x00000400
-        # CREATE_BREAKAWAY_FROM_JOB. The worker job's commit ceiling must
-        # not charge this child: that wait is the empty result pipe. If the
-        # outer job forbids breakaway, start in the worker job instead.
-        # That is not a retry of a missing executable. An AppContainer create
-        # also returns winerror 2 (file not found) when the parent can see
-        # the image and the working directory but the container cannot yet.
-        # A busy runner does that just after the private-directory grant.
-        # Two more passes cover it. Winerror 193 is not a valid application
-        # and is not retried. A winerror 2 whose image this process cannot
-        # stat is not retried either.
         ok = False
         failed = 0
         executable_path = Path(executable)
@@ -5197,15 +4552,12 @@ def _win_pipe(kernel):
     read = ctypes.c_void_p()
     write = ctypes.c_void_p()
     security = _WinSecurityAttributes(ctypes.sizeof(_WinSecurityAttributes), None, 1)
-    # The default pipe is a few kilobytes. One bar is one write; a larger
-    # buffer keeps that write from blocking on the child's first read.
     if not kernel.CreatePipe(ctypes.byref(read), ctypes.byref(write), ctypes.byref(security), 65536):
         raise _win_fail("CreatePipe failed")
     return read.value, write.value
 
 
 def _win_require_container(lease: _WinLease, process) -> None:
-    """Refuse to resume a process that is not an empty AppContainer."""
     advapi = lease.advapi
     kernel = lease.kernel
     advapi.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
@@ -5268,9 +4620,6 @@ def _windows_env(work: Path) -> dict:
         "TMP": str(work),
         "HOME": str(work),
         "USERPROFILE": str(work),
-        # The real directory. Pointing this at the private temp does not
-        # locate the AppContainer profile, and CreateProcess then fails
-        # with ERROR_ENVVAR_NOT_FOUND (203).
         "LOCALAPPDATA": local,
         "PYTHONUNBUFFERED": "1",
         "PYTHONIOENCODING": "utf-8",
@@ -5285,11 +4634,6 @@ def _windows_env(work: Path) -> dict:
 
 
 def _windows_env_entries(env: dict) -> list[str]:
-    """``name=value`` lines in the order CreateProcess requires.
-
-    Windows rejects an unsorted block with ERROR_ENVVAR_NOT_FOUND (203).
-    Names are compared case-insensitively. A name may not contain ``=``.
-    """
     entries = []
     for key in sorted(env, key=str.upper):
         if not key or "=" in key or "\0" in key:
@@ -5304,11 +4648,6 @@ def _windows_env_entries(env: dict) -> list[str]:
 
 
 def _windows_env_block(env: dict):
-    """A double-null-terminated Unicode environment block.
-
-    ``create_unicode_buffer`` stores a Python string through a setter that
-    stops at the first null, so the block is filled one character at a time.
-    """
     entries = _windows_env_entries(env)
     chars: list[str] = []
     for entry in entries:
@@ -5347,7 +4686,6 @@ def _win_arm_job(kernel, process, *, memory_bytes: int, cpu_seconds: int):
 
 
 class _WindowsPopen:
-    """The slice of subprocess.Popen the referee uses, backed by CreateProcess."""
 
     def __init__(self, process, pid, stdin_fd, stdout_fd, stderr_fd, kernel, job):
         self._process = process

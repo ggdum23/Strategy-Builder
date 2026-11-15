@@ -1,9 +1,3 @@
-"""Arena and Desk profiles.
-
-The two profiles do not share a fill venue, leverage cap, financing rule,
-borrow rate, dividend rule, fee table, warm-up, or liquidation rule.
-This module names those choices. It does not price a fill.
-"""
 
 from __future__ import annotations
 
@@ -15,12 +9,10 @@ from . import costs_desk
 
 @dataclass(frozen=True)
 class Profile:
-    """Switches that must stay on one side of the Arena/Desk line."""
 
     name: str
     max_abs_target: float
     fill_venue: str
-    # The runner reads this field. It is the engine constant, not a second copy.
     borrow_rate_annual: float
     financing_rate_annual: float
     dividends: bool
@@ -47,8 +39,6 @@ ARENA = Profile(
     share_factor_default=1.0,
 )
 
-# liquidation, margin, and the fee month are the same numbers as DeskConfig.
-# test_desk_engine_defaults_match_the_profile locks the pair.
 DESK = Profile(
     name="desk",
     max_abs_target=3.0,

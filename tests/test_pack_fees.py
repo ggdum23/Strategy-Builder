@@ -1,4 +1,3 @@
-"""Raw and anonymized runs bill the same per-share fees. The child never sees the sidecar."""
 
 from __future__ import annotations
 
@@ -29,11 +28,6 @@ ET = timezone(timedelta(hours=-4))
 
 
 class RoundTrip:
-    """Buy on the first regular session, flat from the eighth. No clock is hardcoded.
-
-    The same class runs on Arena bars (phase is ``session``) and Desk bars
-    (phase is ``phase``). Session identity is the day index or the session id.
-    """
 
     WANTS_EXTENDED_HOURS = False
 
@@ -57,7 +51,6 @@ class RoundTrip:
 
 
 class SidecarHunter:
-    """Looks for the operator canary on the channels Phase 1 actually isolates."""
 
     WANTS_EXTENDED_HOURS = False
 
@@ -222,7 +215,6 @@ def test_anonymized_pack_matches_raw_per_share_fees(tmp_path, anonymized_qqq, pr
 
 
 class TargetOnce:
-    """One target on the first regular bar. Later bars leave the position alone."""
 
     WANTS_EXTENDED_HOURS = False
     TARGET = 1.0
@@ -243,7 +235,6 @@ class TargetShort(TargetOnce):
 
 
 class ScaleFrame:
-    """Records runner-frame locals while on_bar is on the stack."""
 
     WANTS_EXTENDED_HOURS = False
     SCALE = 1.7

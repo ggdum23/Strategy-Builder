@@ -1,4 +1,3 @@
-"""Ninth review. Clock tokens, PNG text, and typed designer publish."""
 
 from __future__ import annotations
 
@@ -84,7 +83,6 @@ def _plant_text(png: bytes, caption: str) -> bytes:
 
 
 def test_desk_clocks_export_and_a_designer_folder_shows_no_plant(qtbot, tmp_path):
-    """Desk fill times survive the scales that share their minutes, and the plant is not in designer/."""
     frame = _frame()
     books = run_books(_Hold, frame, "desk", share_factor=7.777, with_benchmarks=False)
     result, metrics = books["strategy"]

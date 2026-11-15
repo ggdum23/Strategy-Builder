@@ -1,4 +1,3 @@
-"""Inspect a filled-file folder and, when asked, record it."""
 
 from __future__ import annotations
 

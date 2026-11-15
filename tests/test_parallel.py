@@ -1,4 +1,3 @@
-"""Parallel scoring: same numbers, one bad strategy, and a pack that stays anonymous."""
 
 from __future__ import annotations
 
@@ -84,8 +83,6 @@ TWO = (
 
 
 def test_rank_is_excess_return_then_id_and_failures_go_last():
-    # total_return order is the reverse of excess order. Ranking by the raw
-    # total would put high_total first and a/s last among the finite rows.
     rows = [
         {
             "status": "ok",
@@ -229,7 +226,6 @@ def test_workers_do_not_change_the_leaderboard_or_the_metrics(tmp_path):
 
     books = run_books(load_strategy_class(strategies[0].path), _frame(), "arena")
     written = json.loads((Path(serial.results[0].out_dir) / "metrics.json").read_text(encoding="utf-8"))
-    # results are rank order, not input order. Compare the flat book by id.
     flat = next(item for item in serial.results if item.strategy_id == "flat")
     written = json.loads((Path(flat.out_dir) / "metrics.json").read_text(encoding="utf-8"))
     live = books["strategy"][1]
@@ -425,9 +421,6 @@ def test_cancel_stops_the_batch(tmp_path):
         on_progress=on_progress,
         cancel=token,
     )
-    # 45s plus two jail budgets is 225s, past the 180s pytest cap, so the
-    # bound could not fail. One jail of slack is under that cap. Linux stays
-    # at 45s. A cancel that never arrives still runs until the worker budget.
     assert time.monotonic() - started < windows_limit(45, 1)
     assert result.cancelled is True
     assert result.failures == len(result.results)
@@ -659,15 +652,6 @@ _WIN_HOG_BYTES = 640 * 1024 * 1024
 
 
 def _memory_cap(baseline: int, linux_margin: int) -> int:
-    """Cap above one process. On Windows, above the worker plus the jail.
-
-    The poll sums those working sets. On the GitHub runner that pair has
-    been anywhere from about 96 MiB to about 240 MiB above one process, so
-    a fixed gap smaller than the pair stopped the flat strategy. 512 MiB
-    is above that pair. The hog allocates more than 512 MiB on Windows, so
-    it still crosses the cap whatever the pair was. Linux keeps the tighter
-    margin and the smaller allocation.
-    """
     margin = _WIN_PAIR_MARGIN if sys.platform == "win32" else linux_margin
     return baseline + margin
 
@@ -739,7 +723,6 @@ def _alive(pid: int) -> bool:
             text=True,
             check=False,
         )
-        # tasklist CSV quotes the pid. A substring match would treat 12 as 123.
         return f"\"{pid}\"" in listed.stdout
     stat = Path(f"/proc/{pid}/stat")
     if not stat.exists():
@@ -830,11 +813,6 @@ def _assert_grandchild_gone(marker: Path, label: str) -> None:
 
 @windows_jails(4)
 def test_grandchild_is_reaped_on_timeout_cancel_and_memory(tmp_path):
-    """A long-lived child of the strategy dies on timeout, cancel, and the RSS kill.
-
-    Each scenario is bounded. If stopping the worker is a no-op, the assertion
-    fails and the cleanup signal still reaps the process so pytest can exit.
-    """
     market = FrameMarket("book", "TEST", frame=_frame())
 
     timeout_marker = tmp_path / "timeout.json"
@@ -1102,11 +1080,6 @@ def _anon_pack(tmp_path: Path, symbol: str, name: str = "", price_factor: float 
 
 
 def _pack_for_ticker_two(tmp_path: Path, name: str, price_factor: float):
-    """One Monday session and two prices, with no anonymized cell equal to ``2``.
-
-    A second anonymized day is numbered 2, and Wednesday's weekday is 2. Either
-    cell is the ticker, so this pack stays on Monday and scales away from ``.2``.
-    """
     from backtester.data import load_named
     from backtester.pack import build_pack
     from backtester.registry import entry_from_inspection, save_registry, upsert_series
@@ -1353,9 +1326,6 @@ def test_rss_poll_kills_without_a_memory_error(tmp_path):
 
 
 def _orphan_strategy(_marker: Path, _ready: Path, *, ignore_term: bool, action: str) -> str:
-    # The jail does not let the strategy start a grandchild. These actions
-    # cover the worker's own exit paths: a clean return, an error, a timeout,
-    # and a cancel. ``ignore_term`` is kept so the call sites stay explicit.
     del ignore_term
     if action == "raise":
         finish = "        raise RuntimeError('grandchild-left-behind')\n"
@@ -1405,12 +1375,6 @@ def _run_orphan(tmp_path: Path, name: str, *, ignore_term: bool, action: str, ti
 
 @windows_jails(5)
 def test_grandchildren_are_reaped_after_return_error_timeout_and_cancel(tmp_path):
-    """A process the strategy starts dies on every exit, including a clean return.
-
-    The SIGTERM-ignoring grandchild stays alive if the group is not SIGKILLed
-    after the leader has exited. Plain ``sleep`` dies on SIGTERM, so it only
-    proves the success and error paths signal the group at all.
-    """
     returned, elapsed = _run_orphan(
         tmp_path, "sleep-ok", ignore_term=False, action="return", timeout_s=runner_timeout(1, 30), cancel=False
     )
@@ -1480,7 +1444,6 @@ def test_designer_leaderboard_keeps_distinct_ids_for_ticker_case_variants(tmp_pa
     )
     assert result.failures == 0, [(item.strategy_id, item.status, item.error) for item in result.results]
     job_dirs = [Path(item.out_dir) for item in result.results]
-    # A case-insensitive disk would otherwise make both workers share equity.png.
     assert len({str(path).casefold() for path in job_dirs}) == 2
     for path in job_dirs:
         assert (path / "designer" / "equity.png").read_bytes().startswith(b"\x89PNG")
@@ -1602,7 +1565,6 @@ def _registered(index: Path, run_id: str, out: Path) -> None:
 @windows_jails(16)
 @OWNER_PC
 def test_schema_token_tickers_publish_and_register(tmp_path):
-    """Headers such as borrow_cost are not the ticker COST."""
     from backtester.report import read_leaderboard
 
     for symbol in _SCHEMA_TICKERS:
@@ -1668,11 +1630,6 @@ _REAL_COPYTREE = shutil.copytree
 
 
 def _plant_ticker_file(src, dst, *args, **kwargs):
-    """Drop a ticker-named file beside the copied job, not inside it.
-
-    The per-job audit looks at the copied directory. A sibling is only visible
-    to the whole-tree audit. That failure must not blank the other strategies.
-    """
     _REAL_COPYTREE(src, dst, *args, **kwargs)
     metrics = Path(dst) / "metrics.json"
     if not metrics.is_file():
@@ -1777,7 +1734,6 @@ def test_parallel_cli_exits_without_a_traceback_when_one_row_fails(tmp_path, mon
     assert info["id"] in index["runs"]
 
 
-# The names in README.md. PROGRAM.md and PLAN.md are not in this repo.
 _REQUIRED_SYMBOLS = (
     "AAPL",
     "ABBV",
@@ -1931,7 +1887,6 @@ def test_one_embedded_id_does_not_fail_the_mixed_batch(tmp_path):
 
 @windows_jails(4)
 def test_an_id_carrying_both_batch_tickers_is_scrubbed(tmp_path):
-    """One row's symbol is not enough: COST and ZZZX are both in the id."""
     from backtester.report import read_leaderboard
 
     zzzx_pack, zzzx_side, _built = _anon_pack(tmp_path, "ZZZX", name="zzzx", price_factor=1.15)
@@ -2177,7 +2132,6 @@ def test_numeric_ticker_suffix_is_not_published(tmp_path):
 
 @windows_jails(8)
 def test_a_forced_ticker_suffix_is_renamed_off_disk(tmp_path, monkeypatch):
-    """A directory named with a ticker must not survive the audit."""
     from backtester.parallel import _designer_component as real_component
 
     state = {"poisoned": False}
@@ -2260,12 +2214,6 @@ def _assert_designer_names(designer: Path, symbols) -> None:
 @pytest.mark.parametrize("symbol", _REQUIRED_SYMBOLS + _PASSING_EXTRA_SYMBOLS)
 @windows_jails(4)
 def test_every_symbol_publishes_a_clean_book(tmp_path, symbol):
-    """A symbol that passes the guard publishes under canonical names as RANDOM.
-
-    The designer tree audits clean, readers open metrics.json and
-    leaderboard.csv by those names, and in-book ids equal the directory names.
-    The operator leaderboard keeps the original strategy id.
-    """
     from backtester.report import load_report, read_leaderboard
 
     profile, benchmarks = _publish_profile(symbol)
@@ -2325,7 +2273,6 @@ def test_every_symbol_publishes_a_clean_book(tmp_path, symbol):
 
 
 def test_a_reserved_symbol_rejects_the_batch_before_output(tmp_path):
-    """EQUITY is reserved. The batch does not start and leaves no tree."""
     from backtester.pack import load_sidecar
 
     aapl_pack, aapl_side, _built = _anon_pack(tmp_path, "AAPL", name="aapl", price_factor=1.2)
@@ -2348,12 +2295,6 @@ def test_a_reserved_symbol_rejects_the_batch_before_output(tmp_path):
 
 @windows_jails(1)
 def test_setsid_cannot_move_a_grandchild_out_of_the_worker_group(tmp_path):
-    """The worker filter still denies setsid, and a jailed strategy cannot spawn.
-
-    The worker installs the filter after its own setsid and after the jail is
-    up. A grandchild of the worker, not of the strategy, stays in the group.
-    The strategy process is the jail, which does not allow the spawn at all.
-    """
     if sys.platform != "linux":
         pytest.skip("setsid is the Linux process-group escape")
     marker = tmp_path / "setsid.json"

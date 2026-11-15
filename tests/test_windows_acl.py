@@ -1,11 +1,3 @@
-"""ACL targets stay inside directories the app owns.
-
-``C:\\Windows`` was an explicit ``SystemRoot`` candidate in the historical
-icacls list. On a GitHub runner the interpreter is under
-``C:\\hostedtoolcache``, and walking that prefix's parents does not reach
-``C:\\Windows``. The grant must drop the system directory instead of
-writing it.
-"""
 
 import json
 import sys
@@ -76,9 +68,6 @@ APP = r"C:\ProgramData\Strategy Builder\jail"
 LOCAL = r"C:\Users\runner\AppData\Local"
 USER_PYTHON = r"C:\Users\runner\AppData\Local\Programs\Python\Python312"
 
-# The old icacls roots: interpreter, SystemRoot, a Program Files install,
-# the user-profile Local directory that used to be denied, plus the
-# ancestors those roots produced.
 OLD_CANDIDATES = [PREFIX, SYSTEM, PROGRAM_FILES_PYTHON, INSIDE_WINDOWS, VENV, FROZEN, LOCAL]
 
 
@@ -177,7 +166,6 @@ def test_an_existing_ace_is_not_rewritten():
 
 
 def _suite_conftest():
-    """Load tests/conftest.py even when gui/conftest.py owns the name ``conftest``."""
     import importlib.util
 
     path = Path(__file__).resolve().parent / "conftest.py"
@@ -471,8 +459,6 @@ def test_an_earlier_allow_wins_and_an_inherit_only_ace_does_not():
     assert ace_grants_access([(0, 0x08, traverse), (5, 0, traverse)], traverse)
     assert not ace_grants_access([(6, 0, traverse), (0, 0, traverse)], traverse)
     assert not ace_grants_access([], traverse)
-    # A deny of one still-open bit denies the whole check. A deny of an
-    # unrelated bit does not. An inherit-only deny does not apply here.
     assert not ace_grants_access([(1, 0, traverse), (0, 0, 0x21)], 0x21)
     assert ace_grants_access([(1, 0, 0x1), (0, 0, traverse)], traverse)
     assert ace_grants_access([(1, 0x08, traverse), (0, 0, traverse)], traverse)
@@ -656,8 +642,6 @@ def test_canonical_paths_cannot_reach_a_protected_directory():
     for raw in refused:
         with pytest.raises(SandboxError, match="refusing to edit the ACL"):
             refuse_acl_target(raw, allow=[r"C:\ok"], environ=ENV)
-    # The allow root contains the lexical prefix. Dropping ``..`` would leave
-    # the target inside that root. Collapsing it leaves the root and is refused.
     desktop = r"C:\Users\Jeu\Desktop"
     escaped = desktop + r"\..\..\Windows\System32"
     assert canonicalize_acl_path(escaped) == r"C:\Users\Windows\System32"
@@ -743,7 +727,6 @@ def _strategy(path: Path) -> Path:
 
 
 def test_a_refused_launch_does_not_stage_the_runtime(tmp_path, monkeypatch):
-    """The interpreter roots are checked before the profile copies anything."""
     import backtester.sandbox as sandbox
 
     prefix = tmp_path / "py"
@@ -780,7 +763,6 @@ def test_a_refused_launch_does_not_stage_the_runtime(tmp_path, monkeypatch):
 
 
 def test_a_staged_grant_is_still_refused_after_the_profile_is_warm(tmp_path, monkeypatch):
-    """Moving the check earlier still covers the copy Windows would grant."""
     import backtester.sandbox as sandbox
 
     prefix = tmp_path / "py"
@@ -976,7 +958,6 @@ def test_cleanup_drops_aces_while_holding_the_profile_lock(monkeypatch):
 
 
 def test_a_deny_root_inside_a_runtime_prefix_refuses_the_launch(tmp_path, monkeypatch):
-    """A cache inside a runtime prefix stops the launch. The mount stays whole."""
     import backtester.sandbox as sandbox
     from backtester.sandbox import (
         _LANDLOCK_READ,
@@ -1043,9 +1024,6 @@ def test_tmp_and_etc_are_not_broader_than_the_jail_needs():
         Path("/work"),
         "/etc/ld.so.cache",
     )
-    # The plan always names the private tmpfs ``/tmp``. A Windows test
-    # process renders ``Path("/tmp/py")`` with backslashes, which is the
-    # string the late bind uses.
     tmpfs = cmd.index("/tmp")
     assert cmd[tmpfs - 1] == "--tmpfs"
     assert cmd.index(str(late_root)) > tmpfs
@@ -1087,11 +1065,6 @@ def test_the_caller_cap_is_the_jail_ceiling_and_a_long_job_fails():
 
 
 def test_the_memory_poll_does_not_rewrite_shared_ctypes_prototypes():
-    """Parallel books poll together. Prototypes stay off the cached WinDLL.
-
-    Assigning ``argtypes`` on ``ctypes.WinDLL("kernel32")`` from each poll
-    raced, and one sample was a multi-gigabyte sum for a flat strategy.
-    """
     source = Path(__file__).resolve().parents[1].joinpath("src", "backtester", "limits.py").read_text(
         encoding="utf-8"
     )

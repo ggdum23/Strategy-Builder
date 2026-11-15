@@ -1,10 +1,3 @@
-"""Operator-side work. No Qt, and no sidecar fields in the status payload.
-
-The worker process is the parent the runner already expects: it may read the
-sidecar, then ``run_pack`` drops that document before the strategy process
-starts. A file strategy is a path string. This process does not import it.
-Status files receive paths and headlines only.
-"""
 
 from __future__ import annotations
 
@@ -34,13 +27,6 @@ from .validate import config_record, normalize, validate_config
 
 @dataclass(frozen=True)
 class JobFailure:
-    """The exception a job worker caught, separate from its traceback.
-
-    A direct failure's banner is ``message`` (``str(exc)``). A strategy failure
-    (``strategy`` is true) banners :func:`failure_line` of the strategy type and
-    message. The log shows ``traceback``. The UI does not read the traceback
-    to decide the sentence.
-    """
 
     type_name: str
     message: str
@@ -83,7 +69,6 @@ _TRACEBACK_MARK = "Traceback (most recent call last):"
 
 
 def failure_message(value) -> str:
-    """The sentence a banner shows. A plain string is already that sentence."""
     if isinstance(value, JobFailure):
         if value.strategy:
             return failure_line(value.type_name, value.message)
@@ -99,7 +84,6 @@ def failure_message(value) -> str:
 
 
 def failure_detail(value) -> str:
-    """The log text. The traceback stays here, off the banner."""
     if isinstance(value, JobFailure):
         return value.traceback or value.message
     return str(value)
@@ -114,7 +98,6 @@ def _first_content_line(text: str) -> str:
 
 
 def _outer_exception_text(text: str) -> str:
-    """The outermost exception block of a traceback, message lines included."""
     block = text.rsplit(_TRACEBACK_MARK, 1)[-1]
     start = None
     lines = block.splitlines()
@@ -138,12 +121,6 @@ def _outer_exception_text(text: str) -> str:
 
 
 def failure_view(text: str) -> tuple[str, str]:
-    """The line a cell or banner shows, and the text kept for a tooltip.
-
-    A traceback shows the outermost exception's first line (``Type: message``).
-    The tooltip keeps the traceback. A plain multiline message shows its first
-    line and keeps the whole message for the tooltip.
-    """
     raw = str(text or "").strip()
     if not raw:
         return "", ""
@@ -210,7 +187,6 @@ def _optional_int(value):
 
 
 def inspect_series(src, symbol: str, *, bar_minutes: int = 1, price_kind: str, phase_map_text: str = "", splits_text: str = "") -> dict:
-    """Inspect filled files. Declared splits are not passed into the loader."""
     if not str(symbol).strip():
         raise ValueError("ticker is required")
     if price_kind not in ("raw", "total_return"):
@@ -256,7 +232,6 @@ def record_series(
     splits_text: str = "",
     borrow_rate: float | None = None,
 ) -> dict:
-    """Registry write. Profile and price kind are required, matching the CLI."""
     if not profile:
         raise ValueError("recording a series needs a profile. Refusing to guess from the ticker.")
     if price_kind not in ("raw", "total_return"):
@@ -302,7 +277,6 @@ def build_pack_job(
     price_kind: str = "raw",
     phase_map_text: str = "",
 ) -> dict:
-    """Build a pack. The returned dict has no scale factor and no date map."""
     if anonymize is None:
         raise ValueError("choose named or anonymized. Refusing to guess.")
     if not str(registry_path).strip():
@@ -363,7 +337,6 @@ def _pack_kwargs(config: dict) -> dict:
 
 
 def _headline(payload: dict) -> dict:
-    """A few fields the status line may show. The dashboard rereads the files."""
     keys = ("final_equity", "total_return", "profile", "symbol", "n_fills", "disqualified")
     return {key: payload.get(key) for key in keys if key in payload}
 
@@ -481,7 +454,6 @@ class _PackMarket:
 
 
 class _CancelToken:
-    """Same two methods as ``backtester.parallel.CancelToken`` when Phase 3 is absent."""
 
     def __init__(self) -> None:
         self._flag = threading.Event()
@@ -494,7 +466,6 @@ class _CancelToken:
 
 
 def _parallel_types():
-    """Prefer the Phase 3 types. Fall back to local stand-ins so the call still happens."""
     try:
         from backtester.parallel import CancelToken, NamedMarket, PackMarket, StrategyRef
     except ImportError:
@@ -524,11 +495,6 @@ def _progress_fields(event) -> dict:
 
 
 def _run_batch(config: dict, status_path) -> dict:
-    """One call to ``runner.run_parallel``, which runs ``backtester.parallel``.
-
-    This file does not score the books. It reads the report files the runner wrote.
-    A test can replace ``backtester.runner.run_parallel``.
-    """
     from ..runner import run_parallel
 
     issues = validate_config(config)
@@ -635,7 +601,6 @@ def execute_run(config: dict, status_path=None) -> dict:
 
 
 def process_entry(mode: str, config: dict, status_path: str) -> None:
-    """Spawn target. ``mode`` is repeated so the child does not trust a partial dict silently."""
     import os
     import sys
 
@@ -652,8 +617,5 @@ def process_entry(mode: str, config: dict, status_path: str) -> None:
         result = execute_run(config, status_path)
         _status(status_path, {"state": "done", "result": result})
     except BaseException as exc:
-        # Cancel still kills this process from outside. An exception that
-        # unwinds the worker, including KeyboardInterrupt and SystemExit,
-        # is recorded so the window has a banner instead of a stuck "running".
         failure = JobFailure.capture(exc)
         _status(status_path, {"state": "error", "failure": failure.as_dict()})

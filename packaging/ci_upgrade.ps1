@@ -1,4 +1,3 @@
-# Install over an existing per-user install. config.json must be left as the user edited it.
 
 param(
     [Parameter(Mandatory = $true)][string]$SetupExe,

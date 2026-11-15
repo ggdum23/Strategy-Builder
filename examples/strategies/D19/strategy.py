@@ -1,18 +1,3 @@
-"""Vol-managed long-only strategy for ASSET.
-
-Once per regular session, ten minutes before the close, set exposure from the
-20-session close-to-close realized volatility. Stay fully long while realized
-vol is contained; step exposure down, in quarter-turns, as realized vol rises.
-Never short and never lever beyond 1x.
-
-Decision times: minute 950 (15:50) on a full session, minute 770 (12:50) on a
-short session. The order fills at the next bar's open (15:51, or 12:51).
-All other bars return None, so an unchanged target never sends an order.
-
-Lookbacks use only bars already seen. Session boundaries are detected when the
-minute-of-day falls, not from the day index. History is built from whatever
-bars arrive, including a warm-up that does not start at day 0.
-"""
 
 import math
 
@@ -24,14 +9,11 @@ class Strategy:
     TARGET_VOL = 0.18
     STEP = 0.25
     CAP = 1.0
-    # Exact quarter-turns. Indexed by round(exposure * 4).
     GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 
     def __init__(self):
         self.prev_minute = None
         self.today_close = None
-        # Completed regular-session closes, oldest first. Only the last
-        # LOOKBACK closes enter the estimator; the list is truncated.
         self.closes = []
 
     def on_bar(self, bar, state):
@@ -63,7 +45,6 @@ class Strategy:
         return self._target(close)
 
     def _target(self, close):
-        # Need LOOKBACK completed closes plus today's price: LOOKBACK returns.
         if len(self.closes) < self.LOOKBACK:
             return 0.0
         window = self.closes[-self.LOOKBACK :] + [close]
@@ -88,7 +69,6 @@ class Strategy:
             raw = self.CAP
         if raw < 0.0:
             raw = 0.0
-        # Round half up onto the 0.25 grid, then snap to an exact grid value.
         k = int(math.floor(raw / self.STEP + 0.5))
         if k < 0:
             k = 0

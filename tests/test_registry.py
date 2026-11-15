@@ -1,4 +1,3 @@
-"""Registry schema, inferred hours, and the ingest/list/show commands."""
 
 from __future__ import annotations
 
@@ -184,4 +183,4 @@ def test_ingest_and_registry_commands(tmp_path, capsys):
     assert refused == 2
     err = capsys.readouterr().err
     assert "profile" in err
-    assert listed.out  # the first ingest told the operator what it inferred
+    assert listed.out

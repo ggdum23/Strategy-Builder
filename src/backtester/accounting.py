@@ -1,18 +1,3 @@
-"""Price basis, cash interest, and financing. One record for every run.
-
-The Arena and Desk engines do not share a fill, a borrow charge, or a
-liquidation rule. This module names the switches those engines record and
-the cash amounts a session boundary may add. It does not price a fill.
-
-Rates are decimals. ``0.07`` is 7 percent per year, not 7. A rate above
-``1.0`` (100 percent per year) is rejected. Withholding is the fraction of
-a positive long dividend kept back, from ``0`` through ``1``.
-
-Accrual is one step of ``rate / 252`` at each session boundary. The base is
-the previous session's snap, taken before that charge. There is no
-calendar-day count here. The referee's real-month mode is a different
-switch and is not applied by this module.
-"""
 
 from __future__ import annotations
 
@@ -25,10 +10,6 @@ SESSIONS_PER_YEAR = 252
 PRICE_BASES = frozenset({"raw", "total_return"})
 METHODS = frozenset({"none", "profile_dividends", "cash_dividends", "registry_series"})
 
-# Closed tokens a designer report may print. They are not tickers.
-# A symbol that casefolds to one of these whole values is reserved. The
-# strings are not split on "_", so ``session_boundary_1_252`` does not
-# reserve the symbol ``1``.
 VOCABULARY = frozenset(
     {
         "raw",
@@ -41,7 +22,6 @@ VOCABULARY = frozenset(
     }
 )
 
-# Leaderboard columns, in order. ``profile`` is already its own column.
 LEADERBOARD_KEYS = (
     "price_basis",
     "total_return_method",
@@ -54,7 +34,6 @@ LEADERBOARD_KEYS = (
     "dividends_applied",
 )
 
-# Compared as a tuple. A leaderboard with two different tuples is refused.
 IDENTITY_KEYS = (
     "profile",
     "price_basis",
@@ -70,9 +49,6 @@ IDENTITY_KEYS = (
 
 RECORD_KEYS = IDENTITY_KEYS
 
-# Whole symbols reserved before an anonymized pack or designer tree is written.
-# Values and keys this phase writes into designer-visible files. Match the
-# full casefolded symbol. Do not split these on "_".
 EXACT_RESERVED = frozenset(
     set(VOCABULARY)
     | set(LEADERBOARD_KEYS)
@@ -83,7 +59,6 @@ _BOOL_NAMES = frozenset({"bool", "bool_", "bool8"})
 
 
 class Accounting:
-    """The switches one run used. ``as_dict`` is the public record."""
 
     def __init__(
         self,
@@ -128,7 +103,6 @@ def _reject_bool_or_text(name: str, value) -> None:
 
 
 def require_annual_rate(name: str, value) -> float:
-    """A finite annual decimal in ``[0, 1]``. ``1`` is 100 percent per year."""
     _reject_bool_or_text(name, value)
     try:
         rate = float(value)
@@ -146,7 +120,6 @@ def require_annual_rate(name: str, value) -> float:
 
 
 def require_withholding_rate(name: str, value) -> float:
-    """Fraction of a positive long dividend withheld, from 0 through 1."""
     _reject_bool_or_text(name, value)
     try:
         rate = float(value)
@@ -164,7 +137,6 @@ def require_withholding_rate(name: str, value) -> float:
 
 
 def normalize_price_basis(value) -> str:
-    """``raw`` or ``total_return``. ``None`` is ``raw``. ``total-return`` is accepted."""
     if value is None:
         return "raw"
     if isinstance(value, str):
@@ -175,7 +147,6 @@ def normalize_price_basis(value) -> str:
 
 
 def normalize_series_kind(value) -> str:
-    """The kind of series the file is. Same vocabulary as the price basis."""
     if value is None:
         return "raw"
     if isinstance(value, str):
@@ -186,7 +157,6 @@ def normalize_series_kind(value) -> str:
 
 
 def borrowed_base(shares, price, equity) -> float:
-    """``max(0, |position value| - equity)`` on one pre-charge snap."""
     borrowed = abs(shares * price) - equity
     if borrowed < 0.0:
         borrowed = 0.0
@@ -194,11 +164,6 @@ def borrowed_base(shares, price, equity) -> float:
 
 
 def idle_base(shares, price, equity) -> float:
-    """``max(0, equity - |position value|)`` on the same snap.
-
-    Idle cash and borrowed money are not both positive. They are both zero
-    when the position value equals equity.
-    """
     idle = equity - abs(shares * price)
     if idle < 0.0:
         idle = 0.0
@@ -206,18 +171,10 @@ def idle_base(shares, price, equity) -> float:
 
 
 def session_accrual(rate_annual: float, base: float, sessions_per_year: int = SESSIONS_PER_YEAR) -> float:
-    """One session of simple accrual. ``rate_annual / 252 * base`` at the default."""
     return rate_annual / sessions_per_year * base
 
 
 def dividend_cash(shares, amount, withholding_rate: float) -> float:
-    """Cash from one dividend.
-
-    ``withholding_rate == 0`` evaluates ``shares * amount`` and returns that
-    product. A positive long dividend with a positive withholding rate
-    receives ``shares * amount * (1 - withholding)``. A short pays the gross
-    ``shares * amount``. A non-positive amount is not withheld.
-    """
     if withholding_rate == 0.0:
         return shares * amount
     if shares > 0.0 and amount > 0.0:
@@ -226,13 +183,6 @@ def dividend_cash(shares, amount, withholding_rate: float) -> float:
 
 
 def price_basis_refusal(symbol: str | None, *, splits: bool, declared: str | None = None) -> str:
-    """The raw price basis was refused.
-
-    An empty split list names ``--price-basis total_return``. A declared
-    split list says that opt-in does not run the series. Prices are not
-    rewritten on either path. ``declared`` is the stored adjustment
-    (``raw`` or ``total_return``).
-    """
     kind = "total_return" if declared is None else str(declared)
     who = f"{symbol} is {kind}" if symbol else f"series is {kind}"
     head = f"{who} and is not runnable. "
@@ -261,16 +211,6 @@ def resolve_accounting(
     withholding_rate=None,
     dividends=None,
 ) -> Accounting:
-    """Turn omitted switches into the profile default and name the method.
-
-    Arena's omitted financing rate is 0. Desk's omitted financing rate is the
-    desk rate (0.07). Omitted cash and withholding are 0. A raw Arena run
-    still refuses a dividend file. A raw Desk run with a dividend file is
-    ``profile_dividends``. ``price_basis="total_return"`` on a raw series is
-    ``cash_dividends`` and requires that file. A series declared
-    ``total_return`` runs only when the price basis is ``total_return``, and
-    then as ``registry_series`` with no dividend file.
-    """
     name = get_profile(profile).name
     chosen = get_profile(name)
     basis = normalize_price_basis(price_basis)
@@ -328,7 +268,6 @@ def resolve_accounting(
 
 
 def stamp_accounting(metrics: dict, accounting: Accounting) -> dict:
-    """Write the flat keys and a nested ``accounting`` object onto ``metrics``."""
     record = accounting.as_dict()
     metrics.update(record)
     metrics["accounting"] = dict(record)
@@ -339,11 +278,6 @@ def stamp_accounting(metrics: dict, accounting: Accounting) -> dict:
 
 
 def row_identity(row: dict):
-    """The accounting tuple on one leaderboard row, or None when the row has none.
-
-    Rows written before these columns existed have no ``price_basis``. Those
-    rows are not compared. A row that records a price basis is compared.
-    """
     basis = row.get("price_basis")
     if basis is None or basis == "":
         return None
@@ -361,7 +295,6 @@ def row_identity(row: dict):
 
 
 def refuse_mixed_rows(rows) -> None:
-    """Raise when stamped rows disagree. Rows with no price basis are ignored."""
     seen = []
     for row in rows:
         ident = row_identity(row)

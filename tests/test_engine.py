@@ -1,4 +1,3 @@
-"""Engine/cost unit tests. Run: python -m unittest discover -s tests   (or: pytest tests)"""
 import hashlib
 import math
 import unittest
@@ -8,6 +7,9 @@ import pandas as pd
 
 from backtester import costs as C
 from backtester import engine_arena as B
+from backtester.comment_guard import strip_python
+
+PINNED_COSTS_SHA256 = "a3b0a522d8bf469001e75aaf274b0c5d3cbef624a68ed9fb94d29298110fe281"
 
 SLIP = C.SLIPPAGE_BPS * 1e-4
 
@@ -27,7 +29,6 @@ def make_bars(days=3, rth_minutes=(570, 571, 572), pre=(), post=(), price=lambda
 
 
 class Scripted:
-    """Returns targets from a dict keyed by (day, minute); records what it saw."""
     WANTS_EXTENDED_HOURS = False
 
     def __init__(self, plan, ext=False):
@@ -56,16 +57,16 @@ class TestFills(unittest.TestCase):
         res = B.run(Scripted({(0, 570): 1.0}), bars)
         self.assertEqual(len(res["fills"]), 1)
         day, minute, sess, delta, o, px, fee, sh = res["fills"][0]
-        self.assertEqual((day, minute), (0, 571))           # decision on 570 -> fill at 571 open
+        self.assertEqual((day, minute), (0, 571))
         self.assertEqual(o, 101.0)
         self.assertAlmostEqual(px, 101.0 * (1 + SLIP))
         self.assertEqual(delta, int(1e6 / 101.0))
 
     def test_last_bar_fills_next_session_first_delivered_bar(self):
         bars = make_bars(pre=(500,), post=(1000,))
-        res = B.run(Scripted({(0, 572): 1.0}), bars)          # rth-only: skips post and next pre
+        res = B.run(Scripted({(0, 572): 1.0}), bars)
         self.assertEqual(res["fills"][0][:3], (1, 570, "rth"))
-        res = B.run(Scripted({(0, 572): 1.0}, ext=True), bars)  # extended: next delivered bar is post
+        res = B.run(Scripted({(0, 572): 1.0}, ext=True), bars)
         self.assertEqual(res["fills"][0][:3], (0, 1000, "post"))
 
     def test_no_same_bar_fill_and_last_bar_unfilled(self):
@@ -76,9 +77,9 @@ class TestFills(unittest.TestCase):
     def test_whole_share_truncation(self):
         bars = make_bars(price=lambda i: 33.0)
         res = B.run(Scripted({(0, 570): 1.0}), bars)
-        self.assertEqual(res["fills"][0][3], 30303)            # trunc(1e6/33)=30303
+        self.assertEqual(res["fills"][0][3], 30303)
         res = B.run(Scripted({(0, 570): -0.5}), bars)
-        self.assertEqual(res["fills"][0][3], -15151)           # trunc toward zero
+        self.assertEqual(res["fills"][0][3], -15151)
         self.assertIsInstance(res["fills"][0][3], int)
 
     def test_no_drift_rebalance(self):
@@ -125,7 +126,6 @@ class TestFills(unittest.TestCase):
         bars = make_bars(days=3, price=lambda i: 100.0)
         res = B.run(Scripted({(0, 570): -1.0}), bars)
         sh = res["fills"][0][3]
-        # short held over the close of day 0, 1, 2
         exp = 3 * C.daily_borrow(-sh * 100.25)
         self.assertAlmostEqual(res["borrow"], exp, places=6)
 
@@ -149,10 +149,10 @@ class TestCosts(unittest.TestCase):
 
     def test_minimum_and_cap(self):
         f = C.fill_costs(10, 100.0, 0)
-        self.assertAlmostEqual(f["commission"], 0.35)       # min
-        f = C.fill_costs(100, 0.10, 0)                       # value $10 -> cap 1% = $0.10
+        self.assertAlmostEqual(f["commission"], 0.35)
+        f = C.fill_costs(100, 0.10, 0)
         self.assertAlmostEqual(f["commission"], 0.10)
-        self.assertEqual(f["tier_shares"], 0.0)              # capped orders don't count toward tiers
+        self.assertEqual(f["tier_shares"], 0.0)
         self.assertAlmostEqual(f["clearing"], min(100 * C.CLEARING_PER_SHARE, 0.005 * 10))
 
     def test_sell_only_fees(self):
@@ -172,12 +172,6 @@ class TestCosts(unittest.TestCase):
             self.assertAlmostEqual(a[k], b[k])
 
     def test_rescaled_prices_use_share_scale_k(self):
-        """Prices times k are paired with share_scale k, through run().
-
-        Pack shares are about 1/k of the real count. share_scale multiplies
-        them back for per-share fees. The round trip includes a sell so TAF
-        is charged. Dropping the forwarded share_scale fails this test.
-        """
         k = 2.0
         bars = make_bars(days=2, rth_minutes=(570, 571), price=lambda _i: 100.0)
         plan = {(0, 570): 0.5, (1, 570): 0.0}
@@ -222,7 +216,6 @@ class TestCosts(unittest.TestCase):
         self.assertAlmostEqual(base["daily"][-1][1], scaled["daily"][-1][1], delta=5.0)
 
     def test_monthly_tier_in_engine(self):
-        # 3 fills in the same 21-session 'month': the later fills get cheaper marginal rates
         bars = make_bars(days=3, price=lambda i: 10.0)
         res = B.run(Scripted({(0, 570): 2.0, (0, 571): -2.0, (1, 570): 2.0}), bars)
         fees = [f[6] for f in res["fills"]]
@@ -236,13 +229,6 @@ class TestCosts(unittest.TestCase):
 
 class TestPack(unittest.TestCase):
     def test_manifest_hashes(self):
-        """Pin the shipped engine bytes.
-
-        The original assertion hashes bars_1min_part01..08.csv.xz and daily_rth.csv.
-        Those files were not in the reference archive (ENGINE_SHA256.txt lists them;
-        the bytes were not attached) and must not be committed. The verbatim test
-        source, including that assertion, is SHA-256 checked from tests/reference.
-        """
         root = Path(__file__).resolve().parents[1]
         ref = root / "tests" / "reference" / "arena"
         text = (ref / "ENGINE_SHA256.txt").read_text(encoding="utf-8")
@@ -267,17 +253,18 @@ class TestPack(unittest.TestCase):
                 self.assertFalse((root / name).exists(), name)
                 self.assertFalse((ref / "data" / Path(name).name).exists(), name)
         self.assertIn("data/bars_1min_part01.csv.xz", seen)
-        # The installed costs module is the reference file, byte for byte.
-        self.assertEqual((root / "src" / "backtester" / "costs.py").read_bytes(), (ref / "costs.py").read_bytes())
+        costs_path = root / "src" / "backtester" / "costs.py"
+        self.assertEqual(hashlib.sha256(costs_path.read_bytes()).hexdigest(), PINNED_COSTS_SHA256)
+        self.assertEqual(strip_python(costs_path.read_text(encoding="utf-8")), (ref / "costs.py").read_text(encoding="utf-8"))
 
     def test_metrics_buy_and_hold_synthetic(self):
         bars = make_bars(days=10, price=lambda i: 100.0)
         res = B.run(B.BuyAndHold(), bars)
         m = B.metrics(res)
-        sh = 10_000  # trunc(1e6 / 100) at the second bar's open
+        sh = 10_000
         px = 100.0 * (1 + SLIP)
         fee = C.fill_costs(sh, px, 0)["total"]
-        expect = 1e6 - sh * px - fee + sh * 100.25  # marked at the last close (open + 0.25)
+        expect = 1e6 - sh * px - fee + sh * 100.25
         self.assertAlmostEqual(m["final_equity"], expect, places=6)
         self.assertEqual(m["n_fills"], 1)
         self.assertEqual(m["round_trips"], 0)

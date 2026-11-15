@@ -1,21 +1,3 @@
-"""Volatility-scaled long with a slow mean-reversion tilt.
-
-One decision per regular session, on the closing bar (minute 959, or 779 on a
-short session). The order fills at the next session's open. Long or flat only.
-
-Until 200 completed sessions are in hand the strategy stays flat. After that:
-
-    rv      = sample stdev of the last 15 close-to-close returns, annualised
-    base    = min(1.75, 0.20 / rv)
-    dist    = close / SMA(200) - 1
-    mult    = clip(1 - 5 * dist, 0.50, 1.50)
-    desired = clip(base * mult, 0, 1.75)
-
-A new target is sent only when it differs from the live target by more than
-0.12. Otherwise the previous target is kept (no order, so exposure can drift).
-
-Runtime: stdlib only. All inputs are the bars passed to on_bar / on_day_end.
-"""
 
 import math
 
@@ -34,18 +16,16 @@ class Strategy:
     ANN = math.sqrt(252.0)
 
     def __init__(self):
-        self._closes = []          # completed session closes, oldest first
-        self._target = 0.0         # last target sent to the engine
-        self._decided = False      # already chose a target on this session
+        self._closes = []
+        self._target = 0.0
+        self._decided = False
         self._close_pushed = False
-        self._late_close = None    # session close captured in on_day_end if the decision bar was missed
+        self._late_close = None
 
     def on_bar(self, bar, state):
         minute = bar["minute"]
         decision_minute = 779 if bar["short_session"] else 959
 
-        # Fallback: previous session ended without a decision bar. Record its close
-        # and decide on this first bar (fills one bar later than usual).
         if self._late_close is not None:
             close = self._late_close
             self._late_close = None
@@ -63,7 +43,6 @@ class Strategy:
 
     def on_day_end(self, summary):
         if not self._close_pushed:
-            # Decision minute never arrived. Keep the close and act next session.
             px = summary.get("rth_close")
             if px is not None:
                 self._late_close = px
@@ -104,7 +83,6 @@ class Strategy:
 
     def _realized_vol(self, closes):
         n = self.VOL_LOOKBACK
-        # last n close-to-close returns; need n+1 prices
         window = closes[-(n + 1):]
         rets = [window[i] / window[i - 1] - 1.0 for i in range(1, len(window))]
         m = sum(rets) / n

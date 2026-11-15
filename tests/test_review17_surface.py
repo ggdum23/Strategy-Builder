@@ -1,4 +1,3 @@
-"""Seventeenth review. Recorded rows, case-suffixed folders, and the exception line."""
 
 from __future__ import annotations
 

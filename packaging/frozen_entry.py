@@ -1,15 +1,3 @@
-"""Entry point for the frozen console and windowed executables.
-
-PyInstaller runs this file as ``__main__``. Runtime hooks run first, including
-the multiprocessing hook that replaces ``freeze_support``. The calls below are
-the first thing this file does so a spawn child (``--multiprocessing-fork``)
-and a resource-tracker child enter the multiprocessing module instead of the
-CLI. Walk-forward then scrubs argv, cwd, and the environment inside that
-child. See docs/ISOLATION.md.
-
-Do not import the application, matplotlib, or Qt at module level. A worker
-pays for every import that happens before ``freeze_support`` returns.
-"""
 
 from __future__ import annotations
 
@@ -18,22 +6,6 @@ from pathlib import Path
 
 
 def _prefer_agg_backend() -> None:
-    """Keep frozen reports on Agg when PySide6 is in the same bundle.
-
-    Matplotlib's default becomes a Qt backend once PySide6 is installed.
-    Report workers import pyplot only after ``freeze_support`` has entered
-    the child, and a walk-forward child then replaces the environment, so
-    an ``MPLBACKEND`` value set by the parent does not survive. Selecting
-    Agg here sticks for the process. Desktop code can still call
-    ``matplotlib.use`` with another backend before it imports pyplot.
-    The resource-tracker process does not import pyplot; skip the matplotlib
-    import there.
-
-    A frozen jail is this same executable. ``--sandbox-child`` runs the
-    bundled child entry and stops, before ``freeze_support`` and before
-    matplotlib. The working directory is already the private jail directory.
-    Spawn workers do not pass that flag.
-    """
     import os
 
     if "--sandbox-child" in sys.argv:
@@ -62,7 +34,6 @@ def _emit(text: str) -> None:
 
 
 def _ensure_stdio() -> None:
-    """Windowed executables start with stdout and stderr set to None."""
     import os
 
     if sys.stdout is None:
@@ -210,11 +181,6 @@ def _call_gui_module(function, extra: list[str]) -> int:
 
 
 def launch_gui(argv: list[str]) -> int:
-    """Run ``backtester gui`` when that package exists, otherwise a placeholder.
-
-    ``--launcher-check`` only proves the executable started. It does not open
-    a window. The flag is reserved by this launcher.
-    """
     _ensure_stdio()
     if "--launcher-check" in argv:
         return _launcher_check(argv)
@@ -233,15 +199,11 @@ def launch_gui(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None, *, gui: bool | None = None, environ: dict | None = None) -> int:
-    """Program body. The frozen ``__main__`` block calls ``freeze_support`` first."""
     config_env = environ
     _ensure_config(config_env)
     args = list(sys.argv[1:] if argv is None else argv)
     use_gui = is_gui_executable() if gui is None else gui
     if use_gui:
-        # launch_gui ensures config again only for the placeholder text. The
-        # call above already created the directory. Pass the same environment
-        # by writing nothing further here.
         if "--launcher-check" in args:
             _ensure_stdio()
             return _launcher_check(args)
@@ -257,14 +219,7 @@ if __name__ == "__main__":
     import multiprocessing
     import multiprocessing.spawn
 
-    # Before freeze_support, so a spawn child (including a report worker)
-    # has selected Agg before it imports pyplot. The resource tracker is
-    # the exception inside _prefer_agg_backend.
     _prefer_agg_backend()
-    # Spawn children and the resource tracker re-enter this executable.
-    # PyInstaller's runtime hook has already replaced these functions.
-    # Calling the spawn one first also covers a build where that hook did
-    # not replace the Windows-only multiprocessing.freeze_support.
     multiprocessing.spawn.freeze_support()
     multiprocessing.freeze_support()
     raise SystemExit(main())

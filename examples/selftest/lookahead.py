@@ -1,7 +1,3 @@
-"""Read stdin, which is the next bar that has not been sent yet.
-
-The read blocks until the per-call timeout. The referee disqualifies it.
-"""
 
 import os
 

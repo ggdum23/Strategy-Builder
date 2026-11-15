@@ -1,10 +1,3 @@
-"""Compact columns for a prepared series.
-
-Low-cardinality text is a categorical code. A canonical ``timestamp_et`` is
-five small integer arrays, formatted only when a caller reads one stamp.
-Numeric columns stay memory-mappable. The values a strategy or a report
-reads are the same strings and numbers as a fully materialized frame.
-"""
 
 from __future__ import annotations
 
@@ -12,7 +5,6 @@ import numpy as np
 import pandas as pd
 from pandas.api.extensions import ExtensionArray, ExtensionDtype
 
-# ``HH:MM`` for minute 0..1439. Categorical codes for ``time`` are minutes.
 CLOCK_TEXT = tuple(f"{minute // 60:02d}:{minute % 60:02d}" for minute in range(24 * 60))
 
 
@@ -27,11 +19,6 @@ class StampDtype(ExtensionDtype):
 
 
 class StampArray(ExtensionArray):
-    """Canonical ``YYYY-MM-DDTHH:MM:SS±HH:MM`` stamps, stored as components.
-
-    ``offset`` is minutes east of UTC. Seconds are 00. One row formats to the
-    same text ``datetime.isoformat`` produces for that stamp.
-    """
 
     _dtype = StampDtype()
 
@@ -141,7 +128,6 @@ def is_stamp(series) -> bool:
 
 
 def categorical_codes(series):
-    """``(codes, labels)`` for a categorical or a plain text column."""
     if isinstance(series.dtype, pd.CategoricalDtype):
         labels = [str(value) for value in series.cat.categories]
         return series.cat.codes.to_numpy(copy=False), labels
@@ -150,6 +136,5 @@ def categorical_codes(series):
 
 
 def take_labels(labels, codes) -> np.ndarray:
-    """Object array of the selected labels. The strings themselves are shared."""
     table = np.asarray(list(labels), dtype=object)
     return np.take(table, np.asarray(codes))

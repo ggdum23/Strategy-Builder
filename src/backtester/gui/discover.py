@@ -1,4 +1,3 @@
-"""Find strategy files without executing them."""
 
 from __future__ import annotations
 
@@ -7,11 +6,6 @@ from pathlib import Path
 
 
 def discover_strategies(path) -> list[Path]:
-    """One Python file, or every ``strategy.py`` under a folder.
-
-    A folder search does not pick up arbitrary modules. A file the operator
-    points at is accepted under any name; the AST check then looks for ``Strategy``.
-    """
     file = Path(path)
     if file.is_file():
         if file.suffix.lower() != ".py":
@@ -26,7 +20,6 @@ def discover_strategies(path) -> list[Path]:
 
 
 def summarize_strategy(path) -> dict:
-    """Static summary. The file is parsed, not imported."""
     file = Path(path)
     record = {
         "path": str(file),

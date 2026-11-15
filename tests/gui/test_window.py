@@ -1,4 +1,3 @@
-"""Offscreen window tests. Skipped unless the gui extra is installed."""
 
 from __future__ import annotations
 
@@ -72,7 +71,6 @@ def _grab(window, name: str, tmp_path: Path) -> None:
     assert pixmap.save(str(target), "PNG")
     blob = target.read_bytes()
     assert blob.startswith(b"\x89PNG")
-    # Windows zlib stores this dark window near 19 KB. A blank grab is far smaller.
     assert len(blob) > 8_000
     if os.environ.get("STRATEGY_BUILDER_UPDATE_SCREENSHOTS") == "1":
         SHOTS.mkdir(parents=True, exist_ok=True)
@@ -425,7 +423,6 @@ def test_screenshots(qtbot, tmp_path):
 
 
 def _present_designer(window, tmp_path: Path) -> None:
-    """An anonymized book. The shot must not show the ticker, the scale, or a date."""
     metrics = dict(ARENA_METRICS)
     metrics["symbol"] = "ZZZX"
     metrics["ticker"] = "QQQ"
@@ -546,7 +543,6 @@ def _table_text(table) -> str:
 
 
 def _shot_equity() -> list[float]:
-    """A rise, an 8% dip, and a recovery to the stored final equity. Picture only."""
     values = []
     for index in range(40):
         if index < 16:
@@ -568,7 +564,6 @@ def _heat_has(window, needle: str) -> bool:
 
 
 def _designer_surfaces(window) -> str:
-    """Text a designer can see: the results page, the status bar, and the root chip."""
     chunks = [_visible_blob(window.results_page)]
     status = window.statusBar()
     if status is not None:

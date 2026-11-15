@@ -1,10 +1,3 @@
-"""Read the project version and the Inno Setup form of it.
-
-The frozen executable prints ``backtester.__version__``. The installer
-compiler needs a numeric version. This script fails the build when those
-diverge, so the setup filename and the ``--version`` line stay on the same
-number.
-"""
 
 from __future__ import annotations
 
@@ -41,7 +34,6 @@ def module_version() -> str:
 
 
 def inno_version(version: str) -> str:
-    """Numeric dotted version Inno Setup will accept. Suffixes are dropped."""
     numbers: list[str] = []
     for part in version.split(".")[:4]:
         digits = []
@@ -61,7 +53,6 @@ def inno_version(version: str) -> str:
 
 
 def version_info(version: str) -> str:
-    """Four-part Windows version resource: major.minor.build.revision."""
     parts = inno_version(version).split(".")
     while len(parts) < 4:
         parts.append("0")
@@ -69,11 +60,6 @@ def version_info(version: str) -> str:
 
 
 def version_info_text(version: str | None = None) -> str:
-    """PyInstaller version-info file for both frozen executables.
-
-    ``EXE(version=...)`` evaluates this text into a ``VSVersionInfo``.
-    A bare ``0.1.0.0`` string is not a version resource.
-    """
     text = version_info(project_version() if version is None else version)
     parts = tuple(int(part) for part in text.split("."))
     filevers = "(%d, %d, %d, %d)" % parts

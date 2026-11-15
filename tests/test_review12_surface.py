@@ -1,4 +1,3 @@
-"""Twelfth review. A digit does not glue to a longer ticker, and a raw scale id fails."""
 
 from __future__ import annotations
 

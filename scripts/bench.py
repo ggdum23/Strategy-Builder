@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""Time the prepared-data path on a deterministic synthetic series.
-
-``--scale ci`` is 20 sessions, about nineteen thousand one-minute bars.
-That is what the perf workflow gates. ``--scale year`` is 252 sessions.
-``--scale full`` is 23 years of weekdays. Each scale times a cold load, a
-warm load, one Arena book, one Desk book, an Arena walk-forward, the jailed
-Arena and Desk runs, and Arena parallel. The ci and year scales use 1, 2, 4,
-and 8 workers. The full scale stops at 4 workers.
-The generator is synthetic and is not a market download. Nothing it writes
-is committed.
-
-The gate limits are loose on purpose. They catch a quadratic loader or a
-broken cache. They are not the 23-year target. Report the printed machine
-line with the numbers: a different host is not comparable.
-"""
 
 from __future__ import annotations
 
@@ -38,8 +22,6 @@ SCALES = {
     "full": 23 * 252,
 }
 
-# Seconds. Wide enough that a loaded CI runner still passes, tight enough
-# that the old per-session volume loop cannot.
 GATES = {
     "cold_load_s": 60.0,
     "warm_load_s": 30.0,
@@ -83,12 +65,6 @@ def _proc_kb(pid: int, label: str) -> float:
 
 
 def _tree_mb() -> tuple[float, float]:
-    """RSS and PSS of this process and its descendants, in MiB.
-
-    PSS counts a shared mapping once across the tree. RSS counts it in
-    every process. Windows has no ``/proc`` and reports the process high-water
-    RSS for both.
-    """
     if not Path("/proc/self/status").is_file():
         rss = _rss_mb()
         return rss, rss
@@ -120,7 +96,6 @@ def _tree_mb() -> tuple[float, float]:
 
 
 class _Peak:
-    """Highest tree RSS and PSS seen while a phase is running."""
 
     def __init__(self) -> None:
         self.rss = 0.0
@@ -175,7 +150,6 @@ def _time(fn):
 
 
 def _write_strategies(directory: Path, count: int = 8) -> list[Path]:
-    """One strategy file per worker slot so 1/2/4/8 each have real jobs."""
     paths = []
     for index in range(count):
         folder = directory / f"s{index}"

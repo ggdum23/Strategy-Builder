@@ -1,10 +1,3 @@
-"""Network probe. Both connects must fail with an access error.
-
-The loopback target is a server the test is already listening on. A closed
-port can answer ECONNREFUSED before the jail is asked, so that result is not
-a block. A timeout or a completed handshake is not a block either. On
-Windows the process also has to be an AppContainer with no capabilities.
-"""
 
 import errno
 import json

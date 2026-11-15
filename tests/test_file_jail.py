@@ -1,10 +1,3 @@
-"""The operator process does not import a file strategy.
-
-The marker is written at import, next to the file the loader opened. The jail
-loads a copy, so a jailed import does not create that marker. A thread started
-at import walks frames and reads any file named on argv. The snapshot of that
-walk must not contain the sidecar.
-"""
 
 from __future__ import annotations
 
@@ -134,8 +127,6 @@ def capture_books(monkeypatch):
 def _prepared_sample(tmp_path):
     src = tmp_path / "src"
     _write_days(src, "TEST", 4)
-    # The anonymized sidecar carries the real symbol. The strategy must not
-    # see that file.
     nik = tmp_path / "nik"
     _write_days(nik, "NIK", 2)
     nik_loaded = load_named(nik, "NIK")

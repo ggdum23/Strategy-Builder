@@ -1,10 +1,3 @@
-"""Designer-facing books.
-
-Canonical equity, the flat fee in ``costs_designer``, and the profile's
-slippage and rate accruals. This module does not read a scale factor and
-does not call the per-share fee schedules. The operator invoice is a
-different run.
-"""
 
 from __future__ import annotations
 
@@ -19,13 +12,6 @@ from .report import enrich_arena_metrics
 
 
 def session_dividends(dividends, date_map):
-    """Calendar amounts keyed by pack session id.
-
-    The caller passes cash per pack share. This function only remaps the
-    calendar date. ``None`` stays ``None`` (no file). An empty map means the
-    file was present and this window has no ex-date only when the caller
-    already filtered it.
-    """
     if not dividends:
         return dividends
     if not isinstance(date_map, dict) or not date_map:
@@ -67,7 +53,6 @@ def spawn_kwargs(
     withholding_rate=None,
     accounting=None,
 ):
-    """Keyword arguments for one designer child. Equity is not an argument."""
     return {
         "borrow_rate_annual": borrow_rate_annual,
         "financing_rate_annual": financing_rate_annual,
@@ -119,7 +104,6 @@ def _metrics(profile: str, result: dict, accounting, borrow_rate_annual):
 
 
 def execute(strategy, frame, profile: str, *, desk_bars=None, **kwargs):
-    """One designer book. Starting equity is the canonical index."""
     from .runner import _arena_dividend_days
 
     name = get_profile(profile).name
@@ -183,7 +167,6 @@ def execute(strategy, frame, profile: str, *, desk_bars=None, **kwargs):
 
 
 def run_books(strategy_cls, frame, profile: str, **kwargs):
-    """Strategy and benchmarks, each a new instance, on the designer model."""
     with_benchmarks = kwargs.get("with_benchmarks", True)
     desk_bars = kwargs.get("desk_bars")
     if desk_bars is None and get_profile(profile).name == "desk":
@@ -209,7 +192,6 @@ def _tag(result, strategy):
 
 
 def accept_books(profile: str, frame, child_books: dict, kwargs: dict) -> dict:
-    """Recompute designer statistics in the parent. Benchmarks run again here."""
     from .runner import _metric_delta
 
     if "strategy" not in child_books:

@@ -1,16 +1,3 @@
-"""Volatility-throttled long-only book for ASSET.
-
-Once per regular session, on the last bar, choose a target exposure in
-{0, 0.25, 0.5, 0.75, 1}. Exposure is min(1, 0.18 / EWMA volatility) and is
-left unchanged until the raw fraction differs by at least one step (0.25).
-The book is never short and never levered above 1x. The decision fills at
-the next session's open.
-
-Volatility is a RiskMetrics EWMA (lambda 0.94) of close-to-close simple
-returns, seeded with the mean of the first 20 squared returns, then
-annualized with 252 sessions. The variance floor is 5% annualized so a
-quiet patch cannot ask for more than the 1x cap already imposes.
-"""
 import math
 
 

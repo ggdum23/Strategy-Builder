@@ -1,4 +1,3 @@
-"""Design versus locked tail. Future bars must not reach a decision."""
 
 from __future__ import annotations
 
@@ -81,7 +80,6 @@ class DeskProbe:
 
 
 class ArenaRec:
-    """Records delivered days. Importable so the spawned design run can unpickle it."""
 
     WANTS_EXTENDED_HOURS = False
 
@@ -128,7 +126,6 @@ def _holds_close(obj, needle, depth=0):
 
 
 def _read_temp_pickles(needle):
-    """Unpickle every readable temp candidate. Returns whether the close was found, and how many files were read."""
     root = Path(tempfile.gettempdir())
     paths = set(root.glob("bt-locked-*")) | set(root.glob("*.pkl"))
     saw = False
@@ -153,11 +150,6 @@ def _read_temp_pickles(needle):
 
 
 class SpillHunter:
-    """Globs the temp directory for the locked spill and tries to unpickle it.
-
-    The needle is a class constant so the child does not need a parent-set
-    attribute. It exists only on the locked slice.
-    """
 
     needle = 91_827_364.0
     WANTS_EXTENDED_HOURS = False
@@ -175,13 +167,6 @@ class SpillHunter:
 
 
 class MemoryScanner:
-    """Trades only if a locked-tail close is visible on the stack or in gc.
-
-    The needle is a class attribute, so a scan of every float would see it even
-    in a clean process. The scan looks for that close inside market-data
-    containers: a frame column, a bar dict, or a numeric array long enough to
-    be a column.
-    """
 
     needle = 87_654_321.0
     WANTS_EXTENDED_HOURS = False
@@ -198,7 +183,6 @@ class MemoryScanner:
 
 
 class DesignInfluence:
-    """A class flag set during design must not arm the locked run."""
 
     primed = False
     WANTS_EXTENDED_HOURS = False
@@ -219,7 +203,6 @@ def _close_equals(value, needle) -> bool:
 
 
 def market_holds(needle: float) -> bool:
-    """True when ``needle`` appears as a bar close reachable from this process."""
 
     def holds(obj) -> bool:
         try:
@@ -360,7 +343,6 @@ def test_design_process_cannot_see_the_locked_close(tmp_path, profile):
     assert observer.saw is False
     assert design["strategy"][0]["n_fills"] == 0
     assert summary["design"]["n_fills"] == 0
-    # The locked book is a different interpreter. It may see its own tail.
     assert locked["strategy"][0]["observer"].checked is True
 
 
@@ -398,7 +380,6 @@ def test_slice_requires_exactly_one_cut_and_clips_warmup():
 
 
 class ChildSurface:
-    """Records the argv, cwd, and environment the strategy actually sees."""
 
     WANTS_EXTENDED_HOURS = False
 

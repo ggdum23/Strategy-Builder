@@ -1,4 +1,3 @@
-"""Command line on the real October 2026 sample, from a directory that is not the repo."""
 
 from __future__ import annotations
 
@@ -87,7 +86,7 @@ def test_arena_sample_month(tmp_path):
     assert bench_file["financing_rate_annual"] == 0.0
     assert bench_file["n_fills"] == 1
     curve = (out / "equity_curve.csv").read_text(encoding="utf-8").strip().splitlines()
-    assert len(curve) == 23  # header + 22 sessions
+    assert len(curve) == 23
     assert "2026-10-01" in curve[1]
     assert (out / "equity.csv").read_bytes() == (out / "equity_curve.csv").read_bytes()
     assert (out / "equity.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")

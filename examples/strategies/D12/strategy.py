@@ -1,13 +1,3 @@
-"""Volatility-managed long exposure for ASSET.
-
-Once per regular session, on the last bar, set a long target equal to
-10% / 10-session realized volatility, capped at 1.0 (never short, never
-levered). The target is quantized to 0.05 and updated only when it moves
-by at least 0.10, so unchanged days send no order.
-
-All constants were frozen on the design window. Runtime inputs are the
-bars passed into on_bar; nothing is read from disk.
-"""
 import math
 
 
@@ -21,11 +11,11 @@ def _quantize(x, step=0.05):
 class Strategy:
     WANTS_EXTENDED_HOURS = False
 
-    RV_LOOKBACK = 10          # session closes used for realized vol
-    TARGET_VOL = 0.10         # annualized vol the position is scaled toward
-    MAX_LEV = 1.0             # hard cap; account limit is 2, this is tighter
-    RV_FLOOR = 0.06           # prevents a near-zero vol print from maxing size
-    BAND = 0.10               # minimum target change that sends an order
+    RV_LOOKBACK = 10
+    TARGET_VOL = 0.10
+    MAX_LEV = 1.0
+    RV_FLOOR = 0.06
+    BAND = 0.10
     STEP = 0.05
 
     def __init__(self):

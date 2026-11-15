@@ -1,8 +1,3 @@
-"""Write metrics.json, the equity curve, the fill and trade files, and the PNG.
-
-An anonymized run also gets a ``designer/`` tree. That tree is what a strategy
-designer may be shown. The files beside it are the operator copy.
-"""
 
 from __future__ import annotations
 
@@ -64,9 +59,6 @@ _BANNED_DESIGNER_TEXT = (
     "factor_mac",
     "borrow_rate_source",
 )
-# Free-text values and names use the underscore-aware ticker pattern.
-# Schema keys and CSV headers do not. Status, bool, and numeric columns keep
-# the tokens this report itself writes there.
 _FREE_TEXT_KEYS = frozenset(
     {
         "strategy_id",
@@ -105,8 +97,6 @@ _STATUS_TOKENS = frozenset({"ok", "error", "timeout", "cancelled", "memory", "cr
 _BOOL_TOKENS = frozenset({"true", "false"})
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
-# Rank is assigned after sorting. The sort is excess total return, then id.
-# Desk and Arena both use that excess. Sharpe is not the rank.
 OPERATOR_LEADERBOARD_COLUMNS = (
     "rank",
     "strategy_id",
@@ -157,21 +147,12 @@ DESIGNER_LEADERBOARD_COLUMNS = tuple(
     if column != "symbol" and redacted_key_allowed(column)
 ) + ("cost_model",)
 
-# What ``load_report`` returns. The desktop window reads this shape.
 REPORT_CONTRACT = "strategy-builder.report.v1"
 
-# flock is per process. Threads in this process need their own lock, or two
-# register_run calls in one interpreter both pass the file lock.
 _INDEX_THREAD_LOCK = threading.Lock()
 
 
 def percent_up_days(equity, initial):
-    """Fraction of marks whose return is strictly positive.
-
-    A previous mark of 0 has no defined return. That session is not an up day
-    and it stays in the denominator. No marks returns null. The function does
-    not divide by zero.
-    """
     if not equity:
         return None
     previous = initial
@@ -184,7 +165,6 @@ def percent_up_days(equity, initial):
 
 
 def json_ready(value):
-    """Strict JSON: non-finite floats become null."""
     if isinstance(value, dict):
         return {str(key): json_ready(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -318,12 +298,6 @@ def _equity_points(profile: str, result: dict) -> list[float]:
 
 
 def _plot_equity(path: Path, profile: str, result: dict, *, designer: bool = False) -> None:
-    """Equity against the session index. The chart has no ticker and no date.
-
-    The operator file keeps a title and a software tag. A designer file asks
-    matplotlib to write neither, and ``publish_designer`` then drops every
-    text chunk.
-    """
     points = _equity_points(profile, result)
     if not points:
         return
@@ -352,7 +326,6 @@ def _plot_equity(path: Path, profile: str, result: dict, *, designer: bool = Fal
 
 
 def _casefold_index(text: str) -> tuple[str, list[int]]:
-    """Casefold ``text`` and remember which original character each fold came from."""
     folded: list[str] = []
     origins: list[int] = []
     for index, char in enumerate(text):
@@ -363,18 +336,6 @@ def _casefold_index(text: str) -> tuple[str, list[int]]:
 
 
 def ticker_token_spans(text: str, symbol: str) -> list[tuple[int, int]]:
-    """Original spans where ``symbol`` is its own token in ``text``.
-
-    Matching uses ``str.casefold`` on both sides, then maps the hit back onto
-    ``text``. A symbol that contains a letter and is longer than one character
-    uses a letter boundary, so a digit does not glue: ``QQQ1``,
-    ``QQQ2momentum``, and ``1QQQ`` all match ``QQQ``. A one-character symbol,
-    and a symbol that is only digits, keeps an alphanumeric boundary, so ``V``
-    matches ``my_V_v2`` and does not match ``v2``, ``2`` does not match
-    ``S00002``, and ``10`` does not match ``S00010``. ``ß`` matches ``SS`` and
-    ``ﬁ`` matches ``FI``. This is the only token match. Report scrubbing, the
-    designer audit, and the screen all call it.
-    """
     if not text or not symbol:
         return []
     needle = symbol.casefold()
@@ -423,7 +384,6 @@ def _replace_token(text: str, symbol: str, replacement: str) -> str:
 
 
 def _symbol_order(symbols) -> tuple[str, ...]:
-    """Longer symbols first, so ``GOOGL`` is considered before ``GOOG``."""
     if isinstance(symbols, str):
         return (symbols,) if symbols else ()
     ordered: list[str] = []
@@ -449,7 +409,6 @@ def _float_token(text: str) -> bool:
 
 
 def _exempt_designer_value(key: str, text: str) -> bool:
-    """Tokens this report writes, and only in the columns that emit them."""
     if key == "cost_model" and is_cost_label(text):
         return True
     folded = text.strip().casefold()
@@ -465,7 +424,6 @@ def _exempt_designer_value(key: str, text: str) -> bool:
 
 
 def _boundary_tokens(text: str) -> tuple[str, ...]:
-    """Alphanumeric runs of ``text``, casefolded. The same boundaries as the ticker rule."""
     folded = text.casefold()
     tokens: list[str] = []
     buf: list[str] = []
@@ -480,7 +438,6 @@ def _boundary_tokens(text: str) -> tuple[str, ...]:
     return tuple(tokens)
 
 
-# Canonical designer and pack paths. These spellings are never renamed.
 _FIXED_REPORT_NAMES = (
     "designer",
     "equity_curve.csv",
@@ -500,16 +457,8 @@ _FIXED_REPORT_NAMES = (
     "daily_rth.csv.gz",
     "referee.json",
 )
-# Extensions the audit would match in a file name, including ``tbl`` so a
-# ticker of that extension cannot be anonymized into a report path.
 _EXTENSION_TOKENS = ("csv", "gz", "json", "png", "tbl")
-# Designer-facing replacement for a ticker. Operator files keep the original
-# symbol. ``_designer_component`` reads this same constant. It is reserved, so
-# a symbol that casefolds to ``random`` is rejected before anonymized work.
 TICKER_STAND_IN = "RANDOM"
-# Free text the designer audit cannot exempt: PNG Title and Software, the
-# audience and profile values, session labels, the desk fill kind, and the
-# sentences written into error.json. Schema keys and CSV headers are not here.
 _UNEXEMPT_REPORT_TEXT = (
     "equity",
     "strategy-builder",
@@ -545,15 +494,6 @@ RESERVED_VOCABULARY = _reserved_vocabulary()
 
 
 def reserved_symbol_conflict(symbol: str) -> str | None:
-    """The reserved token ``symbol`` matches, or None.
-
-    The symbol is NFKC-normalized first, then casefolded. Report-name tokens
-    use :func:`ticker_token_spans`, bounded by a non-alphanumeric character.
-    ``SS`` does not match ``random``. ``2`` does
-    not match ``2x`` or ``001``. Accounting values and keys match the whole
-    symbol only. ``session_boundary_1_252`` does not reserve ``1``, ``SESSION``,
-    or ``252``.
-    """
     if not isinstance(symbol, str) or symbol == "":
         return None
     normalized = unicodedata.normalize("NFKC", symbol)
@@ -567,11 +507,6 @@ def reserved_symbol_conflict(symbol: str) -> str | None:
 
 
 def require_anonymizable_symbol(symbol: str) -> None:
-    """Reject a symbol that cannot be anonymized without renaming a report file.
-
-    The CLI prints this message and exits 2. Call it before any anonymized
-    pack or designer tree is written. A raw operator run does not call it.
-    """
     if reserved_symbol_conflict(symbol) is None:
         return
     raise ValueError(
@@ -581,21 +516,11 @@ def require_anonymizable_symbol(symbol: str) -> None:
 
 
 def designer_visible_name(symbols=()) -> str:
-    """Stand-in written into a scrubbed strategy or source id.
-
-    Fixed report files keep their canonical names. The stand-in is always
-    :data:`TICKER_STAND_IN`. A symbol that casefolds to that word is rejected
-    by :func:`require_anonymizable_symbol` before this runs, so there is no
-    fallback spelling. Directory suffixes (``RANDOM-2``) are applied by the
-    caller that reserves the folder name. ``symbols`` is unused; the batch
-    cannot change the stand-in.
-    """
     del symbols
     return TICKER_STAND_IN
 
 
 def _designer_kind(path) -> str:
-    """How to parse a designer file. Names are canonical, so the suffix decides."""
     suffix = Path(path).suffix.lower()
     if suffix == ".png":
         return "png"
@@ -607,7 +532,6 @@ def _designer_kind(path) -> str:
 
 
 def _safe_stand_in(symbols) -> str:
-    """The replacement token. Always :data:`TICKER_STAND_IN`."""
     return designer_visible_name(symbols)
 
 
@@ -625,11 +549,6 @@ def _scrub_text(value: str, symbol: str, *, key: str = "", replacement: str | No
 
 
 def scrub_symbols(value: str, symbols, *, key: str = "") -> str:
-    """Scrub every symbol in ``symbols``. A string is one symbol, not a list of characters.
-
-    The stand-in is :data:`TICKER_STAND_IN`. A symbol that casefolds to that
-    word is rejected before an anonymized book is written.
-    """
     replacement = _safe_stand_in(symbols)
     text = value
     ordered = _symbol_order(symbols)
@@ -641,7 +560,6 @@ def scrub_symbols(value: str, symbols, *, key: str = "") -> str:
 
 
 def redact_metrics(payload, *, symbol: str = ""):
-    """Drop the ticker, calendar dates, and scale factors from a report object."""
 
     def walk(value, key=""):
         if isinstance(value, dict):
@@ -664,7 +582,6 @@ def redact_metrics(payload, *, symbol: str = ""):
 
 
 def scrub_frame_dates(frame):
-    """Blank calendar dates. Session ids such as ``S00001`` stay."""
     if frame is None or "date" not in getattr(frame, "columns", ()):
         return frame
     out = frame.copy(deep=True)
@@ -712,15 +629,6 @@ def scrub_designer_tree(
     source_id: str = "",
     source_name: str = "",
 ) -> None:
-    """Rewrite free-text values so they use the batch's scrubbed ids.
-
-    File names stay canonical. ``folder`` and ``source_name`` are the
-    disambiguated path components, suffix included. A per-job scrub may
-    already have replaced the ticker with a different stand-in than the
-    batch uses. The value is still this row's id when scrubbing it and
-    scrubbing the original id produce the same text, and the file then
-    receives the directory component, ``-N`` included.
-    """
     root = Path(directory)
 
     def same_row_id(value: str, original: str) -> bool:
@@ -792,7 +700,6 @@ def scrub_designer_tree(
 
 
 def _listed_metric_number(key: str, text: str) -> bool:
-    """An allow-listed numeric cell. A yyyymmdd integer is not a date there."""
     if not key or key in {"strategy_id", "source_id", "name", "message", "error"}:
         return False
     if not redacted_key_allowed(key):
@@ -808,13 +715,6 @@ def _listed_metric_number(key: str, text: str) -> bool:
 
 
 def _designer_value_error(key: str, text: str, symbol: str) -> str | None:
-    """Why this value cannot be shown, or None when it is safe.
-
-    ``symbol`` is compared with free text (ids, errors, captions, names) as
-    its own token, so ``my_zzzx_v2`` still matches. Other values fail only
-    when the whole value is the ticker. Keys and CSV headers are not passed
-    here. Status, bool, and numeric cells keep the tokens those columns emit.
-    """
     if not isinstance(text, str) or text == "":
         return None
     text = unicodedata.normalize("NFKC", text)
@@ -843,7 +743,6 @@ def _raise_designer_value(filename: str, key: str, text: str, symbol: str) -> No
 
 
 def _raise_designer_name(name: str, symbol: str) -> None:
-    """File and directory names are free text. A ticker token in the name fails."""
     reason = _designer_value_error("caption", name, symbol)
     if reason == "the ticker":
         raise RuntimeError(f"{name} is named with the ticker")
@@ -852,13 +751,6 @@ def _raise_designer_name(name: str, symbol: str) -> None:
 
 
 def designer_component_problem(name: str, *, symbols=(), scale: float | None = None) -> str | None:
-    """Why a path component cannot be published, or None when it can.
-
-    A strategy id is designer-supplied. The allow-list grammar decides a
-    single-token name before the ticker and the scale. A decimal is not an
-    id. ``day 2024`` is a date. A slash is an unsafe name before it is a
-    date. The directory check and the publication audit both call this.
-    """
     if not isinstance(name, str) or name == "":
         return "an empty name"
     if name in {".", ".."} or any(ch in name for ch in '\\/:*?"<>|') or name.endswith((" ", ".")):
@@ -889,7 +781,6 @@ def designer_component_problem(name: str, *, symbols=(), scale: float | None = N
 
 
 def _fallback_component(symbols=(), scale: float | None = None, stems: tuple[str, ...] = ()) -> str:
-    """An opaque path component that passes :func:`designer_component_problem`."""
     choices = stems or ("strategy", "book", "result", "entry")
     for stem in choices:
         if designer_component_problem(stem, symbols=symbols, scale=scale) is None:
@@ -898,7 +789,6 @@ def _fallback_component(symbols=(), scale: float | None = None, stems: tuple[str
 
 
 def _raise_schema_label(filename: str, label: str) -> None:
-    """A JSON key or a CSV header. The ticker pattern does not apply."""
     label = unicodedata.normalize("NFKC", label)
     for token in _BANNED_DESIGNER_TEXT:
         if token in label:
@@ -970,7 +860,6 @@ def _itxt_strings(data: bytes) -> list[str]:
 
 
 def _png_metadata_texts(blob: bytes) -> list[str]:
-    """Uncompressed and zlib text chunks. Pixel data is not a caption."""
     if not blob.startswith(_PNG_SIGNATURE):
         raise ValueError("not a png")
     pos = 8
@@ -1014,19 +903,6 @@ def _audit_png_file(path: Path, symbol: str) -> None:
 
 
 def assert_designer_clean(directory, *, symbol: str, scale: float | None = None) -> None:
-    """Raise if a designer tree still carries a ticker, a date, a factor, or a price.
-
-    JSON and CSV are parsed. The ticker pattern is not applied to schema keys
-    or CSV headers, so a column such as ``borrow_cost`` is not the ticker
-    ``COST``. Free-text values and file or directory names still match an
-    embedded ticker, including ``my_zzzx_v2`` and a one-character symbol in
-    ``my_V_v2``. The match is casefolded, so ``ß`` is ``SS``. A value that is
-    exactly the ticker fails, including PNG text and metadata, unless that
-    column is where the report writes the token (``ok``, ``inf``, ``true``,
-    a float). A file named ``V.json`` fails. The same walk then scans names
-    and text with the operator scale. A scale or a price in free text raises.
-    PNG pixel bytes are not part of that scan.
-    """
     root = Path(directory)
     paths = [root, *list(root.rglob("*"))]
     for path in paths:
@@ -1054,7 +930,6 @@ def assert_designer_clean(directory, *, symbol: str, scale: float | None = None)
 
 
 def _operator_scale(wrapper: dict) -> float | None:
-    """The invoice scale still on the operator wrapper. Not written into ``designer/``."""
     if not isinstance(wrapper, dict):
         return None
 
@@ -1079,13 +954,10 @@ def _operator_scale(wrapper: dict) -> float | None:
 
 
 def _audit_publication(root: Path, *, symbol: str, scale: float | None) -> None:
-    """NFKC scale check plus a price check. A hit raises. Pixel bytes are not read."""
     from .gui.audience import export_text, scan_publication
 
     symbols = (symbol,) if symbol else ()
     for path in [root, *list(root.rglob("*"))]:
-        # The same predicate as a designer path component. A strategy id is
-        # not a price. The message does not repeat the rejected name.
         if designer_component_problem(path.name, symbols=symbols, scale=scale):
             raise RuntimeError("a designer folder failed the designer check")
         if not path.is_file():
@@ -1122,7 +994,6 @@ _COMPARE_FIELDS = (
 
 
 def _fee_drag_bps(fees, equity):
-    """``fees / equity * 10000``, half-up to 0.1 bp. Missing equity is null."""
     from decimal import Decimal, ROUND_HALF_UP
 
     if isinstance(fees, bool) or isinstance(equity, bool):
@@ -1179,10 +1050,6 @@ def _comparison_books(real_books, designer_books) -> dict:
 
 
 def write_cost_comparison(path, profile: str, real_books, designer_books, *, windows=None) -> None:
-    """Operator side-by-side of the real schedule and the designer flat fee.
-
-    ``difference`` is designer minus real. This file is not part of ``designer/``.
-    """
     document = {
         "profile": get_profile_name(profile),
         "label": cost_label(profile),
@@ -1205,17 +1072,6 @@ def get_profile_name(profile: str) -> str:
 def publish_designer(
     out_dir, profile: str, frame, books, wrapper: dict, *, symbol: str, scale: float | None = None
 ) -> Path:
-    """Write the designer-facing copy under ``out_dir/designer``.
-
-    ``books`` are the designer books. Cost drag is that book's fees over its
-    equity. ``scale`` is the operator invoice scale used only to scan the
-    tree; it is not written into ``designer/``. When the caller omits it, a
-    scale still sitting on the wrapper is used. Metrics, fills, trades,
-    liquidation, and benchmarks keep the shared allow-list, and a string is
-    kept only when that key's schema allows it. A hit deletes ``designer/``
-    and raises, so a dirty tree is not left to open. The operator files next
-    to this tree are not rewritten.
-    """
     root = Path(out_dir) / "designer"
     if root.exists():
         shutil.rmtree(root)
@@ -1246,7 +1102,6 @@ def publish_designer(
 
 
 def _restrict_designer_book(dest: Path) -> None:
-    """Drop columns the allow-list does not name. Equity values stay exact."""
     for name in ("equity_curve.csv", "fills.csv", "trades.csv"):
         _filter_designer_csv(dest / name)
     curve = dest / "equity_curve.csv"
@@ -1305,11 +1160,6 @@ def _csv_cell(value) -> str:
 
 
 def write_leaderboard(path, rows, *, audience: str = "operator") -> None:
-    """Write ``leaderboard.csv``. ``rows`` are already in rank order.
-
-    Rows that record a price basis must share one accounting setting.
-    Rows with no price basis are left alone so an older board still writes.
-    """
     refuse_mixed_rows(rows)
     if audience == "operator":
         columns = OPERATOR_LEADERBOARD_COLUMNS
@@ -1360,7 +1210,6 @@ def _unlock_index(fd: int, kind: str) -> None:
 
 
 def _replace_index(path: Path, document: dict) -> None:
-    """Write the index via a private temp file in the same directory."""
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -1377,12 +1226,6 @@ def _replace_index(path: Path, document: dict) -> None:
 
 
 def register_run(index_path, run_id: str, run_dir, *, kind: str, profile: str) -> None:
-    """Record ``run_id`` → directory. The index is an operator file.
-
-    Concurrent callers share one lock file. Each writer then replaces the
-    index from its own temporary file, so two runs cannot tear the JSON or
-    drop a row the other one added.
-    """
     path = Path(index_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(str(path) + ".lock")
@@ -1409,7 +1252,6 @@ def register_run(index_path, run_id: str, run_dir, *, kind: str, profile: str) -
 
 
 def resolve_run(run, *, index_path=None) -> Path:
-    """A directory with a report, or an id stored in the run index."""
     candidate = Path(run)
     if candidate.is_dir() and (
         (candidate / "run.json").is_file() or (candidate / "metrics.json").is_file()
@@ -1439,14 +1281,6 @@ def _redact_row(row: dict, symbol: str) -> dict:
 
 
 def _coerce_cell(value):
-    """Turn one leaderboard cell into the type the report contract uses.
-
-    Empty is null. ``true`` and ``false`` are booleans. A token with a decimal
-    point or an exponent is a float. A whole number is an int. Anything else
-    stays text. ``inf``, ``-inf``, and ``nan`` are floats here, so a parallel
-    cell is never the text ``inf``. The CSV file itself still stores that
-    text; ``read_leaderboard`` does not coerce it.
-    """
     if not isinstance(value, str):
         return value
     text = value.strip()
@@ -1491,11 +1325,6 @@ def _with_comparison(view: dict, directory: Path, audience: str) -> dict:
 
 
 def load_report(run, *, audience: str = "operator", index_path=None) -> dict:
-    """Structured view of one run. ``designer`` never includes the operator secrets.
-
-    Parallel rows use ``strategy-builder.report.v1``: numeric cells are numbers,
-    flags are booleans, and a blank cell is null.
-    """
     if audience not in {"operator", "designer"}:
         raise ValueError("audience must be operator or designer")
     directory = resolve_run(run, index_path=index_path)

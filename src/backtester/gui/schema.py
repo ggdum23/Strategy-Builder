@@ -1,22 +1,3 @@
-"""Report-file contract the window reads. It does not compute these figures.
-
-Phase 3 owns ``metrics.json``, the equity and fill CSVs, the equity PNG, and
-``leaderboard.csv``. This module is the shape the window expects. A field or
-file that is absent is left absent. Nothing here is filled in with a zero or
-with a local recalculation.
-
-Official definitions, from the engine metric functions:
-
-- 252 sessions per year.
-- Risk-free rate is 0.
-- Returns are regular-session close marks. The first return is against initial equity.
-- Sharpe is mean(return) / sample stdev * sqrt(252). Sortino uses the downside
-  deviation of the same returns (population form, matching the engines).
-- Max drawdown is the minimum of equity / running peak − 1, with initial equity
-  on the path. Duration counts sessions from peak until recovery.
-- Calmar is CAGR / |max drawdown|.
-- Desk daily marks are the last regular-session close of each session.
-"""
 
 from __future__ import annotations
 
@@ -30,10 +11,6 @@ ANNUALIZATION = (
     "The window displays the number stored in the report. It does not recompute it."
 )
 
-# A finished book. Everything else is optional.
-# These are the names ``backtester.report`` writes. Each file has one role.
-# ``equity.csv`` is the byte copy of ``equity_curve.csv``. It is not a second
-# curve, and a renamed file is not read in its place.
 METRICS_FILE = "metrics.json"
 WALKFORWARD_FILE = "walkforward.json"
 EQUITY_CURVE_FILE = "equity_curve.csv"
@@ -45,8 +22,6 @@ LIQUIDATION_FILE = "liquidation.json"
 LEADERBOARD_FILE = "leaderboard.csv"
 RUN_CONFIG_FILE = "run_config.json"
 BATCH_STATUS_FILE = "batch_status.json"
-# Operator export copies these names. A designer export writes the on-screen
-# columns instead, including when the folder is a published ``designer/`` tree.
 COPY_FILES = (
     METRICS_FILE,
     EQUITY_CURVE_FILE,
@@ -61,9 +36,6 @@ EQUITY_COLUMNS = ("equity",)
 EXPOSURE_COLUMNS = ("exposure", "position")
 SESSION_COLUMNS = ("date", "session", "day")
 
-# Operator sidecar keys. A designer-facing view must not render these.
-# Named operator runs still show ``cost_basis`` (the invoice, scale 1).
-# An anonymized or designer view drops that object. See ``gui.audience``.
 WITHHELD_KEYS = frozenset(
     {
         "date_map",
@@ -87,8 +59,6 @@ FILL_COLUMNS = frozenset(
 )
 EPISODE_COLUMNS = frozenset({"pnl", "side", "entry_notional"})
 
-# Keys already presented in a dedicated panel. Other scalar keys are listed
-# under "other reported fields" so a Phase 3 addition is visible.
 PANEL_KEYS = frozenset(
     {
         "benchmarks",
@@ -108,7 +78,6 @@ PANEL_KEYS = frozenset(
 
 @dataclass(frozen=True)
 class MetricSpec:
-    """How to label one reported field. ``kind`` is a display format, not a formula."""
 
     key: str
     label: str
@@ -239,9 +208,6 @@ METRICS: tuple[MetricSpec, ...] = (
     ),
 )
 
-# Settings and dollar amounts from the accounting record. The results page
-# lists these in this order. Dollar amounts can be inverted into a notional
-# or a share count; the designer allow-list drops those and keeps the settings.
 ACCOUNTING_KEYS = (
     "price_basis",
     "total_return_method",
@@ -262,7 +228,6 @@ HEADLINE_KEYS = tuple(spec.key for spec in METRICS if spec.group == "headline")
 ACTIVITY_KEYS = tuple(spec.key for spec in METRICS if spec.group == "activity")
 DESK_KEYS = tuple(spec.key for spec in METRICS if spec.group == "desk")
 
-# The results page leads with these seven stored fields, in this order.
 KPI_KEYS = (
     "total_return",
     "cagr",
@@ -274,9 +239,6 @@ KPI_KEYS = (
 )
 
 
-# Phase 3 ``leaderboard.csv`` columns (operator set; designer drops ``symbol``).
-# Kinds follow docs/METRICS.md at 3016825: a return or a session fraction is a
-# fraction, Calmar is a ratio, and dollars stay dollars.
 _LEADERBOARD_KIND = {
     "rank": "count",
     "strategy_id": "text",
@@ -382,11 +344,6 @@ LEADERBOARD_LABELS = {
 
 
 def leaderboard_kind(key: str) -> str:
-    """Display kind for one leaderboard or metric column. Ratios are two decimals.
-
-    Every Phase 3 leaderboard column has a kind, so the cell goes through
-    ``format_number`` and not a raw significant-figure dump.
-    """
     if key in _LEADERBOARD_KIND:
         return _LEADERBOARD_KIND[key]
     if key.endswith("_return") or key.startswith("frac_sessions") or key.startswith("frac_bars") or key.endswith("_frac"):
@@ -400,8 +357,6 @@ def leaderboard_kind(key: str) -> str:
         return "ratio2"
     return spec.kind
 
-# Columns used when a batch has no leaderboard.csv. Each cell is copied from
-# that run's metrics.json. The window does not rank by a formula of its own.
 ASSEMBLED_COLUMNS = (
     "strategy",
     "profile",

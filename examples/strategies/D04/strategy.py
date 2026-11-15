@@ -1,17 +1,3 @@
-"""Overnight-premium hold with a trend-and-volatility risk-off.
-
-ASSET's drift is earned mostly by holding across the session close. A round trip
-that owns only the overnight gap costs more than that gap is worth, so this
-strategy does not day-trade. It stays long (target +1) and steps aside only when
-both of the following are true at the pre-close decision bar:
-
-- the decision price is below its 180-session moving average, and
-- 20-session realized volatility, annualized, is above 20%.
-
-Otherwise the target is +1. No shorts, no leverage, one decision per regular
-session. Extended hours are not traded; a long target is held through the close
-and the overnight gap, and a flat target is flat for both.
-"""
 import math
 
 
@@ -20,11 +6,9 @@ class Strategy:
 
     MA_SESSIONS = 180
     VOL_SESSIONS = 20
-    VOL_LIMIT = 0.20  # annualized, sample std * sqrt(252)
+    VOL_LIMIT = 0.20
     TARGET_LONG = 1.0
     TARGET_FLAT = 0.0
-    # Bar-start minute of the decision. Fill is the next bar's open, still
-    # before the regular-session close (15:59 full session, 12:59 short).
     DECISION_MINUTE = 958
     DECISION_MINUTE_SHORT = 778
 
@@ -49,7 +33,6 @@ class Strategy:
             return None
         self._last_decision_day = day
         self.prices.append(px)
-        # 180 prices for the average; 21 prices for 20 close-to-close returns.
         keep = self.MA_SESSIONS + 1
         if len(self.prices) > keep:
             del self.prices[: len(self.prices) - keep]
@@ -62,7 +45,6 @@ class Strategy:
         if len(p) < n:
             return self.TARGET_LONG
         ma = sum(p[-n:]) / n
-        # Sample standard deviation of the last w close-to-close decision returns.
         rets = []
         start = len(p) - w
         for i in range(start, len(p)):

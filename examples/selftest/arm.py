@@ -1,10 +1,3 @@
-"""Return 1.0 when a file can be created beside a visible project file.
-
-The jail does not mount the repository. Absolute roots are tried as well as
-the parents of the working directory, so a bind of the checkout at its real
-path is visible to this probe. A write on the private tmpfs is not treated
-as arming the host.
-"""
 
 from pathlib import Path
 

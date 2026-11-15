@@ -1,16 +1,3 @@
-"""On-disk columns for a series that has already been validated.
-
-A later run maps the columns instead of parsing the monthly files again.
-The directory name is a hash. Named series are keyed by the source bytes,
-the loader version, and the load parameters. A window or a designer view is
-keyed by the column bytes, so a walk-forward slice does not contain the
-locked bars and a designer artifact is a different directory from the
-operator series.
-
-Designer manifests do not store a source path, a scale, a date map, or the
-real ticker. The cache is size-bounded. A write that fails does not fail
-the run that already holds the frame.
-"""
 
 from __future__ import annotations
 
@@ -53,12 +40,10 @@ _BANNED_COLUMNS = frozenset(
 )
 _ISO_DATE = __import__("re").compile(r"\d{4}-\d{2}-\d{2}")
 
-# The last cache error. A failed write is not fatal; tests can read this.
 LAST_CACHE_ERROR: BaseException | None = None
 
 
 def _runtime_prefixes() -> list[Path]:
-    """Interpreter locations. The default cache is not placed inside them."""
     found: list[Path] = []
     for raw in (sys.prefix, getattr(sys, "base_prefix", ""), os.path.dirname(sys.executable)):
         if not raw:
@@ -81,11 +66,6 @@ def _inside_any(path: Path, roots: list[Path]) -> bool:
 
 
 def _default_cache_outside_runtime(path: Path) -> Path:
-    """Move a computed default that landed inside the interpreter.
-
-    An explicit ``STRATEGY_BUILDER_PREPARED_DIR`` is not passed here. That
-    path stays where the operator put it, and the launch refuses it.
-    """
     prefixes = _runtime_prefixes()
     if not _inside_any(path, prefixes):
         return path
@@ -108,13 +88,6 @@ def _default_cache_outside_runtime(path: Path) -> Path:
 
 
 def default_cache_dir() -> Path:
-    """The prepared-data directory for this machine.
-
-    ``STRATEGY_BUILDER_PREPARED_DIR`` wins, including a path inside the
-    interpreter. The computed default never sits inside the interpreter
-    prefix. Windows uses LOCALAPPDATA. Everywhere else uses
-    ``$XDG_CACHE_HOME`` or ``~/.cache``.
-    """
     override = os.environ.get("STRATEGY_BUILDER_PREPARED_DIR")
     if override:
         return Path(override)
@@ -142,11 +115,6 @@ def max_bytes() -> int:
 
 
 def lookup_named(symbol: str, *, bar_minutes: int, price_kind: str, phase_map, paths) -> tuple[str, object | None]:
-    """Return ``(key, series)``. ``series`` is None when the cache misses.
-
-    A corrupt entry is removed. The caller then builds the frame and stores
-    it under the same key.
-    """
     key = named_key(
         symbol=symbol,
         bar_minutes=bar_minutes,
@@ -173,7 +141,6 @@ def save_named(
     phase_map,
     source,
 ) -> Path | None:
-    """Write a named artifact. Returns None when the write cannot be finished."""
     try:
         extra = {
             "symbol": str(symbol),
@@ -192,11 +159,6 @@ def save_named(
 
 
 def store_frame(frame: pd.DataFrame, *, kind: str, symbol: str | None = None) -> Path:
-    """Content-addressed columns. Designer frames are screened first.
-
-    ``symbol``, when given, is used only to refuse a designer view that
-    still contains that ticker. It is not written into the manifest.
-    """
     if kind not in {"window", "designer", "operator"}:
         raise ValueError("prepared kind is not supported")
     if kind == "designer":
@@ -209,7 +171,6 @@ def store_frame(frame: pd.DataFrame, *, kind: str, symbol: str | None = None) ->
 
 
 def load_frame(path) -> pd.DataFrame:
-    """Map one artifact. A failed integrity check removes it and raises."""
     root = Path(path)
     manifest = _verified_manifest(root)
     if manifest is None:
@@ -219,7 +180,6 @@ def load_frame(path) -> pd.DataFrame:
 
 
 def read_manifest(path) -> dict:
-    """The manifest of an artifact that passed the integrity check."""
     manifest = _verified_manifest(Path(path))
     if manifest is None:
         raise ValueError("prepared entry failed its integrity check")
@@ -227,7 +187,6 @@ def read_manifest(path) -> dict:
 
 
 def list_entries(root=None) -> list[dict]:
-    """One public record per artifact. Designer rows are labeled RANDOM."""
     base = Path(root) if root is not None else default_cache_dir()
     if not base.is_dir():
         return []
@@ -270,7 +229,6 @@ def list_entries(root=None) -> list[dict]:
 
 
 def delete_entry(key: str, root=None) -> None:
-    """Remove one artifact. The key is a hash, not a path."""
     if not isinstance(key, str) or len(key) != 64 or any(ch not in "0123456789abcdef" for ch in key):
         raise ValueError("prepared key is not a cache id")
     base = Path(root) if root is not None else default_cache_dir()
@@ -281,11 +239,6 @@ def delete_entry(key: str, root=None) -> None:
 
 
 def rebuild_entry(key: str, root=None):
-    """Delete a named artifact and load its source again.
-
-    Window and designer artifacts have no source path. They are rebuilt when
-    the run that produced them stores them again.
-    """
     if not isinstance(key, str) or len(key) != 64 or any(ch not in "0123456789abcdef" for ch in key):
         raise ValueError("prepared key is not a cache id")
     base = Path(root) if root is not None else default_cache_dir()
@@ -317,10 +270,6 @@ def rebuild_entry(key: str, root=None):
 
 
 def screen_designer(frame: pd.DataFrame, *, symbol: str | None = None, manifest: dict | None = None) -> None:
-    """Refuse a designer artifact that still carries operator data.
-
-    The error text does not include the ticker, the date, or the cell.
-    """
     columns = {str(name) for name in frame.columns}
     if columns & _BANNED_COLUMNS:
         raise ValueError("designer view contains an operator column")
@@ -468,7 +417,6 @@ def _category_digest(categories) -> str:
 
 
 def _column_hash_bytes(series: pd.Series) -> list[bytes]:
-    """Stable bytes for one column. Categorical text is codes plus labels."""
     from .frame_columns import StampArray
 
     if isinstance(series.dtype, pd.CategoricalDtype):
@@ -761,11 +709,6 @@ def _touch(path: Path) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    """Flush one file. A read-only handle makes Windows ``fsync`` raise EBADF.
-
-    The bytes are already in the file. A platform that still refuses the
-    flush does not fail the cache write; the reader checks the BLAKE2b.
-    """
     try:
         fd = os.open(path, os.O_RDWR)
     except OSError:
@@ -780,7 +723,6 @@ def _fsync_file(path: Path) -> None:
 
 
 def _fsync_dir(path: Path) -> None:
-    """Flush a directory. Windows often cannot open a directory this way."""
     try:
         fd = os.open(path, os.O_RDONLY)
     except OSError:
@@ -842,13 +784,6 @@ def _sweep_partials(root: Path) -> None:
 
 
 def _drop_cache_entry(child: Path) -> bool:
-    """Remove one cache directory. True only when this delete finished.
-
-    A Windows sharing violation leaves the directory in place. Retry only
-    when the delete raises and the directory is still there. A delete that
-    returns has finished; a directory published again under the same name
-    is a new entry and is not removed by this pass.
-    """
     for _attempt in range(2):
         if not child.exists():
             return True
@@ -861,18 +796,6 @@ def _drop_cache_entry(child: Path) -> bool:
 
 
 def _enforce_budget(root: Path, *, keep: str) -> None:
-    """Drop oldest entries until the directory is within ``max_bytes``.
-
-    The size is subtracted only after the directory is confirmed gone. A
-    delete that raises is retried once and then skipped, so an open handle
-    does not free budget that is still on disk. A delete that returns is
-    finished, and a directory published again under that name stays.
-
-    An entry that is already mapped stays readable until that mapping is
-    dropped. Unlinking the directory does not unmap it. The published files
-    are immutable after the rename. The next open hashes them again and
-    deletes the directory when the BLAKE2b or the row count does not match.
-    """
     cap = max_bytes()
     entries = []
     total = 0

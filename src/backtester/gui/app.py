@@ -1,8 +1,3 @@
-"""Open the research terminal.
-
-High-DPI scaling is left to Qt 6. The rounding policy is pass-through so a
-Windows display at 150% does not snap the window to a blurrier step.
-"""
 
 from __future__ import annotations
 

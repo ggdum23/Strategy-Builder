@@ -1,20 +1,3 @@
-"""Named local 1-minute bars.
-
-Files are ``<SYM>_1min_filled_YYYY-MM.csv.gz`` with columns
-``timestamp_et,epoch_utc,open,high,low,close,volume,wap,count,filled,session``.
-Prices stay raw unless the operator declares another price kind. A
-total-return series is stored with ``runnable`` false. A raw run is refused.
-``--price-basis total_return`` runs it when the split list is empty. Prices
-are not rewritten. ``share_factor`` for this loader is 1.0. A split table is
-configuration: a non-empty list is rejected rather than applied silently.
-
-Session clock hours are inferred from the stamps. Nothing in this module
-fills in a 04:00–19:59 template. The engine's ``short_session`` flag is a
-separate rule (full regular close at 15:59) and is not the inferred window.
-
-Resampling is session-anchored. A bar never contains minutes from two sessions
-or two phases. A partial tail is kept and marked ``partial``.
-"""
 
 from __future__ import annotations
 
@@ -30,8 +13,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Bump when a successful load would not byte-match the previous loader.
-# Prepared-data keys include this, so an old cache is not reused.
 LOADER_VERSION = 2
 
 REQUIRED_COLUMNS = (
@@ -51,8 +32,6 @@ REQUIRED_COLUMNS = (
 _FILE_RE = re.compile(r"^(.+)_1min_filled_(\d{4})-(\d{2})\.csv\.gz$")
 _PHASES = {"pre", "rth", "post"}
 _PRICE_KINDS = {"raw", "total_return"}
-# Column name timestamp_et claims this family of offsets. Any other offset
-# contradicts the column, so the loader stops instead of renaming the zone.
 _ET_OFFSETS = {"-04:00", "-05:00"}
 _FULL_REGULAR_CLOSE_MINUTE = 15 * 60 + 59
 _TIME_TEXT = np.array(
@@ -62,7 +41,6 @@ _TIME_TEXT = np.array(
 
 
 def monthly_filled_filename(symbol: str, year: int, month: int) -> str:
-    """File name Greg's filled trees use. The symbol may contain a dot (BRK.B)."""
     if not isinstance(symbol, str) or not symbol or "/" in symbol or "\\" in symbol:
         raise ValueError(f"invalid symbol {symbol!r}")
     if not isinstance(year, int) or isinstance(year, bool) or year < 1900:
@@ -73,16 +51,10 @@ def monthly_filled_filename(symbol: str, year: int, month: int) -> str:
 
 
 def monthly_filled_path(root, symbol: str, year: int, month: int):
-    """Join ``root / filename`` without assuming the path flavour.
-
-    ``root`` may be a ``pathlib.Path`` or a ``PureWindowsPath``. The result
-    stays on that flavour, so a Windows path can be built on Linux.
-    """
     return root / monthly_filled_filename(symbol, year, month)
 
 
 def assert_no_silent_splits(splits) -> None:
-    """Raw mode does not adjust prices. An explicit split list must not be ignored."""
     if splits:
         raise ValueError(
             "Split tables are configuration and are not applied in this phase. "
@@ -93,7 +65,6 @@ def assert_no_silent_splits(splits) -> None:
 
 @dataclass(frozen=True)
 class SessionVariant:
-    """A day-shape that is not the modal window for that label."""
 
     start_minute: int
     end_minute: int
@@ -113,7 +84,6 @@ class SessionVariant:
 
 @dataclass(frozen=True)
 class SessionSegment:
-    """Clock window inferred for one session label. Not a template."""
 
     label: str
     engine_phase: str
@@ -147,7 +117,6 @@ class SessionSegment:
 
 @dataclass(frozen=True)
 class Inspection:
-    """What a series actually is, written down before anyone runs a strategy on it."""
 
     symbol: str
     columns: tuple
@@ -220,8 +189,6 @@ class Inspection:
 class LoadedSeries:
     frame: pd.DataFrame
     inspection: Inspection
-    # Directory of the prepared columns, when this load was served from or
-    # written to the cache. None when the cache could not be used.
     prepared: str | None = None
 
 
@@ -239,7 +206,6 @@ class WalkSlices:
 
 
 def discover_filled_files(src, symbol: str) -> list[Path]:
-    """Monthly files under ``src``, or ``src`` itself when it is one file."""
     root = Path(src)
     if root.is_file():
         match = _FILE_RE.match(root.name)
@@ -267,11 +233,6 @@ def discover_filled_files(src, symbol: str) -> list[Path]:
 
 
 def absent_months(paths, symbol: str) -> tuple[str, ...]:
-    """YYYY-MM labels with no file, from the earliest file through the latest.
-
-    A holiday gap inside a file that exists is not a missing month. One file,
-    or a run of consecutive months, returns an empty tuple.
-    """
     keys = []
     for path in paths:
         match = _FILE_RE.match(Path(path).name)
@@ -302,7 +263,6 @@ def _read_month(path: Path) -> pd.DataFrame:
     extra = [str(name) for name in frame.columns if str(name) not in REQUIRED_COLUMNS]
     if extra:
         raise ValueError(f"{path.name} has extra columns: {', '.join(extra)}")
-    # Names, not positions. A reordered file still lines up.
     return frame.loc[:, list(REQUIRED_COLUMNS)].copy()
 
 
@@ -320,7 +280,6 @@ def _as_utc_stamp(value) -> datetime:
 
 
 def dividend_file_sha256(path) -> str:
-    """SHA-256 of the dividend file bytes. This is not a pack or designer field."""
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -329,7 +288,6 @@ def dividend_file_sha256(path) -> str:
 
 
 def load_dividends(path) -> dict[str, float]:
-    """CSV with columns ``session,amount``. ``session`` matches the desk session id (YYYY-MM-DD)."""
     frame = pd.read_csv(path)
     if list(frame.columns)[:2] != ["session", "amount"] and not {"session", "amount"} <= set(frame.columns):
         raise ValueError("dividends file needs columns session,amount")
@@ -375,7 +333,6 @@ def _median(values: list[float]) -> float:
 
 
 def _phase_mapping(original: list[str], phase_map) -> list[str]:
-    """Map file labels onto pre/rth/post. Without a map, unknown labels are an error."""
     if phase_map is None:
         mapping = {}
     elif isinstance(phase_map, dict):
@@ -523,13 +480,6 @@ def _infer_fill_policy(closes: list[float], volumes: list[float], filled: list[i
                 "a filled=1 bar is not a stale print (volume 0 and OHLC equal to the previous close). "
                 "Fill policy is ambiguous."
             )
-        # OHLC equality is checked by the caller for every bar's own range.
-        # A stale bar must also be flat; the previous-close check plus the
-        # OHLC-contains-open rule is not enough if high differs. The caller
-        # passes close only. Flatness is checked here via the volume gate and
-        # the dedicated OHLC scan below when we have the rows. This loop sees
-        # close. The load path checks open/high/low before calling a richer
-        # scanner. See _stale_ohlc.
     return "stale_forward_fill", n_filled, unfilled, True
 
 
@@ -550,11 +500,6 @@ def _stale_bars_are_flat(frame: pd.DataFrame) -> None:
 
 
 def infer_session_segments(dates, minutes, labels, phases) -> tuple[SessionSegment, ...]:
-    """Infer one clock window per label from the bars that carry it.
-
-    The window is the modal ``(first minute, last minute, bar count)`` across
-    days. Other shapes are recorded as variants. There is no default session.
-    """
     if not dates:
         raise ValueError("no bars to infer session hours from")
     seen_minute = set()
@@ -608,9 +553,6 @@ def _segments_from_shapes(per_label, phase_of) -> tuple[SessionSegment, ...]:
         ranked = counts.most_common()
         top_count = ranked[0][1]
         tied = [signature for signature, count in ranked if count == top_count]
-        # A tie is not a 04:00–19:59 guess. The listed window is the longest
-        # shape, then the later close, then the earlier open. Every other
-        # shape stays a variant, and the loader names the tie in its notes.
         tied.sort(key=lambda signature: (signature[2], signature[1], -signature[0]), reverse=True)
         start, end, modal_bars = tied[0]
         bar_counts = [count for _start, _end, count, _gapped in days]
@@ -646,11 +588,6 @@ def _segments_from_shapes(per_label, phase_of) -> tuple[SessionSegment, ...]:
 
 
 def _fast_clock(texts: list[str]):
-    """Components of the canonical ``YYYY-MM-DDTHH:MM:SS±HH:MM`` stamp.
-
-    Returns None when any value is a different shape. The caller then uses
-    ``datetime.fromisoformat`` so the error text stays the same.
-    """
     count = len(texts)
     if count == 0:
         return None
@@ -741,14 +678,12 @@ def _fast_clock(texts: list[str]):
 
 
 def _finite_columns(symbol: str, columns: list[tuple[np.ndarray, str]]) -> None:
-    """Same column order as the row scan this replaced. The message names the column."""
     for values, name in columns:
         if not bool(np.isfinite(values).all()):
             raise ValueError(f"{symbol} has a non-finite {name}")
 
 
 def _session_volume(dates: np.ndarray, volumes: np.ndarray) -> list[float]:
-    """One total per session, in first-seen order. Not the quadratic mask."""
     codes, _uniques = pd.factorize(dates, sort=False)
     totals = np.bincount(codes.astype(np.int64, copy=False), weights=np.asarray(volumes, dtype=np.float64))
     return [float(value) for value in totals]
@@ -777,7 +712,6 @@ def _median_array(values) -> float:
 
 
 def _coded_segments(date_codes, date_labels, minutes, label_codes, label_names, phase_for_label):
-    """Same windows as ``infer_session_segments``, from integer codes."""
     date_codes = np.asarray(date_codes)
     minutes = np.asarray(minutes)
     label_codes = np.asarray(label_codes)
@@ -829,11 +763,6 @@ def _coded_segments(date_codes, date_labels, minutes, label_codes, label_names, 
 
 
 def _parse_fast(paths, symbol: str, phase_map):
-    """One month at a time. None when a stamp is not the canonical 25-character form.
-
-    The caller then uses the row-wise parser so the error text stays the same.
-    Canonical months never hold the concatenated text frame.
-    """
     from .frame_columns import CLOCK_TEXT, StampArray
 
     chunks = []
@@ -1039,7 +968,6 @@ def _parse_fast(paths, symbol: str, phase_map):
 
 
 def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=(), phase_map=None, price_kind: str = "raw") -> LoadedSeries:
-    """Load filled months for one symbol. Does not copy or rewrite the source files."""
     assert_no_silent_splits(splits)
     if price_kind not in _PRICE_KINDS:
         raise ValueError(
@@ -1102,9 +1030,6 @@ def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=(), phase_map=N
         counts = raw["count"].to_numpy(dtype=np.float64, copy=True)
         filled_values = raw["filled"].to_numpy(dtype=np.float64, copy=True)
         if fast is not None:
-            # The canonical path has already copied the columns it needs.
-            # Dropping the parsed months here is what keeps a long series
-            # from holding two full copies through validation and the cache write.
             del raw
             gc.collect()
         _finite_columns(
@@ -1357,14 +1282,6 @@ def load_named(src, symbol: str, *, bar_minutes: int = 1, splits=(), phase_map=N
 
 
 def resample(frame: pd.DataFrame, bar_minutes: int) -> pd.DataFrame:
-    """Bucket each (day, phase) segment from its own first minute.
-
-    A trailing partial bucket is kept and marked ``partial=1``. It is not dropped,
-    not padded, and not filled with the next segment. If the minute restarts
-    inside a segment, that restart is a new segment and is not mixed into the
-    previous bucket. A bucket is complete only when it holds ``bar_minutes``
-    contiguous source minutes.
-    """
     if isinstance(bar_minutes, bool) or not isinstance(bar_minutes, int) or bar_minutes < 1:
         raise ValueError("bar-minutes must be a positive integer")
     if bar_minutes == 1:
@@ -1499,7 +1416,6 @@ def _accumulate(bucket, row):
 
 
 def _desk_trade_count(value) -> float:
-    """Trade count for a Desk bar. The scaled pack value is not a whole number."""
     count = float(value)
     if not math.isfinite(count):
         raise ValueError("desk bar count is not finite")
@@ -1507,13 +1423,6 @@ def _desk_trade_count(value) -> float:
 
 
 def frame_to_desk_bars(frame: pd.DataFrame) -> list[dict]:
-    """Desk bars. ``session`` is the real date; ``phase`` is pre/rth/post.
-
-    Column ``count`` is pulled by name. Iterating tuples would rename it,
-    because ``count`` clashes with a tuple method. The trade count stays a
-    float: an anonymized pack multiplies it by ``volume_factor``, and
-    truncating that product would show Desk a different bar from Arena.
-    """
     rows = []
     previous = None
     columns = {name: frame[name].tolist() for name in (
@@ -1544,10 +1453,6 @@ def frame_to_desk_bars(frame: pd.DataFrame) -> list[dict]:
 
 
 def prepare_desk_bars(frame: pd.DataFrame):
-    """Validate desk bars once. Books on the same frame share the columns.
-
-    ``engine_desk.run`` reads the columns. It does not build a dict per bar.
-    """
     from .engine_desk import PreparedDeskBars, table_from_frame
 
     return PreparedDeskBars(table_from_frame(frame))
@@ -1561,12 +1466,6 @@ def slice_walkforward(
     design_fraction: float | None = None,
     warmup_days: int = 0,
 ) -> WalkSlices:
-    """Split a frame into a design window and a locked tail.
-
-    The design frame contains no bar from the locked tail. Warm-up rows for the
-    locked run, when requested, are strictly earlier than the locked start.
-    There is no default cut.
-    """
     choices = [design_end_day is not None, design_end_date is not None, design_fraction is not None]
     if sum(choices) != 1:
         raise ValueError("pass exactly one of design_end_day, design_end_date, design_fraction")

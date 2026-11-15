@@ -1,4 +1,3 @@
-"""Designer runs bill a flat fee. The operator invoice stays the real schedule."""
 
 from __future__ import annotations
 
@@ -44,7 +43,6 @@ SCALES = (0.25, 1.0, 1.7, 7.777)
 
 
 class BuyThenSell:
-    """Target 1.0 at 09:30 and flat at 09:31. The next bar fills each order."""
 
     WANTS_EXTENDED_HOURS = False
 
@@ -69,7 +67,6 @@ def _round_tenth(value: Decimal) -> Decimal:
 
 
 def _reference_average(sec_rate, taf_rate, taf_max) -> tuple[Decimal, Decimal, Decimal]:
-    """Buy bps, sell bps, and their average at the documented $100 / 10,000-share fill."""
     shares = Decimal(10_000)
     notional = Decimal(1_000_000)
     commission = shares * Decimal("0.0035")
@@ -322,8 +319,6 @@ def _rewrite(sidecar, *, allow_scale_mismatch=False, resign=False, **changes):
     document = json.loads(Path(sidecar).read_text(encoding="utf-8"))
     document.update(changes)
     if resign:
-        # The operator holds the key, so an intentional billing-scale edit can
-        # be signed again. A tamper that does not resign is refused.
         document["factor_mac"] = factor_mac(bytes.fromhex(document["factor_key"]), document)
     Path(sidecar).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     return load_sidecar(sidecar, allow_scale_mismatch=allow_scale_mismatch)
@@ -469,7 +464,6 @@ def test_anonymized_sidecar_rejects_a_share_scale_other_than_the_price_factor(tm
 
 @windows_jails(8)
 def test_designer_dividend_is_real_div_times_build_price_factor(tmp_path):
-    """A $1.25 dividend on a 1.7x pack pays 2.125 per pack share, at every billing scale."""
     src, registry = _write_series(tmp_path, days=2)
     pack, sidecar = _build(tmp_path, src, registry, price_factor=1.7)
     dividends = {"2024-03-05": 1.25}

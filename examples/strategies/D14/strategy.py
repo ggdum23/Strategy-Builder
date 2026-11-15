@@ -1,21 +1,9 @@
-"""Long-only volatility targeting for ASSET.
-
-Once per regular session, at the last RTH bar, forecast next-session volatility
-with a fast EWMA of daily close-to-close log returns and set gross exposure to
-0.18 / sigma, capped at 2. Weights are quantized to 1/4 and traded only when
-the new weight differs from the live target by at least 1/2. The order fills
-at the next session's open (engine convention). No shorts.
-
-All constants were selected on design sessions 0..1999. Runtime inputs are the
-bars passed to on_bar; nothing is read from disk or the network.
-"""
 import math
 
 
 class Strategy:
     WANTS_EXTENDED_HOURS = False
 
-    # Forecast and sizing. 0.90 half-life is about 6.6 sessions.
     LAM = 0.90
     TARGET_VOL = 0.18
     PRIOR_VOL = 0.20
@@ -26,7 +14,7 @@ class Strategy:
     def __init__(self):
         self.var = (self.PRIOR_VOL ** 2) / 252.0
         self.prev_close = None
-        self.held = None  # last target actually sent
+        self.held = None
 
     def _quantize(self, raw):
         if raw < 0.0:
@@ -56,9 +44,6 @@ class Strategy:
         if not math.isfinite(close) or close <= 0.0:
             return None
 
-        # One decision per session, on the last regular-session bar
-        # (15:59, or 12:59 when the session ends at 13:00). The fill is the
-        # next session's open. Intraday bars do not change the target.
         if minute != (779 if short else 959):
             return None
 
@@ -71,8 +56,6 @@ class Strategy:
         self.prev_close = close
 
         q = self._target_from_var()
-        # First close always publishes the prior-vol weight. Later closes
-        # publish only when the quantized weight has moved by the band.
         if self.held is None or abs(q - self.held) >= self.BAND - 1e-12:
             self.held = q
             return q

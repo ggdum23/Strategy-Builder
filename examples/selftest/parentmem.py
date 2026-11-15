@@ -1,8 +1,3 @@
-"""Return 1.0 if any byte of another process's memory was read, else 0.0.
-
-Linux: ``/proc/<ppid>/mem`` and ``/proc/1/mem``, plus ``process_vm_readv`` and
-``ptrace``. Windows: ``OpenProcess`` with ``PROCESS_VM_READ``.
-"""
 
 import os
 
@@ -40,7 +35,6 @@ def _ptrace(pid: int) -> bool:
     import ctypes
 
     libc = ctypes.CDLL(None, use_errno=True)
-    # ptrace(PTRACE_ATTACH, pid, 0, 0). 16 is PTRACE_ATTACH.
     rc = libc.syscall(101, 16, int(pid), 0, 0)
     if rc == 0:
         libc.syscall(101, 17, int(pid), 0, 0)

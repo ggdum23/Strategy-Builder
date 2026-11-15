@@ -1,15 +1,3 @@
-"""Split the Windows suite into jobs that finish inside the 25-minute cap.
-
-The fast files share a shard. The walk-forward file and the accounting file
-each have their own, because a single walk is the slow call. A test in a
-file shard whose Windows budget is above 60 seconds is lifted into a
-``jail-`` shard and deselected from the file run, so the 60-second cap does
-not cover a multi-jail test. Parallel tests and those lifted tests are
-packed so the sum of their Windows timeouts stays at or under 12 minutes,
-which is well under the 25-minute job cap. A test marked ``windows_jails(n)``
-is budgeted at 90 seconds per jail. Every other test is budgeted at 60.
-``tests/test_jailed_examples.py`` stays in the jailed-examples job.
-"""
 
 from __future__ import annotations
 
@@ -24,8 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 PARALLEL_CHUNK = 12
 DEFAULT_TEST_S = 60
 JAIL_BUDGET_S = 90
-# 12 minutes. The job cap is 25, so a shard that burns its whole budget
-# still has room to start and to print the summary.
 SHARD_BUDGET_S = 12 * 60
 SHARD_HARD_S = 18 * 60
 
@@ -40,6 +26,7 @@ FILE_SHARDS = {
         "tests/test_isolation.py",
         "tests/test_metrics.py",
         "tests/test_mutations.py",
+        "tests/test_no_comments.py",
         "tests/test_pack.py",
         "tests/test_phase9_perf.py",
         "tests/test_phase9_equiv.py",
@@ -104,12 +91,6 @@ _FILE_TO_SHARD = {path: name for name, paths in FILE_SHARDS.items() for path in 
 
 
 def _windows_budget(item) -> int:
-    """Seconds this test may use on a Windows runner.
-
-    The mark's count is the number of jails. The budget is 90 seconds each,
-    and it stops at the shard hard limit so one long mark is still a job
-    the 25-minute runner can finish.
-    """
     mark = item.get_closest_marker("windows_jails")
     if mark is None or not mark.args:
         return DEFAULT_TEST_S
@@ -117,7 +98,6 @@ def _windows_budget(item) -> int:
 
 
 def collect() -> list[tuple[str, int]]:
-    """Node ids and Windows budgets, without the jailed-examples job."""
     import pytest
 
     found: list[tuple[str, int]] = []
@@ -140,11 +120,6 @@ def collect() -> list[tuple[str, int]]:
 
 
 def _pack(pairs: list[tuple[str, int]], prefix: str) -> dict[str, list[str]]:
-    """Pack tests so each shard stays within the 12-minute budget.
-
-    A test that cannot share a shard is pulled out first. Otherwise a
-    60-second test is left sitting alone between two long ones.
-    """
     heavy = [(nodeid, seconds) for nodeid, seconds in pairs if seconds + DEFAULT_TEST_S > SHARD_BUDGET_S]
     light = [(nodeid, seconds) for nodeid, seconds in pairs if seconds + DEFAULT_TEST_S <= SHARD_BUDGET_S]
     shards: dict[str, list[str]] = {}
@@ -174,11 +149,8 @@ def _pack(pairs: list[tuple[str, int]], prefix: str) -> dict[str, list[str]]:
 
 
 def assign(items: list[tuple[str, int]]) -> dict[str, list[str]]:
-    """Each collected test in exactly one shard. Unknown files land in ``rest``."""
     shards: dict[str, list[str]] = {name: [] for name in FILE_SHARDS}
     parallel: list[tuple[str, int]] = []
-    # A multi-jail test does not belong in a file shard whose other tests
-    # are budgeted at 60 seconds. It is packed on its own.
     lifted: list[tuple[str, int]] = []
     rest: list[str] = []
     for nodeid, seconds in items:
@@ -227,14 +199,12 @@ def problems(items: list[tuple[str, int]], shards: dict[str, list[str]]) -> list
 
 
 def _targets(name: str, nodeids: list[str]) -> list[str]:
-    """File paths for a whole-file shard. Node ids would exceed the Windows command limit."""
     if name in FILE_SHARDS:
         return list(FILE_SHARDS[name])
     return nodeids
 
 
 def _deselect(name: str, items: list[tuple[str, int]]) -> list[str]:
-    """Node ids pulled out of a file shard. The file path would run them again."""
     if name not in FILE_SHARDS:
         return []
     files = set(FILE_SHARDS[name])

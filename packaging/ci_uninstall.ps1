@@ -1,9 +1,3 @@
-# Silent uninstall.
-# The first-phase unins000.exe exits before Inno runs usPostUninstall, and that
-# callback is what logs "keeping" or "deleting" and what deletes the profile.
-# This script waits for the log line, the profile state, and the second-phase
-# process (_unins.tmp under a temp is-*-uninstall.tmp directory) before returning.
-# A keep result requires the upgrade sentinel to still be in config.json.
 
 param(
     [Parameter(Mandatory = $true)][string]$Destination,
@@ -35,8 +29,6 @@ if (Test-Path -LiteralPath $log) {
 }
 
 function Test-UninstallPhaseRunning {
-    # The second phase runs as _unins.tmp. That file can outlive the process,
-    # so only a live process counts. unins000.exe is the first phase.
     $cim = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $name = [string]$_.Name
         $exe = [string]$_.ExecutablePath
@@ -76,9 +68,6 @@ function Wait-UninstallSettled {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('keep', 'delete')][string]$Mode
     )
-    # usPostUninstall runs after a 500 ms sleep in the second phase. 30 s covers
-    # that gap and a slow DelTree. Returning earlier lets the next install start
-    # while the profile is still being removed.
     $deadline = (Get-Date).AddSeconds(30)
     while ($true) {
         $result = Invoke-UninstallGuard -Mode $Mode

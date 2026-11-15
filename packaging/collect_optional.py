@@ -1,18 +1,3 @@
-"""What the frozen bundle picks up from the build environment.
-
-PyInstaller already follows normal imports. This module adds the pieces that
-are optional or easy to miss:
-
-- every ``backtester`` submodule, so a later phase is collected by being
-  installed, without a spec edit
-- matplotlib's data files when matplotlib is installed
-- PySide6, including the platforms, styles, and imageformats plugins, when
-  PySide6 is installed
-- pyqtgraph when it is installed (its own hook collects templates and data)
-
-The Windows build installs the ``gui`` extra when ``pyproject.toml`` defines
-one. Until then these Qt packages are absent and are not collected.
-"""
 
 from __future__ import annotations
 
@@ -98,9 +83,6 @@ def hiddenimports() -> list[str]:
             ]
         )
     if installed("pyqtgraph"):
-        # The official hook collects submodules except examples (importing
-        # examples constructs a Qt application). Name the package so that
-        # hook runs; do not walk examples from here.
         hidden.append("pyqtgraph")
         hidden.append("pyqtgraph.multiprocess.bootstrap")
     return _unique(hidden)
@@ -118,12 +100,6 @@ def matplotlib_datas() -> list[tuple[str, str]]:
 
 
 def qt_plugin_binaries() -> list[tuple[str, str]]:
-    """platforms, styles, and imageformats, using PyInstaller's Qt layout.
-
-    Hidden imports of QtGui and QtWidgets trigger the same official hooks.
-    Collecting here as well keeps the three plugin directories explicit, and
-    the archive dedupes a file that both paths name.
-    """
     if not installed("PySide6"):
         return []
     from PyInstaller.utils.hooks.qt import pyside6_library_info
@@ -152,8 +128,6 @@ def qt_plugin_binaries() -> list[tuple[str, str]]:
 
 
 def excludes() -> list[str]:
-    # One Qt binding. PySide6 is the GUI extra. pytest is the source-checkout
-    # test command and is not part of the frozen program.
     return [
         "PyQt5",
         "PyQt6",

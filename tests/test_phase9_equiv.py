@@ -1,32 +1,3 @@
-"""Byte-identity with main 2b73448 on a synthetic 20-session series.
-
-The golden file is the normalized report tree of that commit, captured on
-this host (CPython 3.12, NumPy 2.5) and checked against a second run.
-``sidecar.json`` drops ``factor_key``, ``factor_mac``, ``source_root``,
-and ``pack_id`` (a random key, the operator's directory, and the hash of
-the compressed pack bytes). ``run.json`` drops ``id``. PNG bytes are
-locked on Linux, where they matched main; Windows checks the PNG signature
-because the chart font is not the same file. Report paths are compared
-with forward slashes. Text files are hashed after ``\\r\\n`` is folded to
-``\\n``, because ``Path.write_text`` and the CSV writer use the platform
-newline. A gzip member with mtime 0 and no file name is hashed after it
-is inflated, because zlib does not promise the same compressed bytes on
-Windows and on Linux. ``pack_id`` is that compressed-byte hash, so a JSON
-file is hashed with the id zeroed. The writers are unchanged, so a
-Windows run still matches ``main`` on Windows.
-
-NumPy 2.4 (CPython 3.11) and NumPy 2.5 disagree by one unit in the last
-place on a few Desk reductions: average exposure, turnover per year,
-annualized volatility, and the Sharpe ratio that divides by that
-volatility. The same figures show up in the buy-and-hold and 2× benchmark
-files, the walk-forward summary, and the parallel leaderboard. ``numpy24``
-in the golden file is the hash ``main`` wrote for each of those files on
-NumPy 2.4.6. Equity, fills, and every other report file are one hash on
-both. The comparison accepts a file when its hash is the NumPy 2.5 hash
-or that NumPy 2.4 hash.
-
-Packs refuse ``--unsafe-in-process``. The jailed pack is the pack surface.
-"""
 
 from __future__ import annotations
 
@@ -74,12 +45,10 @@ class _Hold:
 
 _PACK_ID = re.compile(br'"pack_id": "[0-9a-f]{64}"')
 _PACK_ID_ZERO = b'"pack_id": "' + (b"0" * 64) + b'"'
-# mtime 0, no flags. The OS byte and the compressor's xfl are not part of the check.
 _GZIP_CANON = b"\x1f\x8b\x08\x00\x00\x00\x00\x00"
 
 
 def _neutralize_pack_id(blob: bytes) -> bytes:
-    """Zero ``pack_id`` without reserializing the rest of the document."""
     return _PACK_ID.sub(_PACK_ID_ZERO, blob)
 
 
@@ -268,7 +237,6 @@ def test_parallel_matches_main(tmp_path, monkeypatch):
 
 
 def test_cold_warm_and_uncached_reports_match(tmp_path, monkeypatch):
-    """The prepared cache does not change a book. A failed cache is the same book."""
     cache = tmp_path / "prepared"
     cache.mkdir()
     monkeypatch.setenv("STRATEGY_BUILDER_PREPARED_DIR", str(cache))

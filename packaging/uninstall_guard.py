@@ -1,11 +1,3 @@
-"""Decide whether a silent uninstall has really finished.
-
-Inno's first-phase unins000.exe exits before CurUninstallStepChanged(usPostUninstall).
-A check that only looks at the profile directory in that gap passes even when
-the second phase is about to delete it. These functions return "ok" only after
-the uninstall log records the decision, and they fail if the profile disappears
-or the opposite decision is logged.
-"""
 
 from __future__ import annotations
 
@@ -19,12 +11,6 @@ DELETING = "Strategy Builder deleting "
 
 
 def judge_keep(log_text: str, config_text: str | None, *, sentinel: str) -> str:
-    """Return "wait" or "ok". Raise SystemExit when the keep contract breaks.
-
-    "ok" requires the keeping line and the original config, still carrying
-    the upgrade sentinel. An empty log while the config remains is "wait",
-    which is the gap after the first phase exits.
-    """
     log_text = log_text or ""
     if DELETING in log_text:
         raise SystemExit("uninstall log says it is deleting the profile")
@@ -50,7 +36,6 @@ def judge_keep(log_text: str, config_text: str | None, *, sentinel: str) -> str:
 
 
 def judge_delete(log_text: str, *, root_exists: bool) -> str:
-    """Return "wait" or "ok". A missing directory without the deleting line is not success."""
     log_text = log_text or ""
     if KEEPING in log_text:
         raise SystemExit("DELETEUSERDATA was ignored; uninstall kept the profile")
@@ -60,7 +45,6 @@ def judge_delete(log_text: str, *, root_exists: bool) -> str:
 
 
 def _read(path: Path) -> tuple[str, bool]:
-    """Return (text, exists). A locked file exists with empty text so the caller waits."""
     if not path.exists():
         return "", False
     try:

@@ -1,4 +1,3 @@
-"""Thirteenth review. A strategy id that is a calendar date fails that one job."""
 
 from __future__ import annotations
 
@@ -14,8 +13,6 @@ from backtester.report import _designer_value_error, assert_designer_clean, desi
 from test_parallel import FLAT, _anon_pack, _strategy
 from windows_open import windows_jails
 
-# Every spelling the publisher used to accept, plus the controls that stay.
-# ``day 2024`` is a date. A decimal year is still a number.
 DATES = (
     "04-Jan-2024",
     "2024-1-4",
@@ -40,7 +37,6 @@ _SCALE = 1.1
 
 
 def _date_hits(text: str) -> tuple[bool, bool, bool, bool, bool]:
-    """The five gates, as a date verdict. A price is not a date."""
     component = designer_component_problem(text, symbols=(), scale=_SCALE) == "a calendar date"
     value = _designer_value_error("caption", text, "") == "a calendar date"
     scanned = scan_publication(text, scale=_SCALE) == "a date"

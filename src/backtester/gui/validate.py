@@ -1,10 +1,3 @@
-"""Check a run before it starts. Defaults that would change a result must be visible.
-
-Unset borrow, financing, and dividends are passed as ``None`` so the runner
-applies the profile's own rule. The transcript says so. Arena rejects a fee
-multiple other than 1, a financing rate, and a dividend file; this check
-refuses those before the engine is called.
-"""
 
 from __future__ import annotations
 
@@ -65,7 +58,6 @@ def _optional_int(value, label: str, issues: list[str]) -> int | None:
 
 
 def normalize(raw: dict) -> dict:
-    """Copy a draft into the dict the worker accepts. Does not invent a cut or a profile."""
     strategies = raw.get("strategies") or ()
     return {
         "mode": str(raw.get("mode") or "").strip().lower(),
@@ -93,7 +85,6 @@ def normalize(raw: dict) -> dict:
 
 
 def validate_config(raw: dict) -> list[str]:
-    """Human-readable problems. Empty means the draft can be launched."""
     config = normalize(raw)
     issues: list[str] = []
     if config["mode"] not in _MODES:
@@ -233,7 +224,6 @@ def _sha256(path: Path) -> str | None:
 
 
 def config_record(raw: dict) -> dict:
-    """The full launch record. Unset rates stay null on purpose."""
     config = normalize(raw)
     strategies = []
     for item in config["strategies"]:
@@ -281,7 +271,6 @@ def config_record(raw: dict) -> dict:
 
 
 def transcript(raw: dict) -> str:
-    """Monospace preview of what will be passed. Includes the problems, if any."""
     record = config_record(raw)
     issues = validate_config(raw)
     lines = [

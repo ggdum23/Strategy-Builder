@@ -1,10 +1,3 @@
-"""Smoke-test a frozen backtester executable.
-
-Runs version, ingest, a short arena run, and a walk-forward that has to
-spawn children. The walk-forward strategy records the scrubbed argv and
-environment. Sample bars are read from ``sample_data`` when that tree
-exists, otherwise from ``assets/sample``.
-"""
 
 from __future__ import annotations
 
@@ -19,8 +12,6 @@ from pathlib import Path
 
 DESIGN_END = "2026-10-16"
 
-# User-profile and data-root names the walk-forward child must not see.
-# The full contract is runner._ENV_KEEP: every other key is also a failure.
 FORBIDDEN_ENV = (
     "HOME",
     "USERPROFILE",
@@ -97,12 +88,6 @@ def _child_env(src: Path) -> dict:
 
 
 def assert_child_surface(payload: dict) -> None:
-    """The strategy saw only the runner allowlist.
-
-    The working directory starts empty. The one file the runner itself
-    creates there is ``stdio.log``, the capped copy of the child's stdout
-    and stderr. Any other name is a file the strategy could see.
-    """
     from backtester.runner import _ENV_KEEP
 
     reported = payload.get("env_keys")
@@ -124,12 +109,6 @@ def assert_child_surface(payload: dict) -> None:
 
 
 def assert_jailed_surface(payload: dict) -> None:
-    """The strategy process is the jail, not the worker's temp directory.
-
-    Its cwd holds the copied strategy and the protocol child. A data file,
-    a sibling of the strategy, or anything else is a mount that should not
-    be there. HOME and USERPROFILE are checked by the caller against the cwd.
-    """
     entries = payload.get("cwd_entries")
     if not isinstance(entries, list):
         raise SystemExit(f"child cwd entries are not a list: {entries!r}")
@@ -152,7 +131,6 @@ def assert_jailed_surface(payload: dict) -> None:
 
 
 def windows_file_version(path: Path) -> str:
-    """Fixed file and product version from a PE version resource."""
     import ctypes
     from ctypes import wintypes
 
@@ -231,7 +209,6 @@ def _gui_executable(cli: Path) -> Path:
 
 
 def require_gui_launcher(report_text: str) -> None:
-    """The gui extra ships, so the frozen window must report the real launcher."""
     if report_text != "launcher-check: gui":
         raise SystemExit(f"unexpected launcher report {report_text!r}")
 
@@ -354,8 +331,6 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
             raise SystemExit("walk-forward design window is not before the locked window")
         if not (walk_dir / "design" / "metrics.json").is_file() or not (walk_dir / "locked" / "metrics.json").is_file():
             raise SystemExit("walk-forward did not write design and locked metrics")
-        # The worker is still a spawn child (multiprocessing-fork, argv
-        # backtester-design). The strategy process is the jail.
         probes = [walk_dir / "design" / "child_surface.json", walk_dir / "locked" / "child_surface.json"]
         missing = [path for path in probes if not path.is_file()]
         if missing:
@@ -528,8 +503,6 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
     surface = json.loads(surface_path.read_text(encoding="utf-8"))
     if surface.get("secret_seen") or surface.get("read"):
         raise SystemExit(f"hostile strategy read the operator file: {surface}")
-    # EPERM, EACCES, or WinError 10013. A refused or timed-out connect
-    # means the socket was attempted, which is not a block.
     if surface.get("network") not in (1, 13, 10013):
         raise SystemExit(f"hostile strategy was not denied the network: {surface}")
     if "frozen-smoke-note" in json.dumps(surface):

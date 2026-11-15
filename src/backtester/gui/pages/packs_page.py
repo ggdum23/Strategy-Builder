@@ -1,4 +1,3 @@
-"""Build a named or anonymized pack. The sidecar is a path, never a document."""
 
 from __future__ import annotations
 

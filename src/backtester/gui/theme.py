@@ -1,4 +1,3 @@
-"""Dark and light themes. Fusion plus a stylesheet, so Windows and Linux match."""
 
 from __future__ import annotations
 

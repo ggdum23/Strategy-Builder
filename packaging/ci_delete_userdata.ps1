@@ -1,4 +1,3 @@
-# Reinstall, then uninstall with /DELETEUSERDATA. The market-data folder stays.
 
 param(
     [Parameter(Mandatory = $true)][string]$SetupExe,

@@ -1,4 +1,3 @@
-"""Tenth review. Designer PNGs keep rendering chunks only. Hex pack ids are not scales."""
 
 from __future__ import annotations
 
@@ -167,7 +166,6 @@ def test_source_id_mapping_is_letters_and_leaves_other_ids_alone():
 
 
 def test_forty_thousand_hex_ids_are_not_false_scales():
-    """The stored letter id is not a scale. A raw id whose value is the scale still is."""
     rng = random.Random(20261111)
     pinned = (
         "pack_25e2abcdef",

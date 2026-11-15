@@ -1,8 +1,8 @@
-"""Installer layout, frozen entry, and user-config behavior."""
 
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import sys
 from pathlib import Path, PureWindowsPath
@@ -12,12 +12,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGING = ROOT / "packaging"
 sys.path.insert(0, str(PACKAGING))
-
-import collect_optional  # noqa: E402
-import frozen_entry  # noqa: E402
-import make_icon  # noqa: E402
-import strategy_builder_config  # noqa: E402
-import versions  # noqa: E402
+collect_optional = importlib.import_module("collect_optional")
+frozen_entry = importlib.import_module("frozen_entry")
+make_icon = importlib.import_module("make_icon")
+strategy_builder_config = importlib.import_module("strategy_builder_config")
+versions = importlib.import_module("versions")
 
 DATA_ROOT = "C:\\Users\\Jeu\\Desktop\\Backtester"
 
@@ -90,6 +89,8 @@ def test_installer_script_defaults_and_keeps_user_data():
     assert "/DELETEUSERDATA" in text
     assert "UninstallSilent" in text
     assert "SaveStringsToUTF8FileWithoutBOM" in text
+    assert "if WizardSilent then" in text
+    assert "if not IsAdminInstallMode then" in text
     assert 'Flags: unchecked' in text
     assert "skipifsilent" in text
     assert "desktopicon" in text
@@ -155,8 +156,8 @@ def test_workflow_builds_installs_smokes_and_publishes():
         assert phrase in text
     smoke = (PACKAGING / "smoke_frozen.py").read_text(encoding="utf-8")
     assert "walkforward" in smoke
-    assert "multiprocessing-fork" in smoke
-    assert "backtester-design" in smoke
+    assert 'payload.get("argv") != ["strategy"]' in smoke
+    assert '"--sandbox-child" not in command' in smoke
     probe = (PACKAGING / "smoke" / "probe_strategy.py").read_text(encoding="utf-8")
     assert "GetCommandLineW.restype" in probe
     assert "c_wchar_p" in probe
@@ -219,12 +220,6 @@ def test_freeze_support_runs_before_the_application():
 
 
 def test_frozen_sandbox_child_is_this_executable_on_linux(monkeypatch):
-    """The frozen jail child is the same executable. Source runs keep the .py shim.
-
-    This does not build a Windows installer. It checks the command the jail
-    would exec, and that ``--sandbox-child`` enters ``sandbox_child.main``
-    before matplotlib and before the CLI.
-    """
     import backtester.sandbox as sandbox
     import backtester.sandbox_child as child
 
@@ -291,7 +286,6 @@ def test_version_and_placeholder_and_launcher_check(tmp_path, capsys):
         gui=True,
         environ=env,
     ) == 0
-    # The desktop package is on this branch, so the frozen window launches it.
     assert report.read_text(encoding="utf-8").strip() == "launcher-check: gui"
     config = strategy_builder_config.ensure_user_config(env, defaults)
     assert frozen_entry.show_placeholder(config, interactive=False) == 0
@@ -308,7 +302,6 @@ def test_keep_check_fails_when_the_profile_is_deleted_late():
     original = json.dumps({"schema": 1, "data_root": sentinel, "ci_marker": "upgrade-keep"})
     keeping = "Strategy Builder keeping C:\\Users\\runner\\AppData\\Local\\StrategyBuilder"
     deleting = "Strategy Builder deleting C:\\Users\\runner\\AppData\\Local\\StrategyBuilder"
-    # First-phase exit: the config is still there and the second phase has not logged.
     assert uninstall_guard.judge_keep("", original, sentinel=sentinel) == "wait"
     late_delete = [
         ("", original),
@@ -328,7 +321,6 @@ def test_keep_check_fails_when_the_profile_is_deleted_late():
     fresh = json.dumps({"schema": 1, "data_root": DATA_ROOT})
     with pytest.raises(SystemExit, match="sentinel"):
         uninstall_guard.judge_keep(keeping, fresh, sentinel=sentinel)
-    # A directory that vanished without this uninstall's deleting line is not success.
     assert uninstall_guard.judge_delete("", root_exists=False) == "wait"
     assert uninstall_guard.judge_delete(deleting, root_exists=True) == "wait"
     assert uninstall_guard.judge_delete(deleting, root_exists=False) == "ok"

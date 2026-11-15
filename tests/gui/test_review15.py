@@ -1,4 +1,3 @@
-"""Fifteenth review. A banner is the exception sentence, read off the exception."""
 
 from __future__ import annotations
 

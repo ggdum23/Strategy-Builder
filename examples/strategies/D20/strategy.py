@@ -1,26 +1,3 @@
-"""Contrarian pullback with a trend filter and a volatility kill-switch.
-
-Decision once per regular session, on the last RTH bar (15:59, or 12:59 on a
-shortened session). The order fills at the next delivered bar's open, which is
-the next session's open. Extended hours are not used.
-
-Until 200 session closes have been seen the target is +1.0 (there is nothing
-to estimate yet). After that the target is a pure function of closes already
-in hand:
-
-- trend up:        last close > 200-session simple mean
-- pullback:        last close is 5% or more below the 20-session high
-- vol kill:        stdev of the last 20 close-to-close returns, annualized
-                   with sqrt(252), is at least 30%
-
-Priority (first match wins):
-1. Vol kill and trend broken  -> 0.0  (flat)
-2. Vol kill or trend broken   -> 0.5
-3. Trend up and pullback      -> 2.0
-4. Otherwise                  -> 1.0
-
-No shorts. Targets are discrete, so an unchanged state sends no order.
-"""
 
 import math
 
@@ -65,7 +42,6 @@ class Strategy:
             return self.TARGET_BASE
         sma = sum(self.closes) / n
         hi = max(self.closes[-self.HIGH_LOOKBACK :])
-        # 20 close-to-close returns end on today's close (21 prices).
         rets = []
         start = n - (self.VOL_LOOKBACK + 1)
         for i in range(start + 1, n):
