@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import re
+import warnings
 from pathlib import Path
 
 from backtester import comment_guard
@@ -22,6 +24,7 @@ def test_comment_file_allowlist_is_exactly_the_two_pinned_cost_files():
     assert comment_guard.is_documentation("docs/screenshots/desk.png")
     assert not comment_guard.is_documentation("docs/helper.py")
     assert not comment_guard.is_documentation("docs/tool.sh")
+    assert not comment_guard.is_documentation("docs/art.svg")
     assert not comment_guard.is_documentation("src/backtester/engine_arena.py")
     assert comment_guard.issues_for("docs/helper.py", "x = 1  # hidden\n") == [
         comment_guard.Finding("docs/helper.py", 1, "comment")
@@ -113,9 +116,9 @@ def test_unknown_code_suffixes_fail_closed_and_python_windows_files_are_scanned(
 
 def test_workflow_run_blocks_scan_embedded_python_docstrings():
     heredoc = "run: |\n  python - <<'PY'\n  \"\"\"hidden\"\"\"\n  x = 1\n  PY\n"
-    assert comment_guard.yaml_issue_lines(heredoc) == [(3, "docstring")]
+    assert _has_kind(heredoc, "inline-python")
     python_shell = "- shell: python\n  run: |\n    \"\"\"hidden\"\"\"\n    x = 1\n"
-    assert comment_guard.yaml_issue_lines(python_shell) == [(3, "docstring")]
+    assert _has_kind(python_shell, "inline-python")
     bash = "run: |\n  echo hello\n"
     assert comment_guard.yaml_issue_lines(bash) == []
 
@@ -139,6 +142,10 @@ def test_sandbox_header_constants_keep_their_values():
     assert sandbox.GRANT_ACCESS == 1
     assert sandbox.REVOKE_ACCESS == 4
     assert sandbox.TRUSTEE_IS_SID == 0
+    assert sandbox.FWPM_LAYER_ALE_AUTH_CONNECT_V4 == (0xC38D57D1, 0x05A7, 0x4C33, (0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82))
+    assert sandbox.FWPM_LAYER_ALE_AUTH_CONNECT_V6 == (0x4A72393B, 0x319F, 0x44BC, (0x84, 0xC3, 0xBA, 0x54, 0xDC, 0xB3, 0xB6, 0xB4))
+    assert sandbox.FWPM_SUBLAYER_UNIVERSAL == (0xEEBECC03, 0xCED4, 0x4380, (0x81, 0x9A, 0x27, 0x34, 0x39, 0x7B, 0x2B, 0x74))
+    assert sandbox.FWPM_CONDITION_ALE_PACKAGE_ID == (0x71BC78FA, 0xF17C, 0x4997, (0xA6, 0x02, 0x6A, 0xBB, 0x26, 0x1F, 0x35, 0x1C))
     assert sandbox._LANDLOCK_READ_DIR == 1 << 3
     assert sandbox._LANDLOCK_READ == (1 << 0) | (1 << 2) | sandbox._LANDLOCK_READ_DIR
     write_bits = (1 << 1) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 13) | (1 << 14)
@@ -156,6 +163,10 @@ def test_sandbox_header_constants_keep_their_values():
     assert "grfAccessMode = REVOKE_ACCESS" in text
     assert "TrusteeForm = TRUSTEE_IS_SID" in text
     assert "_LANDLOCK_READ_DIR" in text
+    assert "guid(*FWPM_LAYER_ALE_AUTH_CONNECT_V4)" in text
+    assert "guid(*FWPM_LAYER_ALE_AUTH_CONNECT_V6)" in text
+    assert "guid(*FWPM_SUBLAYER_UNIVERSAL)" in text
+    assert "guid(*FWPM_CONDITION_ALE_PACKAGE_ID)" in text
 
 
 def test_pack_day_cuts_are_not_named_run_defaults():
@@ -164,3 +175,175 @@ def test_pack_day_cuts_are_not_named_run_defaults():
         assert "TRAIN_LAST_DAY" not in text
         assert "DESIGN_LAST_DAY" not in text
         assert re.search(r"\bWINDOWS\b", text) is None
+
+
+def _has_kind(text: str, kind: str) -> bool:
+    return any(item_kind == kind for _line, item_kind in comment_guard.yaml_issue_lines(text))
+
+
+def test_discarded_expression_statements_are_flagged():
+    samples = [
+        'f"""hidden comment"""\n',
+        'f"""hidden {1}"""\n',
+        'rf"""hidden"""\n',
+        'b"""hidden comment"""\n',
+        'rb"hidden"\n',
+        'b"hid" b"den"\n',
+        '("""hidden comment""",)\n',
+        '["hidden comment"]\n',
+        '{"hidden"}\n',
+        '{"note": "hidden"}\n',
+        "name\n",
+        "obj.attr\n",
+        "...\n",
+        "def f():\n    x = 1\n    ...\n",
+    ]
+    for sample in samples:
+        assert comment_guard.python_issue_lines(sample), sample
+    reason = "an ellipsis is the empty body of a function or class, and pass is the other spelling"
+    assert comment_guard.python_issue_lines("def f():\n    ...\n") == [], reason
+    assert comment_guard.python_issue_lines("async def f():\n    ...\n") == [], reason
+    assert comment_guard.python_issue_lines("class C:\n    ...\n") == [], reason
+    assert comment_guard.python_issue_lines("name()\n") == []
+    assert comment_guard.python_issue_lines("(x := 1)\n") == []
+    assert comment_guard.python_issue_lines("def f():\n    yield 1\n") == []
+    assert comment_guard.python_issue_lines("async def f():\n    await name()\n") == []
+
+
+def test_generated_no_effect_expression_statements_are_flagged():
+    rng = random.Random(15)
+    atoms = [
+        "0",
+        "None",
+        "True",
+        "...",
+        "'text'",
+        '"text"',
+        '"""hidden comment"""',
+        "b'hid'",
+        'b"""hidden comment"""',
+        "rb'hidden'",
+        'b"hid" b"den"',
+        'f"hidden"',
+        'f"""hidden comment"""',
+        'f"""hidden {1}"""',
+        'rf"""hidden"""',
+        "name",
+        "obj.attr",
+        "obj.attr.other",
+    ]
+
+    def compose(depth: int) -> str:
+        if depth >= 3 or rng.randrange(4) == 0:
+            return rng.choice(atoms)
+        kind = rng.choice(["paren", "tuple", "list", "dict", "attr", "subscript", "binop", "compare", "ifexp", "lambda", "gen", "set"])
+        inner = compose(depth + 1)
+        if kind == "paren":
+            return f"({inner})"
+        if kind == "tuple":
+            return f"({inner}, {compose(depth + 1)})"
+        if kind == "list":
+            return f"[{inner}, {compose(depth + 1)}]"
+        if kind == "dict":
+            return "{'k': " + inner + "}"
+        if kind == "attr":
+            return f"({inner}).attr"
+        if kind == "subscript":
+            return f"({inner})[0]"
+        if kind == "binop":
+            return f"({inner} + {compose(depth + 1)})"
+        if kind == "compare":
+            return f"({inner} == {compose(depth + 1)})"
+        if kind == "ifexp":
+            return f"({inner} if flag else {compose(depth + 1)})"
+        if kind == "lambda":
+            return f"(lambda: {inner})"
+        if kind == "gen":
+            return f"({inner} for item in items)"
+        return "{" + inner + "}"
+
+    produced = 0
+    for _ in range(80):
+        expr = compose(0)
+        for source in (expr + "\n", "def f():\n    value = 1\n    " + expr + "\n"):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SyntaxWarning)
+                    compile(source, "<generated>", "exec")
+            except SyntaxError:
+                continue
+            findings = comment_guard.python_issue_lines(source)
+            assert findings, source
+            produced += 1
+    assert produced >= 80
+    allowed = [
+        "name()\n",
+        "obj.method()\n",
+        "name() + 1\n",
+        "(x := 1)\n",
+        "name() if flag else other\n",
+        "(lambda x=name(): x)\n",
+        "(item for item in name())\n",
+        'f"{name()}"\n',
+        "[name() for item in items]\n",
+        "def f():\n    yield 1\n",
+        "def f():\n    yield from name()\n",
+        "async def f():\n    await name()\n",
+        "def f():\n    ...\n",
+        "class C:\n    ...\n",
+    ]
+    for source in allowed:
+        assert comment_guard.python_issue_lines(source) == [], source
+
+
+def test_workflow_inline_python_and_yaml_comments_fail_closed():
+    indented = "run: |\n  python - <<'PY'\n    \"\"\"hidden\"\"\"\n    x = 1\n  PY\n"
+    assert _has_kind(indented, "inline-python")
+    colon = "run: |\n  python - <<'PY'\n  x = 1  # hidden\n  :\n  PY\n"
+    assert _has_kind(colon, "inline-python")
+    explicit = "- shell: python\n  run: |2\n    \"\"\"hidden\"\"\"\n"
+    assert _has_kind(explicit, "inline-python")
+    shell_after = "- run: |\n    \"\"\"hidden\"\"\"\n  shell: python\n"
+    assert _has_kind(shell_after, "inline-python")
+    unbuffered = "- shell: python -u\n  run: |\n    \"\"\"hidden\"\"\"\n"
+    assert _has_kind(unbuffered, "inline-python")
+    command = "run: |\n  python -c 'x = 1  # hidden'\n"
+    assert _has_kind(command, "inline-python")
+    defaults = "jobs:\n  test:\n    defaults:\n      run:\n        shell: python\n    steps:\n      - run: |\n          \"\"\"hidden\"\"\"\n"
+    assert _has_kind(defaults, "inline-python")
+    written = "run: |\n  cat > tool.py << 'PY'\n  \"\"\"hidden\"\"\"\n  PY\n"
+    assert _has_kind(written, "inline-python")
+    data = "run: |\n  cat <<'EOF'\n  # not a comment\n  EOF\n"
+    assert comment_guard.yaml_issue_lines(data) == []
+    assert comment_guard.yaml_issue_lines("name: ci # hidden\n") == [(1, "comment")]
+    assert comment_guard.yaml_issue_lines('title: "echo # no"\n') == []
+    assert comment_guard.yaml_issue_lines("run: |\n  echo hello # hidden\n") == [(2, "comment")]
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines("a: &anchor 1\n"))
+
+
+def test_config_comments_are_case_insensitive_and_cover_ini_and_markup():
+    assert comment_guard.issues_for("Requirements.txt", "# hidden\n") == [
+        comment_guard.Finding("Requirements.txt", 1, "comment")
+    ]
+    assert comment_guard.issues_for("requirements.TXT", "# hidden\n") == [
+        comment_guard.Finding("requirements.TXT", 1, "comment")
+    ]
+    assert comment_guard.issues_for("setup.cfg", "; hidden\n") == [
+        comment_guard.Finding("setup.cfg", 1, "comment")
+    ]
+    assert comment_guard.issues_for("app.INI", "; hidden\n") == [
+        comment_guard.Finding("app.INI", 1, "comment")
+    ]
+    assert comment_guard.issues_for("setup.cfg", "key = 'a; b'\n") == []
+    assert comment_guard.issues_for("art.svg", "<svg><!-- hidden --></svg>\n") == [
+        comment_guard.Finding("art.svg", 1, "comment")
+    ]
+    assert comment_guard.issues_for("docs/art.svg", "<!-- hidden -->\n") == [
+        comment_guard.Finding("docs/art.svg", 1, "comment")
+    ]
+    assert comment_guard.issues_for("note.xml", "<!-- hidden -->\n") == [
+        comment_guard.Finding("note.xml", 1, "comment")
+    ]
+    assert comment_guard.issues_for("page.HTML", "<!-- hidden -->\n") == [
+        comment_guard.Finding("page.HTML", 1, "comment")
+    ]
