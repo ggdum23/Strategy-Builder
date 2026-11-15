@@ -13,10 +13,11 @@ FILE_ALLOWLIST = (
 
 DIRECTIVE_ALLOWLIST: tuple[tuple[str, str], ...] = ()
 
-_DOC_PARENTS = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 _HASH_SUFFIXES = {".toml", ".ini", ".cfg"}
 _SLASH_SUFFIXES = {".js", ".mjs", ".cjs", ".qml"}
-_PY_SUFFIXES = {".py", ".spec"}
+_PY_SUFFIXES = {".py", ".pyw", ".spec"}
+_DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico"}
+_DATA_SUFFIXES = {".csv", ".gif", ".gz", ".ico", ".jpeg", ".jpg", ".json", ".png", ".svg", ".txt", ".webp", ".xz", ".zip"}
 
 
 class Finding:
@@ -24,6 +25,11 @@ class Finding:
         self.path = path
         self.line = line
         self.kind = kind
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Finding):
+            return False
+        return (self.path, self.line, self.kind) == (other.path, other.line, other.kind)
 
     def __repr__(self) -> str:
         return f"Finding({self.path!r}, {self.line}, {self.kind!r})"
@@ -149,20 +155,40 @@ def python_spans(text: str) -> list[tuple[int, int, str]]:
             start, end = _expand_lines(normalized, starts, start, end)
         spans.append((start, end, ""))
     tree = ast.parse(normalized)
+    spans.extend(_string_statement_spans(normalized, starts, tree))
+    spans.sort()
+    return spans
+
+
+def _string_statement_spans(text: str, starts: list[int], tree: ast.AST) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
     for node in ast.walk(tree):
-        if not isinstance(node, _DOC_PARENTS) or not node.body or not _is_string_statement(node.body[0]):
-            continue
-        statement = node.body[0]
+        for field in ("body", "orelse", "finalbody"):
+            body = getattr(node, field, None)
+            if not isinstance(body, list) or not body or not all(isinstance(item, ast.stmt) for item in body):
+                continue
+            allow_empty = isinstance(node, ast.Module) and field == "body"
+            spans.extend(_body_string_spans(text, starts, body, allow_empty=allow_empty))
+    return spans
+
+
+def _body_string_spans(text: str, starts: list[int], body: list[ast.stmt], *, allow_empty: bool) -> list[tuple[int, int, str]]:
+    strings = [statement for statement in body if _is_string_statement(statement)]
+    if not strings:
+        return []
+    replace_first = not allow_empty and len(strings) == len(body)
+    spans: list[tuple[int, int, str]] = []
+    for index, statement in enumerate(strings):
+        end_line = statement.end_lineno if statement.end_lineno is not None else statement.lineno
+        end_column = statement.end_col_offset if statement.end_col_offset is not None else statement.col_offset
         start = _position(starts, statement.lineno, statement.col_offset)
-        end = _position(starts, statement.end_lineno, statement.end_col_offset)
-        needs_pass = not isinstance(node, ast.Module) and len(node.body) == 1
-        if needs_pass:
+        end = _position(starts, end_line, end_column)
+        if replace_first and index == 0:
             spans.append((start, end, "pass"))
             continue
-        if _outside_is_whitespace(normalized, starts, start, end):
-            start, end = _expand_lines(normalized, starts, start, end)
+        if _outside_is_whitespace(text, starts, start, end):
+            start, end = _expand_lines(text, starts, start, end)
         spans.append((start, end, ""))
-    spans.sort()
     return spans
 
 
@@ -207,22 +233,27 @@ def _unique_lines(found: list[tuple[int, str]]) -> list[tuple[int, str]]:
     return ordered
 
 
-def _quote_spans_and_hashes(text: str, quote: str) -> list[tuple[int, int]]:
+def _hash_comment_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     index = 0
     size = len(text)
     while index < size:
-        if text.startswith(quote * 3, index):
+        if text.startswith('"""', index) or text.startswith("'''", index):
+            quote = text[index : index + 3]
             index += 3
-            while index < size and not text.startswith(quote * 3, index):
+            while index < size and not text.startswith(quote, index):
+                if quote == '"""' and text[index] == "\\":
+                    index += 2
+                    continue
                 index += 1
             index = min(size, index + 3)
             continue
         char = text[index]
-        if char == quote:
+        if char in "'\"":
+            quote = char
             index += 1
             while index < size:
-                if text[index] == "\\":
+                if quote == '"' and text[index] == "\\":
                     index += 2
                     continue
                 if text[index] == quote:
@@ -243,7 +274,7 @@ def _quote_spans_and_hashes(text: str, quote: str) -> list[tuple[int, int]]:
 def hash_config_issue_lines(text: str) -> list[tuple[int, str]]:
     normalized = _normalize_newlines(text)
     starts = _line_starts(normalized)
-    found = [(_line_number(starts, start), "comment") for start, _end in _quote_spans_and_hashes(normalized, '"')]
+    found = [(_line_number(starts, start), "comment") for start, _end in _hash_comment_spans(normalized)]
     return found
 
 
@@ -389,7 +420,10 @@ def _inno_slash_comment(line: str) -> int | None:
 def shell_issue_lines(text: str) -> list[tuple[int, str]]:
     normalized = _normalize_newlines(text)
     starts = _line_starts(normalized)
-    found = [(_line_number(starts, start), "comment") for start, _end in _shell_comment_spans(normalized)]
+    found = []
+    for start, _end in _shell_comment_spans(normalized):
+        kind = "docstring" if _span_is_docstring(normalized, start) else "comment"
+        found.append((_line_number(starts, start), kind))
     return found
 
 
@@ -401,14 +435,13 @@ def _shell_comment_spans(text: str) -> list[tuple[int, int]]:
         if text.startswith("<<", index):
             index, body_start, body_end = _skip_heredoc(text, index)
             body = text[body_start:body_end]
-            if "#" in body:
-                try:
-                    ast.parse(body)
-                except SyntaxError:
-                    pass
-                else:
-                    for start, end, _replacement in python_spans(body):
-                        spans.append((body_start + start, body_start + end))
+            try:
+                ast.parse(body)
+            except SyntaxError:
+                pass
+            else:
+                for start, end, _replacement in python_spans(body):
+                    spans.append((body_start + start, body_start + end))
             continue
         char = text[index]
         if char == "'":
@@ -635,25 +668,39 @@ def yaml_issue_lines(text: str) -> list[tuple[int, str]]:
         body = lines[body_start:index]
         shell = _step_shell(lines, body_start)
         script = _dedent(body)
-        if shell in {"pwsh", "powershell"}:
-            issues = powershell_issue_lines(script)
-        else:
-            issues = shell_issue_lines(script)
-        for script_line, kind in issues:
+        for script_line, kind in _script_issues(shell, script):
             found.append((body_start + script_line, kind))
     return _unique_lines(found)
 
 
+def _shell_value(stripped: str) -> str | None:
+    marker = "shell:"
+    position = stripped.find(marker)
+    if position < 0:
+        return None
+    return stripped[position + len(marker) :].strip().strip("\"'")
+
+
 def _step_shell(lines: list[str], body_start: int) -> str:
-    cursor = body_start - 2
+    cursor = body_start - 1
     while cursor >= 0:
         stripped = lines[cursor].strip()
+        value = _shell_value(stripped)
+        if value is not None:
+            return value
         if stripped.startswith("- "):
             break
-        if stripped.startswith("shell:"):
-            return stripped.split(":", 1)[1].strip().strip("\"'")
         cursor -= 1
     return "bash"
+
+
+def _script_issues(shell: str, script: str) -> list[tuple[int, str]]:
+    folded = shell.lower()
+    if folded in {"pwsh", "powershell"}:
+        return powershell_issue_lines(script)
+    if folded in {"python", "python3", "py"}:
+        return python_issue_lines(script)
+    return shell_issue_lines(script)
 
 
 def _kind(path: str) -> str | None:
@@ -683,7 +730,9 @@ def _kind(path: str) -> str | None:
         return "html"
     if name.startswith("requirements") and name.endswith(".txt"):
         return "hashconfig"
-    return None
+    if suffix in _DATA_SUFFIXES:
+        return None
+    return "unscanned"
 
 
 def _issue_lines(kind: str, text: str) -> list[tuple[int, str]]:
@@ -724,7 +773,7 @@ def strip_text(kind: str, text: str) -> str:
     elif kind == "yaml":
         stripped = _strip_yaml(normalized)
     elif kind == "hashconfig":
-        stripped = _delete_spans(normalized, _quote_spans_and_hashes(normalized, '"'))
+        stripped = _delete_spans(normalized, _hash_comment_spans(normalized))
     elif kind == "gitignore":
         kept = [line for line in normalized.split("\n") if not line.lstrip(" \t").startswith("#")]
         stripped = "\n".join(kept)
@@ -816,10 +865,7 @@ def _strip_yaml(text: str) -> str:
         shell = _step_shell(lines, body_start)
         script_lines = _dedent(body).split("\n")
         script = "\n".join(script_lines)
-        if shell in {"pwsh", "powershell"}:
-            issues = {line_number for line_number, _kind in powershell_issue_lines(script)}
-        else:
-            issues = {line_number for line_number, _kind in shell_issue_lines(script)}
+        issues = {line_number for line_number, _issue in _script_issues(shell, script)}
         for script_line in issues:
             remove.add(body_start + script_line - 1)
     kept = []
@@ -850,10 +896,11 @@ def _strip_inno(text: str) -> str:
     return stripped
 
 
-def _is_documentation(path: str) -> bool:
-    if path.startswith("docs/"):
+def is_documentation(path: str) -> bool:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".md":
         return True
-    if path.endswith(".md"):
+    if path.startswith("docs/") and suffix in _DOC_IMAGE_SUFFIXES:
         return True
     return False
 
@@ -869,20 +916,36 @@ def tracked_paths(root: Path) -> list[str]:
     return [item for item in raw.split("\0") if item]
 
 
+def issues_for(path: str, text: str) -> list[Finding]:
+    if path in FILE_ALLOWLIST or is_documentation(path):
+        return []
+    kind = _kind(path)
+    if kind is None:
+        return []
+    if kind == "unscanned":
+        return [Finding(path, 1, "unscanned")]
+    findings: list[Finding] = []
+    for line, issue in _issue_lines(kind, text):
+        if issue == "comment" and _directive_allowed(path, _line_text(text, line)):
+            continue
+        findings.append(Finding(path, line, issue))
+    return findings
+
+
 def scan(root: Path | None = None) -> list[Finding]:
     base = root or repo_root()
     findings: list[Finding] = []
     for relative in tracked_paths(base):
-        if relative in FILE_ALLOWLIST or _is_documentation(relative):
+        if relative in FILE_ALLOWLIST or is_documentation(relative):
             continue
         kind = _kind(relative)
         if kind is None:
             continue
+        if kind == "unscanned":
+            findings.append(Finding(relative, 1, "unscanned"))
+            continue
         text = (base / relative).read_text(encoding="utf-8")
-        for line, issue in _issue_lines(kind, text):
-            if issue == "comment" and _directive_allowed(relative, _line_text(text, line)):
-                continue
-            findings.append(Finding(relative, line, issue))
+        findings.extend(issues_for(relative, text))
     return findings
 
 

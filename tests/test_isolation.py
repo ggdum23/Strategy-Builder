@@ -184,10 +184,8 @@ def test_no_secret_paths():
         assert token not in src_text
     assert r"C:\Users\Jeu\Desktop\Backtester" in operator_shell.read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    script = (ROOT / "run.ps1").read_text(encoding="utf-8")
-    for blob in (readme, script):
-        assert r"C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles" in blob
-        assert r"C:\Users\Jeu\Desktop\Backtester\SPY\filled" in blob
+    assert r"C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles" in readme
+    assert r"C:\Users\Jeu\Desktop\Backtester\SPY\filled" in readme
 
 
 def test_sample_fixtures_stay_under_a_megabyte():

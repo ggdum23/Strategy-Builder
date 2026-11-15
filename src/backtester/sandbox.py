@@ -144,11 +144,44 @@ _SANDBOX_DENY = (
     "pidfd_getfd",
 )
 
+FWP_MATCH_EQUAL = 0
+FWP_SID = 13
+FWP_UINT64 = 4
+FWP_ACTION_BLOCK = 0x1001
+SE_FILE_OBJECT = 1
+DACL_SECURITY_INFORMATION = 4
+OWNER_SECURITY_INFORMATION = 1
+FWPM_SESSION_FLAG_DYNAMIC = 0x1
+RPC_C_AUTHN_WINNT = 10
+FILE_TRAVERSE = 0x20
+FILE_READ_ATTRIBUTES = 0x80
+SYNCHRONIZE = 0x100000
+GRANT_ACCESS = 1
+REVOKE_ACCESS = 4
+TRUSTEE_IS_SID = 0
+
 _LANDLOCK_HANDLED_FS = 0xFFFF
 _LANDLOCK_EXECUTE = 1 << 0
+_LANDLOCK_WRITE_FILE = 1 << 1
 _LANDLOCK_READ_FILE = 1 << 2
-_LANDLOCK_READ = _LANDLOCK_EXECUTE | _LANDLOCK_READ_FILE | (1 << 3)
-_LANDLOCK_WRITE = _LANDLOCK_READ | (1 << 1) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 13) | (1 << 14)
+_LANDLOCK_READ_DIR = 1 << 3
+_LANDLOCK_REMOVE_DIR = 1 << 4
+_LANDLOCK_REMOVE_FILE = 1 << 5
+_LANDLOCK_MAKE_DIR = 1 << 7
+_LANDLOCK_MAKE_REG = 1 << 8
+_LANDLOCK_REFER = 1 << 13
+_LANDLOCK_TRUNCATE = 1 << 14
+_LANDLOCK_READ = _LANDLOCK_EXECUTE | _LANDLOCK_READ_FILE | _LANDLOCK_READ_DIR
+_LANDLOCK_WRITE = (
+    _LANDLOCK_READ
+    | _LANDLOCK_WRITE_FILE
+    | _LANDLOCK_REMOVE_DIR
+    | _LANDLOCK_REMOVE_FILE
+    | _LANDLOCK_MAKE_DIR
+    | _LANDLOCK_MAKE_REG
+    | _LANDLOCK_REFER
+    | _LANDLOCK_TRUNCATE
+)
 
 
 class _SockFilter(ctypes.Structure):
@@ -651,7 +684,7 @@ def _read_dacl_entries(path: Path):
     dacl = ctypes.c_void_p()
     security = ctypes.c_void_p()
     status = advapi.GetNamedSecurityInfoW(
-        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+        str(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
     )
     if status != 0 or not security.value:
         if security.value:
@@ -749,7 +782,7 @@ def _owner_sid_text(path: Path) -> str:
     owner = ctypes.c_void_p()
     security = ctypes.c_void_p()
     status = advapi.GetNamedSecurityInfoW(
-        str(path), 1, 1, ctypes.byref(owner), None, None, None, ctypes.byref(security)
+        str(path), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, ctypes.byref(owner), None, None, None, ctypes.byref(security)
     )
     if status != 0 or not security.value or not owner.value:
         if security.value:
@@ -1729,8 +1762,8 @@ def _win_wfp_block(lease: _WinLease) -> None:
     session = Session()
     session.displayData.name = name
     session.displayData.description = name
-    session.flags = 0x1
-    status = fwpu.FwpmEngineOpen0(None, 10, None, ctypes.byref(session), ctypes.byref(engine))
+    session.flags = FWPM_SESSION_FLAG_DYNAMIC
+    status = fwpu.FwpmEngineOpen0(None, RPC_C_AUTHN_WINNT, None, ctypes.byref(session), ctypes.byref(engine))
     if status != 0 or not engine.value:
         raise SandboxError(f"the firewall engine did not open (winerror {status})")
     weight = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
@@ -1743,19 +1776,19 @@ def _win_wfp_block(lease: _WinLease) -> None:
     for label, layer in layers:
         condition = Condition()
         condition.fieldKey = guid(0x71BC78FA, 0xF17C, 0x4997, (0xA6, 0x02, 0x6A, 0xBB, 0x26, 0x1F, 0x35, 0x1C))
-        condition.matchType = 0
-        condition.value.type = 13
+        condition.matchType = FWP_MATCH_EQUAL
+        condition.value.type = FWP_SID
         condition.value.ptr = lease.sid
         filt = Filter()
         filt.displayData.name = name
         filt.displayData.description = name
         filt.layerKey = layer
         filt.subLayerKey = universal
-        filt.weight.type = 4
+        filt.weight.type = FWP_UINT64
         filt.weight.ptr = ctypes.cast(ctypes.byref(weight), ctypes.c_void_p)
         filt.numFilterConditions = 1
         filt.filterCondition = ctypes.pointer(condition)
-        filt.action.type = 0x1001
+        filt.action.type = FWP_ACTION_BLOCK
         added = ctypes.c_uint64()
         status = fwpu.FwpmFilterAdd0(engine, ctypes.byref(filt), None, ctypes.byref(added))
         if status != 0:
@@ -3274,7 +3307,7 @@ def _runtime_acl_entries(lease, *, lock: bool):
         entries[index].grfAccessPermissions = int(mask)
         entries[index].grfAccessMode = int(mode)
         entries[index].grfInheritance = _INHERIT_BOTH
-        entries[index].Trustee.TrusteeForm = 0
+        entries[index].Trustee.TrusteeForm = TRUSTEE_IS_SID
         entries[index].Trustee.ptstrName = sid
     return entries, sids, kernel, ExplicitAccess
 
@@ -3611,15 +3644,17 @@ def _win_grant_traverse(lease: _WinLease, path: Path) -> None:
     advapi.SetNamedSecurityInfoW.restype = ctypes.c_uint32
     dacl = ctypes.c_void_p()
     security = ctypes.c_void_p()
-    status = advapi.GetNamedSecurityInfoW(str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security))
+    status = advapi.GetNamedSecurityInfoW(
+        str(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+    )
     if status != 0:
         raise SandboxError(f"could not read the ACL on {path} (winerror {status})")
     null_dacl = not dacl.value
     entry = ExplicitAccess()
-    entry.grfAccessPermissions = 0x20 | 0x80 | 0x100000
-    entry.grfAccessMode = 1
+    entry.grfAccessPermissions = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    entry.grfAccessMode = GRANT_ACCESS
     entry.grfInheritance = 0
-    entry.Trustee.TrusteeForm = 0
+    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID
     entry.Trustee.ptstrName = lease.sid
     updated = ctypes.c_void_p()
     try:
@@ -3703,7 +3738,7 @@ def _win_ace_present(lease: _WinLease, path: Path, mask: int, ace_type: int) -> 
     dacl = ctypes.c_void_p()
     security = ctypes.c_void_p()
     status = advapi.GetNamedSecurityInfoW(
-        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+        str(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
     )
     if status != 0 or not security.value:
         return False
@@ -3758,7 +3793,7 @@ def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit:
     dacl = ctypes.c_void_p()
     security = ctypes.c_void_p()
     status = advapi.GetNamedSecurityInfoW(
-        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+        str(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
     )
     if status != 0:
         raise SandboxError(f"could not read the ACL on {path} (winerror {status})")
@@ -3767,7 +3802,7 @@ def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit:
     entry.grfAccessPermissions = int(mask)
     entry.grfAccessMode = int(mode)
     entry.grfInheritance = int(inherit)
-    entry.Trustee.TrusteeForm = 0
+    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID
     entry.Trustee.ptstrName = lease.sid
     advapi.SetEntriesInAclW.argtypes = [
         ctypes.c_uint32,
@@ -3793,7 +3828,7 @@ def _win_change_ace(lease: _WinLease, path: Path, mask: int, mode: int, inherit:
 _PACKAGE_SID_TEXTS = ("S-1-15-2-1", "S-1-15-2-2")
 _PACKAGE_SIDS: list | None = None
 _FILE_READ_DATA = 0x1
-_FILE_TRAVERSE_BIT = 0x20
+_FILE_TRAVERSE_BIT = FILE_TRAVERSE
 _GENERIC_READ = 0x80000000
 _GENERIC_EXECUTE = 0x20000000
 _GENERIC_ALL = 0x10000000
@@ -3909,7 +3944,7 @@ def _existing_package_access(path, *, read: bool, traverse: bool, extra_sid=None
     dacl = ctypes.c_void_p()
     security = ctypes.c_void_p()
     status = advapi.GetNamedSecurityInfoW(
-        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+        str(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
     )
     if status != 0 or not security.value:
         if security.value:
@@ -3951,7 +3986,7 @@ def _existing_package_access(path, *, read: bool, traverse: bool, extra_sid=None
 
 
 def _traverse_already_allowed(lease: _WinLease, path: Path) -> bool:
-    mask = _FILE_TRAVERSE_BIT | 0x80 | 0x100000
+    mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
     if _win_ace_present(lease, path, mask, 0):
         return True
     return _existing_package_access(path, read=False, traverse=True, extra_sid=lease.sid)
@@ -4035,15 +4070,15 @@ def _win_revoke_ace(lease: _WinLease, path: Path) -> None:
     dacl = ctypes.c_void_p()
     security = ctypes.c_void_p()
     status = advapi.GetNamedSecurityInfoW(
-        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
+        str(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None, ctypes.byref(dacl), None, ctypes.byref(security)
     )
     if status != 0 or not dacl.value:
         if security.value:
             kernel.LocalFree(security)
         return
     entry = ExplicitAccess()
-    entry.grfAccessMode = 4
-    entry.Trustee.TrusteeForm = 0
+    entry.grfAccessMode = REVOKE_ACCESS
+    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID
     entry.Trustee.ptstrName = lease.sid
     advapi.SetEntriesInAclW.argtypes = [
         ctypes.c_uint32,
