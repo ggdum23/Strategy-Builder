@@ -94,48 +94,49 @@ def test_installer_script_defaults_and_keeps_user_data():
     assert 'Flags: unchecked' in text
     assert "skipifsilent" in text
     assert "desktopicon" in text
-    install = (PACKAGING / "ci_install.ps1").read_text(encoding="utf-8")
-    uninstall = (PACKAGING / "ci_uninstall.ps1").read_text(encoding="utf-8")
+    install = (PACKAGING / "ci_install.py").read_text(encoding="utf-8")
+    uninstall = (PACKAGING / "ci_uninstall.py").read_text(encoding="utf-8")
     assert "/VERYSILENT" in install and "/CURRENTUSER" in install
-    assert 'must contain a space' in install
-    assert "Wait-GuiProcess" in install and "Wait-GuiProcess" in uninstall
-    assert "DeleteUserData" in uninstall
+    assert "must contain a space" in install
+    assert "wait_gui_process" in install and "wait_gui_process" in uninstall
+    assert "--delete-user-data" in uninstall
     assert "/DELETEUSERDATA" in uninstall
     assert "DELETEUSERDATA left" in uninstall
-    assert "AddSeconds(30)" in uninstall
+    assert "time.monotonic() + 30" in uninstall
     assert "uninstall_guard.py" in uninstall
-    assert "_unins.tmp" in uninstall
-    assert "unins*" in uninstall
-    assert uninstall.index("uninstall_guard.py") < uninstall.index('Write-Output "kept $userRoot"')
+    assert '"_unins.tmp"' in (PACKAGING / "ci_process.py").read_text(encoding="utf-8")
+    assert 'startswith("unins")' in (PACKAGING / "ci_process.py").read_text(encoding="utf-8")
+    assert uninstall.index("uninstall_guard.py") < uninstall.index('print(f"kept {user_root}")')
     assert "ci-preserve.txt" in uninstall
-    upgrade = (PACKAGING / "ci_upgrade.ps1").read_text(encoding="utf-8")
+    upgrade = (PACKAGING / "ci_upgrade.py").read_text(encoding="utf-8")
     assert "upgrade-keep" in upgrade
     assert "ci_marker" in upgrade
-    delete = (PACKAGING / "ci_delete_userdata.ps1").read_text(encoding="utf-8")
-    assert "DeleteUserData" in delete
+    delete = (PACKAGING / "ci_delete_userdata.py").read_text(encoding="utf-8")
+    assert "import ci_process" in delete
+    assert "--delete-user-data" in delete
     assert "keep-uninstall removed" in delete
     assert "ci-sentinel-keep.txt" in delete
     assert "ci-data-root-keep.txt" in delete
-    helper = (PACKAGING / "ci_process.ps1").read_text(encoding="utf-8")
-    assert "WaitForExit" in helper
-    assert "UseShellExecute = $false" in helper
+    helper = (PACKAGING / "ci_process.py").read_text(encoding="utf-8")
+    assert "subprocess.run" in helper
+    assert "use_shell_execute = False" in helper
 
 
 def test_workflow_builds_installs_smokes_and_publishes():
     text = (ROOT / ".github" / "workflows" / "installer.yml").read_text(encoding="utf-8")
     assert "windows-latest" in text
     assert "pyinstaller==6.22.3" in (PACKAGING / "requirements-build.txt").read_text(encoding="utf-8")
-    build = (PACKAGING / "build_windows.ps1").read_text(encoding="utf-8")
-    assert '$InnoVersion = "6.7.4"' in build
+    build = (PACKAGING / "build_windows.py").read_text(encoding="utf-8")
+    assert 'INNO_VERSION = "6.7.4"' in build
     assert "$innoVersion" not in build
-    assert "$AppVersion" in build
-    assert "innosetup-$InnoVersion.exe" in build
+    assert "/DAppVersion=" in build
+    assert "innosetup-6.7.4.exe" in build
     assert "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c" in build
-    assert build.index("Inno Setup download hash") < build.index("Wait-GuiProcess")
-    assert "Test-ExactInnoVersion" in build
+    assert build.index("Inno Setup download hash") < build.index("wait_gui_process")
+    assert "def _exact_inno_version" in build
     assert "Compiler engine version" in build
-    assert "function Get-LeadingVersion" not in build
-    assert "$parts.Count -ne $required.Count" in build
+    assert "Get-LeadingVersion" not in build
+    assert "len(parts) != len(required)" in build
     assert "preinstalled compilers are not used" in build
     for phrase in (
         "Build installer",
@@ -150,8 +151,8 @@ def test_workflow_builds_installs_smokes_and_publishes():
         "softprops/action-gh-release",
         "Strategy Builder",
         "smoke_frozen.py",
-        "ci_install.ps1",
-        "ci_uninstall.ps1",
+        "ci_install.py",
+        "ci_uninstall.py",
     ):
         assert phrase in text
     smoke = (PACKAGING / "smoke_frozen.py").read_text(encoding="utf-8")

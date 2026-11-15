@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 import subprocess
 import tokenize
+import unicodedata
 from io import StringIO
 from pathlib import Path
 
@@ -15,11 +17,12 @@ FILE_ALLOWLIST = (
 DIRECTIVE_ALLOWLIST: tuple[tuple[str, str], ...] = ()
 
 _HASH_SUFFIXES = {".toml"}
-_SLASH_SUFFIXES = {".js", ".mjs", ".cjs", ".qml"}
 _PY_SUFFIXES = {".py", ".pyw", ".spec"}
 _DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico"}
-_DATA_SUFFIXES = {".csv", ".gif", ".gz", ".ico", ".jpeg", ".jpg", ".json", ".png", ".txt", ".webp", ".xz", ".zip"}
-_PY_EXES = {"python", "python2", "python3", "py", "python.exe", "python2.exe", "python3.exe", "py.exe"}
+_DATA_SUFFIXES = {".csv", ".gif", ".gz", ".ico", ".jpeg", ".jpg", ".png", ".webp", ".xz", ".zip"}
+_PROSE_TEXT_NAMES = {"license.txt", "install_before.txt"}
+_DATA_TEXT_NAMES = {"engine_sha256.txt"}
+_HTML_ACTIVE = re.compile(r"(?i)(?:<script|<style|(?:^|[\s<])style\s*=|(?<![A-Za-z0-9])on[a-z0-9:-]*\s*=)")
 _KEY_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:(.*)$")
 _BLOCK_STYLE = re.compile(r"[|>](?:[+-][1-9]?|[1-9][+-]?)?$")
 
@@ -111,16 +114,8 @@ def _line_bounds(text: str, starts: list[int], line: int) -> tuple[int, int, int
     return begin, content_end, end
 
 
-def _expression_has_effect(node: ast.AST) -> bool:
-    if isinstance(node, ast.Lambda):
-        defaults = list(node.args.defaults)
-        defaults.extend(item for item in node.args.kw_defaults if item is not None)
-        return any(_expression_has_effect(item) for item in defaults)
-    if isinstance(node, ast.GeneratorExp):
-        return bool(node.generators) and _expression_has_effect(node.generators[0].iter)
-    if isinstance(node, (ast.Call, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr)):
-        return True
-    return any(_expression_has_effect(child) for child in ast.iter_child_nodes(node))
+def _expression_is_allowed(node: ast.AST) -> bool:
+    return isinstance(node, (ast.Call, ast.Await, ast.Yield, ast.YieldFrom))
 
 
 def _bare_ellipsis(statement: ast.Expr, text: str, starts: list[int]) -> bool:
@@ -206,7 +201,7 @@ def _body_no_effect_spans(
             continue
         if stub_ok and len(body) == 1 and _bare_ellipsis(statement, text, starts):
             continue
-        if _expression_has_effect(statement.value):
+        if _expression_is_allowed(statement.value):
             continue
         discarded.append(statement)
     if not discarded:
@@ -241,11 +236,26 @@ def strip_python(text: str) -> str:
     return _restore_newlines(stripped, style)
 
 
+def _rejected_text(text: str) -> bool:
+    if text.startswith("\ufeff"):
+        return True
+    for char in text:
+        if char != "#" and unicodedata.normalize("NFKC", char) == "#":
+            return True
+    return False
+
+
 def python_issue_lines(text: str) -> list[tuple[int, str]]:
+    if _rejected_text(text):
+        return [(1, "unscanned")]
     normalized = _normalize_newlines(text)
     starts = _line_starts(normalized)
+    try:
+        spans = python_spans(text)
+    except (SyntaxError, ValueError, UnicodeError, tokenize.TokenError):
+        return [(1, "unscanned")]
     found: list[tuple[int, str]] = []
-    for start, _end, replacement in python_spans(text):
+    for start, _end, replacement in spans:
         kind = "docstring" if replacement == "pass" or _span_is_docstring(normalized, start) else "comment"
         found.append((_line_number(starts, start), kind))
     return _unique_lines(found)
@@ -322,99 +332,6 @@ def gitignore_issue_lines(text: str) -> list[tuple[int, str]]:
     return found
 
 
-def powershell_issue_lines(text: str) -> list[tuple[int, str]]:
-    normalized = _normalize_newlines(text)
-    starts = _line_starts(normalized)
-    found = [(_line_number(starts, start), "comment") for start, _end in _powershell_spans(normalized)]
-    return found
-
-
-def _here_string_opens(text: str, index: int) -> bool:
-    cursor = index + 2
-    while cursor < len(text) and text[cursor] in " \t":
-        cursor += 1
-    return cursor >= len(text) or text[cursor] == "\n"
-
-
-def _skip_here_string(text: str, index: int, quote: str) -> int:
-    newline = text.find("\n", index)
-    if newline < 0:
-        return len(text)
-    cursor = newline + 1
-    closer = quote + "@"
-    while cursor < len(text):
-        newline = text.find("\n", cursor)
-        if newline < 0:
-            newline = len(text)
-        stripped = text[cursor:newline].lstrip(" \t")
-        if stripped.startswith(closer):
-            return newline
-        cursor = newline + 1 if newline < len(text) else len(text)
-    return len(text)
-
-
-def _powershell_spans(text: str) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    index = 0
-    size = len(text)
-    while index < size:
-        if text.startswith("<#", index):
-            start = index
-            index += 2
-            while index < size and not text.startswith("#>", index):
-                index += 1
-            index = min(size, index + 2)
-            spans.append((start, index))
-            continue
-        if text.startswith('@"', index) and _here_string_opens(text, index):
-            index = _skip_here_string(text, index, '"')
-            continue
-        if text.startswith("@'", index) and _here_string_opens(text, index):
-            index = _skip_here_string(text, index, "'")
-            continue
-        char = text[index]
-        if char == "'":
-            index += 1
-            while index < size:
-                if text.startswith("''", index):
-                    index += 2
-                    continue
-                if text[index] == "'":
-                    index += 1
-                    break
-                index += 1
-            continue
-        if char == '"':
-            index += 1
-            while index < size:
-                if text[index] == "`":
-                    index += 2
-                    continue
-                if text[index] == '"':
-                    index += 1
-                    break
-                index += 1
-            continue
-        if char == "#":
-            start = index
-            while index < size and text[index] != "\n":
-                index += 1
-            spans.append((start, index))
-            continue
-        index += 1
-    return spans
-
-
-def batch_issue_lines(text: str) -> list[tuple[int, str]]:
-    found = []
-    for line_number, line in enumerate(_normalize_newlines(text).split("\n"), 1):
-        stripped = line.lstrip(" \t")
-        folded = stripped.upper()
-        if folded == "REM" or folded.startswith("REM ") or folded.startswith("REM\t") or stripped.startswith("::"):
-            found.append((line_number, "comment"))
-    return found
-
-
 def inno_issue_lines(text: str) -> list[tuple[int, str]]:
     normalized = _normalize_newlines(text)
     found = []
@@ -423,364 +340,42 @@ def inno_issue_lines(text: str) -> list[tuple[int, str]]:
         if stripped.startswith(";"):
             found.append((line_number, "comment"))
             continue
-        if _inno_slash_comment(line) is not None:
+        mark = _inno_slash_comment(line)
+        if mark == -1:
+            found.append((line_number, "unscanned"))
+        elif mark is not None:
             found.append((line_number, "comment"))
     return found
 
 
 def _inno_slash_comment(line: str) -> int | None:
-    quotes = False
+    quote = ""
     index = 0
-    while index < len(line) - 1:
+    while index < len(line):
         char = line[index]
-        if char == "'":
-            if quotes and index + 1 < len(line) and line[index + 1] == "'":
+        if quote == "'":
+            if line.startswith("''", index):
                 index += 2
                 continue
-            quotes = not quotes
+            if char == "'":
+                quote = ""
             index += 1
             continue
-        if char == '"':
-            end = line.find('"', index + 1)
-            if end < 0:
-                return None
-            index = end + 1
-            continue
-        if not quotes and line.startswith("//", index):
-            return index
-        index += 1
-    return None
-
-
-def shell_issue_lines(text: str) -> list[tuple[int, str]]:
-    return _bash_issue_lines(_normalize_newlines(text))
-
-
-def _shell_comment_spans(text: str) -> list[tuple[int, int]]:
-    spans = []
-    for kind, start, end in _bash_events(text):
-        if kind == "comment":
-            spans.append((start, end))
-    return spans
-
-
-def _exe_name(word: str) -> str:
-    token = word.strip("\"'")
-    return token.replace("\\", "/").rsplit("/", 1)[-1].casefold()
-
-
-def _is_python_exe(word: str) -> bool:
-    return _exe_name(word) in _PY_EXES
-
-
-def _is_python_c_flag(word: str) -> bool:
-    if word.startswith("--") or not word.startswith("-") or len(word) < 2:
-        return False
-    return "c" in word[1:]
-
-
-def _command_is_inline_python(words: list[str], heredoc: bool) -> bool:
-    if heredoc and any(_exe_name(word).endswith((".py", ".pyw")) for word in words):
-        return True
-    indexes = [index for index, word in enumerate(words) if _is_python_exe(word)]
-    if not indexes:
-        return False
-    rest = words[indexes[0] + 1 :]
-    if heredoc:
-        return True
-    return any(word == "-" or _is_python_c_flag(word) for word in rest)
-
-
-def _is_python_shell(shell: str) -> bool:
-    parts = shell.strip().split()
-    if not parts:
-        return False
-    return _is_python_exe(parts[0].strip("\"'"))
-
-
-def _is_powershell_shell(shell: str) -> bool:
-    parts = shell.strip().split()
-    if not parts:
-        return False
-    return _exe_name(parts[0].strip("\"'")) in {"pwsh", "powershell", "pwsh.exe", "powershell.exe"}
-
-
-def _bash_issue_lines(text: str) -> list[tuple[int, str]]:
-    starts = _line_starts(text)
-    found = []
-    for kind, start, end in _bash_events(text):
-        if kind == "comment":
-            found.append((_line_number(starts, start), "comment"))
-        else:
-            found.append((start, kind))
-    return _unique_lines(found)
-
-
-def _bash_events(text: str) -> list[tuple[str, int, int]]:
-    events: list[tuple[str, int, int]] = []
-    size = len(text)
-    index = 0
-    words: list[str] = []
-    heredoc = False
-    command_line = 1
-    pending: list[tuple[str, bool]] = []
-
-    def line_of(offset: int) -> int:
-        return text.count("\n", 0, offset) + 1
-
-    def flush() -> None:
-        nonlocal words, heredoc
-        if words and _command_is_inline_python(words, heredoc):
-            events.append(("inline-python", command_line, command_line))
-        words = []
-        heredoc = False
-
-    def consume_heredoc_body(delim: str, strip_tabs: bool) -> bool:
-        nonlocal index
-        while index < size:
-            end = text.find("\n", index)
-            if end < 0:
-                end = size
-            line = text[index:end]
-            compared = line.lstrip("\t") if strip_tabs else line
-            index = end + 1 if end < size else end
-            if compared == delim:
-                return True
-        return False
-
-    while index < size:
-        if text.startswith("\\\n", index) or text.startswith("\\\r\n", index):
-            index += 2 if text.startswith("\\\n", index) else 3
-            continue
-        char = text[index]
-        if char in " \t":
-            index += 1
-            continue
-        if char == "\n":
-            flush()
-            index += 1
-            while pending:
-                delim, strip_tabs = pending.pop(0)
-                if not consume_heredoc_body(delim, strip_tabs):
-                    events.append(("unscanned", line_of(max(0, index - 1)), 0))
-                    pending.clear()
-                    break
-            command_line = line_of(index) if index < size else command_line
-            continue
-        if char == "#":
-            start = index
-            while index < size and text[index] != "\n":
-                index += 1
-            events.append(("comment", start, index))
-            continue
-        if text.startswith("<<<", index):
-            heredoc = True
-            if not words:
-                command_line = line_of(index)
-            index += 3
-            continue
-        if text.startswith("<<", index):
-            if not words:
-                command_line = line_of(index)
-            heredoc = True
-            cursor = index + 2
-            strip_tabs = False
-            if cursor < size and text[cursor] == "-":
-                strip_tabs = True
-                cursor += 1
-            while cursor < size and text[cursor] in " \t":
-                cursor += 1
-            if cursor >= size:
-                events.append(("unscanned", line_of(index), 0))
-                return events
-            if text[cursor] in "'\"":
-                quote = text[cursor]
-                cursor += 1
-                end = text.find(quote, cursor)
-                if end < 0:
-                    events.append(("unscanned", line_of(index), 0))
-                    return events
-                delim = text[cursor:end]
-                cursor = end + 1
-            else:
-                end = cursor
-                while end < size and text[end] not in " \t\n|&;()<>":
-                    end += 1
-                delim = text[cursor:end]
-                cursor = end
-            if delim == "":
-                events.append(("unscanned", line_of(index), 0))
-                return events
-            pending.append((delim, strip_tabs))
-            index = cursor
-            continue
-        if text.startswith(">>", index) or text.startswith(">&", index) or text.startswith("<&", index):
-            index += 2
-            continue
-        if text.startswith("&&", index) or text.startswith("||", index):
-            flush()
-            index += 2
-            command_line = line_of(index)
-            continue
-        if char in "|&;":
-            flush()
-            index += 1
-            command_line = line_of(index)
-            continue
-        if char in "<>":
-            index += 1
-            continue
-        if char in "()":
+        if quote == '"':
+            if char == '"':
+                quote = ""
             index += 1
             continue
         if char in "'\"":
-            if not words:
-                command_line = line_of(index)
             quote = char
-            start = index
             index += 1
-            closed = False
-            while index < size:
-                if quote == '"' and text[index] == "\\":
-                    index += 2
-                    continue
-                if text[index] == quote:
-                    index += 1
-                    closed = True
-                    break
-                index += 1
-            words.append(text[start + 1 : index - 1] if closed else "quoted")
-            if not closed:
-                events.append(("unscanned", line_of(index - 1), 0))
-                return events
             continue
-        if text.startswith("$(", index):
-            if not words:
-                command_line = line_of(index)
-            index += 2
-            depth = 1
-            while index < size and depth:
-                if text[index] in "'\"":
-                    quote = text[index]
-                    index += 1
-                    while index < size and text[index] != quote:
-                        if text[index] == "\\":
-                            index += 2
-                            continue
-                        index += 1
-                    index = min(size, index + 1)
-                    continue
-                if text[index] == "(":
-                    depth += 1
-                elif text[index] == ")":
-                    depth -= 1
-                index += 1
-            words.append("substitution")
-            if depth:
-                events.append(("unscanned", line_of(max(0, index - 1)), 0))
-                return events
-            continue
-        if char == "`":
-            events.append(("unscanned", line_of(index), 0))
-            return events
-        if char == "\\":
-            if not words:
-                command_line = line_of(index)
-            index += 2 if index + 1 < size else 1
-            continue
-        if not words:
-            command_line = line_of(index)
-        start = index
-        while index < size and text[index] not in " \t\n|&;()<>#'\"`\\":
-            index += 1
-        words.append(text[start:index])
-    flush()
-    if pending:
-        events.append(("unscanned", line_of(max(0, size - 1)), 0))
-    return events
-
-
-def _powershell_inline_lines(text: str) -> list[int]:
-    masked = list(text)
-    index = 0
-    size = len(text)
-
-    def blank(start: int, end: int) -> None:
-        for cursor in range(start, end):
-            if masked[cursor] != "\n":
-                masked[cursor] = " "
-
-    while index < size:
-        if text.startswith("<#", index):
-            start = index
-            index += 2
-            while index < size and not text.startswith("#>", index):
-                index += 1
-            index = min(size, index + 2)
-            blank(start, index)
-            continue
-        if text.startswith('@"', index) and _here_string_opens(text, index):
-            start = index
-            index = _skip_here_string(text, index, '"')
-            blank(start, index)
-            continue
-        if text.startswith("@'", index) and _here_string_opens(text, index):
-            start = index
-            index = _skip_here_string(text, index, "'")
-            blank(start, index)
-            continue
-        char = text[index]
-        if char == "'":
-            start = index
-            index += 1
-            while index < size:
-                if text.startswith("''", index):
-                    index += 2
-                    continue
-                if text[index] == "'":
-                    index += 1
-                    break
-                index += 1
-            blank(start, index)
-            continue
-        if char == '"':
-            start = index
-            index += 1
-            while index < size:
-                if text[index] == "`":
-                    index += 2
-                    continue
-                if text[index] == '"':
-                    index += 1
-                    break
-                index += 1
-            blank(start, index)
-            continue
-        if char == "#":
-            start = index
-            while index < size and text[index] != "\n":
-                index += 1
-            blank(start, index)
-            continue
+        if line.startswith("//", index):
+            return index
         index += 1
-    found = []
-    masked_text = "".join(masked)
-    for line_number, line in enumerate(masked_text.split("\n"), 1):
-        for segment in line.replace("|", ";").split(";"):
-            words = segment.split()
-            if _command_is_inline_python(words, "<<" in segment or "<<<" in segment):
-                found.append(line_number)
-    return found
-
-
-def _scan_script(shell: str, script: str) -> list[tuple[int, str]]:
-    if _is_python_shell(shell):
-        return [(1, "inline-python")]
-    if _is_powershell_shell(shell):
-        found = list(powershell_issue_lines(script))
-        found.extend((line, "inline-python") for line in _powershell_inline_lines(script))
-        return _unique_lines(found)
-    return _bash_issue_lines(script)
+    if quote:
+        return -1
+    return None
 
 
 class _YamlScalar:
@@ -983,7 +578,11 @@ def _mapping_pieces(code: str) -> tuple[str | None, str]:
 
 def _starts_with_indicator(value: str) -> bool:
     stripped = value.strip()
-    return bool(stripped) and (stripped[0] in "&*!%" or stripped.startswith("<<"))
+    if not stripped:
+        return False
+    if stripped[0] in "&*!%{}" or stripped.startswith("<<"):
+        return True
+    return stripped[0] == "[" and "{" in stripped
 
 
 def _quotes_closed(value: str) -> bool:
@@ -1033,59 +632,156 @@ def _split_yaml_comment(line: str) -> tuple[str, str | None]:
     return line, None
 
 
-def _shell_from_defaults(node: object, inherited: str) -> str:
-    if not isinstance(node, _YamlMap):
-        return inherited
-    defaults = node.get("defaults")
-    if not isinstance(defaults, _YamlMap):
-        return inherited
-    run = defaults.get("run")
-    if not isinstance(run, _YamlMap):
-        return inherited
-    shell = run.get("shell")
-    if isinstance(shell, _YamlScalar):
-        return shell.text.strip() or inherited
-    return inherited
+_RUN_TOKEN = re.compile(r"[-A-Za-z0-9_./:=,@+,]+")
+_ALLOWED_SHELLS = {"bash", "pwsh", "cmd"}
+_BANNED_COMMANDS = {"eval", "bash", "sh", "dash", "pwsh", "powershell", "bash.exe", "sh.exe", "pwsh.exe", "powershell.exe"}
+_INTERPRETER_PREFIXES = ("python", "pypy", "node", "perl", "ruby", "php")
 
 
-def _visit_yaml(node: object, inherited: str, findings: list[tuple[int, str]]) -> None:
+def _split_run_commands(line: str) -> list[list[str]] | None:
+    commands: list[list[str]] = []
+    tokens: list[str] = []
+    index = 0
+    size = len(line)
+    while index < size:
+        if line[index] in " \t":
+            index += 1
+            continue
+        if line.startswith("&&", index):
+            if not tokens:
+                return None
+            commands.append(tokens)
+            tokens = []
+            index += 2
+            continue
+        if line[index] == "|":
+            if not tokens:
+                return None
+            commands.append(tokens)
+            tokens = []
+            index += 1
+            continue
+        if line[index] in "'\"":
+            quote = line[index]
+            index += 1
+            start = index
+            while index < size and line[index] != quote:
+                if line[index] == "\\" or line[index] == "#":
+                    return None
+                index += 1
+            if index >= size:
+                return None
+            tokens.append(line[start:index])
+            index += 1
+            continue
+        matched = _RUN_TOKEN.match(line, index)
+        if matched is None:
+            return None
+        tokens.append(matched.group(0))
+        index = matched.end()
+    if not tokens:
+        return None if commands else []
+    commands.append(tokens)
+    return commands
+
+
+def _is_inline_interpreter(token: str) -> bool:
+    base = token.casefold().rsplit("/", 1)[-1]
+    if base.endswith(".exe"):
+        base = base[:-4]
+    for prefix in _INTERPRETER_PREFIXES:
+        if base == prefix or base.startswith(prefix):
+            return True
+    return False
+
+
+def _command_allowed(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    for token in tokens:
+        folded = token.casefold()
+        base = folded.rsplit("/", 1)[-1]
+        if folded.startswith("-c") or folded in _BANNED_COMMANDS or base in _BANNED_COMMANDS:
+            return False
+    if _is_inline_interpreter(tokens[0]) and "-" in tokens:
+        return False
+    return True
+
+
+def _run_line_allowed(line: str) -> bool:
+    if line.strip() == "":
+        return True
+    if any(mark in line for mark in ("#", "$(", "`", "<<", "${")):
+        return False
+    commands = _split_run_commands(line)
+    if commands is None:
+        return False
+    return all(_command_allowed(tokens) for tokens in commands)
+
+
+def _drop_unquoted_hash(line: str) -> str:
+    quote = ""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "'\"":
+            quote = char
+            index += 1
+            continue
+        if char == "#":
+            return line[:index]
+        index += 1
+    return line
+
+
+def _check_run(scalar: _YamlScalar, findings: list[tuple[int, str]]) -> None:
+    lines = scalar.text.split("\n")
+    for offset, line in enumerate(lines):
+        if line.strip() == "" or _run_line_allowed(line):
+            continue
+        source = scalar.line_map[offset] if offset < len(scalar.line_map) else scalar.line
+        if "#" in line:
+            findings.append((source, "comment"))
+        if "#" not in line or not _run_line_allowed(_drop_unquoted_hash(line)):
+            findings.append((source, "inline-python"))
+
+
+def _visit_yaml(node: object, findings: list[tuple[int, str]]) -> None:
     if isinstance(node, _YamlSeq):
         for item in node.items:
-            _visit_yaml(item, inherited, findings)
+            _visit_yaml(item, findings)
         return
     if not isinstance(node, _YamlMap):
         return
-    outgoing = _shell_from_defaults(node, inherited)
-    shell_value = node.get("shell")
-    run_value = node.get("run")
-    step_shell = outgoing
-    if isinstance(shell_value, _YamlScalar):
-        step_shell = shell_value.text.strip() or outgoing
-        if _is_python_shell(shell_value.text):
-            findings.append((shell_value.line, "inline-python"))
-    if isinstance(run_value, _YamlScalar):
-        if _is_python_shell(step_shell):
-            findings.append((run_value.line, "inline-python"))
-        else:
-            for script_line, kind in _scan_script(step_shell, run_value.text):
-                if run_value.line_map and 1 <= script_line <= len(run_value.line_map):
-                    findings.append((run_value.line_map[script_line - 1], kind))
-                else:
-                    findings.append((run_value.line, kind))
-    for _key, _line, child in node.entries:
-        _visit_yaml(child, outgoing, findings)
+    seen: set[str] = set()
+    for key, line, child in node.entries:
+        if key in seen:
+            findings.append((line, "unscanned"))
+        seen.add(key)
+        if key == "shell":
+            if not isinstance(child, _YamlScalar) or child.text.strip().casefold() not in _ALLOWED_SHELLS:
+                findings.append((child.line if isinstance(child, _YamlScalar) else line, "inline-python"))
+        elif key == "run":
+            if not isinstance(child, _YamlScalar):
+                findings.append((line, "unscanned"))
+            else:
+                _check_run(child, findings)
+        _visit_yaml(child, findings)
 
 
 def yaml_issue_lines(text: str) -> list[tuple[int, str]]:
-    normalized = _normalize_newlines(text)
-    if normalized.startswith("\ufeff"):
+    if _rejected_text(text):
         return [(1, "unscanned")]
+    normalized = _normalize_newlines(text)
     document = _YamlDocument(normalized.split("\n"))
     document.parse()
-    if document.root is not None and not document.failed:
-        _visit_yaml(document.root, "bash", document.findings)
-    elif document.root is not None:
-        _visit_yaml(document.root, "bash", document.findings)
+    if document.root is not None:
+        _visit_yaml(document.root, document.findings)
     return _unique_lines(document.findings)
 
 
@@ -1094,69 +790,12 @@ def ini_issue_lines(text: str) -> list[tuple[int, str]]:
     starts = _line_starts(normalized)
     return [(_line_number(starts, start), "comment") for start, _end in _hash_comment_spans(normalized, markers="#;")]
 
-def slash_issue_lines(text: str) -> list[tuple[int, str]]:
-    normalized = _normalize_newlines(text)
-    starts = _line_starts(normalized)
-    found = [(_line_number(starts, start), "comment") for start, _end in _slash_spans(normalized)]
-    return found
-
-
-def _slash_spans(text: str) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    index = 0
-    size = len(text)
-    while index < size:
-        char = text[index]
-        if char in "'\"" or (char == "`"):
-            quote = char
-            index += 1
-            while index < size:
-                if text[index] == "\\":
-                    index += 2
-                    continue
-                if text[index] == quote:
-                    index += 1
-                    break
-                index += 1
-            continue
-        if text.startswith("//", index):
-            start = index
-            while index < size and text[index] != "\n":
-                index += 1
-            spans.append((start, index))
-            continue
-        if text.startswith("/*", index):
-            start = index
-            index += 2
-            while index < size and not text.startswith("*/", index):
-                index += 1
-            index = min(size, index + 2)
-            spans.append((start, index))
-            continue
-        index += 1
-    return spans
-
-
-def css_issue_lines(text: str) -> list[tuple[int, str]]:
-    normalized = _normalize_newlines(text)
-    starts = _line_starts(normalized)
-    found = []
-    index = 0
-    while True:
-        start = normalized.find("/*", index)
-        if start < 0:
-            break
-        end = normalized.find("*/", start + 2)
-        end = len(normalized) if end < 0 else end + 2
-        found.append((_line_number(starts, start), "comment"))
-        index = end
-    return found
-
-
 def html_issue_lines(text: str) -> list[tuple[int, str]]:
+    if _rejected_text(text):
+        return [(1, "unscanned")]
     normalized = _normalize_newlines(text)
     starts = _line_starts(normalized)
-    found = []
+    found = [(_line_number(starts, match.start()), "unscanned") for match in _HTML_ACTIVE.finditer(normalized)]
     index = 0
     marker = "<!--"
     while True:
@@ -1165,8 +804,37 @@ def html_issue_lines(text: str) -> list[tuple[int, str]]:
             break
         found.append((_line_number(starts, start), "comment"))
         end = normalized.find("-->", start + len(marker))
-        index = len(normalized) if end < 0 else end + 3
-    return found
+        if end < 0:
+            found.append((_line_number(starts, start), "unscanned"))
+            break
+        index = end + 3
+    return _unique_lines(found)
+
+
+def json_issue_lines(text: str) -> list[tuple[int, str]]:
+    if _rejected_text(text):
+        return [(1, "unscanned")]
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        seen: set[str] = set()
+        document: dict[str, object] = {}
+        for key, value in items:
+            if key in seen:
+                raise ValueError(key)
+            seen.add(key)
+            document[key] = value
+        return document
+
+    try:
+        json.loads(text, object_pairs_hook=pairs)
+    except (json.JSONDecodeError, ValueError, UnicodeError):
+        return [(1, "unscanned")]
+    return []
+
+
+def _requirement_text(name: str) -> bool:
+    folded = name.casefold()
+    return folded.endswith(".txt") and ("requirement" in folded or "constraint" in folded)
 
 
 def _normalized_path(path: str) -> str:
@@ -1179,14 +847,8 @@ def _kind(path: str) -> str | None:
     suffix = Path(normalized).suffix
     if suffix in _PY_SUFFIXES:
         return "python"
-    if suffix == ".ps1":
-        return "powershell"
-    if suffix in {".bat", ".cmd"}:
-        return "batch"
     if suffix == ".iss":
         return "inno"
-    if suffix == ".sh":
-        return "shell"
     if suffix in {".yml", ".yaml"}:
         return "yaml"
     if suffix in {".ini", ".cfg"}:
@@ -1195,14 +857,14 @@ def _kind(path: str) -> str | None:
         return "hashconfig"
     if name in {".gitignore", ".gitattributes"}:
         return "gitignore"
-    if suffix in _SLASH_SUFFIXES:
-        return "slash"
-    if suffix == ".css":
-        return "css"
+    if suffix == ".json":
+        return "json"
     if suffix in {".html", ".htm", ".svg", ".xml"}:
         return "html"
-    if name.startswith("requirements") and suffix == ".txt":
+    if _requirement_text(name):
         return "hashconfig"
+    if suffix == ".txt" and name in _PROSE_TEXT_NAMES | _DATA_TEXT_NAMES:
+        return None
     if suffix in _DATA_SUFFIXES:
         return None
     return "unscanned"
@@ -1211,14 +873,8 @@ def _kind(path: str) -> str | None:
 def _issue_lines(kind: str, text: str) -> list[tuple[int, str]]:
     if kind == "python":
         return python_issue_lines(text)
-    if kind == "powershell":
-        return powershell_issue_lines(text)
-    if kind == "batch":
-        return batch_issue_lines(text)
     if kind == "inno":
         return inno_issue_lines(text)
-    if kind == "shell":
-        return shell_issue_lines(text)
     if kind == "yaml":
         return yaml_issue_lines(text)
     if kind == "hashconfig":
@@ -1227,13 +883,11 @@ def _issue_lines(kind: str, text: str) -> list[tuple[int, str]]:
         return ini_issue_lines(text)
     if kind == "gitignore":
         return gitignore_issue_lines(text)
-    if kind == "slash":
-        return slash_issue_lines(text)
-    if kind == "css":
-        return css_issue_lines(text)
     if kind == "html":
         return html_issue_lines(text)
-    return []
+    if kind == "json":
+        return json_issue_lines(text)
+    return [(1, "unscanned")]
 
 
 def strip_text(kind: str, text: str) -> str:
@@ -1241,11 +895,7 @@ def strip_text(kind: str, text: str) -> str:
         return strip_python(text)
     style = _newline_style(text)
     normalized = _normalize_newlines(text)
-    if kind == "powershell":
-        stripped = _delete_spans(normalized, _powershell_spans(normalized))
-    elif kind == "shell":
-        stripped = _delete_spans(normalized, _shell_comment_spans(normalized))
-    elif kind == "yaml":
+    if kind == "yaml":
         stripped = _strip_yaml(normalized)
     elif kind == "hashconfig":
         stripped = _delete_spans(normalized, _hash_comment_spans(normalized))
@@ -1254,32 +904,10 @@ def strip_text(kind: str, text: str) -> str:
     elif kind == "gitignore":
         kept = [line for line in normalized.split("\n") if not line.lstrip(" \t").startswith("#")]
         stripped = "\n".join(kept)
-        if normalized.endswith("\n"):
-            stripped += "\n" if stripped and not stripped.endswith("\n") else ""
-            if normalized.endswith("\n") and not stripped.endswith("\n"):
-                stripped += "\n"
-    elif kind == "batch":
-        kept = []
-        for line in normalized.split("\n"):
-            stripped_line = line.lstrip(" \t")
-            folded = stripped_line.upper()
-            if folded == "REM" or folded.startswith("REM ") or folded.startswith("REM\t") or stripped_line.startswith("::"):
-                continue
-            kept.append(line)
-        stripped = "\n".join(kept)
         if normalized.endswith("\n") and not stripped.endswith("\n"):
             stripped += "\n"
     elif kind == "inno":
         stripped = _strip_inno(normalized)
-    elif kind == "slash":
-        stripped = _delete_spans(normalized, _slash_spans(normalized))
-    elif kind == "css":
-        stripped = normalized
-        while "/*" in stripped:
-            start = stripped.find("/*")
-            end = stripped.find("*/", start + 2)
-            end = len(stripped) if end < 0 else end + 2
-            stripped = stripped[:start] + stripped[end:]
     elif kind == "html":
         stripped = normalized
         while "<!--" in stripped:
@@ -1369,12 +997,33 @@ def issues_for(path: str, text: str) -> list[Finding]:
         return []
     if kind == "unscanned":
         return [Finding(path, 1, "unscanned")]
+    if _rejected_text(text):
+        return [Finding(path, 1, "unscanned")]
+    try:
+        parsed = _issue_lines(kind, text)
+    except Exception:
+        return [Finding(path, 1, "unscanned")]
     findings: list[Finding] = []
-    for line, issue in _issue_lines(kind, text):
+    for line, issue in parsed:
         if issue == "comment" and _directive_allowed(path, _line_text(text, line)):
             continue
         findings.append(Finding(path, line, issue))
     return findings
+
+
+def _read_tracked(path: Path) -> tuple[str | None, bool]:
+    try:
+        if path.is_symlink() and not path.exists():
+            return None, False
+        data = path.read_bytes()
+    except OSError:
+        return None, False
+    if data.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")):
+        return None, False
+    try:
+        return data.decode("utf-8"), True
+    except UnicodeDecodeError:
+        return None, False
 
 
 def scan(root: Path | None = None) -> list[Finding]:
@@ -1389,7 +1038,10 @@ def scan(root: Path | None = None) -> list[Finding]:
         if kind == "unscanned":
             findings.append(Finding(relative, 1, "unscanned"))
             continue
-        text = (base / relative).read_text(encoding="utf-8")
+        text, ok = _read_tracked(base / relative)
+        if not ok or text is None:
+            findings.append(Finding(relative, 1, "unscanned"))
+            continue
         findings.extend(issues_for(relative, text))
     return findings
 

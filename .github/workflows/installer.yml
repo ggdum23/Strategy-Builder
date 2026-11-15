@@ -36,62 +36,37 @@ jobs:
           python -m pip install -r packaging/requirements-build.txt
       - name: Build installer
         shell: pwsh
-        run: ./packaging/build_windows.ps1
+        run: python packaging/build_windows.py
       - name: Record SHA256
         shell: pwsh
-        run: |
-          Get-Content -LiteralPath packaging/dist/SHA256SUMS
-          $file = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
-          $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          Write-Output "SHA256 $hash"
-          Write-Output "SIZE $($file.Length)"
-          Write-Output "ARTIFACT $($file.Name)"
-          @"
-          ### Installer artifact
-
-          - Name: ``$($file.Name)``
-          - Size: $($file.Length) bytes
-          - SHA256: ``$hash``
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+        run: python packaging/record_setup.py
       - name: Silent install
         shell: pwsh
         env:
           SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
-        run: |
-          $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
-          ./packaging/ci_install.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
+        run: python packaging/ci_install.py
       - name: Smoke tests
         shell: pwsh
         env:
           SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
           SB_SMOKE_DIR: ${{ runner.temp }}\smoke results
-        run: python packaging/smoke_frozen.py --exe "$env:SB_INSTALL_DIR\backtester.exe" --repo . --work $env:SB_SMOKE_DIR
+        run: python packaging/smoke_frozen.py --repo .
       - name: Upgrade over existing install
         shell: pwsh
         env:
           SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
-        run: |
-          $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
-          ./packaging/ci_upgrade.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
+        run: python packaging/ci_upgrade.py
       - name: Silent uninstall
         if: always()
         shell: pwsh
         env:
           SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
-        run: |
-          $unins = Join-Path $env:SB_INSTALL_DIR "unins000.exe"
-          if (-not (Test-Path -LiteralPath $unins)) {
-            Write-Output "uninstall skipped; nothing was installed"
-            exit 0
-          }
-          ./packaging/ci_uninstall.ps1 -Destination $env:SB_INSTALL_DIR
+        run: python packaging/ci_uninstall.py
       - name: Delete user data
         shell: pwsh
         env:
           SB_INSTALL_DIR: ${{ runner.temp }}\Strategy Builder
-        run: |
-          $setup = Get-ChildItem packaging/dist/StrategyBuilder-Setup-*.exe
-          ./packaging/ci_delete_userdata.ps1 -SetupExe $setup.FullName -Destination $env:SB_INSTALL_DIR
+        run: python packaging/ci_delete_userdata.py
       - name: Upload setup.exe
         if: always()
         uses: actions/upload-artifact@v4

@@ -1663,10 +1663,7 @@ _WFP_LAYERS = {"v4": False, "v6": False}
 
 
 def wfp_connect_layers() -> tuple:
-    return (
-        (0xC38D57D1, 0x05A7, 0x4C33, (0x90, 0x4F, 0x7F, 0xBC, 0xEE, 0xE6, 0x0E, 0x82)),
-        (0x4A72393B, 0x319F, 0x44BC, (0x84, 0xC3, 0xBA, 0x54, 0xDC, 0xB3, 0xB6, 0xB4)),
-    )
+    return (FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6)
 
 
 def firewall_timeout_blocks_launch(v4_ready: bool, v6_ready: bool) -> bool:

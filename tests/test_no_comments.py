@@ -74,9 +74,35 @@ def test_python_scanner_flags_comments_and_docstrings_and_keeps_string_hashes():
     )
 
 
-def test_powershell_here_string_is_not_a_comment():
-    assert comment_guard.powershell_issue_lines('@\"\n### title\n\"@\n') == []
-    assert comment_guard.powershell_issue_lines("# hi\n$x = 1\n") == [(1, "comment")]
+def test_unmodeled_script_files_fail_closed():
+    here = '@"\n### title\n"@\n'
+    assert comment_guard.issues_for("tool.ps1", here) == [
+        comment_guard.Finding("tool.ps1", 1, "unscanned")
+    ]
+    assert comment_guard.issues_for("tool.ps1", "python -c 'x = 1 # hidden'\npython3.12 -c 'x = 1'\n") == [
+        comment_guard.Finding("tool.ps1", 1, "unscanned")
+    ]
+    assert comment_guard.issues_for("tool.bat", "echo hi & rem hidden\n") == [
+        comment_guard.Finding("tool.bat", 1, "unscanned")
+    ]
+    assert comment_guard.issues_for("tool.cmd", "rem hidden\n") == [
+        comment_guard.Finding("tool.cmd", 1, "unscanned")
+    ]
+    assert comment_guard.issues_for("a.css", 'a { content: "/* star */"; }\n') == [
+        comment_guard.Finding("a.css", 1, "unscanned")
+    ]
+    assert comment_guard.issues_for("a.css", "/* hidden */\n") == [
+        comment_guard.Finding("a.css", 1, "unscanned")
+    ]
+    assert comment_guard.issues_for("a.css", "body { color: red } // hidden\n") == [
+        comment_guard.Finding("a.css", 1, "unscanned")
+    ]
+    assert comment_guard.issues_for("page.js", '"http://example.com"\n') == [
+        comment_guard.Finding("page.js", 1, "unscanned")
+    ]
+    assert comment_guard.issues_for("docs/tool.sh", "# hidden\n") == [
+        comment_guard.Finding("docs/tool.sh", 1, "unscanned")
+    ]
 
 
 def test_inno_preprocessor_is_not_a_comment():
@@ -167,6 +193,7 @@ def test_sandbox_header_constants_keep_their_values():
     assert "guid(*FWPM_LAYER_ALE_AUTH_CONNECT_V6)" in text
     assert "guid(*FWPM_SUBLAYER_UNIVERSAL)" in text
     assert "guid(*FWPM_CONDITION_ALE_PACKAGE_ID)" in text
+    assert "return (FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6)" in text
 
 
 def test_pack_day_cuts_are_not_named_run_defaults():
@@ -197,6 +224,18 @@ def test_discarded_expression_statements_are_flagged():
         "obj.attr\n",
         "...\n",
         "def f():\n    x = 1\n    ...\n",
+        '"""hidden docstring""" if True else print(0)\n',
+        'print(0) if False else """hidden docstring"""\n',
+        '"""hidden docstring""" or print(0)\n',
+        'f"""hidden {1}""" if True else len("x")\n',
+        'b"""hidden""" if True else len(b"x")\n',
+        '("""hidden""",) if True else len("x")\n',
+        'print(0) and """hidden docstring"""\n',
+        '(lambda: """hidden docstring""")\n',
+        '(lambda: """hidden docstring""")() and """hidden"""\n',
+        '("""hidden""" for i in range(1))\n',
+        '["""hidden""" for i in range(1)]\n',
+        "(x := 1)\n",
     ]
     for sample in samples:
         assert comment_guard.python_issue_lines(sample), sample
@@ -205,8 +244,10 @@ def test_discarded_expression_statements_are_flagged():
     assert comment_guard.python_issue_lines("async def f():\n    ...\n") == [], reason
     assert comment_guard.python_issue_lines("class C:\n    ...\n") == [], reason
     assert comment_guard.python_issue_lines("name()\n") == []
-    assert comment_guard.python_issue_lines("(x := 1)\n") == []
+    assert comment_guard.python_issue_lines("(lambda: name())()\n") == []
+    assert comment_guard.python_issue_lines('(lambda: """hidden docstring""")()\n') == []
     assert comment_guard.python_issue_lines("def f():\n    yield 1\n") == []
+    assert comment_guard.python_issue_lines("def f():\n    yield from name()\n") == []
     assert comment_guard.python_issue_lines("async def f():\n    await name()\n") == []
 
 
@@ -279,6 +320,14 @@ def test_generated_no_effect_expression_statements_are_flagged():
     allowed = [
         "name()\n",
         "obj.method()\n",
+        "(lambda: name())()\n",
+        "def f():\n    yield 1\n",
+        "def f():\n    yield from name()\n",
+        "async def f():\n    await name()\n",
+        "def f():\n    ...\n",
+        "class C:\n    ...\n",
+    ]
+    rejected = [
         "name() + 1\n",
         "(x := 1)\n",
         "name() if flag else other\n",
@@ -286,14 +335,13 @@ def test_generated_no_effect_expression_statements_are_flagged():
         "(item for item in name())\n",
         'f"{name()}"\n',
         "[name() for item in items]\n",
-        "def f():\n    yield 1\n",
-        "def f():\n    yield from name()\n",
-        "async def f():\n    await name()\n",
-        "def f():\n    ...\n",
-        "class C:\n    ...\n",
+        '"""hidden""" if True else print(0)\n',
+        'print(0) and """hidden"""\n',
     ]
     for source in allowed:
         assert comment_guard.python_issue_lines(source) == [], source
+    for source in rejected:
+        assert comment_guard.python_issue_lines(source), source
 
 
 def test_workflow_inline_python_and_yaml_comments_fail_closed():
@@ -314,7 +362,7 @@ def test_workflow_inline_python_and_yaml_comments_fail_closed():
     written = "run: |\n  cat > tool.py << 'PY'\n  \"\"\"hidden\"\"\"\n  PY\n"
     assert _has_kind(written, "inline-python")
     data = "run: |\n  cat <<'EOF'\n  # not a comment\n  EOF\n"
-    assert comment_guard.yaml_issue_lines(data) == []
+    assert _has_kind(data, "inline-python") or _has_kind(data, "comment")
     assert comment_guard.yaml_issue_lines("name: ci # hidden\n") == [(1, "comment")]
     assert comment_guard.yaml_issue_lines('title: "echo # no"\n') == []
     assert comment_guard.yaml_issue_lines("run: |\n  echo hello # hidden\n") == [(2, "comment")]
@@ -347,3 +395,110 @@ def test_config_comments_are_case_insensitive_and_cover_ini_and_markup():
     assert comment_guard.issues_for("page.HTML", "<!-- hidden -->\n") == [
         comment_guard.Finding("page.HTML", 1, "comment")
     ]
+    assert comment_guard.issues_for("constraints.txt", "# hidden\n") == [
+        comment_guard.Finding("constraints.txt", 1, "comment")
+    ]
+    assert comment_guard.issues_for("dev-requirements.txt", "pkg # hidden\n") == [
+        comment_guard.Finding("dev-requirements.txt", 1, "comment")
+    ]
+    assert comment_guard.issues_for("notes.txt", "plain\n") == [
+        comment_guard.Finding("notes.txt", 1, "unscanned")
+    ]
+    assert any(item.kind == "unscanned" for item in comment_guard.issues_for("art.svg", "<svg><script>/* hidden */</script></svg>\n"))
+    assert any(item.kind == "unscanned" for item in comment_guard.issues_for("page.html", "<script>// hidden</script>\n"))
+    assert any(item.kind == "unscanned" for item in comment_guard.issues_for("page.html", '<div style="color:red"></div>\n'))
+    assert any(item.kind == "unscanned" for item in comment_guard.issues_for("art.svg", '<svg onclick="hide"></svg>\n'))
+    assert comment_guard.issues_for("Makefile", "all:\n") == [comment_guard.Finding("Makefile", 1, "unscanned")]
+    assert comment_guard.issues_for("Dockerfile", "FROM python\n") == [comment_guard.Finding("Dockerfile", 1, "unscanned")]
+    assert comment_guard.issues_for("costs.py.bak", "x = 1\n") == [comment_guard.Finding("costs.py.bak", 1, "unscanned")]
+    assert comment_guard.issues_for("src\\backtester\\costs.py", "x = 1  # hidden\n") == [
+        comment_guard.Finding("src\\backtester\\costs.py", 1, "comment")
+    ]
+    assert comment_guard.issues_for("src/backtester/notes.md", "# prose\n") == []
+
+
+def test_workflow_grammar_blocks_the_review_bypasses():
+    substitution = "run: |\n  echo $(\n  # hidden comment\n  echo hi)\n"
+    assert _has_kind(substitution, "comment")
+    duplicate_run = "steps:\n  - run: echo ok\n    run: |\n      echo hi # hidden comment\n"
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(duplicate_run))
+    duplicate_shell = "steps:\n  - shell: bash\n    shell: python\n    run: |\n      \"\"\"hidden\"\"\"\n"
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(duplicate_shell))
+    assert _has_kind(duplicate_shell, "inline-python")
+    duplicate_quote = 'steps:\n  - run: echo ok\n    run: "echo hi # hidden comment"\n'
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(duplicate_quote))
+    for script in (
+        "python3.12 -c 'x = 1 # hidden'\n",
+        "/usr/bin/python3.12 -c 'x = 1'\n",
+        "pythonw -c 'x = 1'\n",
+        "pythonw.exe -c 'x = 1'\n",
+        "pypy3 -c 'x = 1'\n",
+        "bash -c 'echo hi # hidden'\n",
+        "sh -c 'echo hi'\n",
+        "eval 'python -c \"x = 1 # hidden\"'\n",
+        "bash <<'EOF'\npython -c 'x = 1'\nEOF\n",
+        "python3.12 - <<'PY'\n\"\"\"hidden\"\"\"\nPY\n",
+        "bash <<'EOF'\necho hi # hidden\nEOF\n",
+        "bash <<'EOF'\nbash <<'EOF'\necho hi\nEOF\nEOF\n",
+        "dest=tool.py\ncat >\"$dest\" <<'PY'\n",
+        "pwsh -Command 'echo hi'\n",
+        "python -cprint\n",
+        "echo hi | python -\n",
+        "cat >\"$dest\" <<'PY'\n",
+        "echo ${#array}\n",
+        "echo $#\n",
+        "echo ${var#prefix}\n",
+        "python -m pip install -c constraints.txt\n",
+    ):
+        document = "run: |\n" + "".join(f"  {line}" for line in script.splitlines(True))
+        assert comment_guard.yaml_issue_lines(document), script
+    assert _has_kind("steps:\n  - shell: python3.12\n    run: echo ok\n", "inline-python")
+    assert _has_kind("defaults:\n  run:\n    shell: python3.12\n", "inline-python")
+    assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines("run: {echo: ok, echo: hidden}\n"))
+    assert comment_guard.yaml_issue_lines("run: echo hello\n") == []
+    assert comment_guard.yaml_issue_lines("run: python -m backtester test\n") == []
+    assert comment_guard.yaml_issue_lines("run: python3 script.py\n") == []
+    assert comment_guard.yaml_issue_lines("shell: pwsh\nrun: python packaging/build_windows.py\n") == []
+    assert comment_guard.yaml_issue_lines("shell: bash\nrun: echo hello\n") == []
+    assert comment_guard.yaml_issue_lines("shell: cmd\nrun: python script.py\n") == []
+    assert comment_guard.yaml_issue_lines('run: echo "hello # world"\n')
+    assert comment_guard.yaml_issue_lines('run: python -m pip install -e ".[dev]"\n') == []
+    assert comment_guard.yaml_issue_lines("run: echo a,b\n") == []
+
+
+def test_generated_run_lines_outside_the_grammar_are_flagged():
+    rng = random.Random(15)
+    safe = ["python", "sudo", "echo", "apt-get", "-m", "pip", "install", "-y", "script.py", "packaging/build_windows.py"]
+    unsafe = ["#", "$(", "`", "<<", "${", "-c", "eval", "bash", "sh", "dash", ">", "&"]
+    flagged = 0
+    for index in range(40):
+        words = [rng.choice(safe) for _ in range(3)]
+        if index % 2 == 0:
+            words.append(rng.choice(unsafe))
+        line = " ".join(words)
+        document = "run: |\n  " + line + "\n"
+        findings = comment_guard.yaml_issue_lines(document)
+        allowed = comment_guard._run_line_allowed(line)
+        if allowed:
+            assert findings == [], line
+        else:
+            assert findings, line
+            flagged += 1
+    assert flagged >= 20
+
+
+def test_decode_failures_are_findings(tmp_path: Path):
+    import subprocess
+
+    subprocess.check_call(["git", "init"], cwd=tmp_path)
+    (tmp_path / "wide.py").write_bytes(b"\xff\xfe#\x00 \x00\n\x00")
+    (tmp_path / "bad.py").write_bytes(b"\xff")
+    (tmp_path / "link.py").symlink_to("missing.py")
+    subprocess.check_call(["git", "add", "-A"], cwd=tmp_path)
+    found = {item.path: item.kind for item in comment_guard.scan(tmp_path)}
+    assert found.get("wide.py") == "unscanned"
+    assert found.get("bad.py") == "unscanned"
+    assert found.get("link.py") == "unscanned"
+    assert comment_guard.python_issue_lines("\ufeff# hidden\n") == [(1, "unscanned")]
+    assert comment_guard.python_issue_lines("x = 1\n\uff03 hidden\n") == [(1, "unscanned")]
+    assert comment_guard.python_issue_lines("x = 1\n\u200b# hidden\n") == [(1, "unscanned")]

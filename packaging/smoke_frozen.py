@@ -512,11 +512,17 @@ def smoke(exe: Path, repo: Path, work: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Smoke-test a frozen Strategy Builder bundle")
-    parser.add_argument("--exe", type=Path, required=True)
-    parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--work", type=Path, required=True)
+    parser.add_argument("--exe", type=Path)
+    parser.add_argument("--repo", type=Path)
+    parser.add_argument("--work", type=Path)
     args = parser.parse_args(argv)
-    smoke(args.exe, args.repo, args.work)
+    install = os.environ.get("SB_INSTALL_DIR", "")
+    exe = args.exe or (Path(install) / "backtester.exe" if install else None)
+    repo = args.repo or Path(os.environ.get("SB_REPO", "."))
+    work = args.work or (Path(os.environ["SB_SMOKE_DIR"]) if os.environ.get("SB_SMOKE_DIR") else None)
+    if exe is None or work is None:
+        parser.error("--exe and --work are required when SB_INSTALL_DIR and SB_SMOKE_DIR are unset")
+    smoke(exe, repo, work)
     return 0
 
 

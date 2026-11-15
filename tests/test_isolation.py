@@ -156,8 +156,7 @@ def test_no_secret_paths():
         ROOT / "docs",
         ROOT / "packaging",
         ROOT / "README.md",
-        ROOT / "run.ps1",
-        ROOT / "run.bat",
+        ROOT / "run.py",
     ]
     files = []
     for root in roots:

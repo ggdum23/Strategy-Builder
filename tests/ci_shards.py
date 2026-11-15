@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -243,7 +244,12 @@ def main(argv: list[str]) -> int:
         if found:
             print("\n".join(found), file=sys.stderr)
             return 2
-        print("shards=" + json.dumps(list(shards)))
+        line = "shards=" + json.dumps(list(shards))
+        print(line)
+        output = os.environ.get("GITHUB_OUTPUT")
+        if output:
+            with open(output, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
         return 0
     if len(argv) == 2 and argv[1] == "check":
         _items, shards, found = _load()
@@ -253,6 +259,12 @@ def main(argv: list[str]) -> int:
         for name, nodes in shards.items():
             print(f"{name} {len(nodes)}")
         return 0
+    if len(argv) == 2 and argv[1] == "run":
+        shard = os.environ.get("CI_SHARD", "")
+        if not shard:
+            print("CI_SHARD is required", file=sys.stderr)
+            return 2
+        argv = [argv[0], "run", shard]
     if len(argv) == 3 and argv[1] == "run":
         items, shards, found = _load()
         if found:

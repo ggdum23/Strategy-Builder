@@ -38,7 +38,7 @@ On Python 3.11 the GUI extra installs PySide6 6.6 or newer, and not 6.12. PySide
 The window is optional. The commands below do not need it. Paths with spaces,
 including `C:\Users\Jeu\Desktop\Strategy Builder`, are passed through as one path.
 
-`run.ps1` and `run.bat` call `python -m backtester` and do not copy or unzip data.
+`run.py` calls `python -m backtester` and does not copy or unzip data.
 
 ## Named local data
 
@@ -66,16 +66,10 @@ MA, META, MSFT, MU, NVDA, PLTR, QQQ, SPY, TSLA, V, WMT, XOM. `BRK.B` is a legal
 symbol in the file name. This repo does not contain those trees. It contains one
 month, October 2026, for QQQ and SPY, under `assets/sample/`.
 
-```powershell
-.\run.ps1 run --profile arena --ticker QQQ `
-  --strategy .\examples\strategies\D02\strategy.py `
-  --src "C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles\QQQ\filled" `
-  --out .\out\d02
+```text
+py -3 run.py run --profile arena --ticker QQQ --strategy .\examples\strategies\D02\strategy.py --src "C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles\QQQ\filled" --out .\out\d02
 
-.\run.ps1 run --profile desk --ticker SPY `
-  --strategy .\examples\desk\buy_and_hold.py `
-  --src "C:\Users\Jeu\Desktop\Backtester\SPY\filled" `
-  --out .\out\spy
+py -3 run.py run --profile desk --ticker SPY --strategy .\examples\desk\buy_and_hold.py --src "C:\Users\Jeu\Desktop\Backtester\SPY\filled" --out .\out\spy
 ```
 
 `run` writes `metrics.json`, `equity_curve.csv` (also copied to `equity.csv`),
@@ -90,13 +84,11 @@ Definitions are in `docs/METRICS.md`.
 Inspect a tree before trusting it, and record the series when you want to run it
 again. Adding a ticker is a registry entry plus an ingest. It is not a code change.
 
-```powershell
-.\run.ps1 ingest --ticker QQQ `
-  --src "C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles\QQQ\filled" `
-  --registry .\registry.json --profile arena --price-kind raw
+```text
+py -3 run.py ingest --ticker QQQ --src "C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles\QQQ\filled" --registry .\registry.json --profile arena --price-kind raw
 
-.\run.ps1 registry list --registry .\registry.json
-.\run.ps1 registry show --registry .\registry.json --ticker QQQ
+py -3 run.py registry list --registry .\registry.json
+py -3 run.py registry show --registry .\registry.json --ticker QQQ
 ```
 
 That does not copy the files. A new symbol needs its own filled files, its own
@@ -114,12 +106,8 @@ how many sessions before the locked tail are replayed, and the profile decides
 what that replay does. The QQQ pack's 0..2999 / 3000..3795 windows stay on the
 Arena pack runner only. They are not the default here.
 
-```powershell
-.\run.ps1 walkforward --profile arena --ticker QQQ `
-  --strategy .\examples\strategies\D02\strategy.py `
-  --src "C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles\QQQ\filled" `
-  --design-end-date 2024-12-31 --warmup-days 21 `
-  --out .\out\d02_walk
+```text
+py -3 run.py walkforward --profile arena --ticker QQQ --strategy .\examples\strategies\D02\strategy.py --src "C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles\QQQ\filled" --design-end-date 2024-12-31 --warmup-days 21 --out .\out\d02_walk
 ```
 
 ## Two ways to use it

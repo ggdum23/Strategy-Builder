@@ -18,5 +18,5 @@ stays in `backtester.__main__`.
 - The bundle carries its own Python. The machine interpreter is not required.
 - Inno Setup runs the bundled executables. It does not copy or unzip market
   data. `--src` points at files that are already on disk.
-- `run.ps1` and `run.bat` remain the source-checkout helpers. They are not
-  what the installed program runs.
+- `run.py` remains the source-checkout helper. It is not what the installed
+  program runs.
