@@ -19,7 +19,16 @@ DIRECTIVE_ALLOWLIST: tuple[tuple[str, str], ...] = ()
 THREAT_MODEL = (
     "reject any construct that stores unused commentary text in tracked files",
     "treat every unmodeled file type, key, executable or syntax as a finding",
+    "flag a binding of __doc__ or an all-underscore name other than a bare _ in case, for, or a call assignment, a namespace or __dict__ write whose key is not a different constant, and exec, eval, compile, or an alias of setattr, globals, vars, locals, exec, or eval",
 )
+
+DYNAMIC_CALL_ALLOWLIST = (
+    ("compile", "source", "<generated>", "exec"),
+)
+
+_ALIAS_NAMES = frozenset({"setattr", "globals", "vars", "locals", "exec", "eval", "compile"})
+_NAMESPACE_NAMES = frozenset({"globals", "vars", "locals"})
+_DYNAMIC_CALLS = frozenset({"exec", "eval", "compile"})
 
 EXECUTABLE_ALLOWLIST = ("apt-get", "python", "sudo")
 
@@ -284,19 +293,33 @@ def _different_constant_name(node: ast.AST) -> bool:
     return text is not None and text != "__doc__"
 
 
-def _namespace_call(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call) or node.args or node.keywords:
+def _sensitive_name(name: str | None) -> bool:
+    if not name:
         return False
-    func = node.func
-    names = {"globals", "vars", "locals"}
+    if name == "__doc__":
+        return True
+    return _underscore_name(name) and name != "_"
+
+
+def _namespace_func(func: ast.AST) -> bool:
+    while isinstance(func, ast.Attribute) and func.attr == "__call__":
+        func = func.value
     if isinstance(func, ast.Name):
-        return func.id in names
+        return func.id in _NAMESPACE_NAMES
     return (
         isinstance(func, ast.Attribute)
-        and func.attr in names
+        and func.attr in _NAMESPACE_NAMES
         and isinstance(func.value, ast.Name)
         and func.value.id == "builtins"
     )
+
+
+def _namespace_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _namespace_func(node.func)
+
+
+def _is_dunder_dict(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "__dict__"
 
 
 def _target_writes_doc(node: ast.AST) -> bool:
@@ -307,7 +330,7 @@ def _target_writes_doc(node: ast.AST) -> bool:
     if isinstance(node, ast.Attribute):
         return node.attr == "__doc__"
     if isinstance(node, ast.Subscript):
-        if _namespace_call(node.value):
+        if _namespace_call(node.value) or _is_dunder_dict(node.value):
             return not _different_constant_name(node.slice)
         return _const_text(node.slice) == "__doc__"
     if isinstance(node, (ast.Tuple, ast.List)):
@@ -368,17 +391,64 @@ def _setter_kind(func: ast.AST) -> str | None:
         return None
     if func.attr == "__setitem__":
         return "setitem"
-    owner = func.value
-    if not isinstance(owner, ast.Name):
-        return None
-    if func.attr == "setattr" and owner.id == "builtins":
+    if func.attr == "__setattr__":
         return "setattr"
-    if func.attr == "__setattr__" and owner.id == "object":
+    owner = func.value
+    if isinstance(owner, ast.Name) and func.attr == "setattr" and owner.id == "builtins":
         return "setattr"
     return None
 
 
+def _operator_setitem(func: ast.AST) -> bool:
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "setitem"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "operator"
+    )
+
+
+def _call_is_allowlisted(node: ast.Call) -> bool:
+    func = node.func
+    if not isinstance(func, ast.Name) or node.keywords:
+        return False
+    for item in DYNAMIC_CALL_ALLOWLIST:
+        name, *expected = item
+        if func.id != name or len(node.args) != len(expected):
+            continue
+        matched = True
+        for arg, want in zip(node.args, expected):
+            if isinstance(arg, ast.Name) and arg.id == want:
+                continue
+            if isinstance(arg, ast.Constant) and arg.value == want:
+                continue
+            matched = False
+            break
+        if matched:
+            return True
+    return False
+
+
+def _dynamic_exec_call(node: ast.Call) -> bool:
+    func = node.func
+    if isinstance(func, ast.Name) and func.id in _DYNAMIC_CALLS:
+        return not _call_is_allowlisted(node)
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in _DYNAMIC_CALLS
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "builtins"
+    )
+
+
 def _call_is_doc_write(node: ast.Call) -> bool:
+    if _dynamic_exec_call(node):
+        return True
+    if _operator_setitem(node.func):
+        key = _call_argument(node, 1, "key")
+        if key is None:
+            return True
+        return not _different_constant_name(key)
     kind = _setter_kind(node.func)
     if kind is None:
         return False
@@ -399,7 +469,7 @@ def _is_structural_commentary(node: ast.AST) -> bool:
     if isinstance(node, (ast.With, ast.AsyncWith)):
         return any(item.optional_vars is not None and _target_writes_doc(item.optional_vars) for item in node.items)
     if isinstance(node, ast.ExceptHandler):
-        return node.name == "__doc__"
+        return bool(node.name) and (_sensitive_name(node.name) or node.name == "_")
     if isinstance(node, ast.Call):
         return _call_is_doc_write(node)
     return False
@@ -415,14 +485,76 @@ def _node_span(text: str, starts: list[int], node: ast.AST) -> tuple[int, int, s
     return (_position(starts, lineno, col), _position(starts, end_line, end_column), "")
 
 
+def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    return parents
+
+
+def _alias_is_finding(node: ast.alias) -> bool:
+    bound = node.asname or node.name.rsplit(".", 1)[-1]
+    if _sensitive_name(node.asname) or node.asname == "_" or _sensitive_name(bound) or bound == "_":
+        return True
+    if node.name in _ALIAS_NAMES or node.asname in _ALIAS_NAMES:
+        return True
+    return False
+
+
+def _called(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    parent = parents.get(node)
+    return isinstance(parent, ast.Call) and parent.func is node
+
+
+def _binding_node(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.AST | None:
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and _sensitive_name(node.id):
+        return node
+    if isinstance(node, ast.arg) and (_sensitive_name(node.arg) or node.arg == "_"):
+        return node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
+        _sensitive_name(node.name) or node.name == "_"
+    ):
+        return node
+    if isinstance(node, ast.alias) and _alias_is_finding(node):
+        return node
+    if isinstance(node, (ast.Global, ast.Nonlocal)) and any(
+        _sensitive_name(name) or name == "_" for name in node.names
+    ):
+        return node
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and _sensitive_name(node.name):
+        return node
+    if isinstance(node, ast.MatchMapping) and _sensitive_name(node.rest):
+        return node
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in _ALIAS_NAMES and not _called(node, parents):
+        return node
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr in _ALIAS_NAMES
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "builtins"
+        and not _called(node, parents)
+    ):
+        return node
+    return None
+
+
 def _commentary_write_spans(text: str, starts: list[int], tree: ast.AST) -> list[tuple[int, int, str]]:
     spans: list[tuple[int, int, str]] = []
+    parents = _parent_map(tree)
     for node in ast.walk(tree):
-        if not _is_structural_commentary(node):
-            continue
-        span = _node_span(text, starts, node)
-        if span is not None:
-            spans.append(span)
+        chosen: list[ast.AST] = []
+        if _is_structural_commentary(node):
+            chosen.append(node)
+        bound = _binding_node(node, parents)
+        if bound is not None and bound is not node:
+            chosen.append(bound)
+        elif bound is not None and not _is_structural_commentary(node):
+            chosen.append(bound)
+        for item in chosen:
+            span = _node_span(text, starts, item)
+            if span is not None:
+                spans.append(span)
     return spans
 
 

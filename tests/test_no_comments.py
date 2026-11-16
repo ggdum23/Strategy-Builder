@@ -17,6 +17,10 @@ def test_threat_model_rejects_unused_commentary_and_unmodeled_syntax():
     assert comment_guard.THREAT_MODEL == (
         "reject any construct that stores unused commentary text in tracked files",
         "treat every unmodeled file type, key, executable or syntax as a finding",
+        "flag a binding of __doc__ or an all-underscore name other than a bare _ in case, for, or a call assignment, a namespace or __dict__ write whose key is not a different constant, and exec, eval, compile, or an alias of setattr, globals, vars, locals, exec, or eval",
+    )
+    assert comment_guard.DYNAMIC_CALL_ALLOWLIST == (
+        ("compile", "source", "<generated>", "exec"),
     )
     assert comment_guard.EXECUTABLE_ALLOWLIST == ("apt-get", "python", "sudo")
     assert comment_guard.COMMAND_ALLOWLIST == (
@@ -378,6 +382,28 @@ def test_generated_no_effect_expression_statements_are_flagged():
         assert comment_guard.python_issue_lines(source) == [], source
     for source in rejected:
         assert comment_guard.python_issue_lines(source), source
+    binding = random.Random(6)
+    names = ["__doc__", "__", "___"]
+    forms = [
+        "match value:\n    case {name}:\n        pass\n",
+        "match value:\n    case 'hidden' as {name}:\n        pass\n",
+        "match [value]:\n    case [{name}]:\n        pass\n",
+        "match {{'a': 1}}:\n    case {{**{name}}}:\n        pass\n",
+        "class A:\n    match value:\n        case {name}:\n            pass\n",
+        "def {name}():\n    pass\n",
+        "def f({name}):\n    pass\n",
+        "for {name} in items:\n    pass\n",
+        "{name} = 'hidden'\n",
+        "import mod as {name}\n",
+        "x = [1 for {name} in items]\n",
+        "def f():\n    global {name}\n",
+    ]
+    flagged = 0
+    for _index in range(36):
+        source = binding.choice(forms).format(name=binding.choice(names))
+        assert comment_guard.python_issue_lines(source), source
+        flagged += 1
+    assert flagged >= 36
 
 
 def test_workflow_inline_python_and_yaml_comments_fail_closed():
@@ -610,9 +636,9 @@ def test_review4_finite_allowlist_closes_the_filed_rows():
     assert comment_guard.python_issue_lines('(_,) = ("hidden",)\n')
     assert comment_guard.python_issue_lines("_ = print(1)\n") == []
     assert comment_guard.python_issue_lines('for _ in ("hidden",):\n    pass\n') == []
-    assert comment_guard.python_issue_lines('exec("x = 1 # hidden")\n') == []
-    assert comment_guard.python_issue_lines('exec("""hidden""")\n') == []
-    assert comment_guard.python_issue_lines('compile("x = 1", "<s>", "exec")\n') == []
+    assert comment_guard.python_issue_lines('exec("x = 1 # hidden")\n')
+    assert comment_guard.python_issue_lines('exec("""hidden""")\n')
+    assert comment_guard.python_issue_lines('compile("x = 1", "<s>", "exec")\n')
     assert comment_guard.python_issue_lines('x: """hidden""" = 1\n') == []
     assert comment_guard.python_issue_lines('async def f():\n    await "hidden"\n') == []
     assert comment_guard.python_issue_lines('def f():\n    yield "hidden"\n') == []
@@ -693,7 +719,7 @@ def test_review5_structural_rules_close_the_filed_rows():
     assert comment_guard.python_issue_lines('for __doc__ in ("hidden",):\n    pass\n')
     assert comment_guard.python_issue_lines("_ = print(1)\n") == []
     assert comment_guard.python_issue_lines('for _ in ("hidden",):\n    pass\n') == []
-    assert comment_guard.python_issue_lines('exec("x = 1 # hidden")\n') == []
+    assert comment_guard.python_issue_lines('exec("x = 1 # hidden")\n')
     assert comment_guard.python_issue_lines('globals()["name"] = "hidden"\n') == []
     assert comment_guard.python_issue_lines('setattr(sys, "version", "hidden")\n') == []
     assert comment_guard.python_issue_lines('monkeypatch.setattr(sys, "frozen", True)\n') == []
@@ -732,6 +758,44 @@ def test_review5_structural_rules_close_the_filed_rows():
     assert comment_guard.inno_issue_lines("[Code]\n  Result := '{#DefaultDataRoot}';\n") == []
     assert comment_guard.issues_for("book.json", '{"Scripts": {"build": "echo hi # hidden"}}\n')
     assert comment_guard.json_issue_lines('{"description": "echo hi # hidden"}\n') == []
+
+
+def test_review6_bindings_close_the_filed_rows():
+    assert comment_guard.python_issue_lines('match "hidden docstring":\n    case __doc__:\n        pass\n')
+    assert comment_guard.python_issue_lines('match "hidden docstring":\n    case "hidden docstring" as __doc__:\n        pass\n')
+    assert comment_guard.python_issue_lines('match ["hidden docstring"]:\n    case [__doc__]:\n        pass\n')
+    assert comment_guard.python_issue_lines('match {"a": 1}:\n    case {**__doc__}:\n        pass\n')
+    assert comment_guard.python_issue_lines('class A:\n    match "hidden":\n        case __doc__:\n            pass\n')
+    assert comment_guard.python_issue_lines('match "hidden":\n    case __:\n        pass\n')
+    assert comment_guard.python_issue_lines('vars(sys)[f"__doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('vars(sys)["__" + "doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('builtins.vars(sys)[f"__doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('vars(sys.modules["probe_mod"])[f"__doc__"] = "module-doc"\n')
+    assert comment_guard.python_issue_lines('sys.__dict__[f"__doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('mod.__dict__["__" + "doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('type.__setattr__(A, "__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('type.__setattr__(A, f"__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('type.__setattr__(A, "__" + "doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('x = [1 for __doc__ in ("hidden docstring",)]\n')
+    assert comment_guard.python_issue_lines('class A:\n    x = [1 for __doc__ in ("hidden",)]\n')
+    assert comment_guard.python_issue_lines('exec("__doc__ = \'hidden\'")\n')
+    assert comment_guard.python_issue_lines('eval("__doc__")\n')
+    assert comment_guard.python_issue_lines('operator.setitem(sys.__dict__, "__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('globals.__call__()[f"__doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('s = setattr\ns(m, "__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('import sys as __doc__\n')
+    assert comment_guard.python_issue_lines('def __doc__():\n    pass\n')
+    assert comment_guard.python_issue_lines('def f(__doc__):\n    pass\n')
+    assert comment_guard.python_issue_lines('match value:\n    case _:\n        pass\n') == []
+    assert comment_guard.python_issue_lines('x = vars(sys)["version"]\n') == []
+    assert comment_guard.python_issue_lines('vars(sys)["version"] = "hidden"\n') == []
+    assert comment_guard.python_issue_lines('d[f"key"] = "text"\n') == []
+    assert comment_guard.python_issue_lines('object.__setattr__(self, "_flag", threading.Event())\n') == []
+    assert comment_guard.python_issue_lines('compile(source, "<generated>", "exec")\n') == []
+    assert comment_guard.python_issue_lines('app.exec()\n') == []
+    assert comment_guard.python_issue_lines('re.compile(r"a")\n') == []
+    assert comment_guard.python_issue_lines("_ = print(1)\n") == []
+    assert comment_guard.python_issue_lines('for _ in ("hidden",):\n    pass\n') == []
 
 
 def test_decode_failures_are_findings(tmp_path: Path):
