@@ -28,24 +28,21 @@ def _process_names() -> list[str]:
     kernel.Process32NextW.restype = ctypes.c_int
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel.CloseHandle.restype = ctypes.c_int
-    entry = type(
-        "PROCESSENTRY32W",
-        (ctypes.Structure,),
-        {
-            "_fields_": (
-                ("dwSize", ctypes.c_uint32),
-                ("cntUsage", ctypes.c_uint32),
-                ("th32ProcessID", ctypes.c_uint32),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", ctypes.c_uint32),
-                ("cntThreads", ctypes.c_uint32),
-                ("th32ParentProcessID", ctypes.c_uint32),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", ctypes.c_uint32),
-                ("szExeFile", ctypes.c_wchar * 260),
-            )
-        },
-    )
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_wchar * 260),
+        )
+
+    entry = PROCESSENTRY32W
     snapshot = kernel.CreateToolhelp32Snapshot(0x00000002, 0)
     if snapshot in (None, 0, ctypes.c_void_p(-1).value):
         return []

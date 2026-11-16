@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from PySide6.QtGui import QColor, QPalette
 
@@ -38,7 +38,7 @@ class Theme:
     mono: str = "Monospace"
 
     def with_fonts(self, ui: str, mono: str) -> "Theme":
-        return Theme(**{**self.__dict__, "ui": ui, "mono": mono})
+        return replace(self, ui=ui, mono=mono)
 
 
 DARK = Theme(

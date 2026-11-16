@@ -4,6 +4,7 @@ from __future__ import annotations
 import errno
 import gc
 import hashlib
+import inspect
 import hmac
 import math
 import os
@@ -450,7 +451,39 @@ def _tag_observer(result, strategy):
 class _ObserverView:
 
     def __init__(self, values: dict):
-        self.__dict__.update(values)
+        self._fields = dict(values)
+
+    def __getattr__(self, name: str):
+        fields = object.__getattribute__(self, "_fields")
+        try:
+            return fields[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _instance_fields(obj) -> list[tuple[str, object]]:
+    missing = object()
+    kind = type(obj)
+    found = []
+    for key in dir(obj):
+        if not isinstance(key, str) or key == "" or key in {"__dict__", "__weakref__"}:
+            continue
+        try:
+            owned = inspect.getattr_static(obj, key)
+        except AttributeError:
+            continue
+        try:
+            declared = inspect.getattr_static(kind, key)
+        except AttributeError:
+            declared = missing
+        if declared is not missing and owned is declared:
+            continue
+        try:
+            value = getattr(obj, key)
+        except Exception:
+            continue
+        found.append((key, value))
+    return found
 
 
 def _observer_view(observer):
@@ -458,7 +491,7 @@ def _observer_view(observer):
     if not str(module).startswith("backtester_user_strategy_"):
         return observer
     values = {}
-    for key, value in getattr(observer, "__dict__", {}).items():
+    for key, value in _instance_fields(observer):
         try:
             pickle.dumps(value)
         except Exception:

@@ -17,11 +17,20 @@ def test_threat_model_rejects_unused_commentary_and_unmodeled_syntax():
     assert comment_guard.THREAT_MODEL == (
         "reject any construct that stores unused commentary text in tracked files",
         "treat every unmodeled file type, key, executable or syntax as a finding",
-        "flag a binding of __doc__ or an all-underscore name other than a bare _ in case, for, or a call assignment, a namespace or __dict__ write whose key is not a different constant, and exec, eval, compile, or an alias of setattr, globals, vars, locals, exec, or eval",
+        "flag a binding of an all-underscore name other than a bare _ in case, for, or a call assignment, and flag exec, eval, compile, or an alias of setattr, globals, vars, locals, exec, or eval",
+        "any python identifier, attribute name, keyword name, or string constant exactly equal to __doc__ is a finding outside src/backtester/comment_guard.py and tests/test_no_comments.py",
+        "globals, vars, and locals, including a builtins receiver, and an attribute named __dict__ are findings unless the use is a direct subscript read with a constant key",
+        "the name __builtins__, an import of builtins with an alias, a from-import of setitem, ior, setattr, exec, eval, compile, globals, vars, or locals from operator or builtins, and a three-argument type call are findings",
+        "a mixed assignment that discards a slot with _ stays allowed, including x = _ = a value, for B.__, and with as B.__; for (_,) over a literal of strings is a finding",
     )
     assert comment_guard.DYNAMIC_CALL_ALLOWLIST == (
         ("compile", "source", "<generated>", "exec"),
     )
+    assert comment_guard.DOC_TOKEN_ALLOWLIST == (
+        "src/backtester/comment_guard.py",
+        "tests/test_no_comments.py",
+    )
+    assert comment_guard.TYPE_CALL_ALLOWLIST == ()
     assert comment_guard.EXECUTABLE_ALLOWLIST == ("apt-get", "python", "sudo")
     assert comment_guard.COMMAND_ALLOWLIST == (
         ("apt-get", "install", "-y", "bubblewrap"),
@@ -720,7 +729,7 @@ def test_review5_structural_rules_close_the_filed_rows():
     assert comment_guard.python_issue_lines("_ = print(1)\n") == []
     assert comment_guard.python_issue_lines('for _ in ("hidden",):\n    pass\n') == []
     assert comment_guard.python_issue_lines('exec("x = 1 # hidden")\n')
-    assert comment_guard.python_issue_lines('globals()["name"] = "hidden"\n') == []
+    assert comment_guard.python_issue_lines('globals()["name"] = "hidden"\n')
     assert comment_guard.python_issue_lines('setattr(sys, "version", "hidden")\n') == []
     assert comment_guard.python_issue_lines('monkeypatch.setattr(sys, "frozen", True)\n') == []
     assert comment_guard.python_issue_lines("async def f():\n    _ = await name()\n") == []
@@ -788,7 +797,7 @@ def test_review6_bindings_close_the_filed_rows():
     assert comment_guard.python_issue_lines('def f(__doc__):\n    pass\n')
     assert comment_guard.python_issue_lines('match value:\n    case _:\n        pass\n') == []
     assert comment_guard.python_issue_lines('x = vars(sys)["version"]\n') == []
-    assert comment_guard.python_issue_lines('vars(sys)["version"] = "hidden"\n') == []
+    assert comment_guard.python_issue_lines('vars(sys)["version"] = "hidden"\n')
     assert comment_guard.python_issue_lines('d[f"key"] = "text"\n') == []
     assert comment_guard.python_issue_lines('object.__setattr__(self, "_flag", threading.Event())\n') == []
     assert comment_guard.python_issue_lines('compile(source, "<generated>", "exec")\n') == []
@@ -796,6 +805,65 @@ def test_review6_bindings_close_the_filed_rows():
     assert comment_guard.python_issue_lines('re.compile(r"a")\n') == []
     assert comment_guard.python_issue_lines("_ = print(1)\n") == []
     assert comment_guard.python_issue_lines('for _ in ("hidden",):\n    pass\n') == []
+
+
+def test_review7_bans_the_reflective_ingredients():
+    assert comment_guard.python_issue_lines('globals().update({"__doc__": "hidden"})\n')
+    assert comment_guard.python_issue_lines('globals().update(__doc__="hidden")\n')
+    assert comment_guard.python_issue_lines('globals().update([("__doc__", "hidden")])\n')
+    assert comment_guard.python_issue_lines('globals().__ior__({"__doc__": "hidden"})\n')
+    assert comment_guard.python_issue_lines('operator.ior(globals(), {"__doc__": "hidden"})\n')
+    assert comment_guard.python_issue_lines('dict.update(sys.__dict__, {"__doc__": "hidden"})\n')
+    assert comment_guard.python_issue_lines('sys.__dict__.update({"__doc__": "hidden"})\n')
+    assert comment_guard.python_issue_lines('vars(sys).update({"__doc__": "hidden"})\n')
+    assert comment_guard.python_issue_lines('class A:\n    locals().update({"__doc__": "hidden"})\n')
+    assert comment_guard.python_issue_lines('class A:\n    locals().setdefault("__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('globals().setdefault("__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('del __doc__\nglobals().setdefault("__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('globals().update({"version": "1"})\n')
+    assert comment_guard.python_issue_lines('values = {"__doc__": "hidden"}\nglobals().update(values)\n')
+    assert comment_guard.python_issue_lines('self.__dict__.update(values)\n')
+    assert comment_guard.python_issue_lines('__builtins__.exec("__doc__ = \'hidden\'")\n')
+    assert comment_guard.python_issue_lines('__builtins__.eval("(__doc__ := \'hidden\')")\n')
+    assert comment_guard.python_issue_lines('__builtins__.compile("__doc__ = \'hidden\'", "<s>", "exec")\n')
+    assert comment_guard.python_issue_lines('from operator import setitem\nsetitem(sys.__dict__, "__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('import builtins as b\nb.setattr(sys, "__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('getattr(sys, "__dict__")["__" + "doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('g = globals()\ng["__" + "doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('g = globals()\ng |= {"__doc__": "hidden"}\n')
+    assert comment_guard.python_issue_lines('A = type("A", (), {"__doc__": "hidden"})\n')
+    assert comment_guard.python_issue_lines('A = type("A", (), {"run": 1})\n')
+    assert comment_guard.python_issue_lines('type(name, bases, dict=values)\n')
+    assert comment_guard.python_issue_lines('for (_,) in [("hidden comment",)]:\n    pass\n')
+    assert comment_guard.python_issue_lines('x = [1 for (_,) in [("hidden comment",)]]\n')
+    assert comment_guard.python_issue_lines('def f[__doc__]():\n    pass\n')
+    assert comment_guard.python_issue_lines('from builtins import exec, eval, compile, globals, vars, locals, setattr\n')
+    assert comment_guard.python_issue_lines('from operator import ior\n')
+    assert comment_guard.python_issue_lines('name = "__doc__"\n')
+    assert comment_guard.issues_for("src/backtester/comment_guard.py", 'name = "__doc__"\n') == []
+    assert comment_guard.issues_for("tests/test_no_comments.py", 'name = "__doc__"\n') == []
+    assert comment_guard.issues_for("src/backtester/other.py", 'name = "__doc__"\n')
+    assert comment_guard.issues_for("src/backtester/comment_guard.py", "x = 1  # hidden\n")
+    assert comment_guard.issues_for("src/backtester/comment_guard.py", 'globals().update({"version": "1"})\n')
+    assert comment_guard.python_issue_lines('_, x = ("hidden comment", 1)\n') == []
+    assert comment_guard.python_issue_lines('keyword, _, rest = data.partition(":")\n') == []
+    assert comment_guard.python_issue_lines('x = _ = "hidden comment"\n') == []
+    assert comment_guard.python_issue_lines('x = _ = len("hidden")\n') == []
+    assert comment_guard.python_issue_lines('_, value = name()\n') == []
+    assert comment_guard.python_issue_lines('for B.__ in ("hidden",):\n    pass\n') == []
+    assert comment_guard.python_issue_lines('with nullcontext("hidden") as B.__:\n    pass\n') == []
+    assert comment_guard.python_issue_lines('with nullcontext("hidden") as _:\n    pass\n') == []
+    assert comment_guard.python_issue_lines('for (_,) in items:\n    pass\n') == []
+    assert comment_guard.python_issue_lines('match value:\n    case [*_]:\n        pass\n') == []
+    assert comment_guard.python_issue_lines('def f[__]():\n    pass\n') == []
+    assert comment_guard.python_issue_lines('x = type(exc).__name__\n') == []
+    assert comment_guard.python_issue_lines('import builtins\n') == []
+    assert comment_guard.python_issue_lines('from operator import add\n') == []
+    assert comment_guard.python_issue_lines('x = vars(sys)["version"]\n') == []
+    assert comment_guard.python_issue_lines('x = obj.__dict__["version"]\n') == []
+    assert comment_guard.python_issue_lines('d[f"key"] = "text"\n') == []
+    assert comment_guard.python_issue_lines('class View:\n    def __init__(self, values):\n        self._fields = dict(values)\n') == []
+    assert comment_guard.python_issue_lines('return replace(self, ui=ui, mono=mono)\n') == []
 
 
 def test_decode_failures_are_findings(tmp_path: Path):

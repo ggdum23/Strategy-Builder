@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -340,9 +341,34 @@ def _json_value(value):
     raise TypeError(type(value).__name__)
 
 
+def _instance_fields(obj) -> list[tuple[str, object]]:
+    missing = object()
+    kind = type(obj)
+    found = []
+    for key in dir(obj):
+        if not isinstance(key, str) or key == "" or key.startswith("_") or key in {"__dict__", "__weakref__"}:
+            continue
+        try:
+            owned = inspect.getattr_static(obj, key)
+        except AttributeError:
+            continue
+        try:
+            declared = inspect.getattr_static(kind, key)
+        except AttributeError:
+            declared = missing
+        if declared is not missing and owned is declared:
+            continue
+        try:
+            value = getattr(obj, key)
+        except Exception:
+            continue
+        found.append((key, value))
+    return found
+
+
 def _public_state(strategy) -> dict:
     values = {}
-    for key, value in list(getattr(strategy, "__dict__", {}).items()):
+    for key, value in _instance_fields(strategy):
         if not isinstance(key, str) or key.startswith("_"):
             continue
         try:

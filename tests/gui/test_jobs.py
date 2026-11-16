@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from backtester.gui.backend import load_run, read_designer_manifest
 from backtester.gui.jobs import build_pack_job, execute_run, inspect_series, record_series
@@ -268,7 +269,7 @@ def test_batch_calls_run_parallel_with_progress_and_cancel(tmp_path, monkeypatch
             encoding="utf-8",
         )
         kwargs["on_progress"](
-            type("E", (), {"completed": 1, "total": 2, "strategy_id": "bad", "source_id": "QQQ", "status": "error", "message": "boom"})()
+            SimpleNamespace(completed=1, total=2, strategy_id="bad", source_id="QQQ", status="error", message="boom")
         )
         Path(str(status) + ".cancel").write_text("cancel\n", encoding="utf-8")
         for _ in range(40):
@@ -278,18 +279,14 @@ def test_batch_calls_run_parallel_with_progress_and_cancel(tmp_path, monkeypatch
 
             time.sleep(0.05)
         assert kwargs["cancel"].cancelled()
-        return type(
-            "R",
-            (),
-            {
-                "out_dir": str(out_dir),
-                "failures": 1,
-                "results": (
-                    type("J", (), {"strategy_id": strategies[0].strategy_id, "status": "error", "out_dir": str(beta), "error": "boom"})(),
-                    type("J", (), {"strategy_id": strategies[1].strategy_id, "status": "ok", "out_dir": str(alpha), "error": None})(),
-                ),
-            },
-        )()
+        return SimpleNamespace(
+            out_dir=str(out_dir),
+            failures=1,
+            results=(
+                SimpleNamespace(strategy_id=strategies[0].strategy_id, status="error", out_dir=str(beta), error="boom"),
+                SimpleNamespace(strategy_id=strategies[1].strategy_id, status="ok", out_dir=str(alpha), error=None),
+            ),
+        )
 
     monkeypatch.setattr("backtester.runner.run_parallel", fake)
     result = execute_run(

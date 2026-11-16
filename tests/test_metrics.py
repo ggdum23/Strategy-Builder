@@ -405,8 +405,12 @@ def test_desk_financing_and_borrow_match_the_cost_functions():
             return value
         return None
 
+    class LongBook:
+        def on_bar(self, row, account):
+            return target(row, account, 2.0)
+
     long_book = engine_desk.run(
-        type("S", (), {"on_bar": lambda self, row, account: target(row, account, 2.0)})(),
+        LongBook(),
         _bars(),
         DeskConfig(),
     )
@@ -417,8 +421,12 @@ def test_desk_financing_and_borrow_match_the_cost_functions():
     )
     assert financing == long_book["financing"] == long_metrics["financing_cost"]
     assert financing > 0.0
+    class ShortBook:
+        def on_bar(self, row, account):
+            return target(row, account, -1.0)
+
     short_book = engine_desk.run(
-        type("S", (), {"on_bar": lambda self, row, account: target(row, account, -1.0)})(),
+        ShortBook(),
         _bars(),
         DeskConfig(),
     )

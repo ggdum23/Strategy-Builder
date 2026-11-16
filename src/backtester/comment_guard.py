@@ -19,16 +19,30 @@ DIRECTIVE_ALLOWLIST: tuple[tuple[str, str], ...] = ()
 THREAT_MODEL = (
     "reject any construct that stores unused commentary text in tracked files",
     "treat every unmodeled file type, key, executable or syntax as a finding",
-    "flag a binding of __doc__ or an all-underscore name other than a bare _ in case, for, or a call assignment, a namespace or __dict__ write whose key is not a different constant, and exec, eval, compile, or an alias of setattr, globals, vars, locals, exec, or eval",
+    "flag a binding of an all-underscore name other than a bare _ in case, for, or a call assignment, and flag exec, eval, compile, or an alias of setattr, globals, vars, locals, exec, or eval",
+    "any python identifier, attribute name, keyword name, or string constant exactly equal to __doc__ is a finding outside src/backtester/comment_guard.py and tests/test_no_comments.py",
+    "globals, vars, and locals, including a builtins receiver, and an attribute named __dict__ are findings unless the use is a direct subscript read with a constant key",
+    "the name __builtins__, an import of builtins with an alias, a from-import of setitem, ior, setattr, exec, eval, compile, globals, vars, or locals from operator or builtins, and a three-argument type call are findings",
+    "a mixed assignment that discards a slot with _ stays allowed, including x = _ = a value, for B.__, and with as B.__; for (_,) over a literal of strings is a finding",
 )
 
 DYNAMIC_CALL_ALLOWLIST = (
     ("compile", "source", "<generated>", "exec"),
 )
 
+DOC_TOKEN_ALLOWLIST = (
+    "src/backtester/comment_guard.py",
+    "tests/test_no_comments.py",
+)
+
+TYPE_CALL_ALLOWLIST: tuple[tuple[str, ...], ...] = ()
+
 _ALIAS_NAMES = frozenset({"setattr", "globals", "vars", "locals", "exec", "eval", "compile"})
 _NAMESPACE_NAMES = frozenset({"globals", "vars", "locals"})
 _DYNAMIC_CALLS = frozenset({"exec", "eval", "compile"})
+_BUILTIN_MODULES = frozenset({"builtins", "__builtins__"})
+_REFLECT_IMPORTS = frozenset({"setitem", "ior", "setattr", "exec", "eval", "compile", "globals", "vars", "locals"})
+_LOOKUP_NAMES = frozenset({"getattr", "setattr", "hasattr", "delattr"})
 
 EXECUTABLE_ALLOWLIST = ("apt-get", "python", "sudo")
 
@@ -239,7 +253,7 @@ def _expand_lines(text: str, starts: list[int], start: int, end: int) -> tuple[i
     return begin, full_end
 
 
-def python_spans(text: str) -> list[tuple[int, int, str]]:
+def python_spans(text: str, *, ban_doc_token: bool = True) -> list[tuple[int, int, str]]:
     normalized = _normalize_newlines(text)
     starts = _line_starts(normalized)
     spans: list[tuple[int, int, str]] = []
@@ -260,7 +274,7 @@ def python_spans(text: str) -> list[tuple[int, int, str]]:
         spans.append((start, end, ""))
     tree = ast.parse(normalized)
     spans.extend(_no_effect_spans(normalized, starts, tree))
-    spans.extend(_commentary_write_spans(normalized, starts, tree))
+    spans.extend(_commentary_write_spans(normalized, starts, tree, ban_doc_token=ban_doc_token))
     spans.sort()
     return spans
 
@@ -301,17 +315,16 @@ def _sensitive_name(name: str | None) -> bool:
     return _underscore_name(name) and name != "_"
 
 
+def _builtin_module(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and node.id in _BUILTIN_MODULES
+
+
 def _namespace_func(func: ast.AST) -> bool:
     while isinstance(func, ast.Attribute) and func.attr == "__call__":
         func = func.value
     if isinstance(func, ast.Name):
         return func.id in _NAMESPACE_NAMES
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr in _NAMESPACE_NAMES
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "builtins"
-    )
+    return isinstance(func, ast.Attribute) and func.attr in _NAMESPACE_NAMES and _builtin_module(func.value)
 
 
 def _namespace_call(node: ast.AST) -> bool:
@@ -394,7 +407,7 @@ def _setter_kind(func: ast.AST) -> str | None:
     if func.attr == "__setattr__":
         return "setattr"
     owner = func.value
-    if isinstance(owner, ast.Name) and func.attr == "setattr" and owner.id == "builtins":
+    if func.attr == "setattr" and _builtin_module(owner):
         return "setattr"
     return None
 
@@ -433,12 +446,7 @@ def _dynamic_exec_call(node: ast.Call) -> bool:
     func = node.func
     if isinstance(func, ast.Name) and func.id in _DYNAMIC_CALLS:
         return not _call_is_allowlisted(node)
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr in _DYNAMIC_CALLS
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "builtins"
-    )
+    return isinstance(func, ast.Attribute) and func.attr in _DYNAMIC_CALLS and _builtin_module(func.value)
 
 
 def _call_is_doc_write(node: ast.Call) -> bool:
@@ -539,7 +547,159 @@ def _binding_node(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.AST | N
     return None
 
 
-def _commentary_write_spans(text: str, starts: list[int], tree: ast.AST) -> list[tuple[int, int, str]]:
+def _doc_token(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name) and node.id == "__doc__":
+        return True
+    if isinstance(node, ast.Attribute) and node.attr == "__doc__":
+        return True
+    if isinstance(node, ast.keyword) and node.arg == "__doc__":
+        return True
+    if isinstance(node, ast.Constant) and node.value == "__doc__":
+        return True
+    if isinstance(node, ast.alias) and (node.asname == "__doc__" or node.name == "__doc__" or node.name.endswith(".__doc__")):
+        return True
+    if isinstance(node, ast.arg) and node.arg == "__doc__":
+        return True
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "__doc__":
+        return True
+    if isinstance(node, ast.ExceptHandler) and node.name == "__doc__":
+        return True
+    if isinstance(node, (ast.Global, ast.Nonlocal)) and "__doc__" in node.names:
+        return True
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == "__doc__":
+        return True
+    if isinstance(node, ast.MatchMapping) and node.rest == "__doc__":
+        return True
+    if isinstance(node, (ast.TypeVar, ast.TypeVarTuple, ast.ParamSpec)) and node.name == "__doc__":
+        return True
+    return False
+
+
+def _constant_key(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant)
+
+
+def _namespace_is_restricted(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    if not (_namespace_call(node) or _is_dunder_dict(node)):
+        return False
+    parent = parents.get(node)
+    if (
+        isinstance(parent, ast.Subscript)
+        and parent.value is node
+        and isinstance(parent.ctx, ast.Load)
+        and _constant_key(parent.slice)
+    ):
+        return False
+    return True
+
+
+def _lookup_of_dict(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    matched = isinstance(func, ast.Name) and func.id in _LOOKUP_NAMES
+    if not matched and isinstance(func, ast.Attribute) and func.attr in _LOOKUP_NAMES and _builtin_module(func.value):
+        matched = True
+    if not matched:
+        return False
+    candidates = list(node.args[1:2])
+    for item in node.keywords:
+        if item.arg in {None, "name"}:
+            candidates.append(item.value)
+    return any(_const_text(item) == "__dict__" for item in candidates)
+
+
+def _banned_import(node: ast.AST) -> bool:
+    if isinstance(node, ast.Import):
+        return any(alias.name == "builtins" and alias.asname for alias in node.names)
+    if isinstance(node, ast.ImportFrom) and node.module in {"operator", "builtins"}:
+        return any(alias.name in _REFLECT_IMPORTS or alias.asname in _REFLECT_IMPORTS for alias in node.names)
+    return False
+
+
+def _type_call_allowed(node: ast.Call) -> bool:
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else None
+    if name is None or node.keywords:
+        return False
+    for item in TYPE_CALL_ALLOWLIST:
+        if not item or item[0] != name or len(node.args) != len(item) - 1:
+            continue
+        matched = True
+        for arg, want in zip(node.args, item[1:]):
+            if isinstance(arg, ast.Name) and arg.id == want:
+                continue
+            if isinstance(arg, ast.Constant) and arg.value == want:
+                continue
+            matched = False
+            break
+        if matched:
+            return True
+    return False
+
+
+def _three_arg_type(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    matched = isinstance(func, ast.Name) and func.id == "type"
+    if not matched and isinstance(func, ast.Attribute) and func.attr == "type" and _builtin_module(func.value):
+        matched = True
+    if not matched:
+        return False
+    if len(node.args) < 3 and not any(item.arg == "dict" for item in node.keywords):
+        return False
+    return not _type_call_allowed(node)
+
+
+def _literal_string_tree(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return bool(node.elts) and all(_literal_string_tree(item) for item in node.elts)
+    return False
+
+
+def _underscore_tuple(node: ast.AST) -> bool:
+    if not isinstance(node, (ast.Tuple, ast.List)) or not node.elts:
+        return False
+    for item in node.elts:
+        if isinstance(item, ast.Name) and item.id == "_":
+            continue
+        if isinstance(item, (ast.Tuple, ast.List)) and _underscore_tuple(item):
+            continue
+        return False
+    return True
+
+
+def _underscore_literal_target(node: ast.AST) -> ast.AST | None:
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+        target, iter_node = node.target, node.iter
+    else:
+        return None
+    if not _underscore_tuple(target):
+        return None
+    if not isinstance(iter_node, (ast.List, ast.Tuple, ast.Set)) or not iter_node.elts:
+        return None
+    if not all(_literal_string_tree(item) for item in iter_node.elts):
+        return None
+    return target
+
+
+def _spans_overlap(spans: list[tuple[int, int, str]], start: int, end: int) -> bool:
+    for old_start, old_end, _replacement in spans:
+        if start < old_end and end > old_start:
+            return True
+    return False
+
+
+def _commentary_write_spans(
+    text: str,
+    starts: list[int],
+    tree: ast.AST,
+    *,
+    ban_doc_token: bool,
+) -> list[tuple[int, int, str]]:
     spans: list[tuple[int, int, str]] = []
     parents = _parent_map(tree)
     for node in ast.walk(tree):
@@ -547,14 +707,28 @@ def _commentary_write_spans(text: str, starts: list[int], tree: ast.AST) -> list
         if _is_structural_commentary(node):
             chosen.append(node)
         bound = _binding_node(node, parents)
-        if bound is not None and bound is not node:
+        if bound is not None and bound not in chosen:
             chosen.append(bound)
-        elif bound is not None and not _is_structural_commentary(node):
-            chosen.append(bound)
+        if ban_doc_token and _doc_token(node) and node not in chosen:
+            chosen.append(node)
+        if isinstance(node, ast.Name) and node.id == "__builtins__" and node not in chosen:
+            chosen.append(node)
+        if _namespace_is_restricted(node, parents) and node not in chosen:
+            chosen.append(node)
+        if _lookup_of_dict(node) and node not in chosen:
+            chosen.append(node)
+        if _banned_import(node) and node not in chosen:
+            chosen.append(node)
+        if _three_arg_type(node) and node not in chosen:
+            chosen.append(node)
+        literal = _underscore_literal_target(node)
+        if literal is not None and literal not in chosen:
+            chosen.append(literal)
         for item in chosen:
             span = _node_span(text, starts, item)
-            if span is not None:
-                spans.append(span)
+            if span is None or _spans_overlap(spans, span[0], span[1]):
+                continue
+            spans.append(span)
     return spans
 
 
@@ -616,13 +790,13 @@ def _rejected_text(text: str) -> bool:
     return False
 
 
-def python_issue_lines(text: str) -> list[tuple[int, str]]:
+def python_issue_lines(text: str, *, ban_doc_token: bool = True) -> list[tuple[int, str]]:
     if _rejected_text(text):
         return [(1, "unscanned")]
     normalized = _normalize_newlines(text)
     starts = _line_starts(normalized)
     try:
-        spans = python_spans(text)
+        spans = python_spans(text, ban_doc_token=ban_doc_token)
     except (SyntaxError, ValueError, UnicodeError, tokenize.TokenError):
         return [(1, "unscanned")]
     found: list[tuple[int, str]] = []
@@ -1435,7 +1609,7 @@ def _kind(path: str) -> str | None:
 
 def _issue_lines(kind: str, text: str, path: str = "") -> list[tuple[int, str]]:
     if kind == "python":
-        return python_issue_lines(text)
+        return python_issue_lines(text, ban_doc_token=path not in DOC_TOKEN_ALLOWLIST)
     if kind == "inno":
         return inno_issue_lines(text)
     if kind == "yaml":
