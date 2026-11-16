@@ -1,4 +1,3 @@
-"""Tenth review. A planted designer chart displays and exports without the caption."""
 
 from __future__ import annotations
 

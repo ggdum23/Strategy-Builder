@@ -1,21 +1,10 @@
-"""Run one strategy, or a design window and a locked tail.
-
-Benchmarks go through the same engine and the same cost configuration as the
-strategy. Omitted switches are the profile defaults: Arena raw prices, cash
-0, financing 0; Desk raw prices, cash 0, financing 0.07. Opting into
-total-return, a cash rate, or a financing rate is recorded on the metrics.
-
-Phase 1 walk-forward isolation is the heap, class attributes, module globals,
-the environment, argv, and cwd. A strategy file does not run in that worker.
-It runs in the referee jail, one bar at a time, while this process keeps the
-engine, the accounting record, and the window's dividends. See docs/ISOLATION.md.
-"""
 
 from __future__ import annotations
 
 import errno
 import gc
 import hashlib
+import inspect
 import hmac
 import math
 import os
@@ -81,7 +70,6 @@ _DESK_KEYS = _ARENA_KEYS + (
 
 
 def _cost_basis(profile: str, share_factor: float, *, anonymized: bool) -> dict:
-    """What the invoice used. The strategy does not receive this dict."""
     schedule = get_profile(profile).fee_table
     name = get_profile(profile).name
     return {
@@ -100,19 +88,12 @@ def _cost_basis(profile: str, share_factor: float, *, anonymized: bool) -> dict:
 
 
 def _release(holder: list):
-    """Hand the billing value to the callee and leave this frame without it.
-
-    The engine still has the scale for the duration of ``on_bar``. The runner
-    frames above that call do not keep a local named ``share_scale`` or
-    ``share_factor``. Post-fee cash still determines k. See docs/ISOLATION.md.
-    """
     if len(holder) != 1:
         raise RuntimeError("billing handoff is empty")
     return holder.pop()
 
 
 def _report_inside_pack(pack_dir, out_dir) -> bool:
-    """True when the resolved report path is the pack or a path inside it."""
     pack = Path(pack_dir).resolve()
     out = Path(out_dir).resolve()
     try:
@@ -123,11 +104,6 @@ def _report_inside_pack(pack_dir, out_dir) -> bool:
 
 
 def _pack_dividends(dividends, *, anonymized: bool, share_scale: float, date_map: dict):
-    """Real $/real-share amounts become the dict the child engine is given.
-
-    An anonymized pack's session id is ``S#####``. The calendar date and the
-    unscaled amount stay in this process.
-    """
     if not dividends:
         return None
     if not anonymized:
@@ -154,10 +130,6 @@ def _pack_dividends(dividends, *, anonymized: bool, share_scale: float, date_map
 
 
 def _designer_dividends(dividends, date_map, price_factor: float):
-    """Cash per pack share is the file amount times the build-time price factor.
-
-    The child receives the restated map. This is not ``share_scale``.
-    """
     from .designer_run import session_dividends
 
     if not dividends:
@@ -167,10 +139,6 @@ def _designer_dividends(dividends, date_map, price_factor: float):
 
 
 def _record_scale_override(books, *, price_factor: float, share_scale: float) -> None:
-    """Name both factors when the billing scale is not the build-time price factor.
-
-    Equal factors keep the invoice label the operator files already use.
-    """
     if float(price_factor) == float(share_scale):
         return
     note = (
@@ -192,14 +160,6 @@ def _summary(profile: str, metrics: dict) -> dict:
 
 
 def _dividends_for_frame(frame, dividends):
-    """Dividends whose session is in ``frame``.
-
-    Walk-forward calls this in the parent, once per child, before that child
-    is spawned. A key that names a session outside the frame is left out.
-    ``None`` stays ``None`` (no file). When the file had entries and none of
-    them fall in this frame, the result is an empty dict: the file was
-    present and this window has no ex-date. ``run`` does not use this.
-    """
     if not dividends:
         return dividends
     sessions = set()
@@ -223,11 +183,6 @@ def _dividends_for_frame(frame, dividends):
 
 
 def _arena_dividend_days(frame, dividends) -> dict:
-    """Map a dividend file onto Arena day indexes.
-
-    Keys may already be day indexes, or calendar dates / pack session ids
-    that appear in ``frame["date"]``.
-    """
     if not dividends:
         return {}
     if "date" not in frame.columns:
@@ -273,12 +228,6 @@ def _bound_accounting(
     withholding_rate,
     dividends,
 ):
-    """Name the method from the dividend file this process was given.
-
-    Desk's omitted financing rate is ``costs_desk.FINANCING_RATE_ANNUAL``,
-    read here. Walk-forward calls this once in the parent, on the full file,
-    and hands that record to each child. A child does not call it on a slice.
-    """
     name = get_profile(profile).name
     if name == "desk" and financing_rate_annual is None:
         financing_rate_annual = engine_desk.D.FINANCING_RATE_ANNUAL
@@ -294,12 +243,6 @@ def _bound_accounting(
 
 
 def _accounting_for(profile: str, kwargs: dict):
-    """The record already resolved for this book, or a fresh one.
-
-    Walk-forward puts the full-file record on ``kwargs``. That record wins.
-    Resolving again from a window's dividend map would treat an empty slice
-    as "no file".
-    """
     provided = kwargs.get("accounting")
     if provided is not None:
         return provided
@@ -315,12 +258,6 @@ def _accounting_for(profile: str, kwargs: dict):
 
 
 def load_run_series(src, symbol: str, *, bar_minutes: int = 1, price_basis: str = "raw", registry_path=None, splits=()):
-    """Load one named series for a run.
-
-    A registry entry declared ``total_return`` stays ``runnable: false``.
-    This function still returns it when ``price_basis`` is ``total_return``
-    and the entry has no declared splits. A raw request keeps the refusal.
-    """
     from .accounting import normalize_price_basis
     from .registry import get_series, load_registry
 
@@ -372,16 +309,6 @@ def execute(
     accounting=None,
     desk_bars=None,
 ):
-    """Run one strategy instance on ``frame``.
-
-    ``max_day``, when set, refuses a frame whose last session is later than
-    that day. Walk-forward uses it so a design run cannot be handed the tail.
-
-    ``accounting``, when given, is the record already resolved from the full
-    dividend file. This function does not look at whether ``dividends`` is
-    empty. An empty map credits no cash and still keeps that record.
-    """
-    # Drop the parameter name before on_bar. The engine call receives the value.
     billing = [share_factor]
     del share_factor
     name = get_profile(profile).name
@@ -389,11 +316,6 @@ def execute(
         raise RuntimeError(
             f"refusing to run: frame contains day {int(frame['day'].max())} after declared end {int(max_day)}"
         )
-    # No record yet: name the method here. Desk's omitted rate is the live
-    # constant, read in this process. A strategy that patches it changes the
-    # child book, and the parent benchmark (unpatched) rejects the row.
-    # Walk-forward passes the record it already resolved from the full file,
-    # so an empty slice is not read as "no file".
     if accounting is None:
         accounting = _bound_accounting(
             name,
@@ -470,12 +392,6 @@ def _benchmarks(profile: str):
 
 
 def _strategy_spec(strategy_cls):
-    """How the child should obtain the class.
-
-    A class loaded from a file lives in a synthetic module the child cannot
-    import. The child loads that file again. An importable class is pickled
-    by module and name.
-    """
     path = getattr(strategy_cls, "__strategy_path__", None)
     if path:
         return {"kind": "path", "path": str(path)}
@@ -493,7 +409,6 @@ def _load_strategy(spec):
 
 
 def _standalone_frame(frame):
-    """A frame whose pickle contains only its own rows."""
     out = frame.copy(deep=True).reset_index(drop=True)
     out.attrs.clear()
     return out
@@ -534,15 +449,41 @@ def _tag_observer(result, strategy):
 
 
 class _ObserverView:
-    """Picklable copy of a strategy instance loaded from a file.
-
-    The child imports that file under a generated module name. The parent has
-    not imported it, so the instance itself cannot cross the queue. The
-    attributes can. A class the parent already imported is left as it is.
-    """
 
     def __init__(self, values: dict):
-        self.__dict__.update(values)
+        self._fields = dict(values)
+
+    def __getattr__(self, name: str):
+        fields = object.__getattribute__(self, "_fields")
+        try:
+            return fields[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _instance_fields(obj) -> list[tuple[str, object]]:
+    missing = object()
+    kind = type(obj)
+    found = []
+    for key in dir(obj):
+        if not isinstance(key, str) or key == "" or key in {"__dict__", "__weakref__"}:
+            continue
+        try:
+            owned = inspect.getattr_static(obj, key)
+        except AttributeError:
+            continue
+        try:
+            declared = inspect.getattr_static(kind, key)
+        except AttributeError:
+            declared = missing
+        if declared is not missing and owned is declared:
+            continue
+        try:
+            value = getattr(obj, key)
+        except Exception:
+            continue
+        found.append((key, value))
+    return found
 
 
 def _observer_view(observer):
@@ -550,7 +491,7 @@ def _observer_view(observer):
     if not str(module).startswith("backtester_user_strategy_"):
         return observer
     values = {}
-    for key, value in getattr(observer, "__dict__", {}).items():
+    for key, value in _instance_fields(observer):
         try:
             pickle.dumps(value)
         except Exception:
@@ -560,7 +501,6 @@ def _observer_view(observer):
 
 
 def _picklable_books(books):
-    """Send books the parent can unpickle. A file strategy comes back as data."""
     portable = {}
     for label, (result, metrics) in books.items():
         plain = dict(result)
@@ -575,9 +515,6 @@ def _picklable_books(books):
     return portable
 
 
-# Names a spawned book may inherit. Anything else, including a data-root
-# variable, is dropped. PATH stays because the interpreter and native
-# libraries may need it; a data directory placed on PATH is not stripped.
 _ENV_KEEP = frozenset(
     {
         "PATH",
@@ -604,36 +541,21 @@ _ENV_KEEP = frozenset(
         "DYLD_LIBRARY_PATH",
         "LANG",
         "LC_ALL",
-        # The Windows AppContainer profile is stored under this directory.
-        # The worker keeps the value so the jail can be created. The jail
-        # denies the directory. It is not a data root the strategy can read.
         "LOCALAPPDATA",
         "LC_CTYPE",
         "TZ",
     }
 )
 _CHILD_ARGV = ["backtester-design"]
-# Spawn copies the parent argv, cwd, and environment at Process.start.
-# Two books starting together must not interleave that scrub.
 _LAUNCH_LOCK = threading.Lock()
-# The child keeps at most this much of what a strategy prints. The rest is
-# discarded so a large print cannot fill the pipe the parent is reading, and
-# cannot fill the disk. The tail attached to an operator error is shorter.
 _STDIO_CAP_BYTES = 256 * 1024
 _STDIO_NAME = "stdio.log"
 
 
-# One line on a banner. A strategy traceback stays in the log and in the
-# operator error file, not in this sentence.
 _BANNER_LIMIT = 240
 
 
 def failure_line(type_name: str, message: str) -> str:
-    """``Type: message``, or ``strategy raised Type`` when the message is empty.
-
-    Newlines collapse. The outermost exception is the caller's job: pass its
-    type and ``str(exc)``, not ``__cause__``.
-    """
     name = str(type_name or "Exception").split()
     label = name[0] if name else "Exception"
     text = " ".join(str(message).split())
@@ -644,12 +566,6 @@ def failure_line(type_name: str, message: str) -> str:
 
 
 class WorkerFailure(RuntimeError):
-    """A book process failed. ``tail`` is its own stdout/stderr, not a path.
-
-    ``type_name`` and ``detail`` are the strategy exception. ``trace`` is the
-    traceback. The RuntimeError message stays the traceback so an operator
-    error file still has it. A banner uses :func:`failure_line` instead.
-    """
 
     def __init__(
         self,
@@ -668,12 +584,6 @@ class WorkerFailure(RuntimeError):
 
 
 class _StdioCapture:
-    """Redirect fd 1 and fd 2 into a capped file in the worker's directory.
-
-    The redirect is on the descriptors, so a C extension and a subprocess see
-    it. The reader keeps draining after the file is full, which is what stops
-    a large print from blocking the strategy.
-    """
 
     def __init__(self, directory: str, limit: int = _STDIO_CAP_BYTES):
         self.path = Path(directory) / _STDIO_NAME
@@ -750,18 +660,12 @@ class _StdioCapture:
 
 
 def _new_session() -> None:
-    """Make this worker a session leader so a group signal reaches its children.
-
-    Windows has no ``setsid``. The parent puts that worker in a job object
-    instead, before it releases the gate.
-    """
     if os.name == "nt":
         return
     os.setsid()
 
 
 def _drop_directory(entries, banned: str) -> list:
-    """Remove one directory from a path list. Install paths stay."""
     if not banned:
         return list(entries)
     try:
@@ -794,13 +698,6 @@ def _child_environ(source) -> dict:
 
 
 def _pythonpath_to_drop(source) -> list[str]:
-    """PYTHONPATH entries the child must not keep on ``sys.path``.
-
-    The variable itself is not inherited. An entry that is the installed
-    package root stays, because an editable or ``PYTHONPATH=src`` layout
-    imports ``backtester`` from there. Every other entry is removed, including
-    one under the operator's directory that holds another job's report.
-    """
     raw = source.get("PYTHONPATH", "")
     if not raw:
         return []
@@ -822,21 +719,6 @@ def _pythonpath_to_drop(source) -> list[str]:
 
 
 def _enter_child(job):
-    """Scrub the book process before any strategy code runs.
-
-    Returns the argv and cwd spawn copied in, so a test can see that the copy
-    itself was already clean. The scrub runs again here even when spawn already
-    copied a clean argv and environment: a child that inherited the operator
-    process still drops them.
-
-    ``multiprocessing.process.ORIGINAL_DIR`` is the operator's directory from
-    when this interpreter first imported multiprocessing, and spawn puts that
-    directory on ``sys.path``. After the working directory is the empty temp
-    dir, both point there instead. Install paths stay on ``sys.path``.
-    ``PYTHONPATH`` is not in the child environment. Entries from the parent's
-    ``PYTHONPATH`` that are not the installed package are removed here too,
-    because spawn already copied them onto ``sys.path``.
-    """
     inherited_argv = list(sys.argv)
     inherited_cwd = os.getcwd()
     import multiprocessing.process as mp_process
@@ -857,12 +739,6 @@ def _enter_child(job):
 
 
 def _launch_book(ctx, queue, job):
-    """Start one book. Spawn copies argv and cwd at start, so set them first.
-
-    The parent directory, argv, and environment are restored before this
-    returns, including when start fails. The scrub is serialized: a second
-    book must not snapshot the environment while it is cleared.
-    """
     cwd = tempfile.mkdtemp(prefix="bt-book-")
     proc = ctx.Process(target=_books_worker, args=(queue, job), name="walk-forward-book")
     with _LAUNCH_LOCK:
@@ -892,12 +768,6 @@ def _launch_book(ctx, queue, job):
 
 
 def _set_dumpable(enabled: bool) -> int | None:
-    """Set PR_SET_DUMPABLE on Linux. Returns the previous flag, or None elsewhere.
-
-    A non-dumpable parent cannot be attached with ptrace, which is the cheap
-    mitigation for a same-user /proc/<pid>/mem read. It is not a sandbox.
-    Windows DACL work is out of scope for this phase.
-    """
     if sys.platform != "linux":
         return None
     import ctypes
@@ -923,14 +793,6 @@ def _restore_dumpable(previous: int | None) -> None:
 
 
 def _reported_failure(exc: BaseException) -> tuple[str, str, str]:
-    """Type, message, and traceback stored on the worker's error.
-
-    The jail reports a strategy exception as ``Disqualified`` reason
-    ``strategy``. The detail is ``Type: message`` and ``trace`` is the
-    strategy process traceback. The operator banner uses the type and the
-    message. The log uses the traceback. A timeout, a protocol break, and a
-    worker failure stay the exception this process caught.
-    """
     reason = getattr(exc, "reason", None)
     detail = getattr(exc, "detail", None)
     child_trace = getattr(exc, "trace", None)
@@ -943,7 +805,6 @@ def _reported_failure(exc: BaseException) -> tuple[str, str, str]:
 
 
 def _forget_phase_log(cwd) -> None:
-    """Remove the sibling phase log after the jail directory is gone."""
     if os.name != "nt" or not cwd:
         return
     try:
@@ -953,22 +814,12 @@ def _forget_phase_log(cwd) -> None:
 
 
 def phase_log_path(cwd) -> Path:
-    """Phase log beside the jail directory, not inside it.
-
-    The strategy lists its cwd. A log written there is a file the child
-    can read. The parent and the worker both use this sibling path.
-    """
     directory = Path(cwd)
     return directory.with_name(directory.name + ".phase.log")
 
 
 def _books_worker(queue, job):
     _new_session()
-    # The session is created before the jail. The seccomp filter that denies
-    # setsid is installed after a file strategy's jail is up: bubblewrap needs
-    # setsid for its own new session, and the filter would be inherited.
-    # Class strategies have no jail process, so the filter is installed before
-    # they run. See docs/ISOLATION.md.
     spool = None
     try:
         inherited_argv, inherited_cwd = _enter_child(job)
@@ -1059,25 +910,12 @@ def _books_worker(queue, job):
 
 
 _JAIL_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
-# Headroom above the caller's cap so the jail can cross it by one small
-# allocation and the poll can still report the number. It is not a second
-# ceiling: the kernel limit stays this close to the caller's cap.
-# One poll interval of 8 MiB chunks, plus the headroom the memory tests
-# allocate past the cap before they sleep. Still far under the 2 GiB ceiling,
-# so one mapping cannot reach that ceiling.
 _JAIL_CAP_MARGIN = 256 * 1024 * 1024
 _JAIL_CPU_SECONDS = 3600
-# Same default as the referee. A longer bar has to opt in.
 _JAIL_CALL_TIMEOUT_S = 10.0
 
 
 def jail_memory_bytes(memory_cap, *, ceiling: int = _JAIL_MEMORY_BYTES, margin: int = _JAIL_CAP_MARGIN) -> int:
-    """Kernel ceiling for the jailed strategy.
-
-    With no caller cap the ceiling stays at ``ceiling`` (2 GiB). A caller
-    cap is passed through with ``margin`` added, and it is never raised
-    above ``ceiling``. The worker job does not receive this number.
-    """
     if memory_cap is None or isinstance(memory_cap, bool) or not isinstance(memory_cap, int):
         return int(ceiling)
     if memory_cap <= 0:
@@ -1089,14 +927,6 @@ def jail_memory_bytes(memory_cap, *, ceiling: int = _JAIL_MEMORY_BYTES, margin: 
 
 
 def _bind_strategy(strategy, *, in_process: bool):
-    """Return ``(class_or_none, path_or_none)``.
-
-    A path is the jail. A class stamped with ``__strategy_path__`` is a file
-    the caller already loaded, and it takes the same jail unless
-    ``in_process`` is set. ``in_process`` loads a path in this process and
-    strips the file marker so the worker does not jail it. A class with no
-    file marker stays in this process.
-    """
     if in_process:
         if isinstance(strategy, (str, os.PathLike)):
             from .strategy_loader import load_strategy_class
@@ -1109,8 +939,6 @@ def _bind_strategy(strategy, *, in_process: bool):
                 strategy.__strategy_path__ = None
         return strategy, None
     if isinstance(strategy, (str, os.PathLike)):
-        # Absolute before any worker changes directory. A relative path
-        # resolved after that chdir points at the empty temp directory.
         return None, os.path.abspath(strategy)
     path = getattr(strategy, "__strategy_path__", None)
     if path:
@@ -1129,16 +957,6 @@ def _run_jailed_books(
     audience="operator",
     memory_cap=None,
 ):
-    """Engine in this process. The strategy file runs in the referee jail.
-
-    ``kwargs`` already holds the accounting record and this window's dividend
-    slice. Those stay here. The pipe carries bars and decisions only, so a
-    locked ex-date is not in the design strategy and the scale is not in
-    either strategy process. The jail's kernel ceiling is the caller's cap
-    plus a small margin, and never the 2 GiB default when a cap was set.
-    The parent's poll still reports that cap. The worker job has no commit
-    limit.
-    """
     from .referee import Disqualified, jailed_strategy
     from .sandbox import lock_worker_session
 
@@ -1163,8 +981,6 @@ def _run_jailed_books(
         call_timeout=float(call_timeout),
         memory_cap=memory_cap,
     ) as remote:
-        # The jail is already a new session. Later forks of this worker cannot
-        # leave the group.
         lock_worker_session()
         try:
             if audience == "designer":
@@ -1175,9 +991,6 @@ def _run_jailed_books(
                 books = run_books(lambda: remote, frame, profile, share_factor=share_factor, **kwargs)
             surface = remote.snapshot()
         except Disqualified as exc:
-            # Prints live in the jail log. Attach them to this worker's stdio
-            # before the operator error is built. A hard exit (os._exit) has
-            # no decision line; leave with that status so the row is a crash.
             remote.spill_stdio(wait=exc.reason in {"strategy", "crash", "protocol"})
             if exc.reason == "crash":
                 code = remote.exit_code()
@@ -1203,12 +1016,6 @@ def _note_child(books, inherited_argv, inherited_cwd) -> None:
 
 
 def _kill_group(pgid: int, sig: int) -> None:
-    """Signal a saved process group. The leader may already have been reaped.
-
-    ``os.getpgid`` fails with ``ESRCH`` once the leader is gone, so the caller
-    passes the id it recorded when the worker became the session leader. A
-    missing group is the process already being dead, not an error.
-    """
     try:
         os.killpg(int(pgid), sig)
     except ProcessLookupError:
@@ -1220,15 +1027,6 @@ def _kill_group(pgid: int, sig: int) -> None:
 
 
 def _stop_process(proc, job=None, pgid=None) -> None:
-    """End a worker and the processes it started.
-
-    ``pgid`` is the worker pid recorded after ``setsid``. Linux signals that
-    group with SIGTERM and then SIGKILL even when the leader has already
-    exited, so a grandchild is not left with ``ppid`` 1. SIGKILL is not
-    conditional on the leader still being alive: a child that ignores SIGTERM
-    would otherwise survive. Windows terminates the job object on this path,
-    including a normal return. Both waits are bounded.
-    """
     if job is not None:
         try:
             job.terminate()
@@ -1286,13 +1084,6 @@ def _wait_until_started(proc, event, queue, timeout: float, stop=None, job=None,
 
 
 def _pipe_bytes(reader) -> int | None:
-    """Bytes already in a Windows result pipe. ``None`` on other systems.
-
-    ``PeekNamedPipe`` does not consume the message. ``connection.wait`` on
-    this pipe posts a zero-byte overlapped read and then cancels it, which
-    leaves a ``WriteFile`` of a result larger than the 8 KiB pipe buffer
-    blocked in the child.
-    """
     if os.name != "nt":
         return None
     import _winapi
@@ -1304,7 +1095,6 @@ def _pipe_bytes(reader) -> int | None:
 
 
 def _phase_child_pids(phase_dir) -> list[int]:
-    """Jailed pids the worker recorded. Toolhelp can miss an AppContainer."""
     if not phase_dir:
         return []
     try:
@@ -1323,14 +1113,6 @@ def _phase_child_pids(phase_dir) -> list[int]:
 
 
 def _watched_rss(pid: int, job, phase_dir=None):
-    """Resident set of the worker, its children, and any jailed pid it named.
-
-    On Windows the same walk also reads commit, and the larger total is
-    what the cap compares. Job members and phase-log pids that toolhelp
-    already listed are not counted twice. Children of those extra pids
-    are included. A job that reports more than 32 members fails the book
-    instead of summing the 32-pid prefix.
-    """
     from .limits import member_list_overflow, process_tree_watch_bytes
 
     if job is not None and hasattr(job, "assigned_process_count"):
@@ -1351,7 +1133,6 @@ def _watched_rss(pid: int, job, phase_dir=None):
 
 
 def _windows_hang_detail(proc, job, phase_dir) -> str:
-    """Phase, job accounting, commit, and who holds the profile mutex."""
     parts = []
     if phase_dir:
         path = phase_log_path(phase_dir)
@@ -1382,13 +1163,6 @@ def _windows_hang_detail(proc, job, phase_dir) -> str:
 
 
 def _note_windows_wait(proc, pending: int | None, started: float, job=None, phase_dir=None) -> None:
-    """One line on the real stderr every two seconds, for the Windows CI log.
-
-    Every ten seconds the line includes the phase file, the job limits, the
-    worker commit, and whether the profile mutex is held. A pytest timeout
-    kills the test before the worker-timeout exception is raised, so the
-    diagnosis has to be on this path.
-    """
     waited = time.monotonic() - started
     slot = int(waited // 2)
     if slot < 1 or getattr(proc, "_sb_wait_note", -1) == slot:
@@ -1414,14 +1188,6 @@ def _note_windows_wait(proc, pending: int | None, started: float, job=None, phas
 def _take_result(
     proc, queue, timeout: float, *, memory_bytes: int | None = None, stop=None, job=None, pgid=None, phase_dir=None
 ):
-    """Read the result, or raise as soon as the child exits without one.
-
-    A dead child used to block on ``queue.get`` until the 600s timeout.
-    On Linux the process sentinel and the queue are waited together. On
-    Windows only the sentinel is waited: the pipe is drained with
-    ``PeekNamedPipe`` and a real read. ``memory_bytes`` and ``stop`` are
-    watched in this process. They are not sent to the child.
-    """
     import queue as queue_mod
     from multiprocessing.connection import wait
 
@@ -1438,8 +1204,6 @@ def _take_result(
         elif wait([reader], timeout=0):
             queued = True
         if queued:
-            # A timeout posted as the resident set crosses the cap is the
-            # memory stop. The cap is what the caller asked to enforce.
             if memory_bytes is not None:
                 rss = _watched_rss(proc.pid, job, phase_dir)
                 if rss is not None and rss > int(memory_bytes):
@@ -1488,7 +1252,6 @@ def _take_result(
 
 
 def _metric_delta(child, parent) -> list[str]:
-    """Top-level keys whose JSON forms differ. Empty means the books agree."""
     from .report import json_ready
 
     left = json_ready(child)
@@ -1503,13 +1266,9 @@ def _metric_delta(child, parent) -> list[str]:
 
 
 def _metrics_from_result(profile: str, result: dict, *, anonymized: bool, borrow_rate_annual, run_kwargs=None):
-    """The statistics ``execute`` would attach, computed in this process."""
     name = get_profile(profile).name
     kwargs = dict(run_kwargs or {})
     if name == "desk" and kwargs.get("financing_rate_annual") is None:
-        # The strategy book was already run. Stamp the rate stored on that
-        # result so the recomputation matches it. Benchmarks are re-run here
-        # and still read the live constant.
         recorded = (result.get("config") or {}).get("financing_rate_annual")
         if recorded is not None:
             kwargs["financing_rate_annual"] = recorded
@@ -1532,14 +1291,6 @@ def _metrics_from_result(profile: str, result: dict, *, anonymized: bool, borrow
 
 
 def _accept_child_books(profile: str, frame, child_books: dict, kwargs: dict) -> dict:
-    """Recompute statistics here. A child that rewrote them fails the book.
-
-    The strategy's bars ran in the child, so a patched cost constant can still
-    change that book's fills. The numbers published for the book are computed
-    again from those fills in this process. Benchmarks are run again here, on
-    this process's copy of the engine. A mismatch fails the row instead of
-    publishing the child's copy. See docs/ISOLATION.md.
-    """
     if "strategy" not in child_books:
         raise RuntimeError("strategy process returned no strategy book")
     strategy_result, child_metrics = child_books["strategy"]
@@ -1613,12 +1364,6 @@ def _failure_from_message(message) -> WorkerFailure:
 
 
 def _series_for_child(frame, audience: str) -> str | None:
-    """Store ``frame`` and return its directory. The job does not carry the bars.
-
-    A designer audience only accepts a designer artifact. A failed write falls
-    back to pickling for an operator run. A designer frame that still contains
-    operator data is refused.
-    """
     from .prepared import store_frame
 
     kind = "designer" if audience == "designer" else "window"
@@ -1645,34 +1390,11 @@ def _isolated_books(
     series_path=None,
     **kwargs,
 ):
-    """Run ``run_books`` in a fresh spawned interpreter.
-
-    The child receives this frame, the strategy, and the run kwargs. Its argv
-    is ``['backtester-design']``, its cwd is an empty temporary directory, and
-    its environment is the allowlist in ``_child_environ``. ``during``, when
-    given, runs in the parent after the child is up and before the child
-    continues. A long-lived process is not reused.
-
-    ``timeout`` starts after the child has entered, so interpreter startup is
-    not part of the strategy budget. ``memory_bytes`` and ``stop`` stay in
-    the parent. ``strategy_path``, when set, is loaded in the child so an
-    import error belongs to that strategy.
-
-    The gate is always used. On Windows the job object is armed before the
-    gate opens, so a process the strategy starts is in that job. If that
-    assignment fails, the run fails instead of falling back to signaling only
-    the worker pid. On Linux the worker pid is the process-group id once the
-    child has entered, and every exit path signals that group. Statistics
-    and benchmarks are recomputed in this process from the child's result.
-    """
     import multiprocessing
 
     from .limits import arm_worker_job
 
     if os.name == "nt":
-        # The runtime ACL is once per machine. Pay for it here, before the
-        # worker's timeout clock starts, so a book does not spend its budget
-        # walking the Python tree.
         from .sandbox import warm_windows_profile
 
         warm_windows_profile()
@@ -1686,7 +1408,6 @@ def _isolated_books(
     else:
         spec = _strategy_spec(strategy_cls)
     if spec.get("kind") == "path":
-        # launch() runs in the worker, where the pytest observer is not set.
         from .sandbox import note_launch
 
         note_launch()
@@ -1730,8 +1451,6 @@ def _isolated_books(
         if os.name == "nt" and guard is None:
             raise RuntimeError("the worker could not be placed in a job object")
         _wait_until_started(proc, gate["started"], result_queue, 60, stop, guard)
-        # setsid has run: the started event is set after it. The group id is
-        # the worker pid. Keep it after the leader is reaped; getpgid cannot.
         if os.name != "nt" and proc.pid:
             pgid = int(proc.pid)
         try:
@@ -1764,9 +1483,6 @@ def _isolated_books(
             raise failure
         if proc.exitcode not in (0, None):
             raise RuntimeError(f"walk-forward worker exited {proc.exitcode}\n")
-        # The child has exited. Load the artifact only when this process still
-        # has to recompute benchmarks or accept a designer book. Until then the
-        # parent does not keep a second copy of the series.
         wants_frame = audience == "designer" or bool(run_kwargs.get("with_benchmarks", True))
         if frame is None:
             if wants_frame:
@@ -1785,8 +1501,6 @@ def _isolated_books(
             return accept_books(profile, held, message[1], run_kwargs)
         return _accept_child_books(profile, held, message[1], run_kwargs)
     finally:
-        # Success, a strategy exception, and a parent-side failure all come
-        # through here. The group is signaled even when the worker has exited.
         _stop_process(proc, guard, pgid)
         if guard is not None:
             guard.close()
@@ -1819,7 +1533,6 @@ def run_books(
     withholding_rate: float | None = None,
     accounting=None,
 ):
-    """Fresh instance per book. Benchmarks reuse the strategy's cost configuration."""
     billing = [share_factor]
     del share_factor
     common = dict(
@@ -1857,12 +1570,6 @@ def run_books(
 
 
 def _write_child_surface(directory, books) -> None:
-    """Write a strategy's own report when it stored one.
-
-    The jail cannot create that file beside the strategy. The worker writes
-    it into the operator directory after the engine has finished. It is not
-    copied into ``designer/``.
-    """
     observer = books["strategy"][0].get("observer")
     surface = getattr(observer, "surface", None)
     if not isinstance(surface, dict):
@@ -1883,15 +1590,6 @@ def write_books(
     designer_books=None,
     scale: float | None = None,
 ) -> dict:
-    """Write the strategy curves at the top of ``out_dir`` and benchmarks underneath.
-
-    An anonymized run also writes ``designer/``. That tree is the copy a
-    strategy designer may see. It has no ticker, no calendar date, and no
-    scale factor. When ``designer_books`` is given, that tree is those books
-    (flat fee, canonical equity). The files next to it are the operator copy
-    and may have the real ticker and the real fees. Those operator files are
-    written from ``books`` either way.
-    """
     if anonymized:
         from .report import require_anonymizable_symbol
 
@@ -2007,8 +1705,6 @@ def run_named(
         if call_timeout is not None:
             book_kwargs["call_timeout"] = float(call_timeout)
         if series_path:
-            # The worker maps this artifact. Drop the parent's frame for the
-            # duration of the jail, then map it again to write the report.
             loaded = None
             gc.collect()
             books = _isolated_books(
@@ -2053,7 +1749,6 @@ class _SliceMeta:
 
 
 def _keystream(key: bytes, nonce: bytes, nbytes: int) -> bytes:
-    """HMAC-SHA256 keystream. ``key`` is the only secret; ``nonce`` is stored in the file."""
     chunks = []
     produced = 0
     counter = 0
@@ -2074,7 +1769,6 @@ def _xor(data: bytes, stream: bytes) -> bytes:
 
 
 def _seal(payload: bytes, key: bytes) -> bytes:
-    """Encrypt ``payload``. The file holds a nonce and a MAC, not the key."""
     nonce = os.urandom(16)
     cipher = _xor(payload, _keystream(key, nonce, len(payload)))
     mac = hmac.new(key, b"BTLK" + nonce + cipher, hashlib.sha256).digest()
@@ -2094,7 +1788,6 @@ def _open_sealed(blob: bytes, key: bytes) -> bytes:
 
 
 def _spill_frame(frame, key: bytes) -> str:
-    """Write a sealed frame. The file is not a readable pickle, and ``key`` is not written."""
     payload = pickle.dumps(_standalone_frame(frame), protocol=pickle.HIGHEST_PROTOCOL)
     sealed = _seal(payload, key)
     del payload
@@ -2139,32 +1832,6 @@ def walk_forward(
     in_process: bool = False,
     call_timeout: float | None = None,
 ):
-    """Design run sees only design bars. The locked run may replay earlier bars as warm-up.
-
-    The parent keeps the design slice and writes the locked window as a sealed
-    blob. The key stays in this function: it is not put in the child job, the
-    environment, argv, or any file. The caller's frame is dropped before the
-    design child starts, and the locked window is opened only after that child
-    has exited. Each book is a new spawned interpreter. See docs/ISOLATION.md.
-
-    Arena warm-up trades, then rescales to the starting equity and keeps exposure.
-    Desk warm-up is flat (``live`` false) and goes live flat at the starting equity.
-    Those are different engines. This function does not merge them.
-
-    The parent resolves one accounting record from the full dividend file,
-    then gives each child that record and only the ex-dates inside that
-    child's frame. An empty map means the file was present and this window
-    has no ex-date. The child does not decide the method from the map.
-    A dividend date that is not in the full sample fails here, for Arena and
-    for Desk, before either child starts. An Arena ``run`` still rejects a
-    date that is not in its sample. A Desk ``run`` still looks a session up
-    and credits nothing when the key is absent.
-
-    The books written here are operator books. They keep the original ticker.
-    There is no designer tree, so a symbol that is reserved for anonymized
-    reports is allowed. ``anonymized`` stamps those operator books. Named
-    walks leave it false.
-    """
     strategy_cls, strategy_path = _bind_strategy(strategy_cls, in_process=in_process)
     if share_factor != 1.0 and not allow_scale:
         raise ValueError(
@@ -2179,9 +1846,6 @@ def walk_forward(
         warmup_days=warmup_days,
     )
     if dividends:
-        # Both profiles. A locked ex-date is in this frame, so it passes here
-        # and is left out of the design child below. A date that is in neither
-        # window is not in the sample.
         _arena_dividend_days(frame, dividends)
     accounting = _bound_accounting(
         profile,
@@ -2346,20 +2010,6 @@ def run_pack(
     in_process: bool = False,
     call_timeout: float | None = None,
 ):
-    """Run a pack. The sidecar stays in this process.
-
-    The operator child is billed on real share counts (``share_scale``).
-    An anonymized pack also runs a designer child: flat fee, canonical
-    equity, no scale factor. Dividend cash per pack share for that child is
-    the file amount times the price factor authenticated by the operator
-    MAC, never ``share_scale``. The operator child still receives amounts
-    times ``share_scale``. Neither child receives the sidecar document, the
-    date map, the ticker, the volume factor, the factor key, or the note.
-
-    ``allow_scale_mismatch`` is the test override that bills a scale other
-    than that price factor. The invoice then records both factors. The MAC
-    is still checked.
-    """
     if in_process:
         raise ValueError("--unsafe-in-process cannot run a pack or an anonymized book")
     strategy_cls, strategy_path = _bind_strategy(strategy_cls, in_process=False)
@@ -2403,8 +2053,6 @@ def run_pack(
     )
     if borrow_rate_annual is None and secret["borrow_rate_source"] == "explicit":
         borrow_rate_annual = float(secret["borrow_rate_annual"])
-    # The rest of the sidecar (date map, ticker, volume factor, note) is not
-    # copied into the child job. Drop the document before the spawn.
     del secret
     gc.collect()
     designer_books = None
@@ -2470,7 +2118,6 @@ def run_pack(
         },
     )
     _write_child_surface(out_dir, books)
-    # Not written to metrics.json. A test reads what the child strategy observed.
     observer = books["strategy"][0].get("observer")
     if observer is not None:
         payload["strategy_observer"] = observer
@@ -2498,14 +2145,6 @@ def walk_pack(
     cash_rate_annual: float | None = None,
     withholding_rate: float | None = None,
 ):
-    """Walk-forward a pack.
-
-    Operator design and locked books use the real fee schedule and
-    ``share_scale``. An anonymized pack publishes the design window under
-    ``designer/`` on the flat fee and the canonical equity. The locked
-    window stays an operator book. ``cost_comparison.json`` shows both
-    windows on both cost models.
-    """
     from .designer_run import spawn_kwargs
     from .pack import load_pack, load_sidecar, require_build_price_factor
     from .report import publish_designer, write_cost_comparison
@@ -2670,7 +2309,6 @@ def walk_pack(
 
 
 def run_parallel(*args, **kwargs):
-    """Score many strategies. See ``backtester.parallel.run_parallel``."""
     from .parallel import run_parallel as _run
 
     return _run(*args, **kwargs)

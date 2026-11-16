@@ -1,4 +1,3 @@
-"""``python -m backtester.gui`` opens the same window as ``python -m backtester gui``."""
 
 from __future__ import annotations
 

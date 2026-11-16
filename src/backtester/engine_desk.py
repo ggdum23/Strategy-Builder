@@ -1,11 +1,3 @@
-"""Desk profile engine.
-
-Specified in the engineering plan as sim.py. That file does not exist in the
-reference material, so this module is the implementation. It does not call the
-Arena engine or the Arena fee function.
-
-Rules and the interpretations they required are in docs/DESK_SPEC_DECISIONS.md.
-"""
 
 from __future__ import annotations
 
@@ -23,12 +15,8 @@ from .accounting import dividend_cash, idle_base, require_annual_rate, require_w
 
 @dataclass
 class DeskConfig:
-    """Run configuration. Official schedule defaults; ticker facts are not baked in."""
 
     initial_equity: float = 1_000_000.0
-    # Counted shares are abs(pack shares) * share_factor. When every pack price
-    # is the real price times k, pass k: pack shares are about 1/k of the real
-    # count, and per-share fees then use real shares. 1.0 is the raw-file default.
     share_factor: float = 1.0
     borrow_rate_annual: float = D.BORROW_RATE_ANNUAL
     financing_rate_annual: float = D.FINANCING_RATE_ANNUAL
@@ -39,17 +27,12 @@ class DeskConfig:
     fee_mult: float = 1.0
     slippage_bps: float = D.SLIPPAGE_BPS
     max_abs_target: float = 3.0
-    # Same numbers as profiles.DESK. test_desk_engine_defaults_match_the_profile locks them.
     margin_call_leverage: float = 3.15
     margin_call_target: float = 3.0
     liquidation_hwm_fraction: float = 0.30
     live_start_ordinal: int = 0
     dividends: dict | None = None
-    # None keeps the 21-session fee month. The referee passes a calendar-month
-    # callable. A local run does not, so the kit month stays the kit month.
     month_of_session: object | None = None
-    # None uses costs_desk.fill_costs. A model prices the fill and this engine
-    # does not pass share_factor into that call.
     cost_model: object | None = None
 
     def __post_init__(self):
@@ -77,11 +60,8 @@ class DeskConfig:
 
 
 def parse_target(raw, limit):
-    """None holds. Finite numbers are clipped to [-limit, limit]. Bool and str raise."""
     if raw is None:
         return None
-    # Python bool and numpy.bool both report a bool type name. numpy.bool is
-    # not a subclass of bool on current NumPy, and float(True) would be 1.0.
     if type(raw).__name__ in {"bool", "bool_", "bool8"}:
         raise ValueError("desk target must be a real number or None, not bool")
     if isinstance(raw, (str, bytes, bytearray)):
@@ -130,7 +110,6 @@ def _time_of(row, minute):
 
 
 def _trade_count(value, index: int) -> float:
-    """Trade count as a real number. A scaled pack count is not a whole number."""
     if value is None or value == "":
         value = 0.0
     try:
@@ -143,7 +122,6 @@ def _trade_count(value, index: int) -> float:
 
 
 class _DeskTable:
-    """Columnar desk bars. One strategy view is built per call, not per row stored."""
 
     def __init__(self, session_codes, session_labels, phase_codes, phase_labels, minute, open_, high, low, close, volume, wap, count, filled):
         self.session_codes = np.asarray(session_codes)
@@ -199,7 +177,6 @@ class _DeskTable:
 
 
 class _DeskRow:
-    """One bar. The table is shared; only the index changes between calls."""
 
     __slots__ = ("table", "index")
 
@@ -221,7 +198,6 @@ class _DeskRow:
 
 
 class PreparedDeskBars:
-    """Bars validated once. ``run`` does not copy them into a dict per row."""
 
     def __init__(self, table: _DeskTable):
         self.table = table
@@ -234,7 +210,6 @@ class PreparedDeskBars:
 
 
 def normalize_bars(bars):
-    """Copy bars into plain dicts and reject a stream that cannot be simulated."""
     if hasattr(bars, "to_dict"):
         records = bars.to_dict("records")
     else:
@@ -349,7 +324,6 @@ class _Book:
         self.last_ordinal = 0
 
     def enter_live(self):
-        """Flat $1,000,000. Warm-up targets are not kept."""
         self.cash = float(self.cfg.initial_equity)
         self.shares = 0
         self.target = 0.0
@@ -423,7 +397,6 @@ class _Book:
             rate=self.cfg.financing_rate_annual,
             sessions_per_year=self.cfg.sessions_per_year,
         )
-        # fee_mult does not scale borrow. Spec item 11.
         bor = D.borrow_due(
             snap["shares"],
             snap["price"],
@@ -596,7 +569,6 @@ class _Book:
         )
 
     def _month_key(self, live_ordinal, row):
-        """Fee-month id. The default is a block of sessions, not a calendar month."""
         fn = self.cfg.month_of_session
         if fn is None:
             return live_ordinal // self.cfg.sessions_per_month
@@ -679,7 +651,6 @@ class _Book:
 
 
 def _session_index(rows):
-    """Per-bar session ordinal, last RTH index, and last bar index."""
     ordinals = []
     last_rth = {}
     last_index = {}
@@ -697,12 +668,6 @@ def _session_index(rows):
 
 
 def _without_share_factor(cfg: DeskConfig):
-    """A config object that does not carry share_factor.
-
-    Deleting the dataclass attribute falls back to the class default, which
-    is still 1.0. The cost-model path has to use an object that has no such
-    attribute, so a strategy walking frames cannot see that default.
-    """
     values = {
         field.name: getattr(cfg, field.name)
         for field in fields(cfg)
@@ -712,7 +677,6 @@ def _without_share_factor(cfg: DeskConfig):
 
 
 def _reported_config(cfg) -> dict:
-    """Operator config keeps share_factor. The cost-model path does not."""
     reported = {
         "borrow_rate_annual": cfg.borrow_rate_annual,
         "financing_rate_annual": cfg.financing_rate_annual,
@@ -763,7 +727,6 @@ def _reject_frame(index: int, kind: str, session, phase, minute) -> None:
 
 
 def table_from_frame(frame) -> _DeskTable:
-    """Validate a frame the way ``normalize_bars`` does, without a dict per bar."""
     if frame is None or len(frame) == 0:
         raise ValueError("desk engine received no bars")
     required = ("session", "date", "minute", "open", "high", "low", "close")
@@ -862,7 +825,6 @@ def table_from_frame(frame) -> _DeskTable:
 
 
 def table_from_rows(rows) -> _DeskTable:
-    """Arrays from bars ``normalize_bars`` already accepted."""
     if not rows:
         raise ValueError("desk engine received no bars")
     session_labels = []
@@ -918,7 +880,6 @@ def table_from_rows(rows) -> _DeskTable:
 
 
 def _session_index_table(table: _DeskTable):
-    """Per-bar session ordinal, last RTH index, and last bar index."""
     codes = table.session_codes
     n = table.n
     ordinals = np.zeros(n, dtype=np.int32)
@@ -948,14 +909,10 @@ def _session_index_table(table: _DeskTable):
 
 
 def run(strategy, bars, config=None):
-    """Simulate `strategy` on desk rules. `bars` is a frame or a sequence of mappings."""
     cfg = config if config is not None else DeskConfig()
     if not isinstance(cfg, DeskConfig):
         raise TypeError("config must be a DeskConfig")
     if cfg.cost_model is not None:
-        # Designer fills do not use share_factor. Replace the config before
-        # on_bar so the default 1.0 is not an attribute a strategy can see.
-        # The operator path, cost_model None, still binds it.
         cfg = _without_share_factor(cfg)
         config = cfg
     if isinstance(bars, PreparedDeskBars):
@@ -1020,8 +977,6 @@ def run(strategy, bars, config=None):
         raw = strategy.on_bar(view, account)
         if not book.liquidated:
             book.take_target(raw)
-            # Every RTH bar close, not only the last one. "An RTH close" in the
-            # spec is not the phrase used for the daily mark ("last RTH close").
             if row["phase"] == "rth" and book.pending is None and book.shares != 0:
                 marked = book.cash + book.shares * close
                 if marked > 0.0 and D.margin_call_required(
@@ -1087,24 +1042,12 @@ def run(strategy, bars, config=None):
 
 
 def _session_return(current, previous):
-    """Session return. A previous mark of 0 is undefined and is stored as 0.
-
-    It is not an up day, and it does not raise. A positive previous mark uses
-    ``current / previous - 1``.
-    """
     if previous == 0:
         return 0.0
     return current / previous - 1.0
 
 
 def _cagr(final, initial, years):
-    """Compound growth. A finite equity path that overflows the power returns a non-finite CAGR.
-
-    Arena's numpy power does the same: the value is infinite rather than an exception,
-    and the JSON writer stores that as null. One huge session must not kill a walk-forward.
-    A zero initial equity has no defined growth rate. That case is -1, the same
-    value a non-positive final equity already uses, not an infinite gain.
-    """
     if initial == 0:
         return -1.0
     if not final > 0.0:
@@ -1122,7 +1065,6 @@ def _cagr(final, initial, years):
 
 
 def metrics(res):
-    """Statistics on last-RTH-close marks. Definitions match the Arena metrics function."""
     daily = res["daily"]
     initial = res["initial_equity"]
     if not daily:
@@ -1250,14 +1192,12 @@ def metrics(res):
 
 
 class BuyAndHold:
-    """Passive 1x long through the desk engine. One fill, then hold."""
 
     def on_bar(self, bar, account):
         return 1.0
 
 
 class TwoXLong:
-    """Constant 2x long. Financing is whatever the desk engine charges (7% by default)."""
 
     def on_bar(self, bar, account):
         return 2.0

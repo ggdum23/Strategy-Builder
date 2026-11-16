@@ -1,4 +1,3 @@
-"""Browse past run directories. Opening one loads its report files."""
 
 from __future__ import annotations
 

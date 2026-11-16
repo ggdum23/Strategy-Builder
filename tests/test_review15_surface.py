@@ -1,4 +1,3 @@
-"""Fifteenth review. Job status comes from the run record, not from metrics.json."""
 
 from __future__ import annotations
 

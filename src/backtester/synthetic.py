@@ -1,10 +1,3 @@
-"""Deterministic filled files for benchmarks and equivalence tests.
-
-The prices sit on a one-cent grid. Weekdays come from a fixed start. A
-session is 04:00–19:59 America/New_York, and every 20th session ends the
-regular segment at 13:00 with no post-session bars. Nothing here is a
-market download. Do not commit the files this writes.
-"""
 
 from __future__ import annotations
 
@@ -20,12 +13,6 @@ _SHORT_RTH = (9 * 60 + 30, 13 * 60)
 
 
 def eastern_offset(day: date) -> str:
-    """US Eastern offset for a bar at or after 04:00.
-
-    DST since 2007 starts at 02:00 on the second Sunday of March and ends
-    at 02:00 on the first Sunday of November. Sessions in this generator
-    begin at 04:00, so the transition hour itself is never a bar.
-    """
     if _nth_sunday(day.year, 3, 2) <= day < _nth_sunday(day.year, 11, 1):
         return "-04:00"
     return "-05:00"
@@ -48,7 +35,6 @@ def _phase(minute: int, rth_end: int, post: bool) -> str | None:
 
 
 def session_days(sessions: int, *, start: date | None = None) -> list[date]:
-    """``sessions`` weekdays beginning at ``start`` (2 Jan 2003, a Thursday)."""
     if isinstance(sessions, bool) or not isinstance(sessions, int) or sessions < 1:
         raise ValueError("sessions must be a positive integer")
     day = date(2003, 1, 2) if start is None else start
@@ -61,10 +47,6 @@ def session_days(sessions: int, *, start: date | None = None) -> list[date]:
 
 
 def write_series(root, symbol: str = "SYN", *, sessions: int = 3, start: date | None = None) -> Path:
-    """Write monthly ``<SYM>_1min_filled_YYYY-MM.csv.gz`` files under ``root``.
-
-    Returns the directory that holds the files. ``root`` is created.
-    """
     if not isinstance(symbol, str) or not symbol or "/" in symbol or "\\" in symbol:
         raise ValueError(f"invalid symbol {symbol!r}")
     destination = Path(root)
@@ -120,7 +102,6 @@ def write_series(root, symbol: str = "SYN", *, sessions: int = 3, start: date | 
 
 
 def _unix_naive(year: int, month: int, day: int, hour: int, minute: int, second: int = 0) -> int:
-    """Unix time of a civil clock read as UTC. No leap seconds."""
     y = year - (month <= 2)
     m = month + 9 if month <= 2 else month - 3
     era = y // 400 if y >= 0 else (y - 399) // 400

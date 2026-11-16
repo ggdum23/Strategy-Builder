@@ -1,17 +1,18 @@
 # Arena port notes
 
 `src/backtester/engine_arena.py` is the reference `backtest.py`.
-`src/backtester/costs.py` is the reference `costs.py`, byte for byte.
-`src/backtester/arena_runner.py` is the reference `run_backtest.py` with the
-import pointed at this package. The verbatim files, including the original
-`tests/test_engine.py`, live under `tests/reference/arena/` and are checked
-against `ENGINE_SHA256.txt`.
+`src/backtester/costs.py` keeps the pinned bytes
+`a3b0a522d8bf469001e75aaf274b0c5d3cbef624a68ed9fb94d29298110fe281`, comments included.
+`tests/reference/arena/costs.py` is that file with comments and docstrings removed,
+and the fee code matches. `src/backtester/arena_runner.py` is the reference
+`run_backtest.py` with the import pointed at this package. The vendored files,
+including the original `tests/test_engine.py`, live under `tests/reference/arena/`
+and are checked against `ENGINE_SHA256.txt`.
 
 The textual differences in `engine_arena.py` are:
 
-- The module docstring, plus a comment that `WINDOWS` (design 0..2999,
-  validation 3000..3795, 504-session warm-up) are the anonymized QQQ pack cuts
-  and are not a global default.
+- `WINDOWS` (design 0..2999, validation 3000..3795, 504-session warm-up) are the
+  anonymized QQQ pack cuts and are not a global default.
 - `from . import costs as C` instead of `import costs`.
 - `_read_chunk` no longer writes a pickle beside the source. An installed
   package must not write next to itself. The frame is the one `pandas.read_csv`

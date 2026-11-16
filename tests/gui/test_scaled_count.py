@@ -1,4 +1,3 @@
-"""A fractional anonymized trade count stays fractional through the GUI."""
 
 from __future__ import annotations
 
@@ -38,11 +37,6 @@ def _count_cells(pack: Path, name: str) -> list[str]:
 
 
 def _strategy(path: Path, scaled: float) -> None:
-    """Trade once, and refuse a bar whose count is not the scaled fraction.
-
-    The strategy file is copied into the jail. It cannot open a host log.
-    A drifted count raises in the child, so the run fails instead of filling.
-    """
     path.write_text(
         "class Strategy:\n"
         "    def on_bar(self, bar, state):\n"

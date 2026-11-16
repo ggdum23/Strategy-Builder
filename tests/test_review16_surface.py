@@ -1,4 +1,3 @@
-"""Sixteenth review. Status files and job rows, without Qt."""
 
 from __future__ import annotations
 

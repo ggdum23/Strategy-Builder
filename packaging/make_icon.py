@@ -1,8 +1,3 @@
-"""Write the Strategy Builder icon.
-
-The bytes are deterministic. The installer build regenerates the file so a
-checkout and a CI build use the same image.
-"""
 
 from __future__ import annotations
 
@@ -15,7 +10,6 @@ def _bgra(red: int, green: int, blue: int, alpha: int = 255) -> bytes:
 
 
 def _pixel(x: int, y: int, size: int) -> bytes:
-    """A dark field with three gold bars. Coordinates are top-left."""
     margin = max(1, size // 16)
     if x < margin or y < margin or x >= size - margin or y >= size - margin:
         return _bgra(0x0B, 0x1C, 0x28)
@@ -37,7 +31,6 @@ def _pixel(x: int, y: int, size: int) -> bytes:
 
 
 def _dib(size: int) -> bytes:
-    """BMP-in-ICO image: XOR mask (bottom-up BGRA) plus a zero AND mask."""
     header = struct.pack(
         "<IIIHHIIIIII",
         40,

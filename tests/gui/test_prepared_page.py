@@ -1,4 +1,3 @@
-"""Prepared-data table on the data page."""
 
 from __future__ import annotations
 

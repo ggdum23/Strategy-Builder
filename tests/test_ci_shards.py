@@ -1,4 +1,3 @@
-"""The Windows jobs partition the suite. A new file has to be assigned."""
 
 from __future__ import annotations
 

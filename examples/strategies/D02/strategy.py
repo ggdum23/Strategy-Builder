@@ -1,21 +1,10 @@
-"""Opening-gap absorption.
-
-The book stays long one times equity. When the regular session opens 1.2% or more
-below the previous regular close, exposure is lifted to two times equity for 30
-minutes and then put back to one times. There is no short and no flat state after
-the opening trade.
-
-Decisions use only the bar that just closed and state carried forward from earlier
-bars. The extra unit fills at the next bar's open (the 09:31 bar). It is removed
-by a decision on the 10:00 bar, which fills on the 10:01 bar.
-"""
 
 CORE = 1.0
 BOOST = 2.0
-GAP_THRESHOLD = 0.012  # fade down-gaps at least this large
+GAP_THRESHOLD = 0.012
 HOLD_MINUTES = 30
-OPEN_MINUTE = 570  # 09:30, first regular bar
-EXIT_MINUTE = OPEN_MINUTE + HOLD_MINUTES  # 10:00 bar; fill is the following open
+OPEN_MINUTE = 570
+EXIT_MINUTE = OPEN_MINUTE + HOLD_MINUTES
 
 
 class Strategy:
@@ -54,7 +43,6 @@ class Strategy:
             self.checked = False
             self.boosting = False
 
-        # No prior close yet (first session seen): get long and wait.
         if self.prev_close is None or self.prev_close <= 0:
             if abs(state["target"] - CORE) > 1e-12:
                 return CORE
@@ -70,7 +58,6 @@ class Strategy:
                         self.boosting = True
                         return BOOST
 
-        # Scheduled exit, or a last-bar safety exit so a boost is not held overnight.
         if self.boosting and (minute >= EXIT_MINUTE or minute == last):
             self.boosting = False
             return CORE

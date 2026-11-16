@@ -1,8 +1,3 @@
-"""Reserved report names are rejected before an anonymized run writes anything.
-
-Fixed designer and pack files keep their canonical names. The designer-facing
-stand-in for a ticker is RANDOM. A raw operator run is not checked.
-"""
 
 from __future__ import annotations
 

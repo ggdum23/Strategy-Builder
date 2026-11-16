@@ -1,4 +1,3 @@
-"""Background work so the Qt thread never runs an engine."""
 
 from __future__ import annotations
 
@@ -12,7 +11,6 @@ from .jobs import JobFailure, process_entry
 
 
 class FunctionThread(QThread):
-    """One call off the UI thread. Used for inspect, registry, and pack builds."""
 
     succeeded = Signal(object)
     failed = Signal(object)
@@ -25,15 +23,12 @@ class FunctionThread(QThread):
         try:
             result = self._fn()
         except BaseException as exc:
-            # The thread records the failure and returns. A kill of the run
-            # process is the supervisor's cancel path, not this handler.
             self.failed.emit(JobFailure.capture(exc))
         else:
             self.succeeded.emit(result)
 
 
 def _stop_process(proc, status_path) -> None:
-    """Stop the worker and, when it detached, the engine children it spawned."""
     import os
     import signal
     import sys
@@ -71,7 +66,6 @@ def read_status(path) -> dict | None:
 
 
 class ProcessSupervisor(QObject):
-    """A spawned operator process. Cancel terminates it."""
 
     progress = Signal(dict)
     finished = Signal(dict)

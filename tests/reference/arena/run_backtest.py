@@ -1,21 +1,15 @@
-"""Official runner (IMMUTABLE). Usage:
-    python run_backtest.py --strategy strategy.py --window full|design|validation [--out results]
-Writes results/<label>_<window>_{metrics.json,daily.csv,fills.csv,trades.csv} for the strategy AND for
-buy-and-hold run through the same engine and costs, plus results/<label>_<window>_summary.json.
-Windows: full = days 0..3795, design = 0..2999, validation = 3000..3795 (validation replays the
-previous 504 sessions as a live warm-up, then resets the account to $1M keeping exposure).
-"""
 import argparse
+import importlib
 import importlib.util
 import json
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import backtest as B  # noqa: E402
+import pandas as pd
 
-import pandas as pd  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+B = importlib.import_module("backtest")
 
 
 def load_strategy(path):

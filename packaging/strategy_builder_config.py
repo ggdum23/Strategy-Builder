@@ -1,14 +1,3 @@
-"""User settings for the installed app.
-
-Market data stays where it already is. ``data_root`` is a path the installer
-or the user wrote into a JSON file. This module does not contain a machine
-path and it does not create that folder.
-
-Backtests, the series registry, and this config live under the per-user
-directory ``StrategyBuilder`` inside ``LOCALAPPDATA`` (or the XDG data home
-on other systems). Uninstall leaves that directory alone unless the user
-asks for it to be removed.
-"""
 
 from __future__ import annotations
 
@@ -28,7 +17,6 @@ Market data is not stored here. data_root in config.json points at the filled fi
 
 
 def user_data_dir(environ: dict | None = None, *, platform: str | None = None) -> Path:
-    """Directory that survives uninstall. Does not create it."""
     env = os.environ if environ is None else environ
     system = sys.platform if platform is None else platform
     if system == "win32":
@@ -53,13 +41,6 @@ def config_path(environ: dict | None = None, *, platform: str | None = None) -> 
 
 
 def console_executable(executable: str | Path | None = None) -> Path:
-    """The console ``backtester`` executable that sits beside this process.
-
-    In the frozen bundle ``sys.executable`` is either ``backtester.exe`` or
-    ``Strategy Builder.exe``. A windowed process that needs a console child
-    launches the sibling console executable. It is not a Python interpreter
-    and it does not accept ``-m``.
-    """
     exe = Path(sys.executable if executable is None else executable)
     name = "backtester.exe" if exe.suffix.lower() == ".exe" or sys.platform == "win32" else "backtester"
     if exe.suffix.lower() == ".exe":
@@ -93,11 +74,6 @@ def ensure_user_config(
     *,
     platform: str | None = None,
 ) -> dict:
-    """Create the user directory and config if needed. Never creates ``data_root``.
-
-    An existing ``data_root`` is left as the user set it. ``runs_dir`` and
-    ``registry_path`` are rewritten to this machine's user directory.
-    """
     env = os.environ if environ is None else environ
     directory = user_data_dir(env, platform=platform)
     runs = directory / "runs"

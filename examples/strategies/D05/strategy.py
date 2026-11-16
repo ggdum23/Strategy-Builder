@@ -1,13 +1,3 @@
-"""Volatility-managed long position.
-
-Once per regular session, on the last bar, set exposure to
-round(min(1.5, 0.15 / rv) / 0.5) * 0.5, where rv is the annualized standard
-deviation of the last 20 session returns. The order fills at the next
-session's open. The position is always long or, in extreme volatility, flat.
-No shorts. Regular session only.
-
-All parameters are fixed constants. State is built only from bars passed to on_bar.
-"""
 from collections import deque
 
 import numpy as np

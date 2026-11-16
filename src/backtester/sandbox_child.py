@@ -1,18 +1,7 @@
-"""Strategy process for the one-bar referee.
-
-The parent launches this file with ``python -I -S`` inside the sandbox, or
-re-invokes a frozen executable with ``--sandbox-child``. stdin and stdout are
-the protocol. One request is read, ``on_bar`` runs, one decision is written.
-The next bar is not in the pipe until that decision is written, so a strategy
-that reads stdin here blocks until the per-call timeout.
-
-This file is copied into the private directory next to ``strategy.py``. It
-uses the standard library only. It does not embed a data path, a scale, or a
-ticker.
-"""
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -21,10 +10,6 @@ import threading
 import traceback
 from pathlib import Path
 
-# Decisions go here. File descriptor 1 stays the protocol unless the parent
-# asked for a captured print log. The referee CLI does not, so a second line
-# on stdout is still a protocol failure. A designer run does, so print()
-# cannot forge a decision and a large print cannot fill the pipe.
 _PROTO = 1
 _STDIO_LIMIT = 256 * 1024
 _stdio_read = None
@@ -36,10 +21,6 @@ _IPC = None
 
 
 def _ipc():
-    """The frame codec. A source jail runs with ``python -I``, which leaves the
-    script directory off ``sys.path``, so the sibling file is loaded by path.
-    A frozen child imports the package module.
-    """
     global _IPC
     if _IPC is not None:
         return _IPC
@@ -72,13 +53,6 @@ def _send(payload: dict) -> None:
 
 
 def _exception_error(exc: BaseException) -> dict:
-    """One protocol line for a strategy exception.
-
-    ``error`` is ``Type: message`` so the parent banner can name the
-    exception. ``trace`` is the strategy process traceback, which the
-    operator log shows and the banner does not. The tail is kept when the
-    text is long, because the raised line is at the end.
-    """
     trace = traceback.format_exc()
     if len(trace) > 16_000:
         trace = trace[-16_000:]
@@ -86,13 +60,6 @@ def _exception_error(exc: BaseException) -> dict:
 
 
 def _prepare_stdio(capture: bool) -> None:
-    """Park the protocol on another fd and drain prints into ``stdio.log``.
-
-    The drain keeps reading after the file is full, which is what stops an
-    8 MiB print from blocking ``on_bar``. The file is the strategy's cwd, so
-    the strategy can see the cap. Closing the write end on the way out lets
-    the drain finish before this process exits.
-    """
     global _PROTO, _stdio_read, _stdio_thread
     if not capture:
         return
@@ -139,7 +106,6 @@ def _prepare_stdio(capture: bool) -> None:
 
 
 def _finish_stdio() -> None:
-    """Close the print pipe and wait until ``stdio.log`` has the bytes."""
     global _stdio_done
     if _stdio_done or _stdio_thread is None:
         return
@@ -156,7 +122,6 @@ _stdin_buf = b""
 
 
 def _recv() -> dict | None:
-    """Read one length-prefixed frame. Bytes past that frame stay buffered."""
     global _stdin_buf
     ipc = _ipc()
     while len(_stdin_buf) < 4:
@@ -185,11 +150,6 @@ def _recv() -> dict | None:
 
 
 def _apply_limits() -> bool:
-    """Apply rlimits when the host asked, and report whether prints are captured.
-
-    The limits file is removed before the strategy is loaded. Windows has no
-    rlimit; the job object is the cap there. The capture flag is independent.
-    """
     path = Path("limits.json")
     if not path.is_file():
         return False
@@ -199,11 +159,6 @@ def _apply_limits() -> bool:
     if os.name != "nt":
         import resource
 
-        # The parent wrote this ceiling. Bubblewrap's user namespace makes 64
-        # the whole jail. Landlock shares the host uid, so the ceiling is the
-        # task count from before the ruleset plus the same 64-task headroom.
-        # clone3 returns ENOSYS; threads use clone with CLONE_THREAD, and a
-        # further process is EPERM from the filter.
         nproc = spec.get("nproc")
         if isinstance(nproc, int) and not isinstance(nproc, bool) and nproc > 0:
             _set_nproc(int(nproc))
@@ -218,7 +173,6 @@ def _apply_limits() -> bool:
 
 
 def _set_nproc(ceiling: int) -> None:
-    """Apply the parent's process ceiling without raising the hard limit."""
     import resource
 
     _soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
@@ -230,12 +184,6 @@ def _set_nproc(ceiling: int) -> None:
 
 
 def _extend_path() -> None:
-    """Use only the staged package directories the parent resolved.
-
-    ``-S`` already skipped site-packages. These entries are inserted in the
-    parent's order, in front of the standard library, and the file is removed
-    before the strategy is loaded.
-    """
     path = Path("deps.json")
     if not path.is_file():
         return
@@ -247,8 +195,6 @@ def _extend_path() -> None:
         if entry not in sys.path:
             sys.path.insert(0, entry)
     if os.name == "nt" and hasattr(os, "add_dll_directory"):
-        # The real directory the parent imported. add_dll_directory rejects
-        # the junction in the slot (WinError 87) and wants this path.
         dlls = spec.get("dlls") if isinstance(spec, dict) else None
         for raw in dlls or []:
             try:
@@ -264,7 +210,6 @@ def _extend_path() -> None:
 
 
 def _windows_token_facts() -> dict:
-    """AppContainer facts for this process. Empty capabilities are required."""
     import ctypes
 
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -309,7 +254,6 @@ def _windows_token_facts() -> dict:
 
 
 def _refuse_if_unconfined() -> str | None:
-    """A Windows child that is not an empty AppContainer does not run the strategy."""
     if os.name != "nt":
         return None
     facts = _windows_token_facts()
@@ -384,7 +328,6 @@ def _second(message: dict):
 
 
 def _json_value(value):
-    """A snapshot the parent can store. Callables and open handles stay here."""
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
@@ -398,9 +341,34 @@ def _json_value(value):
     raise TypeError(type(value).__name__)
 
 
+def _instance_fields(obj) -> list[tuple[str, object]]:
+    missing = object()
+    kind = type(obj)
+    found = []
+    for key in dir(obj):
+        if not isinstance(key, str) or key == "" or key.startswith("_") or key in {"__dict__", "__weakref__"}:
+            continue
+        try:
+            owned = inspect.getattr_static(obj, key)
+        except AttributeError:
+            continue
+        try:
+            declared = inspect.getattr_static(kind, key)
+        except AttributeError:
+            declared = missing
+        if declared is not missing and owned is declared:
+            continue
+        try:
+            value = getattr(obj, key)
+        except Exception:
+            continue
+        found.append((key, value))
+    return found
+
+
 def _public_state(strategy) -> dict:
     values = {}
-    for key, value in list(getattr(strategy, "__dict__", {}).items()):
+    for key, value in _instance_fields(strategy):
         if not isinstance(key, str) or key.startswith("_"):
             continue
         try:
@@ -429,8 +397,6 @@ def main() -> int:
         try:
             strategy, wants, has_day_end = _load()
         except BaseException as exc:
-            # Wait for hello so the error is the reply, not a write into a
-            # pipe the parent has not opened yet.
             _recv()
             _send(_exception_error(exc))
             return 1

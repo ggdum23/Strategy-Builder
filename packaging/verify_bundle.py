@@ -1,4 +1,3 @@
-"""Fail the build if the one-folder bundle is missing a required piece."""
 
 from __future__ import annotations
 
@@ -36,8 +35,6 @@ def verify(directory: Path) -> None:
     gui = _exe(directory, "Strategy Builder")
     if cli.stat().st_size <= 0 or gui.stat().st_size <= 0:
         raise SystemExit("an executable is empty")
-    # A one-file executable is tens of megabytes and has no sibling _internal.
-    # The onedir bootloader is the small stub; libraries live beside it.
     if cli.stat().st_size > 30_000_000 and not any(internal.iterdir()):
         raise SystemExit("backtester looks like a one-file build")
 

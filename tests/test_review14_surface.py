@@ -1,4 +1,3 @@
-"""Fourteenth review. Designer strategy ids use one allow-list grammar."""
 
 from __future__ import annotations
 
@@ -13,7 +12,6 @@ from backtester.report import _designer_value_error, assert_designer_clean, desi
 from test_parallel import FLAT, _anon_pack, _strategy
 from windows_open import windows_jails
 
-# Spellings from reviews 13 and 14, plus two-digit years, epochs, and weekdays.
 DATES = (
     "04-Jan-2024",
     "2024-1-4",
@@ -95,7 +93,6 @@ _SCALE = 1.1
 
 
 def _date_hits(text: str) -> tuple[bool, bool, bool, bool, bool]:
-    """The five gates, as a date verdict. A price or an unsafe name is not a date."""
     component = designer_component_problem(text, symbols=(), scale=_SCALE) == "a calendar date"
     value = _designer_value_error("caption", text, "") == "a calendar date"
     scanned = scan_publication(text, scale=_SCALE) == "a date"
@@ -121,20 +118,34 @@ def test_publishable_ids_pass_every_gate(text):
     assert scrub_text(text, (), scale=_SCALE) == text
 
 
+HORIZONTAL_BAR = "\u2015"
+ZERO_WIDTH_SPACE = "\u200b"
+SOFT_HYPHEN = "\u00ad"
+NO_BREAK_SPACE = "\u00a0"
+EM_SPACE = "\u2003"
+THIN_SPACE = "\u2009"
+IDEOGRAPHIC_SPACE = "\u3000"
+EM_DASH = "\u2014"
+MINUS_SIGN = "\u2212"
+
+
+def _separated(separator: str, *parts: str) -> str:
+    return separator.join(parts)
+
+
 def test_other_dashes_spaces_and_format_characters_are_dates():
-    """A separator is any non-alphanumeric, after format characters become a break."""
     samples = (
-        "01\u201504\u201524",  # horizontal bar, not folded to ASCII hyphen
-        "01\u200b04\u200b24",  # zero-width space
-        "01\u00ad04\u00ad24",  # soft hyphen
-        "01\u00a004\u00a024",  # no-break space
-        "01\u200304\u200324",  # em space
-        "01\u200904\u200924",  # thin space
-        "01\u300004\u300024",  # ideographic space
-        "01\u201404\u201424",  # em dash
-        "01\u221204\u221224",  # minus
-        "4\u2015Jan\u201524",
-        "Jan\u201524",
+        _separated(HORIZONTAL_BAR, "01", "04", "24"),
+        _separated(ZERO_WIDTH_SPACE, "01", "04", "24"),
+        _separated(SOFT_HYPHEN, "01", "04", "24"),
+        _separated(NO_BREAK_SPACE, "01", "04", "24"),
+        _separated(EM_SPACE, "01", "04", "24"),
+        _separated(THIN_SPACE, "01", "04", "24"),
+        _separated(IDEOGRAPHIC_SPACE, "01", "04", "24"),
+        _separated(EM_DASH, "01", "04", "24"),
+        _separated(MINUS_SIGN, "01", "04", "24"),
+        _separated(HORIZONTAL_BAR, "4", "Jan", "24"),
+        _separated(HORIZONTAL_BAR, "Jan", "24"),
         "01 04 24",
     )
     for text in samples:

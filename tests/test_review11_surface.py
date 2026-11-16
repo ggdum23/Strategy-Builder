@@ -1,4 +1,3 @@
-"""Eleventh review. Strategy ids are not prices. Both gates read the stored id."""
 
 from __future__ import annotations
 

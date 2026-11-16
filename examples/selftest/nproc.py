@@ -1,8 +1,3 @@
-"""Return 0.0 when a new process is refused.
-
-fork is EPERM. clone3 is ENOSYS, so glibc falls back to clone, and clone
-without CLONE_THREAD is EPERM. A thread is still allowed to start.
-"""
 
 import ctypes
 import errno

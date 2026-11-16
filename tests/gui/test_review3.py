@@ -1,4 +1,3 @@
-"""Third review of d1a6958. Each test fails when its fix is reverted."""
 
 from __future__ import annotations
 

@@ -1,8 +1,3 @@
-"""Return 0.0 when io_uring setup, enter, and register are all EPERM.
-
-The numbers are the generic and x86_64 values. A machine with a different
-number reports itself as not denied, so the probe fails instead of guessing.
-"""
 
 import ctypes
 import errno

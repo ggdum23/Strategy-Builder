@@ -1,4 +1,3 @@
-"""Twelfth review. Leading-digit ids stay visible, and a job row opens its designer book."""
 
 from __future__ import annotations
 

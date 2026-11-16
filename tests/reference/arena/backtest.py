@@ -1,22 +1,3 @@
-"""Official backtest engine (IMMUTABLE - do not modify; official scoring uses an identical copy).
-
-Execution model
-- Bars are delivered one at a time, in time order. Strategies that set WANTS_EXTENDED_HOURS = True
-  receive pre/post-session bars too; otherwise only regular-session ('rth') bars are delivered.
-- After bar t has CLOSED the engine calls strategy.on_bar(bar, state) -> target exposure in [-2, 2]
-  (fraction of current equity, negative = short) or None (= keep the current target).
-- A changed target is filled at the OPEN of the NEXT DELIVERED bar (a decision on the last bar of
-  a session therefore fills at the first delivered bar of the next session, gap included).
-  There are no same-bar fills.
-- Shares = trunc(target * equity_at_fill_open / fill_open), whole shares; equity_at_fill_open is
-  cash + shares * open of the fill bar. Orders are sent only when the target changes: holding the
-  same target never rebalances for drift.
-- Targets are clamped to [-2, 2]. A non-finite target is an error.
-- Costs: see costs.py (commission tiers, exchange/clearing/regulatory fees, 1 bp slippage, short
-  borrow). Cash earns 0 %, leverage is not charged financing.
-- Daily equity is marked at the close of the last regular-session bar of each session.
-- strategy.on_day_end(summary) (optional) is called after the last delivered bar of each session.
-"""
 import json
 import math
 import os
@@ -31,18 +12,16 @@ DATA_DIR = os.path.join(PACK_DIR, "data")
 CACHE_DIR = os.path.join(PACK_DIR, ".cache")
 INITIAL_EQUITY = 1_000_000.0
 MAX_ABS_TARGET = 2.0
-DESIGN_LAST_DAY = 2999       # design window = days 0..2999
-TRAIN_LAST_DAY = 3795        # validation window = days 3000..3795 (locked, one-shot)
-VALIDATION_WARMUP_DAYS = 504  # validation runs replay the previous 504 sessions first, then reset to $1M
+DESIGN_LAST_DAY = 2999
+TRAIN_LAST_DAY = 3795
+VALIDATION_WARMUP_DAYS = 504
 BAR_FIELDS = ("day", "weekday", "minute", "time", "session", "open", "high", "low", "close",
               "volume", "wap", "count", "filled", "short_session")
 WINDOWS = {"full": (0, TRAIN_LAST_DAY), "design": (0, DESIGN_LAST_DAY),
            "validation": (DESIGN_LAST_DAY + 1, TRAIN_LAST_DAY)}
 
 
-# ----------------------------------------------------------------------------------------- data
 def _chunks():
-    """[(path, first_day, last_day)] from data/MANIFEST.json."""
     with open(os.path.join(DATA_DIR, "MANIFEST.json")) as f:
         man = json.load(f)
     return [(os.path.join(DATA_DIR, name), int(r[0]), int(r[1])) for name, r in sorted(man["chunks"].items())]
@@ -60,7 +39,6 @@ def _read_chunk(path):
 
 
 def load_bars(first_day=0, last_day=TRAIN_LAST_DAY):
-    """All 1-minute bars (pre, rth, post) for day indices [first_day, last_day]."""
     parts = []
     for p, a, z in _chunks():
         if z < first_day or a > last_day:
@@ -76,21 +54,12 @@ def load_daily():
     return pd.read_csv(os.path.join(DATA_DIR, "daily_rth.csv"))
 
 
-# ------------------------------------------------------------------------------------- engine
 def _local_month(day):
     return day // C.LOCAL_SESSIONS_PER_MONTH
 
 
 def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month_of_day=None,
         taf_active_of_day=None, reset_day=None, period_label_of_day=None, record_fills=True):
-    """Run `strategy` over `bars` (DataFrame with BAR_FIELDS, all sessions, time-ordered).
-
-    reset_day: if given, the account is rescaled to `initial_equity` (keeping exposure) at the
-      first bar of that day and all statistics are computed from that point (earlier days are a
-      warm-up replay that trades normally).
-    month_of_day / taf_active_of_day / period_label_of_day: callables day -> value (defaults: 21-session
-      fee months, TAF always charged, 252-session periods).
-    """
     month_of_day = month_of_day or _local_month
     taf_active_of_day = taf_active_of_day or (lambda d: True)
     wants_ext = bool(getattr(strategy, "WANTS_EXTENDED_HOURS", False))
@@ -98,14 +67,12 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
 
     bars = bars.reset_index(drop=True)
     is_rth = (bars["session"].values == "rth")
-    # last regular-session bar of each day (mark-to-market point)
     rth_idx = np.flatnonzero(is_rth)
     rth_days = bars["day"].values[rth_idx]
     last_rth = np.zeros(len(bars), bool)
     if len(rth_idx):
         last_rth[rth_idx[np.r_[rth_days[1:] != rth_days[:-1], True]]] = True
     deliver = np.ones(len(bars), bool) if wants_ext else is_rth
-    # per-day regular-session summary for on_day_end
     rth = bars[is_rth]
     g = rth.groupby("day", sort=True)
     dsum = pd.DataFrame({"open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
@@ -113,13 +80,12 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                          "short_session": g["short_session"].first(), "weekday": g["weekday"].first()})
     dsum_rec = {int(k): v for k, v in dsum.to_dict("index").items()}
 
-    sel = np.flatnonzero(deliver | last_rth)  # mark bars are always processed (not delivered if eth-only)
+    sel = np.flatnonzero(deliver | last_rth)
     cols = {k: bars[k].values[sel].tolist() for k in BAR_FIELDS}
     dlv = deliver[sel].tolist()
     lrth = last_rth[sel].tolist()
     days = cols["day"]
     n = len(sel)
-    # last delivered bar of each day
     last_dlv = [False] * n
     seen = set()
     for j in range(n - 1, -1, -1):
@@ -133,10 +99,9 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
     fees_tot = {k: 0.0 for k in ("commission", "exchange", "clearing", "pass_through", "cat", "sec", "taf", "total")}
     slip_tot = 0.0; borrow_tot = 0.0; traded_notional = 0.0; eth_notional = 0.0; n_fills = 0
     fills = []
-    daily = []  # (day, equity, exposure, shares, close, period)
+    daily = []
     sum_abs_exp = 0.0; n_exp = 0; n_long = 0; n_short = 0
-    # episode tracking
-    ep = None  # dict(start_day, start_j, side, cf)
+    ep = None
     episodes = []
     cur_day = None
     O = cols["open"]; Cl = cols["close"]; S = cols["session"]
@@ -152,7 +117,6 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
         if day != cur_day:
             cur_day = day
             if not started and day >= reset_day:
-                # rescale account to initial_equity keeping exposure, using the last mark
                 last_eq = daily[-1][1] if daily else cash
                 last_px = daily[-1][4] if daily else O[j]
                 if last_eq > 0:
@@ -172,14 +136,13 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 ep_bar_count[0] = 0
                 started = True
         o = O[j]
-        # ---- fill pending order at this bar's open
         if pending is not None and dlv[j]:
             tgt = pending; pending = None
             eq_open = cash + shares * o
             if eq_open <= 0:
                 busted = True; new_sh = 0
             else:
-                new_sh = int(tgt * eq_open / o)  # trunc toward zero
+                new_sh = int(tgt * eq_open / o)
             delta = new_sh - shares
             if delta != 0:
                 px = C.slipped_price(o, delta)
@@ -196,7 +159,6 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 n_fills += 1
                 if record_fills:
                     fills.append((day, cols["minute"][j], S[j], delta, o, px, fc["total"], new_sh))
-                # episodes
                 old = shares
                 if old != 0 and (new_sh == 0 or (new_sh > 0) != (old > 0)):
                     frac = abs(old) / abs(delta)
@@ -225,7 +187,6 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
                 sum_abs_exp += abs(x); n_exp += 1
                 if shares > 0: n_long += 1
                 elif shares < 0: n_short += 1
-        # ---- daily mark at regular-session close
         if lrth[j]:
             if shares < 0:
                 b = C.daily_borrow(-shares * c)
@@ -235,7 +196,6 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
             if eq <= 0 and not busted:
                 busted = True
             daily.append((day, eq, (shares * c / eq) if eq > 0 else 0.0, shares, c))
-        # ---- strategy decision
         if dlv[j]:
             bar = {k: cols[k][j] for k in keys}
             state = {"equity": eq, "cash": cash, "shares": shares, "position": (shares * c / eq) if eq > 0 else 0.0,
@@ -275,10 +235,7 @@ def run(strategy, bars, *, initial_equity=INITIAL_EQUITY, share_scale=1.0, month
     }
 
 
-# ------------------------------------------------------------------------------------ metrics
 def metrics(res, period_label_of_day=None):
-    """Performance statistics. Conventions: 252 sessions/year, rf = 0, daily returns from
-    regular-session-close marks, first return measured against initial equity."""
     d = res["daily"]
     E0 = res["initial_equity"]
     if not d:
@@ -300,7 +257,6 @@ def metrics(res, period_label_of_day=None):
     peak = np.maximum.accumulate(path)
     dd = path / peak - 1
     mdd = dd.min()
-    # longest drawdown duration in sessions (peak to recovery or end)
     longest = 0; cur = 0
     for v in dd[1:]:
         cur = cur + 1 if v < 0 else 0
@@ -339,7 +295,6 @@ def metrics(res, period_label_of_day=None):
         "frac_sessions_long_at_close": float((expo > 0).mean()), "frac_sessions_short_at_close": float((expo < 0).mean()),
         "busted": bool(res["busted"]),
     }
-    # per-period returns: 252-session blocks (local) or labels supplied by caller
     lab = period_label_of_day or res.get("period_label_of_day")
     if lab is None:
         start = days[0]
@@ -358,7 +313,6 @@ def metrics(res, period_label_of_day=None):
 
 
 class BuyAndHold:
-    """Benchmark: target +1.0 on the first bar and hold (no drift rebalancing)."""
     WANTS_EXTENDED_HOURS = False
 
     def on_bar(self, bar, state):

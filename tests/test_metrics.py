@@ -1,4 +1,3 @@
-"""Hand values for the published metrics. The engines are not rewritten here."""
 
 from __future__ import annotations
 
@@ -88,12 +87,10 @@ def _desk(**kwargs):
 
 
 def test_drawdown_duration_is_sessions_and_resets_on_a_tie():
-    # path peak stays 100 through 95; the tie at 100 resets; 70 starts a new streak.
     reported, _ = _arena(equity=[90, 80, 95, 100, 70], initial=100)
     assert reported["max_drawdown"] == 70 / 100 - 1
     assert reported["max_drawdown"] == pytest.approx(-0.3)
     assert reported["max_dd_duration_sessions"] == 3
-    # A new high at 110 is drawdown 0. The three closes under 110 are the streak.
     second, _ = _arena(equity=[110, 100, 105, 90], initial=100)
     assert second["max_dd_duration_sessions"] == 3
     assert second["max_drawdown"] == 90 / 110 - 1
@@ -151,7 +148,6 @@ def test_blocks_follow_the_day_index_not_the_row_number():
     assert reported["period_returns"]["S02"] == 90 / 120 - 1
     assert reported["period_returns"]["S01"] == pytest.approx(0.2)
     assert reported["period_returns"]["S02"] == pytest.approx(-0.25)
-    # A row-count block would be a single return of 90/100 - 1.
     assert 90 / 100 - 1 not in reported["period_returns"].values()
     desk, _ = _desk(equity=[120, 90], ordinals=[0, 252], initial=100)
     assert desk["period_returns"]["B01"] == 120 / 100 - 1
@@ -164,12 +160,10 @@ def test_close_exposure_splits_long_short_and_flat():
     assert reported["avg_abs_exposure_close"] == 0.5
     assert reported["frac_sessions_long_at_close"] == 1 / 3
     assert reported["frac_sessions_short_at_close"] == 1 / 3
-    # The bar statistic is a different input and must not be copied from the closes.
     assert reported["avg_abs_exposure_bars"] == 0.25
 
 
 def test_sharpe_and_sortino_use_252_and_every_day_in_the_downside():
-    # 100 -> 125 is +0.25. 125 -> 118.75 is -0.05. Mean 0.1. Sample variance 0.045.
     equity = [125.0, 118.75]
     reported, _ = _arena(equity=equity, initial=100.0)
     returns = np.array([equity[0] / 100.0 - 1.0, equity[1] / equity[0] - 1.0])
@@ -180,8 +174,6 @@ def test_sharpe_and_sortino_use_252_and_every_day_in_the_downside():
     assert reported["ann_vol"] == sd * math.sqrt(252)
     downside = math.sqrt(float(np.mean(np.minimum(returns, 0.0) ** 2)))
     assert reported["sortino"] == mean / downside * math.sqrt(252)
-    # Dropping the flat... there is no flat day. Dropping the up day from the
-    # denominator (down-days only) is the wrong Sortino.
     down_only = math.sqrt(float(np.sum(np.minimum(returns, 0.0) ** 2)) / float(np.sum(returns < 0)))
     assert downside != down_only
     assert reported["sortino"] != pytest.approx(mean / down_only * math.sqrt(252))
@@ -413,8 +405,12 @@ def test_desk_financing_and_borrow_match_the_cost_functions():
             return value
         return None
 
+    class LongBook:
+        def on_bar(self, row, account):
+            return target(row, account, 2.0)
+
     long_book = engine_desk.run(
-        type("S", (), {"on_bar": lambda self, row, account: target(row, account, 2.0)})(),
+        LongBook(),
         _bars(),
         DeskConfig(),
     )
@@ -425,8 +421,12 @@ def test_desk_financing_and_borrow_match_the_cost_functions():
     )
     assert financing == long_book["financing"] == long_metrics["financing_cost"]
     assert financing > 0.0
+    class ShortBook:
+        def on_bar(self, row, account):
+            return target(row, account, -1.0)
+
     short_book = engine_desk.run(
-        type("S", (), {"on_bar": lambda self, row, account: target(row, account, -1.0)})(),
+        ShortBook(),
         _bars(),
         DeskConfig(),
     )

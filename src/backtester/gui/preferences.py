@@ -1,9 +1,3 @@
-"""Remembered paths. Appearance only, plus the folders the operator already chose.
-
-The default data root is the Windows tree the tool is meant to open. It is
-written into the field the operator can see. A missing folder is an error at
-inspect time. It is not replaced with a sample.
-"""
 
 from __future__ import annotations
 
@@ -38,7 +32,6 @@ def default_store_path() -> Path:
 
 
 def as_path(text: str) -> Path:
-    """One path. Surrounding quotes are removed. Interior spaces stay intact."""
     raw = str(text).strip()
     if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
         raw = raw[1:-1]

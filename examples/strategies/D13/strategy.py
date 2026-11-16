@@ -1,23 +1,8 @@
-"""Volatility-compression regime strategy for ASSET.
-
-Once per regular session, on the last bar, classify the 20-session average true
-range (scaled by price) against its own trailing 252-session distribution and
-set a target exposure:
-
-  compressed  (percentile rank <= 0.25, exit at 0.40)  ->  +1.5
-  neutral                                                 ->  +1.0
-  expanded    (percentile rank >= 0.70, exit at 0.55)  ->   0.0
-
-The account is never short. A change of target fills at the next session's
-open (engine rule). Until 271 completed sessions of history exist the target
-stays flat, because that is how long the ATR percentile takes to form.
-"""
 
 
 class Strategy:
     WANTS_EXTENDED_HOURS = False
 
-    # Hard-coded, walk-forward choices. Do not fit at runtime.
     ATR_WINDOW = 20
     RANK_WINDOW = 252
     COMPRESSED_ENTER = 0.25
@@ -32,8 +17,8 @@ class Strategy:
         self.sess_low = None
         self.sess_close = None
         self.prev_close = None
-        self.trs = []          # last ATR_WINDOW true ranges
-        self.atr_pcts = []     # last RANK_WINDOW values of ATR/close
+        self.trs = []
+        self.atr_pcts = []
         self.regime = "neutral"
         self.target = 0.0
 
@@ -62,7 +47,6 @@ class Strategy:
                 self.sess_low = low
             self.sess_close = close
 
-        # Last regular-session bar: 15:59, or 12:59 on a shortened session.
         if minute != (779 if short else 959):
             return None
         return self._on_session_close()

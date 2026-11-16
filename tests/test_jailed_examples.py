@@ -1,7 +1,3 @@
-"""Every D example, jailed, matches an in-process run on the October sample.
-
-This is the ``jailed_sample`` job. The six-way matrix skips the marker.
-"""
 
 from __future__ import annotations
 

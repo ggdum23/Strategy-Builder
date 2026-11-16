@@ -1,4 +1,3 @@
-"""Pack files stay anonymous. The sidecar holds the identity."""
 
 from __future__ import annotations
 
@@ -317,8 +316,6 @@ def test_metadata_downgrade_cannot_skip_the_mac(tmp_path):
     with pytest.raises(ValueError, match="anonymized flag must be true"):
         load_pack(pack)
     out = tmp_path / "out"
-    # The run reads the sidecar, including its symbol, before the pack. Deleting
-    # the factor MAC is refused there. The pack flag is still checked by load_pack.
     with pytest.raises(ValueError, match="factor MAC"):
         run_pack(_Quiet, pack, sidecar, "arena", out, dividends={"2024-01-03": 1.25}, with_benchmarks=False)
     assert not (out / "metrics.json").exists()
@@ -1148,7 +1145,6 @@ def test_load_pack_rejects_duplicate_manifest_keys(tmp_path):
 
 
 def test_anonymized_schema_gate_refuses_review_repros(tmp_path):
-    """Directory entries, typed cells, and the manifest. One verdict for both gates."""
     src, registry = _series(tmp_path, 1)
     pack = tmp_path / "pack"
     build_pack(
@@ -1171,7 +1167,6 @@ def test_anonymized_schema_gate_refuses_review_repros(tmp_path):
             load_pack(pack, symbol="NIK")
         return str(audit.value), str(loaded.value)
 
-    # A canonical name that points at a clean gzip is still not a regular file.
     target = tmp_path / "HIDDEN-TARGET.csv.gz"
     target.write_bytes(original_bars)
     link = pack / "bars_part_002.csv.gz"
@@ -1364,7 +1359,6 @@ def _replace_column(text: str, column: str, values: list[str]) -> str:
 
 
 def test_build_pack_scales_date_shaped_trade_counts(tmp_path):
-    """Source counts that are dates or an epoch do not reach the designer pack."""
     leaks = [20240102, 20240103, 20240104, 946684800]
     rows = []
     day = datetime(2024, 1, 2)
@@ -1396,14 +1390,10 @@ def test_build_pack_scales_date_shaped_trade_counts(tmp_path):
     loaded = load_pack(pack, symbol="NIK")
     assert list(loaded.frame["count"]) == pytest.approx([value * 0.42 for value in leaks])
     run_pack(_Quiet, pack, sidecar, "arena", tmp_path / "out", with_benchmarks=False)
-    # A hand-written count may still be a date-shaped decimal. It is the same
-    # residual as volume: the builder did not copy the source integer, and the
-    # daily total has to be the sum of the bars.
     bars = gzip.decompress((pack / "bars_part_001.csv.gz").read_bytes()).decode("utf-8")
     daily = gzip.decompress((pack / "daily_rth.csv.gz").read_bytes()).decode("utf-8")
     planted = "20240102"
     bars = _replace_column(bars, "count", [planted] * (len(leaks)))
-    # One row per session in the daily file, and each session has one bar.
     daily = _replace_column(daily, "count", [planted] * len(leaks))
     (pack / "bars_part_001.csv.gz").write_bytes(_recompress(bars.encode("ascii")))
     (pack / "daily_rth.csv.gz").write_bytes(_recompress(daily.encode("ascii")))
@@ -1519,7 +1509,6 @@ def test_ntfs_alternate_stream_is_refused(tmp_path):
 
 
 class _CountSignal:
-    """Long only when the trade count clears 1.2. Both profiles use this class."""
 
     def __init__(self):
         self.counts = []

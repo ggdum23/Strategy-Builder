@@ -1,26 +1,3 @@
-"""Score many strategies, each in its own process.
-
-The worker is the same book process as a pack run: spawn, argv
-``['backtester-design']``, an empty working directory, and the environment
-allowlist. The sidecar, the date map, and the dividend file stay in the
-parent. The designer child receives cash per pack share (the file amount
-times the price factor authenticated by the operator MAC). The operator
-child receives the file amount times its billing scale. ``share_scale`` is
-passed the same way
-a single pack run passes it. Desk dividends are remapped here before the
-child starts.
-
-Results do not depend on how many workers ran or which job finished first.
-A strategy that crashes, hangs, or exceeds the resident-set cap is one failed
-row. The other jobs keep running. ``CancelToken.cancel`` stops work that has
-not finished. It is safe to call from another thread. ``on_progress`` runs on
-the thread that called ``run_parallel``.
-
-The leaderboard sorts by excess total return against the 1x book. An anonymized
-job also lands in ``designer/``, priced with the flat designer fee and the
-canonical equity. That child is not given the billing scale. The operator
-copy of the same job still is.
-"""
 
 from __future__ import annotations
 
@@ -67,7 +44,6 @@ from .report import (
 
 @dataclass(frozen=True)
 class StrategyRef:
-    """One ``strategy.py``. ``strategy_id`` is the label on the leaderboard."""
 
     strategy_id: str
     path: str
@@ -75,7 +51,6 @@ class StrategyRef:
 
 @dataclass(frozen=True)
 class NamedMarket:
-    """Raw files. Share factor is 1. ``load_named`` runs in the parent."""
 
     src: str
     symbol: str
@@ -85,7 +60,6 @@ class NamedMarket:
 
 @dataclass(frozen=True)
 class PackMarket:
-    """A pack plus the operator sidecar. The child never receives the sidecar."""
 
     pack_dir: str
     sidecar_path: str
@@ -94,11 +68,6 @@ class PackMarket:
 
 @dataclass(frozen=True)
 class FrameMarket:
-    """A frame the parent already loaded. Named data only, share factor 1.
-
-    Anonymized bars belong in a ``PackMarket`` so the sidecar scale is applied
-    in the parent. This object does not carry a scale.
-    """
 
     source_id: str
     symbol: str
@@ -109,7 +78,6 @@ class FrameMarket:
 
 @dataclass(frozen=True)
 class CancelToken:
-    """Thread-safe cancel. ``cancel`` unblocks workers that are still running."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_flag", threading.Event())
@@ -123,7 +91,6 @@ class CancelToken:
 
 @dataclass(frozen=True)
 class ProgressEvent:
-    """One progress notice. ``completed`` counts jobs that have finished."""
 
     completed: int
     total: int
@@ -192,7 +159,6 @@ class _Stop:
 
 
 def discover_strategies(directory) -> tuple[StrategyRef, ...]:
-    """``strategy.py`` in ``directory`` and in each immediate child directory."""
     root = Path(directory)
     if not root.is_dir():
         raise FileNotFoundError(f"strategies directory not found: {root}")
@@ -223,12 +189,6 @@ def discover_strategies(directory) -> tuple[StrategyRef, ...]:
 
 
 def _both_books(frame, *, anonymized: bool, designer, operator):
-    """Return ``(designer_books, operator_books)``.
-
-    An anonymized job runs both children. They do not share a result. On
-    Windows each child pays for a jail launch, so the two launches overlap.
-    One after another, a two-by-two batch crossed the 60-second test cap.
-    """
     if not anonymized:
         return None, operator(frame)
     designer_books = None
@@ -278,7 +238,6 @@ def run_parallel(
     registry_path=None,
     call_timeout: float | None = None,
 ) -> ParallelResult:
-    """Cartesian product of strategies and markets. See the module docstring."""
     from . import runner as runner_mod
 
     name = get_profile(profile).name
@@ -364,16 +323,12 @@ def run_parallel(
                     store_frame(market.frame, kind="designer", symbol=str(market.symbol))
                 )
             elif market.prepared_path:
-                # The named artifact is already the series. Mapping it again
-                # shares the file pages. A window copy would be a second set.
                 shared_series[id(market)] = str(market.prepared_path)
             else:
                 shared_series[id(market)] = str(store_frame(market.frame, kind="window"))
         except Exception:
             shared_series[id(market)] = None
         if shared_series[id(market)] is not None:
-            # Workers map this artifact. The parent thread reloads it after
-            # the child exits, to write the report.
             market.frame = None
     gc.collect()
     assignments = []
@@ -384,8 +339,6 @@ def run_parallel(
         else:
             carried = None
         assignments.append((ref, market, carried))
-    # Windows folds ZzZx and zzzx onto one directory. Reserve names before the
-    # workers start so two threads never write the same equity.png.
     job_dirs = _job_directories(out, assignments)
 
     total = len(assignments)
@@ -424,8 +377,6 @@ def run_parallel(
         ref, market, carried = assignment
         series_path = carried if isinstance(carried, str) else None
         if isinstance(market, _Prepared) and series_path is not None:
-            # The worker maps the artifact. This thread does not keep a copy
-            # while that child is running.
             frame = None
         else:
             frame = carried
@@ -548,8 +499,6 @@ def run_parallel(
             text = _clip(str(exc))
             tail = getattr(exc, "tail", "") or ""
             if tail:
-                # The operator copy keeps the original ticker. The designer
-                # sentence below does not include this tail.
                 shown = str(tail).strip()
                 if shown:
                     text = _clip(text + "\n" + shown[:2000])
@@ -625,7 +574,6 @@ def run_parallel(
         status = row.get("status")
         if status in (None, "ok"):
             continue
-        # Pytest capture does not show this. The Windows job log does.
         sys.__stderr__.write(
             "parallel job %s %s: %s\n"
             % (row.get("strategy_id"), status, _first_line(str(row.get("error") or "")))
@@ -716,12 +664,6 @@ def _check_batch(
 
 
 def _one_accounting(name, prepared, *, price_basis, cash_rate_annual, financing_rate_annual, withholding_rate):
-    """One accounting record for the batch, or None when nothing was prepared.
-
-    Every prepared market must resolve to the same record. A raw series and a
-    total-return series in one leaderboard is a mix, and so is one market
-    with dividends beside one without.
-    """
     if not prepared:
         return None
     kinds = {normalize_series_kind(market.series_kind) for market in prepared}
@@ -772,9 +714,6 @@ def _prepare_markets(markets, dividends, borrow_rate_annual, runner_mod, *, pric
             )
         except Exception as exc:
             if isinstance(market, PackMarket):
-                # A reserved ticker aborts the batch before any report directory
-                # exists. Other pack failures stay per-job so one bad pack
-                # does not drop the rest of the batch.
                 if "reserved report name" in str(exc):
                     raise
                 source_id = market.source_id or _path_source_id(market.pack_dir)
@@ -930,11 +869,6 @@ def _safe_component(value: str) -> str:
 
 
 def _reserve_case_component(value: str, used: set[str]) -> str:
-    """A directory name that stays distinct when the disk ignores case.
-
-    ``used`` holds casefolded names already reserved. ``ZzZx`` and ``zzzx``
-    would be one folder on Windows, so the second becomes ``zzzx-2``.
-    """
     text = _safe_component(value)
     candidate = text
     suffix = 2
@@ -946,7 +880,6 @@ def _reserve_case_component(value: str, used: set[str]) -> str:
 
 
 def _job_directories(out: Path, assignments) -> dict[tuple[str, str], Path]:
-    """One real directory per job, including ids that differ only by case."""
     strategy_names: dict[str, str] = {}
     used_strategies: set[str] = set()
     used_sources: dict[str, set[str]] = {}
@@ -989,8 +922,6 @@ def _first_line(text: str) -> str:
     return line
 
 
-# Columns copied from the strategy metrics. Rank, identity, and the benchmark
-# excess are filled by the batch, not by the engine.
 _PAYLOAD_COLUMNS = (
     "total_return",
     "cagr",
@@ -1136,7 +1067,6 @@ def _row_anonymized(row, assignments) -> bool:
 
 
 def _designer_error_text(item: JobResult) -> str:
-    """The sentence written under designer/, not the operator traceback."""
     if item.status == "ok":
         return ""
     path = Path(item.out_dir) / "designer" / "error.json"
@@ -1149,15 +1079,10 @@ def _designer_error_text(item: JobResult) -> str:
 
 
 def _name_dirty(candidate: str, symbols, scale=None) -> bool:
-    """True when this path component would fail the designer audit.
-
-    The price rule does not apply. Scale, ticker, date, and reserved checks do.
-    """
     return report_mod.designer_component_problem(candidate, symbols=symbols, scale=scale) is not None
 
 
 def _screened_sentence(symbols) -> str:
-    """An error sentence that is not a ticker for any symbol in the batch."""
     for phrase in ("the strategy failed", "withheld", "not published", "stopped"):
         if not _name_dirty(phrase, symbols):
             return phrase
@@ -1172,25 +1097,10 @@ _COMPONENT_SCALES = threading.local()
 
 
 def _designer_component(value: str, symbols, used: set, scales=None) -> str:
-    """A designer path component scrubbed against every symbol in the batch.
-
-    ``used`` stores casefolded names, the same reservation as job directories.
-    ``My_RANDOM_v2`` and ``my_RANDOM_v2`` would be one folder on a
-    case-insensitive disk, so the second becomes ``my_RANDOM_v2-2``. A
-    candidate whose base or suffix is a ticker for any batch symbol is
-    skipped, including ``RANDOM-2`` when the symbol is ``2``. The stand-in
-    is :data:`report_mod.TICKER_STAND_IN`. The same strategy id always gets
-    the same component, so the caller passes one shared ``used`` set.
-    ``scales`` is every invoice scale this name has to survive. Callers that
-    monkeypatch this function pass three arguments, so the bundle also stores
-    the scales on :data:`_COMPONENT_SCALES` for that call.
-    """
     symbol_list = tuple(dict.fromkeys(symbol for symbol in (symbols or ()) if symbol))
     if scales is None:
         scales = getattr(_COMPONENT_SCALES, "values", None)
     scale_list = tuple(scales) if scales else (None,)
-    # A calendar id fails before scrubbing can delete the date. The ticker
-    # rewrite still runs for an id that is only unsafe because of the symbol.
     if strategy_id_has_calendar(str(value)):
         raise ValueError("id is not designer-visible")
 
@@ -1229,7 +1139,6 @@ def _designer_component(value: str, symbols, used: set, scales=None) -> str:
 
 
 def _opaque_component(used: set[str], symbols, scales) -> str:
-    """A folder name that is not the rejected strategy id."""
     symbol_list = tuple(dict.fromkeys(symbol for symbol in (symbols or ()) if symbol))
     scale_list = tuple(scales) if scales else (None,)
     for stem in ("strategy", "book", "result", "entry"):
@@ -1276,7 +1185,6 @@ def _result_for(results, row) -> JobResult:
 
 
 def _fail_published_row(results, row, message: str) -> None:
-    """One job's designer tree failed. The batch still finishes."""
     row["status"] = "error"
     row["error"] = message
     for index, item in enumerate(results):
@@ -1286,7 +1194,6 @@ def _fail_published_row(results, row, message: str) -> None:
 
 
 def _audit_scales(scales) -> tuple:
-    """Scales to pass into ``assert_designer_clean``. ``None`` checks no invoice scale."""
     if scales is None:
         return (None,)
     if isinstance(scales, bool):
@@ -1298,7 +1205,6 @@ def _audit_scales(scales) -> tuple:
 
 
 def _audit_job_tree(dest, symbols, scales=None) -> None:
-    """Audit one job directory at each of that job's invoice scales."""
     probes = list(dict.fromkeys([*symbols, ""]))
     for probe in probes:
         for scale in _audit_scales(scales):
@@ -1318,11 +1224,6 @@ def _cell_violation(copied: dict, symbols) -> str | None:
 
 
 def _write_clean_designer_error(dest, folder: str, source_name: str, profile: str, symbols, scales=None) -> None:
-    """Replace ``dest`` with an error file that passes the audit for every symbol.
-
-    The directory is removed again when the audit fails, so a ticker suffix is
-    never left on disk. ``folder`` and ``source_name`` must already be screened.
-    """
     if _name_dirty(folder, symbols) or _name_dirty(source_name, symbols):
         raise RuntimeError(f"unscreened designer name {folder}/{source_name}")
     phrase = _screened_sentence(symbols)
@@ -1349,7 +1250,6 @@ def _write_clean_designer_error(dest, folder: str, source_name: str, profile: st
 
 
 def _overlay_designer_metrics(copied: dict, dest: Path) -> None:
-    """Replace leaderboard figures with the designer-cost book."""
     path = Path(dest) / "metrics.json"
     if not path.is_file():
         return
@@ -1363,9 +1263,6 @@ def _overlay_designer_metrics(copied: dict, dest: Path) -> None:
         if isinstance(value, (dict, list)):
             continue
         if column in metrics:
-            # Strict JSON stores a non-finite calmar as null. The engine's only
-            # non-finite calmar is +inf (no drawdown). Put that back so the
-            # designer board still prints ``inf``.
             if column == "calmar" and value is None:
                 value = float("inf")
             copied[column] = value
@@ -1381,12 +1278,6 @@ def _overlay_designer_metrics(copied: dict, dest: Path) -> None:
 
 
 def _bundle_designer(out, ranked_rows, assignments, results) -> None:
-    """One directory a designer can be handed. Named jobs stay out of it.
-
-    A scrub or audit failure marks that job ``error`` and stays inside this
-    function. The other jobs are still published, and the caller still writes
-    ``run.json``.
-    """
     selected = []
     symbols = []
     for row, assignment in _rows_with_markets(ranked_rows, assignments):
@@ -1406,8 +1297,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
     designer.mkdir(parents=True)
     mutated = False
     placed = {}
-    # One folder per strategy id. A second id that scrubs to the same text
-    # becomes RANDOM-2. Both markets of one strategy share the folder.
     used_folders: set[str] = set()
     folders: dict[str, str] = {}
     used_sources: dict[str, set[str]] = {}
@@ -1513,9 +1402,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             mutated = True
             names_dirty = _name_dirty(folder, unique_symbols) or _name_dirty(source_name, unique_symbols)
             if names_dirty:
-                # Keep the book. A later pass renames the directory when the
-                # files themselves are clean, so a bad suffix does not fail
-                # the row that ran.
                 continue
             _fail_published_row(results, row, _clip(f"designer audit failed: {exc}"))
             try:
@@ -1543,8 +1429,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
                     copied[column] = scrub_symbols(value, unique_symbols, key=column)
                 else:
                     copied[column] = value
-            # The leaderboard id is the directory name. Do not substitute a
-            # different token; a repair pass renames the directory to match.
             copied["strategy_id"] = folder
             copied["source_id"] = source_name
             if row["status"] == "ok":
@@ -1605,7 +1489,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         return tuple(found) or (None,)
 
     def _rename_clean(folder: str) -> str:
-        """Give a dirty directory a screened name and keep the books."""
         rows_here = _rows_for(folder)
         representative = rows_here[0]["strategy_id"] if rows_here else folder
         new_folder = folder
@@ -1648,11 +1531,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         return new_folder
 
     def _fail_folder(folder: str, message: str) -> None:
-        """Replace one strategy folder with screened error trees.
-
-        A failure here marks the rows and returns. It does not escape, so one
-        dirty folder cannot abort the batch.
-        """
         rows_here = _rows_for(folder)
         old_path = designer / folder
         if old_path.exists():
@@ -1707,14 +1585,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
             _COMPONENT_SCALES.values = None
 
     def isolate_dirty_folders() -> None:
-        """A failure outside one job directory fails that strategy's rows only.
-
-        The published tree is not replaced by a single error file, and a clean
-        strategy keeps its directory. A directory whose name is a ticker is
-        renamed to a screened name. When the files are clean the row stays
-        ok. A failed audit is removed before a screened tree is written, so
-        the dirty name does not remain on disk.
-        """
         nonlocal mutated
         dirty: list[tuple[str, Exception]] = []
         seen_folders: list[str] = []
@@ -1763,7 +1633,6 @@ def _bundle_designer(out, ranked_rows, assignments, results) -> None:
         write_leaderboard(designer / "leaderboard.csv", designer_rows(), audience="designer")
 
     def drop_remaining_dirty() -> None:
-        """A directory that still fails the audit is deleted, not published."""
         nonlocal mutated
         mutated = True
         seen: list[str] = []

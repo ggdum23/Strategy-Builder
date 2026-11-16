@@ -1,4 +1,3 @@
-"""Return 0.0 when a new process cannot be started, else 1.0."""
 
 import os
 import sys

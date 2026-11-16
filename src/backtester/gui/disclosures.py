@@ -1,8 +1,3 @@
-"""Profile rules shown before a run.
-
-Numbers come from ``backtester.profiles``. The sentences say what that profile's
-engine does. They are not a second fee schedule.
-"""
 
 from __future__ import annotations
 
@@ -25,7 +20,6 @@ _FEES = {
 
 
 def profile_rows(name: str) -> tuple[tuple[str, str], ...]:
-    """Labeled rules for one profile. Unknown names raise, the same as the runner."""
     profile = get_profile(name)
     cap = f"{profile.max_abs_target:g}"
     rows = [

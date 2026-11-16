@@ -1,4 +1,3 @@
-"""Fourth review of 466bc44. Each test fails when its fix is reverted."""
 
 from __future__ import annotations
 
@@ -251,7 +250,6 @@ def _path_samples() -> list[str]:
 
 
 def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
-    # These survive the date regex. Only the token filter removes them.
     for glued in ("Jan2024", "January2024", "FY2024", "year2024"):
         shown = designer_surface_text(glued, ())
         assert glued not in shown and "2024" not in shown
@@ -286,9 +284,6 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
     assert not export_allowed(f"held QQQ overnight {ordinary}", symbols=("QQQ",), scale=2)
     assert not export_allowed("scale 2", symbols=(), scale=2)
 
-    # A path consumes the rest of the field, commas included. The ordinary
-    # tokens sit after that path, so this line does not keep them. The check
-    # above keeps the same tokens when the line has no path.
     comment = "held QQQ " + " ".join(dates[:12]) + ", " + " ".join(paths[:4]) + ", " + ordinary + " scale 2"
     metrics = _metrics(
         anonymized=True,
@@ -297,7 +292,6 @@ def test_designer_free_text_cannot_carry_dates_paths_or_scale(qtbot, tmp_path):
         n_fills=9,
         cost_basis={"share_scale": 2, "anonymized": True, "cost_schedule": "arena"},
     )
-    # 0.02 has significand "2", the same digits as this book's scale.
     metrics["excess_total_return"] = 0.03
     metrics["benchmarks"]["buy_and_hold_1x"]["total_return"] = 0.03
     folder = write_book(tmp_path / "fuzz", metrics, benchmark=False)

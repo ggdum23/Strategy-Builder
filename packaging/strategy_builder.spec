@@ -1,14 +1,3 @@
-# -*- mode: python ; coding: utf-8 -*-
-"""One-folder bundle: console backtester.exe and windowed Strategy Builder.exe.
-
-One-file mode is intentionally not used. Startup is faster and antivirus
-products are less likely to flag a directory of ordinary DLLs than a
-self-extracting executable.
-
-Both executables embed this spec's entry script and share _internal.
-The entry dispatches on the executable name. Spawn children re-enter
-whichever executable called them; freeze_support runs before that dispatch.
-"""
 
 import sys
 from pathlib import Path
@@ -23,8 +12,6 @@ import versions
 ROOT = Path(SPECPATH).resolve().parent
 ENTRY = str(ROOT / "packaging" / "frozen_entry.py")
 ICON = str(ROOT / "packaging" / "assets" / "strategy_builder.ico")
-# EXE(version=) loads a VSVersionInfo file. versions.version_info() is the
-# four-part string (0.1.0.0); the file is that string turned into a resource.
 VERSION_FILE = ROOT / "packaging" / "build" / "file_version_info.txt"
 VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
 VERSION_FILE.write_text(versions.version_info_text(), encoding="utf-8")
@@ -40,9 +27,6 @@ a = Analysis(
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],
-    # Agg only. Automatic discovery selects QtAgg once PySide6 is installed,
-    # and report workers must stay headless. The GUI can add QtAgg here if
-    # it calls matplotlib.use("QtAgg") before importing pyplot.
     hooksconfig={"matplotlib": {"backends": ["Agg"]}},
     runtime_hooks=[],
     excludes=collect_optional.excludes(),

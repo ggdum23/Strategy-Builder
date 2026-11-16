@@ -1,16 +1,3 @@
-"""Operator and designer views of one report directory.
-
-``strategy-builder.report.v1`` has two audiences. ``operator`` reads the folder
-the runner wrote. ``designer`` reads ``designer/`` when that tree was published,
-and otherwise reads the operator files. Every designer surface then keeps only
-the shared allow-list. There is no unredacted designer path.
-
-This module does not import the runner or ``report.py`` at load time. The
-ticker match is ``report.ticker_token_spans``, imported inside
-``_ticker_spans``. The allow-list lives in ``designer_allow``, which
-``report.py`` imports as well. Calendar dates are ``calendar_text``:
-one pattern list, shared with the publisher and the audit.
-"""
 
 from __future__ import annotations
 
@@ -46,14 +33,6 @@ _SECRET_TOKENS = (
 _SECRET_WORDS = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:share_scale|share_factor|price_factor|volume_factor|date_map|factor_key|factor_mac|borrow_rate_source)(?![A-Za-z0-9_])"
 )
-# A path may contain spaces and commas (``Strategy Builder, Inc\QQQ\data.csv``).
-# ``\\?\UNC\``, ``\\?\``, and the slash forms ``//?/UNC/`` and ``//?/`` are paths.
-# A drive-relative path (``C:Users\...``, ``C:secret\NOTES.md``) is a path too.
-# So is a relative backslash path that contains ``hidden``, ``secret``, ``graded``,
-# or ``NOTES.md``. After a path starts, the rest of the field belongs to it,
-# including commas, and it stops at a quote or the end of the line. The word
-# immediately before or after a ``\\?\`` / ``//?/`` path goes with it. A slash
-# date such as 2024/1/4 is not a path: a POSIX path needs a letter in it.
 _PATH_TAIL = r"[^'\"\r\n]*"
 _ADJACENT_WORD = r"[A-Za-z][A-Za-z0-9_.-]*"
 _BEFORE_DEVICE = rf"(?:(?<![A-Za-z0-9_]){_ADJACENT_WORD}[ \t]+)?"
@@ -75,13 +54,9 @@ _ABS_PATH = re.compile(
         )
     )
 )
-# A scale value is its own number, not a digit inside ``long_2x`` or ``2.5``.
 _NUMBER_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?(?![A-Za-z0-9_])"
 )
-# Every numeric literal: optional sign, digits, optional decimal, optional exponent.
-# It may be glued to letters or underscores. ``_scale_in_token`` is the one
-# comparison the screen and the export both use.
 _NUMBER_LITERAL = re.compile(
     r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?"
 )
@@ -93,21 +68,14 @@ _FREE_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _SESSION_ID = re.compile(r"[Ss]\d+")
 _YEAR_TOKEN = re.compile(r"(?:19|20)\d{2}")
 _DOTTED_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+")
-# One signed number: optional $, thousands commas, a decimal, an exponent, a trailing %.
-# The exponent may itself be a decimal (``1e7.777``) so it stays one token.
 _NUMBER_CORE = r"(?:\d{1,3}(?:,\d{3})+(?:\.\d*)?|\d+(?:\.\d*)?|\.\d+)"
 _NUMBER_EXP = r"(?:[eE][+-]?(?:\d+(?:\.\d*)?|\.\d+))?"
 _NUMBER_SURFACE = re.compile(rf"[+-]?\$?{_NUMBER_CORE}{_NUMBER_EXP}%?")
 _HYPHEN_WORD = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)+")
-# A signed exponent stays inside the word token (``build2_7777e-3``). The
-# letter class does not swallow the ``e`` of that exponent, or the following
-# ``-3`` would be a separate token and the scale check would miss it.
 _WORD_WITH_EXP = (
     r"(?:(?![eE][+-])[A-Za-z0-9_.])+[eE][+-](?:\d+(?:\.\d*)?|\.\d+)"
     r"|[A-Za-z0-9_.]+"
 )
-# A clock is one token. The colon stays, so ``09:25`` is not the two numbers
-# ``09`` and ``25``. Hours may be one or two digits. Seconds are optional.
 _CLOCK_TOKEN = re.compile(rf"(?<![A-Za-z0-9_])(?:{CLOCK_BODY})(?!\d)")
 _SURFACE_TOKEN = re.compile(
     rf"(?<![A-Za-z0-9_])(?:{CLOCK_BODY})(?!\d)"
@@ -115,32 +83,24 @@ _SURFACE_TOKEN = re.compile(
     rf"|{_HYPHEN_WORD.pattern}"
     rf"|{_WORD_WITH_EXP}"
 )
-# Strategy and source ids are designer-supplied names. A decimal in one is not a price.
 _ID_COLUMNS = frozenset({"strategy_id", "source_id"})
-# One identifier, judged the same way by both gates. A signed exponent inside a
-# name, or a name that starts with a digit. A bare price and free prose are not.
 _IDENTIFIER = re.compile(
     r"(?i)(?:"
     r"[A-Za-z_][A-Za-z0-9_]*(?:[eE][+-](?:\d+(?:\.\d*)?|\.\d+))[A-Za-z0-9_]*"
     r"|\d+[A-Za-z_][A-Za-z0-9_]*(?:[eE][+-](?:\d+(?:\.\d*)?|\.\d+))?[A-Za-z0-9_]*"
     r")\Z"
 )
-# Designer surfaces say RANDOM where a ticker was. The operator view keeps the ticker.
 TICKER_STAND_IN = "RANDOM"
-# Whole-file reads stop at these caps so a huge report cannot exhaust memory.
 JSON_READ_LIMIT = 16 * 1024 * 1024
 CSV_READ_LIMIT = 256 * 1024 * 1024
 PNG_READ_LIMIT = 32 * 1024 * 1024
 
 def refuse_oversized(path: Path, limit: int) -> None:
-    """Do not read a report file whole when it is over the cap."""
     size = path.stat().st_size
     if size > limit:
         raise ValueError(f"{path.name} is {size} bytes, over the {limit} byte read limit")
 
 
-# Keys a designer tree is not allowed to carry. ``cost_basis`` holds the
-# invoice scale. Named operator runs still show that object.
 DESIGNER_DROP_KEYS = frozenset(
     {
         "symbol",
@@ -165,8 +125,6 @@ DESIGNER_DROP_KEYS = frozenset(
     }
 )
 
-# Raw print columns. The allow-list drops these on every designer surface,
-# including a published ``designer/`` tree.
 PRICE_COLUMNS = frozenset(
     {
         "open",
@@ -181,13 +139,9 @@ PRICE_COLUMNS = frozenset(
         "raw_price",
     }
 )
-# Share counts let equity and exposure be inverted back into a price.
 SHARE_COLUMNS = frozenset({"shares", "shares_delta", "shares_after", "position_shares"})
 
-# Unicode minus and dash characters that NFKC leaves unchanged, mapped to ASCII
-# before a numeric literal is read. Fullwidth digits fold under NFKC itself.
 def normalize_surface(text: str) -> str:
-    """NFKC, then unicode minus and dash characters become ASCII ``-``."""
     return fold(text)
 
 
@@ -200,19 +154,10 @@ def _hide_column(name: str, *, drop_prices: bool, allow_list: bool = False) -> b
 
 
 def _consume_paths(text: str, replacement: str = " ") -> str:
-    """Remove absolute paths. The screen filter and ``export_allowed`` both call this."""
     return _ABS_PATH.sub(replacement, text)
 
 
 def _ticker_spans(text: str, symbol: str) -> list[tuple[int, int]]:
-    """The same token match the publisher uses.
-
-    A symbol that contains a letter and is longer than one character uses a
-    letter boundary, so ``QQQ1`` matches ``QQQ``. A one-character symbol, and
-    a digits-only symbol, uses an alphanumeric boundary, so ``V`` does not
-    match ``v2`` and ``10`` does not match ``S00010``. Imported lazily: this
-    module does not import ``report.py`` at load time.
-    """
     from ..report import ticker_token_spans
 
     return ticker_token_spans(text, symbol)
@@ -233,7 +178,6 @@ def _replace_ticker(text: str, symbol: str) -> str:
 
 
 def _symbol_order(symbols: tuple[str, ...]) -> tuple[str, ...]:
-    """Longer casefolds first, so ``SS`` is considered before ``S``."""
     ranked = sorted((symbol for symbol in symbols if symbol), key=lambda item: len(item.casefold()), reverse=True)
     ordered: list[str] = []
     seen: set[str] = set()
@@ -246,20 +190,6 @@ def _symbol_order(symbols: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = None) -> str:
-    """Remove calendar dates, scale words, the scale number, and ticker tokens.
-
-    ISO dates, unpadded ISO, slash dates, dotted DMY and MDY, month names,
-    dotted abbreviations, a period with no space (``Jan.4, 2024``), ordinal
-    days, ``YYYY-MM`` keys, compact eight-digit dates, two-digit-year month
-    dates, and a bare year all count. ``day 2024`` is a date. ``2024.50`` and
-    ``0.2024`` stay numbers. Session ids such as ``S01`` stay. Text is
-    NFKC-folded before that strip. A one-letter ticker is a ticker. A longer
-    symbol that contains a letter uses a letter boundary, so a digit does not
-    glue and ``QQQ1`` is shown as ``RANDOM1``. A one-character symbol, and a
-    digits-only symbol, uses an alphanumeric boundary, so ``V`` does not match
-    ``v2`` and ``10`` does not match ``S00010``. The operator view never calls
-    this. Ticker matching uses casefold, so ``ß`` and ``ﬁ`` count.
-    """
     text = normalize_surface(value)
     text = strip_calendar_dates(text)
     text = _SECRET_WORDS.sub("", text)
@@ -270,7 +200,6 @@ def scrub_text(value: str, symbols: tuple[str, ...], *, scale: float | None = No
 
 
 def _scale_number(scale: float | None) -> float | None:
-    """The invoice scale, when it is a finite number other than 1."""
     if scale is None:
         return None
     try:
@@ -293,10 +222,6 @@ def _same_number(token: str, number: float) -> bool:
 
 
 def _scrub_scale_number(text: str, scale: float | None) -> str:
-    """Remove the scale only when it is its own numeric token.
-
-    ``2`` inside ``long_2x`` or ``2.5`` is a different token and stays.
-    """
     number = _scale_number(scale)
     if number is None:
         return text
@@ -308,7 +233,6 @@ def _scrub_scale_number(text: str, scale: float | None) -> str:
 
 
 def _contains_scale(text: str, scale: float | None) -> bool:
-    """True when a surface token is the invoice scale. Same decision as the screen."""
     if _scale_number(scale) is None:
         return False
     return any(_scale_in_token(match.group(0), scale) for match in _SURFACE_TOKEN.finditer(text))
@@ -358,12 +282,6 @@ def _scrub_string(value: str, symbols: tuple[str, ...], scale: float | None) -> 
 
 
 def _accepted_id(value: str, symbols: tuple[str, ...], scale: float | None) -> str:
-    """A strategy or source id the publisher already accepted.
-
-    Tickers are still rewritten with the shared token match. The free-word
-    filter is not applied, so an id that starts with a digit stays visible.
-    A name and any other free text do not use this path.
-    """
     text = normalize_surface(value)
     return scrub_text(text, symbols, scale=scale).strip()
 
@@ -380,7 +298,6 @@ def _relabel_periods(
     scale: float | None,
     allow_list: bool = False,
 ):
-    """Monthly and yearly keys become ``M1``, ``M2`` and ``Y1``, ``Y2``. Every value stays."""
     clean = {}
     used: set[str] = set()
     for key, item in value.items():
@@ -405,7 +322,6 @@ def _relabel_periods(
 
 
 def _unique_key(renamed: str, used: set[str]) -> str:
-    """A date key that scrubs to nothing gets a stable stand-in instead of collapsing."""
     candidate = renamed.strip() or "field"
     if candidate in used:
         number = 2
@@ -438,7 +354,6 @@ def _scrub_table(
         name = str(column)
         if _hide_column(name, drop_prices=drop_prices, allow_list=allow_list):
             continue
-        # Headers use the same stripper as values. A ticker-only header becomes RANDOM.
         renamed = _unique_key(designer_surface_text(name, symbols, scale=scale), used)
         pairs.append((name, renamed))
     rows = []
@@ -459,11 +374,6 @@ def _scrub_table(
 
 
 def apply_designer(report, symbols: tuple[str, ...], *, redacted: bool, scale: float | None = None) -> None:
-    """Mutate ``report`` so a designer screen cannot render operator secrets.
-
-    ``redacted`` is retained for callers. Every designer surface uses the
-    allow-list, whether or not a published ``designer/`` tree is what was read.
-    """
     report.audience = "designer"
     report.metrics = _scrub_obj(
         with_cost_drag(report.metrics), symbols, drop_prices=True, scale=scale, allow_list=True
@@ -543,11 +453,6 @@ _PROTECTED_CURVE_NAMES = frozenset(
 
 
 def _designer_session_label(label: str, index: int, symbols: tuple[str, ...], scale: float | None) -> str:
-    """A designer tick is the day or session id, else the integer index.
-
-    A calendar date is not a session label. A pure index is kept even when it
-    happens to equal the invoice scale.
-    """
     raw = str(label).strip()
     if _SESSION_ID.fullmatch(raw):
         return raw
@@ -564,7 +469,6 @@ def _wordish(token: str) -> bool:
 
 
 def _numeric_text(token: str) -> str:
-    """The number inside a surface token, without $, thousands commas, or %."""
     text = token.strip()
     sign = ""
     if text[:1] in "+-":
@@ -577,7 +481,6 @@ def _numeric_text(token: str) -> str:
 
 
 def _scientific_parts(literal: str) -> tuple[str, str] | None:
-    """Significand and exponent of one scientific literal, or None."""
     match = re.fullmatch(r"(.+?)[eE]([+-]?(?:\d+(?:\.\d*)?|\.\d+))", literal)
     if match is None:
         return None
@@ -585,14 +488,12 @@ def _scientific_parts(literal: str) -> tuple[str, str] | None:
 
 
 def _recurse_exponent(significand: str, exponent: str) -> bool:
-    """An unsigned integer exponent is not itself a scale, unless the significand is 1."""
     if exponent[:1] in "+-" or "." in exponent:
         return True
     return _significand_digits(significand) == "1"
 
 
 def _significand_digits(literal: str) -> str:
-    """Digits of the significand, with the decimal point and end zeros removed."""
     mantissa = re.split(r"[eE]", literal.strip(), maxsplit=1)[0]
     mantissa = mantissa.lstrip("+-").replace(".", "").replace(",", "")
     digits = mantissa.strip("0")
@@ -635,20 +536,6 @@ def _power_of_ten_multiple(value: float, base: float) -> bool:
 
 
 def _literal_is_scale(literal: str, scale: float) -> bool:
-    """True when this literal is the scale, its reciprocal, or the scale times 10^k.
-
-    A signed or decimal exponent is the same kind of literal, and so is the
-    exponent of a significand of 1. An unsigned integer exponent is not
-    recursed into: ``7.777e3`` still matches by its value, and ``185e2``
-    inside a hex id does not match because the exponent is 2. The parsed
-    value is compared with the scale, with the reciprocal, and with the scale
-    scaled by powers of ten. Those three match at any length. A match that is
-    only the significand digits, with no agreement in magnitude, needs at
-    least three significant digits. ``25`` is still the scale ``0.25`` because
-    it is that scale times one hundred. ``25e0.5`` is not, and a one- or
-    two-digit significand is also an ordinary number. A non-finite or
-    overflowing value is not a match.
-    """
     parts = _scientific_parts(literal)
     if parts is not None and _recurse_exponent(*parts) and _literal_is_scale(parts[1], scale):
         return True
@@ -668,14 +555,6 @@ def _literal_is_scale(literal: str, scale: float) -> bool:
 
 
 def _scale_in_token(token: str, scale: float | None) -> bool:
-    """True when any numeric literal in ``token`` is the invoice scale.
-
-    One regex pulls every literal (optional sign, digits, optional decimal,
-    optional exponent), glued to letters or not. A bare integer counts only
-    when it is the whole token, so ``long_2x`` stays and a standalone ``2``
-    does not. ``2.5`` is a different significand. The screen and the export
-    both call this.
-    """
     number = _scale_number(scale)
     if number is None or not token:
         return False
@@ -694,12 +573,6 @@ def _scale_in_token(token: str, scale: float | None) -> bool:
 
 
 def _keep_surface_token(token: str, *, previous: str, scale: float | None) -> bool:
-    """One decision for the screen filter and for ``export_allowed``.
-
-    A signed number stays whole. A hyphenated word stays whole. A calendar id
-    and the invoice scale do not. ``2024.50`` stays. A bare year does not,
-    including ``day 2024``.
-    """
     del previous
     if CLOCK_TEXT.fullmatch(token):
         return True
@@ -723,11 +596,6 @@ def _keep_surface_token(token: str, *, previous: str, scale: float | None) -> bo
 
 
 def _surface_pieces(text: str, *, scale: float | None) -> tuple[list[str], bool]:
-    """Kept tokens, and whether every token was kept.
-
-    The screen joins the kept tokens. Export fails when any token was dropped.
-    Both call ``_keep_surface_token``.
-    """
     pieces: list[str] = []
     allowed = True
     previous = ""
@@ -743,25 +611,11 @@ def _surface_pieces(text: str, *, scale: float | None) -> tuple[list[str], bool]
 
 
 def _allow_listed_text(text: str, *, scale: float | None = None) -> str:
-    """Keep numbers, session ids, hyphenated words, and words. Drop the rest.
-
-    A signed number, including ``$``, thousands commas, an exponent, and a
-    trailing ``%``, is one token. ``pre-market`` stays hyphenated. A month name
-    is not a word we show. A four-digit year is not shown, including after
-    ``day``. This is the structural layer. The regexes have already run.
-    """
     pieces, _allowed = _surface_pieces(text, scale=scale)
     return " ".join(pieces)
 
 
 def designer_surface_text(value: str, symbols: tuple[str, ...] = (), *, scale: float | None = None) -> str:
-    """Text a designer banner, warning, header, key, or free-text cell may show.
-
-    Paths are consumed through spaces. A ticker is ``RANDOM``. The remainder is
-    limited to numbers, session ids, and words, and the date, ticker, and scale
-    regexes still run. Text is NFKC-normalized first, and unicode minus and
-    dash characters are ASCII ``-`` before a literal is read.
-    """
     raw = normalize_surface(value)
     if "Traceback" in raw or _consume_paths(raw, "") != raw:
         raw = designer_error(raw)
@@ -771,11 +625,6 @@ def designer_surface_text(value: str, symbols: tuple[str, ...] = (), *, scale: f
 
 
 def designer_error(text: str) -> str:
-    """Exception summary with filesystem paths removed.
-
-    The operator view keeps the traceback. A designer cell and its tooltip
-    show this summary instead.
-    """
     cleaned = _consume_paths(normalize_surface(text), "")
     lines = []
     for raw in cleaned.splitlines():
@@ -796,7 +645,6 @@ def _strip_child_error(cleaned: dict, symbols: tuple[str, ...], scale: float | N
 
 
 def _leaf_token(value, symbols: tuple[str, ...], *, scale: float | None = None) -> str:
-    """Last path segment, with dates and tickers already removed. Not a path."""
     text = scrub_text(str(value or ""), symbols, scale=scale).replace("\\", "/").strip()
     if "/" in text:
         text = text.rstrip("/").split("/")[-1]
@@ -812,7 +660,6 @@ def _designer_child(
     scale: float | None = None,
     allow_list: bool = False,
 ) -> dict:
-    """A job row a designer may see. No filesystem path and no ticker."""
     cleaned = _scrub_obj(
         {key: value for key, value in child.items() if key != "path"},
         symbols,
@@ -832,7 +679,6 @@ def _designer_child(
 
 
 def book_is_anonymized(document) -> bool:
-    """True when a metrics or run document says the book was anonymized."""
     if not isinstance(document, dict):
         return False
     if document.get("anonymized") is True or document.get("audience") == "designer":
@@ -877,10 +723,6 @@ def _collect_symbols(document, found: list[str]) -> None:
 
 
 def peek_symbols(folder: Path) -> tuple[str, ...]:
-    """Ticker tokens written on the operator side of ``folder``.
-
-    Used only as a redaction needle. The returned strings are not for display.
-    """
     found: list[str] = []
     for name in ("metrics.json", "run_config.json", "run.json"):
         document = _read_json(folder / name)
@@ -898,7 +740,6 @@ def peek_symbols(folder: Path) -> tuple[str, ...]:
 
 
 def _scale_value(document) -> float | None:
-    """``cost_basis.share_scale``, or ``share_factor`` when the scale is absent."""
     if not isinstance(document, dict):
         return None
     basis = document.get("cost_basis")
@@ -915,13 +756,6 @@ def _scale_value(document) -> float | None:
 
 
 def peek_scale(folder: Path) -> float | None:
-    """Invoice scale recorded on operator metrics. Not for display.
-
-    A single book uses ``folder/metrics.json``. A parallel batch has no file
-    there; the needle is ``share_scale`` on an operator job under ``jobs/``.
-    Opening ``designer/`` reads the sibling ``jobs/`` tree. The number is
-    never shown.
-    """
     folder = Path(folder)
     found = _scale_value(_read_json(folder / "metrics.json"))
     if found is not None:
@@ -952,7 +786,6 @@ def peek_scale(folder: Path) -> float | None:
 
 
 def designer_tree(folder: Path) -> bool:
-    """True when ``folder`` is a published designer directory."""
     if not folder.is_dir():
         return False
     if (folder / "metrics.json").is_file() or (folder / "leaderboard.csv").is_file():
@@ -979,7 +812,6 @@ def _nested_jobs(folder: Path) -> bool:
 
 
 def default_audience(folder: Path) -> str:
-    """``designer`` for an anonymized book or a folder that published ``designer/``."""
     if designer_tree(folder / "designer"):
         return "designer"
     for name in ("metrics.json", "run.json"):
@@ -990,12 +822,6 @@ def default_audience(folder: Path) -> str:
 
 
 def resolve_view(folder: Path, audience: str) -> tuple[str, Path, bool]:
-    """Return ``(audience, directory to read, redacted)``.
-
-    A designer audience is always redacted. ``designer/`` is the directory
-    when that tree was published. The operator folder is read otherwise.
-    Both go through the same allow-list.
-    """
     chosen = (audience or "auto").strip().lower()
     if chosen == "auto":
         chosen = default_audience(folder)
@@ -1010,14 +836,6 @@ def resolve_view(folder: Path, audience: str) -> tuple[str, Path, bool]:
 
 
 def export_text(path: Path) -> str:
-    """Text used to decide whether a designer may receive ``path``.
-
-    A PNG contributes its text chunks (``tEXt``, ``zTXt``, ``iTXt``), including
-    a compressed chunk, plus any bytes after ``IEND``. ``iTXt`` text is UTF-8.
-    Pixel bytes are not text. Any other file is decoded as latin-1, so a
-    binary file cannot skip the check by failing a UTF-8 decode. A file over
-    the read cap is refused before it is read whole.
-    """
     suffix = path.suffix.lower()
     if suffix == ".png":
         limit = PNG_READ_LIMIT
@@ -1066,15 +884,10 @@ def _png_text(data: bytes) -> str:
 
 
 def png_caption(data: bytes) -> str:
-    """Text chunks and anything after IEND. Pixel bytes are not included."""
     return _png_text(data)
 
 
 def _itxt_text(chunk: bytes) -> str:
-    """PNG iTXt. The keyword is Latin-1. The translated keyword and text are UTF-8.
-
-    Flag 1 means the text is zlib, the same rule as zTXt.
-    """
     if b"\x00" not in chunk:
         return chunk.decode("utf-8", "replace")
     keyword, _, rest = chunk.partition(b"\x00")
@@ -1097,11 +910,6 @@ def _itxt_text(chunk: bytes) -> str:
 
 
 def _is_identifier(text: str) -> bool:
-    """True when ``text`` is one strategy or source id, not free prose.
-
-    A signed exponent inside the name counts, and so does a name that starts
-    with a digit. A bare price does not.
-    """
     token = text.strip()
     if not token or any(char.isspace() for char in token):
         return False
@@ -1109,11 +917,6 @@ def _is_identifier(text: str) -> bool:
 
 
 def _identifier_reason(text: str, scale: float | None) -> str | None:
-    """Why one identifier cannot be published, or None. Both gates call this.
-
-    The scale still fails. A calendar id is a date. The token is not a
-    withheld word and it is not a price.
-    """
     if contains_calendar_date(text):
         return "a date"
     if _contains_scale(text, scale):
@@ -1122,7 +925,6 @@ def _identifier_reason(text: str, scale: float | None) -> str | None:
 
 
 def _identifier_in_value(value, scale: float | None) -> str | None:
-    """The shared identifier verdict for a JSON value, or None."""
     if isinstance(value, dict):
         for item in value.values():
             reason = _identifier_in_value(item, scale)
@@ -1141,7 +943,6 @@ def _identifier_in_value(value, scale: float | None) -> str | None:
 
 
 def _structured_identifier_reason(kind: str, payload, scale: float | None) -> str | None:
-    """The shared identifier verdict for a JSON document or a CSV table."""
     if kind == "json":
         return _identifier_in_value(payload, scale)
     for row in payload:
@@ -1154,19 +955,6 @@ def _structured_identifier_reason(kind: str, payload, scale: float | None) -> st
 
 
 def scan_publication(text: str, *, symbols: tuple[str, ...] = (), scale: float | None = None) -> str | None:
-    """None when ``text`` may be published. Otherwise a date, the scale, or a price.
-
-    A calendar date is ``contains_calendar_date``, the same patterns as the
-    screen, including a bare year. ``day 2024`` is a date. That check runs
-    before a price, so ``01.04.2024`` is a date. Allow-listed numeric cells
-    are masked first, so an integer equal to a compact date is not a date.
-    The scale decision is the same token check as the screen. A price is a
-    decimal literal in free text whose absolute value is at least 1.
-    Allow-listed numeric cells are neither. A clock is neither. An exponent
-    inside a hex id is not a price. An identifier uses the same predicate as
-    the export check. The text is read as stored: a raw id is not rewritten
-    before this look. Tickers are the other audit.
-    """
     del symbols
     normalized = normalize_surface(text)
     if contains_calendar_date(_mask_listed_numbers(normalized)):
@@ -1187,14 +975,12 @@ def scan_publication(text: str, *, symbols: tuple[str, ...] = (), scale: float |
 
 
 def _free_has_scale(text: str, scale: float | None) -> bool:
-    """True only when a token is the invoice scale. A year glued into an id is not."""
     if _scale_number(scale) is None:
         return False
     return _contains_scale(text, scale)
 
 
 def _published_cost_label(key, value) -> bool:
-    """The flat-fee sentence is a published constant, not the invoice scale."""
     if str(key or "") != "cost_model" or not isinstance(value, str):
         return False
     from ..costs_designer import is_cost_label
@@ -1237,11 +1023,6 @@ def _json_has_scale(value, scale: float | None, key: str | None = None) -> bool:
 
 
 def _header_parts(name: str) -> tuple[str, str]:
-    """Allow-listed column key, and a display label when the header carries one.
-
-    ``sharpe|Sharpe`` is the key ``sharpe`` plus a label. The label never
-    decides that a column is safe. A header with no listed key stays one cell.
-    """
     text = name.strip()
     if "|" not in text:
         return text, ""
@@ -1254,23 +1035,16 @@ def _header_parts(name: str) -> tuple[str, str]:
 
 
 def _listed_number(cell: str) -> bool:
-    """A raw or formatted number sitting under an allow-listed column key."""
     return _numeric_cell(cell) or _formatted_number(cell)
 
 
 def _listed_metric_key(key: str | None) -> bool:
-    """An allow-listed numeric field. Ids and free-text keys stay visible to the date scan."""
     if not key or key in _ID_COLUMNS or key in {"name", "message", "error"}:
         return False
     return redacted_key_allowed(key)
 
 
 def _mask_listed_numbers(text: str) -> str:
-    """Replace allow-listed numeric cells so a yyyymmdd integer is not a date.
-
-    The date scan is the only caller. Price and scale scans still see the
-    original text. A strategy id that is the digits stays.
-    """
     structured = _structured_document(text)
     if structured is None:
         return text
@@ -1370,11 +1144,6 @@ def _publication_has_price(text: str) -> bool:
 
 
 def _is_price_literal(literal: str) -> bool:
-    """A decimal number at least 1. An exponent with no decimal point is not one.
-
-    ``450.12`` and ``7.777`` are prices. ``42e0`` inside a hex id is not,
-    and neither is an integer share count or a session minute.
-    """
     if "." not in literal:
         return False
     try:
@@ -1444,13 +1213,6 @@ def _csv_has_price(rows: list[list[str]]) -> bool:
 
 
 def export_block_reason(text: str, *, symbols: tuple[str, ...], scale: float | None) -> str | None:
-    """Why ``text`` cannot be exported, or None when it can.
-
-    The reason names the file's problem for the status bar: a secret, a date,
-    a path, a ticker, the scale, or a price. The text is read as stored. A
-    raw id is not rewritten before this look. A strategy or source id is not
-    a price. An identifier uses the same predicate as the publication scan.
-    """
     text = normalize_surface(text)
     structured = _structured_document(text)
     if structured is None:
@@ -1465,25 +1227,10 @@ def export_block_reason(text: str, *, symbols: tuple[str, ...], scale: float | N
 
 
 def export_allowed(text: str, *, symbols: tuple[str, ...], scale: float | None) -> bool:
-    """False when a file still contains operator-only text.
-
-    The date and path regexes are the second layer. A month word next to a
-    year, a path, or the scale as its own number fails even when the spelling
-    is one the date list has not named yet.
-
-    JSON and CSV are structured. A numeric value of an allow-listed key is
-    not scale-scanned, and neither is a formatted number under that same key.
-    The column key is the allow-list, not the display label. A strategy or
-    source id is not a price. Free text, filenames, labels, and other string
-    values still are. Text is NFKC-normalized, and unicode minus and dash
-    characters are ASCII ``-``, before that scan. The text is read as stored.
-    A raw id is not rewritten before this look.
-    """
     return export_block_reason(text, symbols=symbols, scale=scale) is None
 
 
 def _preamble_reason(text: str, symbols: tuple[str, ...]) -> str | None:
-    """Secrets, dates, paths, and tickers. Scale is a separate pass."""
     folded = text.casefold()
     if any(token in folded for token in _SECRET_TOKENS):
         return "a secret"
@@ -1508,12 +1255,6 @@ def _free_text_reason(
     *,
     price: bool = True,
 ) -> str | None:
-    """Why free text fails the export check, or None.
-
-    Allow-listed numeric cells never reach this function. A clock is not a
-    price. ``price`` is false for a strategy or source id: a decimal there is
-    the name, and the scale, ticker, and date checks still run.
-    """
     reason = _preamble_reason(text, symbols)
     if reason:
         return reason
@@ -1539,12 +1280,10 @@ def _free_text_allowed(
     *,
     price: bool = True,
 ) -> bool:
-    """Free text on the screen's export check. A price is rejected, as in ``scan_publication``."""
     return _free_text_reason(text, symbols, scale, price=price) is None
 
 
 def _structured_document(text: str):
-    """``("json", value)`` or ``("csv", rows)`` when the file is a table."""
     stripped = text.strip()
     if stripped.startswith("{") or stripped.startswith("["):
         try:
@@ -1577,7 +1316,6 @@ def _numeric_cell(cell: str) -> bool:
 
 
 def _formatted_number(cell: str) -> bool:
-    """A rendered allow-listed number: dollars, percent, or basis points."""
     token = cell.strip().replace(",", "").replace("$", "").replace("%", "")
     if token.endswith(" bp"):
         token = token[: -len(" bp")]

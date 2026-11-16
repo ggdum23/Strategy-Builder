@@ -1,4 +1,3 @@
-"""Windows path construction, executed on whatever OS the suite is on."""
 
 from pathlib import PureWindowsPath
 

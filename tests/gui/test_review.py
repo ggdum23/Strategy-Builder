@@ -1,8 +1,3 @@
-"""Review fixes for log scale, designer export, and report display.
-
-Each test asserts the behavior the review required. On the previous head the
-log view, the percent formatting, the PNG copy, and the date scrub all fail.
-"""
 
 from __future__ import annotations
 
@@ -33,7 +28,6 @@ from backtester.gui.schema import leaderboard_kind
 from synthetic import ARENA_METRICS, write_book, write_parallel_run
 from test_window import _visible_blob, _window
 
-# Phase 3 leaderboard at 3016825. Every column has a display kind.
 PHASE3_COLUMNS = (
     "rank",
     "strategy_id",
@@ -78,7 +72,6 @@ PHASE3_COLUMNS = (
     "error",
 )
 
-# The row the review loaded from a real Phase 3 leaderboard.
 REAL_ROW = {
     "total_return": 0.03995523164581805,
     "bh_total_return": 0.03995523164581805,
@@ -125,7 +118,6 @@ def test_date_scrubber_catches_spellings_other_than_iso():
 
 
 def _png(text: str) -> bytes:
-    """A 1×1 PNG with the secret in a tEXt chunk and in the raw bytes."""
     raw = b"\x00\x00\x00\x00\x00"
     compressed = zlib.compress(raw)
 

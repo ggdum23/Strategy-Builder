@@ -1,4 +1,3 @@
-"""Thirteenth review. A rejected date id opens its opaque designer directory."""
 
 from __future__ import annotations
 

@@ -1,21 +1,3 @@
-"""One-bar referee.
-
-The official engine stays in this process. The design strategy runs in a child
-process that is handed one bar, then the decision for that bar, and only then
-the next bar. A read that gets ahead of the parent blocks until the per-call
-timeout and the run is disqualified.
-
-A named sample uses the official fee schedule. Arena rescales to the starting
-equity and keeps exposure. Desk stays flat until the account is live.
-Calendar months are applied here.
-
-A pack replay is a designer surface. Fills go through ``DesignerCostModel``
-(0.8 bp flat, no per-share fee) and the canonical designer equity. The parent
-checks the sidecar MAC before it reads the price factor or ``share_scale``,
-then drops the sidecar. The jailed strategy is not given the sidecar,
-``factor_key``, ``factor_mac``, ``share_scale``, or ``share_factor``. The
-operator invoice stays on ``run_pack``, which keeps the real schedule.
-"""
 
 from __future__ import annotations
 
@@ -39,9 +21,6 @@ from .report import enrich_arena_metrics, require_anonymizable_symbol, write_jso
 from .sandbox import WINDOWS_JAIL_STARTUP_S, SandboxError, describe_isolation, launch
 
 DEFAULT_CALL_TIMEOUT_S = 10.0
-# The jailed strategy's ready-wait is 90s on Windows. Replay and probe use
-# the same default. Linux keeps 60s. Callers that pass startup_timeout keep
-# the value they passed.
 DEFAULT_STARTUP_TIMEOUT_S = float(WINDOWS_JAIL_STARTUP_S) if os.name == "nt" else 60.0
 DEFAULT_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_CPU_SECONDS = 3600
@@ -66,7 +45,6 @@ _JAIL_MARKERS = ("bwrap:", "landlock", "seccomp", "no-new-privs", "parent-death"
 
 
 class Disqualified(Exception):
-    """The strategy timed out, crashed, or broke the one-bar protocol."""
 
     def __init__(self, reason: str, detail: str = "", trace: str = ""):
         self.reason = reason
@@ -77,7 +55,6 @@ class Disqualified(Exception):
 
 
 class Prepared:
-    """The book the engine will see, plus the parent-only month maps."""
 
     def __init__(
         self,
@@ -121,7 +98,6 @@ class RefereeOutcome:
 
 
 def prepare_book(hidden, *, profile: str, train=None, warmup_days=None) -> Prepared:
-    """Concatenate warm-up and the hidden sample without mixing the two rules."""
     name = get_profile(profile).name
     if name == "arena":
         if warmup_days is None:
@@ -182,7 +158,6 @@ def prepare_book(hidden, *, profile: str, train=None, warmup_days=None) -> Prepa
 
 
 def run_in_process(strategy, prepared: Prepared, **kwargs):
-    """The same engine call the referee makes, with the strategy in this process."""
     return _score(strategy, prepared, **kwargs)
 
 
@@ -197,7 +172,6 @@ def replay(
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT_S,
     **kwargs,
 ):
-    """Run ``prepared`` through the jail. Returns result, metrics, backend, guarantees."""
     _check_timeouts(call_timeout, startup_timeout)
     box = launch(
         strategy_path,
@@ -235,7 +209,6 @@ def probe(
     bar=None,
     state=None,
 ):
-    """One bar in the jail. Returns the target the strategy produced."""
     _check_timeouts(call_timeout, startup_timeout)
     box = launch(
         strategy_path,
@@ -283,7 +256,6 @@ def run_referee(
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT_S,
     with_benchmarks: bool = True,
 ) -> RefereeOutcome:
-    """Load the operator files, replay, and write the report. The child is already gone."""
     if not strategy or not hidden or not profile or not out:
         raise ValueError("referee needs --strategy, --hidden, --profile, and --out")
     _check_timeouts(call_timeout, startup_timeout)
@@ -455,11 +427,6 @@ def _tail_sessions(frame, count: int):
 
 
 def _reject_overlap(train, hidden) -> None:
-    """Overlap is a real calendar collision.
-
-    Anonymized packs both label their first session ``S00001``. That public id
-    is not the calendar, so it is not the overlap check.
-    """
     if train is None:
         return
     train_cal = [str(value) for value in train["_calendar"].tolist()]
@@ -492,12 +459,6 @@ def _concat(train, hidden):
 
 
 def _separate_public_sessions(frame):
-    """Give a second pack new ``S#####`` ids when the public labels collide.
-
-    Named dates are already the calendar label and are left alone. The
-    calendar used for fee months stays in ``_calendar`` and is not a column
-    the child is sent.
-    """
     groups: dict[str, set[str]] = {}
     for date, calendar in zip(frame["date"].tolist(), frame["_calendar"].tolist()):
         groups.setdefault(str(date), set()).add(str(calendar))
@@ -564,7 +525,6 @@ def _public_frame(frame):
 
 
 def _designer_score(strategy, prepared: Prepared, *, borrow_rate, financing_rate, fee_mult, dividends):
-    """Flat fee. This function does not read ``share_scale`` or ``share_factor``."""
     from .designer_run import execute as designer_execute
 
     name = prepared.profile
@@ -583,7 +543,6 @@ def _designer_score(strategy, prepared: Prepared, *, borrow_rate, financing_rate
 
 
 def _desk_rows(prepared: Prepared):
-    """One normalized bar tuple per prepared book. Benchmarks reuse it."""
     rows = getattr(prepared, "desk_bars", None)
     if rows is None:
         rows = prepare_desk_bars(prepared.frame)
@@ -730,14 +689,9 @@ class _Pipe:
         self._protocol = ""
         self._awaiting = True
         self._closed = False
-        # The parent's resident-set cap, when this worker was given one.
-        # A decision that is still allocating near that cap is not a timeout:
-        # the parent poll is what classifies it as memory.
         self._memory_cap = None
         self._rss_mark = None
         self._noted_byte = False
-        # Windows anonymous pipes are not selectable. POSIX reads the pipe
-        # directly so a helper thread is not on the bar path.
         self._direct = os.name != "nt"
         self._selector = None
         if self._direct:
@@ -790,7 +744,6 @@ class _Pipe:
                     return
 
     def _drain(self, timeout: float) -> None:
-        """Read what the child has already written. POSIX only."""
         if self._selector is None:
             return
         try:
@@ -828,18 +781,12 @@ class _Pipe:
             raise Disqualified("crash", detail) from exc
 
     def set_memory_cap(self, memory_bytes: int | None) -> None:
-        """Remember the parent resident-set cap. It is not sent to the jail."""
         if memory_bytes is None:
             self._memory_cap = None
             return
         self._memory_cap = int(memory_bytes)
 
     def _take_frame(self) -> bytes | None:
-        """One complete frame, or None when the length prefix is still short.
-
-        Bytes after that frame are a second message. The decision is one
-        frame, so those bytes are the same failure as a second JSON line.
-        """
         if len(self._buf) < 4:
             return None
         (length,) = struct.unpack_from("<I", self._buf)
@@ -880,9 +827,6 @@ class _Pipe:
                     continue
             if self._direct and deadline - time.monotonic() > 0:
                 continue
-            # Hello is not the allocation. Extending it once doubled the
-            # ready-wait to the parent's whole budget, so a child that never
-            # wrote ready was reported as an empty pipe.
             if extend and self._allocation_still_under_cap():
                 deadline = time.monotonic() + timeout
                 continue
@@ -892,13 +836,6 @@ class _Pipe:
         raise Disqualified("timeout", detail)
 
     def _allocation_still_under_cap(self) -> bool:
-        """True when this call is still growing and has not crossed the cap.
-
-        A sleep holds a flat resident set and times out on the original
-        budget. A bomb that is already near the cap, but not over it, gets
-        another budget so the parent poll can report the memory stop. Crossing
-        the cap here raises that stop directly.
-        """
         cap = self._memory_cap
         if cap is None:
             return False
@@ -964,7 +901,6 @@ class _Pipe:
         return _decode_target(message.get("target"))
 
     def state(self, timeout: float) -> dict:
-        """JSON-safe attributes the strategy stored on itself. Not a bar."""
         if self._direct:
             self._drain(0)
         with self._cv:
@@ -1030,7 +966,6 @@ class _Remote:
         return self._pipe.state(self._timeout)
 
     def exit_code(self) -> int | None:
-        """The jail process status. Waits briefly when it is already exiting."""
         proc = self._box.process
         code = proc.poll()
         if code is not None:
@@ -1041,13 +976,6 @@ class _Remote:
             return proc.poll()
 
     def spill_stdio(self, *, wait: bool) -> None:
-        """Copy the jail's print log onto this process's stdout.
-
-        Designer runs capture prints in the jail so they are not protocol
-        lines. The worker's own stdio file is what an operator error attaches.
-        Waiting is for a child that is already leaving: a live child is left
-        alone so a parent-side failure does not sit on the timeout.
-        """
         if wait:
             self.exit_code()
         path = Path(self._box.workdir) / "stdio.log"
@@ -1065,12 +993,6 @@ class _Remote:
 
 @contextmanager
 def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_seconds, call_timeout, memory_cap=None):
-    """Run a strategy file in the referee jail. The caller keeps the engine.
-
-    ``on_bar`` sends one bar and reads one decision. The dividend map, the
-    accounting record, and the share scale are not written on the pipe.
-    ``snapshot`` reads the attributes the strategy stored on itself.
-    """
     box = launch(
         strategy_path,
         memory_bytes=int(memory_bytes),
@@ -1084,9 +1006,6 @@ def jailed_strategy(strategy_path, profile, *, deny_paths, memory_bytes, cpu_sec
     pipe = _Pipe(box)
     pipe.set_memory_cap(memory_cap)
     try:
-        # AppContainer startup is not the strategy clock. On Windows the
-        # ready line is allowed WINDOWS_JAIL_STARTUP_S; each bar still uses
-        # call_timeout. Linux keeps the shorter of 60s and the call timeout.
         from .sandbox import WINDOWS_JAIL_STARTUP_S
 
         startup = float(WINDOWS_JAIL_STARTUP_S) if os.name == "nt" else min(60.0, float(call_timeout))

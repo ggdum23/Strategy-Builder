@@ -1,4 +1,3 @@
-"""Seventh review. Scale literals and paths share one check. No Qt required."""
 
 from __future__ import annotations
 
@@ -6,7 +5,6 @@ import pytest
 
 from backtester.gui.audience import designer_surface_text, export_allowed, normalize_surface, redacted_key_allowed
 
-# (scale, token, dropped)
 _SCALE_CASES = (
     (7.777, "build2_7777e-3", True),
     (7.777, "7.777e-3", True),
@@ -49,7 +47,6 @@ def test_scale_literals_match_value_significand_reciprocal_and_powers(scale, tok
         assert not export_allowed(f"see {token} now", symbols=(), scale=scale)
     else:
         assert token in shown
-        # A decimal of at least 1 is a free-text price even when it is not the scale.
         priced = token in {"2.5", "build2_7.777"}
         assert export_allowed(token, symbols=(), scale=scale) is not priced
         assert export_allowed(f"see {token} now", symbols=(), scale=scale) is not priced
@@ -112,7 +109,6 @@ def test_new_metric_keys_are_hidden_unless_listed():
     assert not redacted_key_allowed("surprise_price")
     assert not redacted_key_allowed("close")
     assert not redacted_key_allowed("2024")
-    # Settings cannot be inverted into a price or a share count.
     for key in (
         "accounting",
         "price_basis",
@@ -126,17 +122,11 @@ def test_new_metric_keys_are_hidden_unless_listed():
         "dividends_applied",
     ):
         assert redacted_key_allowed(key), key
-    # Dollars and a per-share dividend amount can be inverted.
     for key in ("cash_interest", "financing_cost", "dividends_net", "dividend_per_share", "amount"):
         assert not redacted_key_allowed(key), key
 
 
 def test_allow_listed_numbers_are_not_scale_scanned():
-    """Ordinary Desk figures share significand digits with common invoice scales.
-
-    The number under an allow-listed key stays. The same digits in free text
-    are still a leak.
-    """
     import json
 
     payload = {
@@ -166,7 +156,6 @@ _CLOCK_SCALES = (None, 0.25, 0.5, 0.7, 2, 7.777)
 
 
 def test_clock_times_stay_whole_and_are_not_the_scale():
-    """``09:25`` is one token. The minute is not a one- or two-digit scale."""
     for stamp in _CLOCKS:
         for scale in _CLOCK_SCALES:
             shown = designer_surface_text(f"fill {stamp} rth", (), scale=scale)
@@ -184,7 +173,6 @@ def test_clock_times_stay_whole_and_are_not_the_scale():
 
 
 def test_real_equity_png_is_text_only_and_a_planted_chunk_is_rejected(tmp_path):
-    """A matplotlib equity figure passes. A tEXt chunk that names the scale or the ticker does not."""
     import struct
     import zlib
 
@@ -238,7 +226,6 @@ _NEEDLES = ("450.12", "7.777", "\u22127.777", "\uff17\uff0e\uff17\uff17\uff17", 
 
 
 def test_a_pack_id_is_not_a_price_and_the_plant_still_is():
-    """Hex in ``pack_<sha>`` is not a price and not the scale. The review's plant is."""
     import json
 
     from backtester.gui.audience import scan_publication
@@ -254,7 +241,6 @@ def test_a_pack_id_is_not_a_price_and_the_plant_still_is():
 
 
 def test_publish_strips_free_text_and_aborts_when_it_survives(tmp_path, monkeypatch):
-    """Allow-listed keys are typed. A price left in a string fails the publish and removes the tree."""
     import json
 
     from backtester.designer_allow import project_designer

@@ -1,9 +1,3 @@
-"""Return 1.0 when a project or sample file outside the jail can be read.
-
-The jail's working directory has no project file above it. Absolute roots
-are built at runtime so this file does not embed an operator path. A readable
-interpreter file does not count: the jail mounts the runtime.
-"""
 
 from pathlib import Path
 

@@ -1,4 +1,3 @@
-"""Desk locks. Tolerances are not loosened: equalities are exact."""
 
 from __future__ import annotations
 
@@ -155,7 +154,6 @@ def test_desk_engine_defaults_match_the_profile():
 
 
 def _close_for_gross(gross: float) -> float:
-    """Close that marks a 3x fill, priced at a literal 1 bp, at ``gross`` leverage."""
     open_px = 100.0
     equity0 = 1_000_000.0
     shares = int(3.0 * equity0 / open_px)
@@ -191,7 +189,6 @@ def test_margin_call_queues_above_3_15_not_at_3_14():
 
 
 def _close_for_equity(equity_target: float) -> float:
-    """Close that marks a 1x fill, priced at a literal 1 bp, at ``equity_target``."""
     open_px = 100.0
     equity0 = 1_000_000.0
     shares = int(equity0 / open_px)
@@ -436,8 +433,6 @@ def test_long_financing_dividend_and_fee_mult_use_the_formula():
     assert res["fills"][0]["fill_price"] == 100.0 * (1.0 + 1.0 * 1.0 * 1e-4)
     assert stressed["financing"] == want2["fin"]
     assert stressed["fees"]["total"] == want2["fees"]
-    # At a price where trunc(equity/price)*price is not the starting equity,
-    # doubled fees do not double the financing dollars. The formula is not multiplied.
     odd = [bar("A", "09:30", "rth", 33), bar("A", "09:31", "rth", 33), bar("B", "09:30", "rth", 33)]
 
     def odd_signal(row, _account):
@@ -568,8 +563,6 @@ def test_post_close_does_not_queue_a_margin_call():
     ]
     _strategy, res = go(lambda row, _account: 3.0 if row["time"] == "09:30" and row["session"] == "S1" else None, bars)
     shares = res["fills"][0]["shares_after"]
-    # Reconstruct cash from the fill the engine reported, then prove the two closes
-    # sit on opposite sides of 3.15. The post close must not create a second fill.
     cash = 1_000_000.0 - shares * res["fills"][0]["fill_price"] - res["fills"][0]["fees"]
     rth_eq = cash + shares * 98.0
     post_eq = cash + shares * 90.0
@@ -600,8 +593,6 @@ def test_later_signal_replaces_an_unfilled_margin_order():
     assert res["fills"][-1]["kind"] == "strategy"
     assert res["fills"][-1]["time"] == "09:30"
     assert res["fills"][-1]["session"] == "S2"
-    # Boundary financing changes cash before the fill. Size from the engine's own
-    # financing event so the assertion is the replacement, not a second formula.
     cash = 1_000_000.0
     shares = 0
     for fill in res["fills"][:-1]:
@@ -669,13 +660,6 @@ def test_post_liquidation_hits_the_next_daily_mark():
 
 
 def test_rescaled_prices_use_share_factor_k():
-    """Prices times k are paired with share_factor k.
-
-    Pack shares are about 1/k of the real count. share_factor multiplies them
-    back for per-share fees. The target stays at 0.5 so both books are on the
-    zero side of the financing threshold, and the round trip sells so TAF is
-    nonzero. Replacing the forwarded share_factor with 1.0 fails this test.
-    """
     k = 2.0
 
     def half(row, _account):
@@ -731,12 +715,6 @@ def test_rescaled_prices_use_share_factor_k():
 
 
 def test_fee_mult_does_not_advance_the_tier():
-    """A doubled tier count would leave the 0.0035 tier. fee_mult must not.
-
-    The first sell is under 300_000 shares and at least half of that boundary.
-    fee_mult is 2, so scaling the tier count would price the next fill from
-    the 0.0020 tier. Both commissions stay on the unscaled 0.0035 tier.
-    """
 
     def ladder(row, _account):
         if row["session"] == "S1" and row["time"] == "09:30":
@@ -765,10 +743,6 @@ def test_fee_mult_does_not_advance_the_tier():
 
 
 def test_fee_mult_does_not_scale_borrow():
-    """Borrow stays 0.0025/252 of short notional when fee_mult is 2.
-
-    Spec item 11. The mark is the previous session's last close, including post.
-    """
     bars = [
         bar("S1", "09:30", "rth", 100),
         bar("S1", "09:31", "rth", 100),
@@ -904,8 +878,6 @@ def test_accounting_identity_includes_financing_borrow_and_dividends():
         return None
 
     _strategy, res = go(signal, bars, dividends={"S2": 0.25})
-    # Same association as the engine: one boundary (fin, then borrow, then dividend)
-    # before that session's fills, and each fill subtracts delta * fill_price + fees.
     cash = 1_000_000.0
     fills = res["fills"]
     assert len(res["financing_events"]) == len(res["borrow_events"]) == len(res["dividend_events"]) == 1
@@ -939,7 +911,6 @@ def test_desk_does_not_call_on_day_end():
 
 
 class OneShotLong:
-    """Module-level so a spawned walk-forward interpreter can import it."""
 
     def on_bar(self, row, _account):
         if row["time"] == "09:30" and row["phase"] == "rth":

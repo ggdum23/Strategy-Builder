@@ -1,4 +1,3 @@
-"""Command line. Printing stays in this module. Walk-forward restores the working directory."""
 
 from __future__ import annotations
 
@@ -399,11 +398,6 @@ def _cmd_run(args) -> int:
 
 
 def _walk_inputs(args):
-    """Load the series and return the frame without keeping the loader object.
-
-    The caller pops ``frame`` in the ``walk_forward`` argument list so this
-    command does not keep a local bound to the full series during the design run.
-    """
     from .runner import load_run_series
 
     loaded, series_kind = load_run_series(
@@ -912,12 +906,8 @@ def _cmd_test() -> int:
     import pytest
 
     root = _repo_root()
-    # The October-sample jail comparison is its own CI job. Running it inside
-    # every matrix cell walks 20 strategies twice through the pipe.
     args = ["-q", "-m", "not jailed_sample"]
     if sys.platform == "win32":
-        # A hung AppContainer grant or a pipe that never returns used to hold
-        # the Windows job for hours. Sixty seconds is the per-test cap there.
         args.extend(["--timeout=60", "--timeout-method=thread"])
     args.append(str(root / "tests"))
     return int(pytest.main(args))

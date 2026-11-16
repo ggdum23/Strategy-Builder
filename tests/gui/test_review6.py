@@ -1,4 +1,3 @@
-"""Sixth review of 810a430. Each test fails when its fix is reverted."""
 
 from __future__ import annotations
 
@@ -70,8 +69,6 @@ def test_embedded_scale_decimal_and_exponent_share_the_token_check():
         assert not export_allowed(token, symbols=(), scale=7.777), token
         kept = designer_surface_text(token, (), scale=2)
         assert token in kept, token
-        # ``7.777`` is a free-text price. ``1e7.777`` is not a price: the decimal
-        # exponent is not a float, so the export check does not treat it as one.
         if re.search(r"[eE][+-]?\d", token):
             assert export_allowed(token, symbols=(), scale=2), token
         else:

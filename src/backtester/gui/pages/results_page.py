@@ -1,4 +1,3 @@
-"""Dashboard over report files. Numbers are read, not recomputed."""
 
 from __future__ import annotations
 
@@ -258,7 +257,6 @@ class ResultsPage(QWidget):
         try:
             report = load_run(self._source_path, audience=chosen) if self._source_path else load_run(path, audience=chosen)
         except (OSError, ValueError, csv.Error, MemoryError) as exc:
-            # One boundary. A decode, parse, or memory failure must not skip the wipe.
             report = _unreadable_report(self._source_path, chosen, exc)
         self._set_audience_combo(report.audience)
         self._show_path(report)
@@ -306,8 +304,6 @@ class ResultsPage(QWidget):
             self.banners.addWidget(Banner(severity, text))
         missing = [self._designer_line(report, item) for item in self._visible_missing(report)]
         if missing:
-            # The period stays off the last name. The designer allow-list would
-            # otherwise read ``benchmarks.`` as one token and drop the field.
             notice = "Not in this report, so left blank: " + ", ".join(missing)
             if report.audience == "designer":
                 text = self._designer_line(report, notice)
@@ -330,7 +326,6 @@ class ResultsPage(QWidget):
             note()
 
     def _designer_line(self, report: RunReport, text: str) -> str:
-        """Designer warnings and banners go through the path stripper and the allow-list."""
         if report.audience != "designer":
             return text
         opened = report.opened or report.directory
@@ -349,7 +344,6 @@ class ResultsPage(QWidget):
         self.header.set_title("Designer report" if audience == "designer" else "Operator report")
 
     def _visible_missing(self, report: RunReport) -> list[str]:
-        """Drop the saved-figure name when the interactive chart already has the curve."""
         if report.kind == "batch":
             has_chart = False
         elif report.kind == "walkforward":
@@ -492,11 +486,6 @@ class ResultsPage(QWidget):
             self.cost_line.setToolTip("")
 
     def _failure_line(self, report: RunReport, text: str) -> tuple[str, str]:
-        """Visible sentence, and the operator text a tooltip may expand to.
-
-        Designer text stays the opaque sentence. A traceback is not copied
-        onto that tooltip.
-        """
         shown, detail = failure_view(text)
         if report.audience == "designer":
             shown = self._designer_line(report, shown)
@@ -531,7 +520,6 @@ class ResultsPage(QWidget):
         body.setVisible(visible)
 
     def _fit_table(self, table, rows: int, cap: int = 8) -> None:
-        """Keep a detail table at the height of its rows so it does not swallow the page."""
         header = max(table.horizontalHeader().sizeHint().height(), 28)
         row_h = max(table.verticalHeader().defaultSectionSize(), 24)
         count = min(max(int(rows), 1), cap)
@@ -685,7 +673,6 @@ class ResultsPage(QWidget):
         return None
 
     def _fill_accounting(self, book: RunReport) -> None:
-        """Settings and dollar amounts the report stored. Nothing is recomputed."""
         metrics = book.metrics if isinstance(book.metrics, dict) else {}
         nested = metrics.get("accounting") if isinstance(metrics.get("accounting"), dict) else {}
         rows = []
@@ -722,7 +709,6 @@ class ResultsPage(QWidget):
         self.periods.setVisible(visible)
 
     def _job_designer_dir(self, report: RunReport, child: dict) -> str:
-        """Published designer directory for one batch row. Not shown in the table."""
         strategy = str(child.get("strategy_id") or "").strip()
         source = str(child.get("source_id") or "").strip()
         root = Path(report.directory) if report.directory else None
@@ -745,7 +731,6 @@ class ResultsPage(QWidget):
         return ""
 
     def _open_job(self, index) -> None:
-        """Double-click loads that row's designer directory."""
         row = self.jobs.source_row(index)
         records = self.jobs.raw_rows()
         if not 0 <= row < len(records):
@@ -878,12 +863,6 @@ class ResultsPage(QWidget):
             self.postmortem.setPlainText("No liquidation post-mortem in this report.")
 
     def _designer_png(self, path: Path) -> tuple[str, bytes | None]:
-        """Canonical bytes for a designer view or export.
-
-        ``ok`` is a PNG with text chunks and trailing bytes removed. ``unread``
-        is a missing, oversized, or malformed file. ``withheld`` is a canonical
-        caption that still fails the shared check.
-        """
         report = self._report
         opened = (report.opened if report is not None else None) or path.parent
         try:
@@ -944,7 +923,6 @@ class ResultsPage(QWidget):
         self._show_figure(pixmap, book.figure.name)
 
     def _wipe_book_surface(self) -> None:
-        """Drop the previous book's picture, tables, and invoice line contents."""
         self._set_cards({})
         self._show_chart(False)
         self.chart.set_study(
@@ -1035,7 +1013,6 @@ class ResultsPage(QWidget):
             self.export_to(chosen)
 
     def export_to(self, dest) -> list[str]:
-        """Copy the files this audience is allowed to see, plus the values on screen."""
         book = self._active_book()
         report = self._report
         target = Path(dest)
@@ -1120,11 +1097,6 @@ class ResultsPage(QWidget):
         return written
 
     def _export_shown(self, target: Path, book, symbols, scale, written: list[str], withheld: list[tuple[str, str]]) -> None:
-        """Write the scrubbed columns on screen. Do not copy the operator CSVs.
-
-        ``equity.csv`` is the raw curve's byte copy, so it is not written here.
-        A published ``designer/`` tree is copied by name instead of taking this path.
-        """
         if book.curves:
             curve = book.curves[0]
             columns = ["session", "equity"]
@@ -1176,7 +1148,6 @@ class ResultsPage(QWidget):
                 withheld.append((FIGURE_FILE, reason))
 
     def _keep_export(self, path: Path, *, symbols, scale, designer: bool = True) -> str | None:
-        """None when the file stays. Otherwise the reason, and the file is deleted."""
         if not designer:
             return None
         try:
@@ -1192,7 +1163,6 @@ class ResultsPage(QWidget):
 
 
 def _unreadable_report(path: str, audience: str, exc: BaseException) -> RunReport:
-    """A decode or parse failure. No book, one warning, and the previous picture can be wiped."""
     folder = Path(path) if path else Path()
     chosen = audience if audience in {"operator", "designer"} else "operator"
     report = RunReport(
@@ -1238,11 +1208,6 @@ def _benchmark_row(label: str, metrics: dict) -> dict:
 
 
 def _designer_column_header(key: str, label: str, symbols, scale) -> str:
-    """The allow-listed key, with a display label only when that label is safe.
-
-    The label is never what makes the column safe. ``2× return`` at scale 2
-    is omitted and the key ``long_2x_total_return`` stays.
-    """
     if not label or label == key:
         return key
     if export_block_reason(label, symbols=symbols, scale=scale) is None:
@@ -1251,7 +1216,6 @@ def _designer_column_header(key: str, label: str, symbols, scale) -> str:
 
 
 def _export_status(written: list[str], withheld: list[tuple[str, str]]) -> str:
-    """Name every file that was saved, and every file that was withheld."""
     kept = "Exported " + ", ".join(written) if written else ""
     held = "; ".join(f"{name} withheld: {reason}" for name, reason in withheld)
     if kept and held:

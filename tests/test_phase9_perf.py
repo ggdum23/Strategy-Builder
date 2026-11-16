@@ -1,4 +1,3 @@
-"""Prepared columns, loader equivalence, jail framing, and the venv mount rule."""
 
 from __future__ import annotations
 
@@ -386,7 +385,6 @@ def test_a_mapped_entry_stays_readable_and_open_rechecks_the_digest(tmp_path, mo
     write_series(tmp_path / "other", "SYN", sessions=4)
     second = load_named(tmp_path / "other", "SYN")
     assert second.prepared
-    # The directory may already be unlinked. The mapping stays readable.
     assert float(mapped[0]) == value
     removed = not first_dir.exists()
     second_value = float(second.frame["close"].iloc[0])
@@ -474,8 +472,6 @@ def test_length_prefixed_decisions_keep_bool_int_and_nan(tmp_path):
     pipe = _Pipe(box)
     try:
         if os.name == "nt":
-            # An unconfined sandbox_child must not run the strategy. The
-            # frames themselves are covered above; a real jail is an AppContainer.
             from backtester.referee import Disqualified
 
             with pytest.raises(Disqualified, match="not an AppContainer"):

@@ -1,19 +1,3 @@
-"""Length-prefixed frames for the one-bar referee.
-
-The child process imports this module by name from its work directory, or as
-``backtester.bar_ipc`` when the interpreter is frozen. The standard library
-only: the jail runs ``python -I -S``.
-
-One frame is a little-endian length and then one body. A second frame in the
-same response is unread output. The parent never sends the next bar until it
-has read the decision for this one.
-
-A bar the engine actually sends is a compact struct (body tag 1). Hello,
-state, day-end, and any bar that does not match that shape stay JSON, which
-is a body starting with ``{``. A decision is tag 2 when the target is a
-scalar the engine accepts. The child still sees one dict per bar, and it
-still writes one decision before it can read another request.
-"""
 
 from __future__ import annotations
 
@@ -73,7 +57,6 @@ _DESK_ACCOUNT = (
 
 
 def dumps(payload: dict) -> bytes:
-    """One JSON frame. ``payload`` must already be JSON-safe (no bare NaN)."""
     if not isinstance(payload, dict):
         raise TypeError("protocol payload must be an object")
     body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -83,7 +66,6 @@ def dumps(payload: dict) -> bytes:
 
 
 def loads(body: bytes) -> dict:
-    """One body, JSON or a compact bar/decision struct, as a dict."""
     payload = _decode_body(body)
     if not isinstance(payload, dict):
         raise ValueError("protocol payload must be an object")
@@ -91,10 +73,6 @@ def loads(body: bytes) -> dict:
 
 
 def pack_bar(payload: dict) -> bytes | None:
-    """A compact bar frame, or None when the bar is not the engine's shape.
-
-    None tells the caller to send JSON. A test probe and a day-end stay JSON.
-    """
     if not isinstance(payload, dict) or payload.get("op") != "bar":
         return None
     bar = payload.get("bar")
@@ -114,7 +92,6 @@ def pack_bar(payload: dict) -> bytes | None:
 
 
 def pack_decision(target) -> bytes | None:
-    """A compact decision frame, or None when the target is not a scalar."""
     encoded = _decision_body(target)
     if encoded is None:
         return None

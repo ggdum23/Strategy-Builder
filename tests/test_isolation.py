@@ -1,4 +1,3 @@
-"""The library stays importable, path-free, and free of operator secrets."""
 
 from __future__ import annotations
 
@@ -108,9 +107,7 @@ def test_runner_charges_the_profile_borrow_rate():
     notional = 1_000_000.0
     assert arena_metrics["borrow_rate_annual"] == profiles.ARENA.borrow_rate_annual == 0.0030
     assert desk_metrics["borrow_rate_annual"] == profiles.DESK.borrow_rate_annual == 0.0025
-    # Held across both session closes. Arena charges at each regular close.
     assert arena_result["borrow"] == 2 * (notional * 0.0030 / 252)
-    # Desk charges once, at the next session boundary, on the previous close.
     assert desk_result["borrow"] == notional * 0.0025 / 252
 
 
@@ -138,8 +135,6 @@ def _enclosing_function(tree: ast.AST) -> dict[int, str | None]:
 
 def test_library_does_not_print_or_touch_the_working_directory():
     allowed = {"__main__.py", "arena_runner.py"}
-    # These two restore the parent cwd before returning. The design-child test
-    # checks that a walk-forward call leaves the caller in the directory it started in.
     cwd_funcs = {"_launch_book", "_enter_child"}
     for path in (ROOT / "src" / "backtester").glob("*.py"):
         if path.name in allowed:
@@ -161,8 +156,7 @@ def test_no_secret_paths():
         ROOT / "docs",
         ROOT / "packaging",
         ROOT / "README.md",
-        ROOT / "run.ps1",
-        ROOT / "run.bat",
+        ROOT / "run.py",
     ]
     files = []
     for root in roots:
@@ -173,16 +167,12 @@ def test_no_secret_paths():
     for path in files:
         if path.suffix in {".gz", ".png", ".pyc"} or "__pycache__" in path.parts:
             continue
-        # PyInstaller writes absolute paths into packaging/build and packaging/dist.
         rel_parts = path.relative_to(ROOT).parts
         if rel_parts[:2] in {("packaging", "build"), ("packaging", "dist")}:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for token in SECRETS:
             assert token not in text, f"{path} contains {token}"
-    # The desktop shell is the operator's process. Its preferences module is the
-    # one place that names the default data folder. Designer packs and the
-    # engines stay free of that path.
     operator_shell = ROOT / "src" / "backtester" / "gui" / "preferences.py"
     src_text = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
@@ -193,10 +183,8 @@ def test_no_secret_paths():
         assert token not in src_text
     assert r"C:\Users\Jeu\Desktop\Backtester" in operator_shell.read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    script = (ROOT / "run.ps1").read_text(encoding="utf-8")
-    for blob in (readme, script):
-        assert r"C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles" in blob
-        assert r"C:\Users\Jeu\Desktop\Backtester\SPY\filled" in blob
+    assert r"C:\Users\Jeu\Desktop\Backtester\1min_Candles-20261107T193139Z-1-001\1min_Candles" in readme
+    assert r"C:\Users\Jeu\Desktop\Backtester\SPY\filled" in readme
 
 
 def test_sample_fixtures_stay_under_a_megabyte():

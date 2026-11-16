@@ -1,4 +1,3 @@
-"""Sort order and the display-string cache. Qt is optional for the core suite."""
 
 from __future__ import annotations
 

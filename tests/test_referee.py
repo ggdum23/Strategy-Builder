@@ -1,4 +1,3 @@
-"""One-bar referee: engine parity, profile warm-up, and the OS jail."""
 
 from __future__ import annotations
 
@@ -281,7 +280,6 @@ def test_colliding_pack_session_ids_stay_distinct_and_keep_the_calendar():
     train = _frame(["2024-01-02", "2024-01-03"], minutes=(570,))
     train["_calendar"] = train["date"]
     train["date"] = ["S00001", "S00001", "S00002", "S00002"][: len(train)]
-    # two minutes, so each date is repeated. Assign by the calendar.
     train["date"] = ["S00001" if cal == "2024-01-02" else "S00002" for cal in train["_calendar"]]
     hidden = _frame(["2024-02-01"], minutes=(570,))
     hidden["_calendar"] = hidden["date"]
@@ -442,8 +440,6 @@ def test_selftest_probes_are_blocked(name, expect):
         pytest.skip("setsid is the Linux escape")
     server = None
     if name == "net.py":
-        # The probe connects to a live listener and to a public address.
-        # ECONNREFUSED from a closed port is not evidence of a block.
         import socket
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -526,11 +522,6 @@ class Strategy:
 @windows_jails(2)
 @OWNER_PC
 def test_sleep_and_lookahead_are_disqualified_within_eight_seconds():
-    """The call budget is 1s. The wall clock includes startup and must stay under 8s.
-
-    On Windows this bound was 13.1s while each launch paid for ``icacls``.
-    The grant is once per machine now. The bound stays strict on Linux.
-    """
     _needs_jail()
     started = time.monotonic()
     with pytest.raises(Disqualified) as slept:
@@ -612,7 +603,6 @@ def _probe_bubblewrap_and_landlock(path, monkeypatch, **kwargs) -> None:
 
 
 def test_x32_syscall_numbers_are_killed(tmp_path):
-    """Bit 0x40000000 is the x32 ABI. It must not fall through to ALLOW."""
     if sys.platform != "linux":
         pytest.skip("the x32 bit is a Linux seccomp number")
     import os
@@ -733,12 +723,6 @@ class Strategy:
 
 
 def test_a_cache_inside_the_runtime_prefix_is_refused(tmp_path, monkeypatch):
-    """A prefix that contains the cache is not mounted.
-
-    The prefix root holds a symlink to a file outside the tree and a
-    hardlink of the cache marker. Both backends refuse before a child
-    starts, so neither name is granted.
-    """
     _needs_jail()
     import backtester.sandbox as sandbox
 

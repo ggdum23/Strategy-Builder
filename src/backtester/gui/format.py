@@ -1,4 +1,3 @@
-"""Format a value that is already in a report. No formulas."""
 
 from __future__ import annotations
 
@@ -10,11 +9,6 @@ MISSING = "—"
 
 
 def is_missing(value: Any) -> bool:
-    """True when the report did not contain a usable number or flag.
-
-    ``False`` and ``0`` are present. ``None``, blanks, and NaN are not.
-    Infinity is present: the report stored a limit (Calmar with no drawdown).
-    """
     if value is None:
         return True
     if isinstance(value, bool):
@@ -27,7 +21,6 @@ def is_missing(value: Any) -> bool:
 
 
 def infinity_text(number: float) -> str:
-    """Display for a stored non-finite limit. NaN is not passed here."""
     return "∞" if number > 0 else "−∞"
 
 
@@ -38,7 +31,6 @@ def _grouped(value: float, digits: int) -> str:
 
 
 def format_number(kind: str, value: Any) -> str:
-    """Render ``value`` for ``kind``. Missing stays an em dash, never zero."""
     if isinstance(value, float) and math.isinf(value):
         return infinity_text(value)
     if is_missing(value):
@@ -85,13 +77,11 @@ def format_number(kind: str, value: Any) -> str:
 
 
 def _money_text(number: float, digits: int) -> str:
-    """Dollars with the sign in front of the symbol: ``-$340.25``."""
     sign = "-" if number < 0 else ""
     return sign + "$" + f"{abs(number):,.{digits}f}"
 
 
 def _money_digits(number: float) -> int:
-    """The value's own scale, at least two places, so fee rows can add up."""
     try:
         exponent = Decimal(str(number)).as_tuple().exponent
     except Exception:
@@ -102,25 +92,21 @@ def _money_digits(number: float) -> int:
 
 
 def _fraction_text(number: float) -> str:
-    """Percent. A non-zero value that would round to 0.00% keeps more digits."""
     scaled = number * 100.0
     if scaled == 0.0:
         return "0.00%"
     if round(scaled, 2) == 0.0:
-        # Eight places still print 0.00000000% for a tiny fraction. Say so.
         if abs(scaled) < 5e-9:
             return f"{scaled:.2e}%"
         magnitude = math.floor(math.log10(abs(scaled)))
         decimals = min(8, max(4, -magnitude + 1))
         return _grouped(scaled, decimals) + "%"
-    # Half away from zero, so a stored -0.04215 reads -4.22%.
     rounded = Decimal(str(scaled)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     sign = "-" if rounded < 0 else ""
     return sign + f"{abs(rounded):,.2f}%"
 
 
 def format_cell(value: Any) -> str:
-    """Table cell. Numbers keep full precision to 6 significant figures, not a new metric."""
     if is_missing(value):
         return MISSING
     if isinstance(value, bool):
@@ -139,11 +125,6 @@ def format_cell(value: Any) -> str:
 
 
 def sort_token(value: Any):
-    """A comparable sort key. Missing sorts first. Types are not mixed at the same rank.
-
-    NaN sorts with the missing group. Infinity sorts as a number, after every
-    finite value when ascending and before them when it is negative.
-    """
     if isinstance(value, float) and math.isinf(value):
         return (1, float(value))
     if is_missing(value):

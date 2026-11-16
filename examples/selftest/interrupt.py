@@ -1,4 +1,3 @@
-"""Raise KeyboardInterrupt. The child must report it, not die on the signal."""
 
 
 class Strategy:

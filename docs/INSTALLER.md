@@ -70,10 +70,10 @@ the window at the end.
 
 From a Windows checkout, with Python 3.12:
 
-```powershell
+```text
 py -3 -m pip install .
 py -3 -m pip install -r packaging\requirements-build.txt
-powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+py -3 packaging\build_windows.py
 ```
 
 The script compiles with Inno Setup 6.7.4 only. It always downloads
@@ -112,7 +112,7 @@ secret. To sign a later build, set these for that process and re-run it:
 | `SIGN_PFX_PASSWORD` | Password for that certificate. |
 | `SIGN_TIMESTAMP_URL` | Optional RFC 3161 timestamp server. The default is DigiCert's. |
 
-`packaging\sign_setup.ps1` uses `signtool sign /fd SHA256 /td SHA256`.
+`packaging\sign_setup.py` uses `signtool sign /fd SHA256 /td SHA256`.
 With `SIGN_PFX_PATH` unset it prints `code signing skipped` and leaves the
 file unsigned. Put the certificate in a GitHub Actions secret and call the
 script from the workflow only after that secret exists. Do not commit the

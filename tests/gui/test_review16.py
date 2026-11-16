@@ -1,4 +1,3 @@
-"""Sixteenth review. A strategy exception banners one line. The traceback stays in the log."""
 
 from __future__ import annotations
 

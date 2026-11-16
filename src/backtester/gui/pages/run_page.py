@@ -1,8 +1,3 @@
-"""Launch a single run, a walk-forward, or a batch.
-
-The page shows a readable summary of the draft. The stored contract is still
-``run_config.json``, written by the worker before the engine starts.
-"""
 
 from __future__ import annotations
 
@@ -330,7 +325,6 @@ class RunPage(QWidget):
         return "\n".join(f"{key}: {label.text()}" for key, label in self._summary_labels)
 
     def replace_summary(self, old: str, new: str) -> None:
-        """Swap displayed paths after validation, for the screenshot fixtures."""
         if not old:
             return
         for _key, label in self._summary_labels:

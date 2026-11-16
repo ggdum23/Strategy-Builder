@@ -1,8 +1,3 @@
-"""Locks that fail if a Phase 1 carry-forward mutation comes back.
-
-Each test is aimed at one named edit. The production code is already correct.
-The assertion is the thing that dies when that edit is applied.
-"""
 
 from __future__ import annotations
 
@@ -76,13 +71,6 @@ def _desk_bar(session, time, phase, price, **kw):
 
 
 def test_arena_month_accumulator_uses_tier_shares_not_pack_shares():
-    """Kills month_vol += abs(delta) in place of tier_shares.
-
-    k=10 turns about 20_000 pack shares into about 200_000 counted shares.
-    Two buys in the same fee month stay under 300_000 pack shares and cross
-    300_000 counted shares, so the second commission changes by about $150
-    when the accumulator uses the wrong quantity.
-    """
     k = 10.0
     bars = _flat_days(2, 50.0)
     result = engine_arena.run(_Plan({(0, 570): 1.0, (1, 570): 2.0}), bars, share_scale=k)
@@ -111,7 +99,6 @@ class _Ladder:
 
 
 def test_desk_month_accumulator_uses_tier_shares_not_pack_shares():
-    """Kills month_shares += abs(delta) in place of tier_shares. Same shape as the Arena lock."""
     k = 10.0
     bars = []
     for session in ("S0", "S1"):
@@ -136,12 +123,6 @@ def test_desk_month_accumulator_uses_tier_shares_not_pack_shares():
 
 
 def test_desk_fee_mult_does_not_scale_cash_borrow_or_financing():
-    """Kills cash -= bor * fee_mult and cash -= fin * fee_mult.
-
-    The borrow and financing accumulators already ignore fee_mult. This locks
-    the cash account at fee_mult=2, where doubling those two charges moves cash
-    by fin+bor.
-    """
     bars = [
         _desk_bar("S1", "09:30", "rth", 100.0),
         _desk_bar("S1", "09:31", "rth", 100.0),
@@ -173,7 +154,6 @@ def test_desk_fee_mult_does_not_scale_cash_borrow_or_financing():
 
 
 def test_desk_metrics_use_252_session_years():
-    """Kills years = n/365, and a 365-day vol or Sharpe that would ride along with it."""
     closes = [100.0, 110.0, 90.0, 120.0]
     bars = []
     for index, close in enumerate(closes):
@@ -212,7 +192,6 @@ def test_desk_metrics_use_252_session_years():
 
 
 def test_runner_hands_the_arena_engine_share_scale_k(monkeypatch):
-    """Kills execute() passing share_scale=1.0 instead of the caller's factor."""
     from backtester import runner
 
     captured = {}
@@ -235,7 +214,6 @@ def test_runner_hands_the_arena_engine_share_scale_k(monkeypatch):
 
 
 def test_a_nonce_derived_key_cannot_open_the_seal():
-    """Kills a seal whose HMAC key is nonce||nonce instead of the caller key."""
     payload = b"locked-tail-frame"
     key = os.urandom(32)
     blob = _seal(payload, key)
@@ -245,8 +223,6 @@ def test_a_nonce_derived_key_cannot_open_the_seal():
     forged = nonce + nonce
     assert len(forged) == 32
     assert forged != key
-    # The keystream itself must depend on the caller key. Replacing that key
-    # with nonce||nonce inside the HMAC makes these two streams identical.
     fixed = bytes(range(16))
     assert _keystream(key, fixed, 32) != _keystream(fixed + fixed, fixed, 32)
     with pytest.raises(ValueError, match="authentication"):

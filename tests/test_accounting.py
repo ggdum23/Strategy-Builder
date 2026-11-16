@@ -1,4 +1,3 @@
-"""Price basis, cash interest, and financing. Defaults stay bit-identical."""
 
 from __future__ import annotations
 
@@ -15,6 +14,7 @@ import pytest
 
 from backtester import costs as arena_costs
 from backtester import engine_arena, engine_desk
+from backtester.comment_guard import strip_python
 from backtester.accounting import (
     borrowed_base,
     dividend_cash,
@@ -86,9 +86,11 @@ def _desk_bars():
 
 
 def test_costs_file_is_the_pinned_reference():
-    digest = hashlib.sha256((ROOT / "src" / "backtester" / "costs.py").read_bytes()).hexdigest()
+    costs_path = ROOT / "src" / "backtester" / "costs.py"
+    digest = hashlib.sha256(costs_path.read_bytes()).hexdigest()
     assert digest == COSTS_SHA256
-    assert digest == hashlib.sha256((ROOT / "tests" / "reference" / "arena" / "costs.py").read_bytes()).hexdigest()
+    vendored = ROOT / "tests" / "reference" / "arena" / "costs.py"
+    assert strip_python(costs_path.read_text(encoding="utf-8")) == vendored.read_text(encoding="utf-8")
 
 
 def test_default_arena_book_matches_the_engine_and_explicit_zeros():
@@ -246,7 +248,6 @@ def test_bases_are_mutually_exclusive_and_the_accrual_is_one_252nd():
 
 def test_flat_cash_interest_is_one_252nd_per_boundary():
     equity = 1_000_000.0
-    # Literal session charges. This does not call session_accrual.
     first = 0.10 / 252.0 * equity
     second = 0.10 / 252.0 * (equity + first)
     arena = engine_arena.run(Flat(), _frame(days=3), cash_rate_annual=0.10)
@@ -538,7 +539,6 @@ def test_arena_warmup_charges_only_live_sessions(tmp_path):
     assert result["daily"][0][1] == 1_000_000.0
     assert result["cash_interest"] == one
     assert result["daily"][1][1] == 1_000_000.0 + one
-    # Flat book: the only cash change is the live charge, added onto the reset equity.
     assert metrics["final_equity"] == metrics["initial_equity"] + metrics["cash_interest"]
     assert metrics["cash_interest"] == one
 
@@ -570,7 +570,6 @@ def test_arena_post_flatten_is_in_the_overnight_snap():
     assert any(fill[2] == "post" and fill[7] == 0 for fill in flat["fills"])
     assert flat["financing"] == 0.0
     assert flat["dividends"] == 0.0
-    # Borrow stays on the last regular bar. A long pays none.
     assert flat["borrow"] == 0.0
     assert held["borrow"] == 0.0
 
@@ -626,7 +625,6 @@ def test_desk_snap_includes_an_rth_flatten_and_not_a_post_target():
 
 
 class _DividendSpy:
-    """Records dividend maps visible on the call stack. Holds one times equity."""
 
     def __init__(self):
         self.seen = []
@@ -937,8 +935,6 @@ def _walk_cli(tmp_path, profile, dividends_text, *, price_basis=None):
         argv.extend(["--price-basis", price_basis])
     started = time.monotonic()
     code = main(argv)
-    # One line per call on the real stderr. Pytest capture hides the normal
-    # stream, and the Windows job log is where a slow call has to be visible.
     if sys.platform == "win32":
         sys.__stderr__.write(
             "walk-cli profile=%s out=%s seconds=%.3f code=%s\n"

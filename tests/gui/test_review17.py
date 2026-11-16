@@ -1,4 +1,3 @@
-"""Seventeenth review. Failure banners, field names, and the results sentence."""
 
 from __future__ import annotations
 

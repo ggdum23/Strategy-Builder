@@ -1,4 +1,3 @@
-"""Return 0.0 when numpy imports and a thread can run a dot product."""
 
 import threading
 

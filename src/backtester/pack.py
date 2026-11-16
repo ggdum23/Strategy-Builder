@@ -1,24 +1,3 @@
-"""Chunked bar packs and the operator sidecar.
-
-An anonymized pack rescales prices and volume and replaces calendar dates with
-session ordinals. The ticker, the date map, and the scale factors are written
-only to the sidecar. Designer-facing file names carry neither a ticker nor a
-year. A chunk is about 250 trading sessions and each file stays under 25 MB.
-
-Prices multiplied by k are paired with share_scale = k. The sidecar file is
-where that number is stored. It also holds a random key and an HMAC over a
-versioned binding of pack_id, the anonymized flag, the date map, k,
-share_scale, and the borrow rate. A null borrow rate stays JSON null. The
-pack files do not contain the factor, the key, or any digest of the factor.
-The runner checks the MAC before it uses k. A sidecar without that MAC is
-refused, named or anonymized. Verification accepts only this version.
-Session ids use ASCII digits. An anonymized pack is a schema: regular
-files with the builder's names, a typed manifest, and a typed CSV cell
-for every column. There is no free-text column and no format scan of
-prices. Trade count is rescaled by the same volume factor as volume.
-When the day has a regular session the daily count is the sum of those
-scaled regular-session bars; otherwise it is the sum of every scaled bar.
-"""
 
 from __future__ import annotations
 
@@ -101,10 +80,7 @@ _MANIFEST_KEYS = {
     "price_basis",
 }
 _CHUNK_KEYS = {"file", "first_day", "last_day", "sessions"}
-# ASCII digits only. Session ids and date_map values. The leak scan uses
-# its own pattern and does not fold Unicode.
 _DATE_RE = re.compile(r"\b(?:19|20)[0-9]{2}-[0-9]{2}-[0-9]{2}\b")
-# Named packs use day 0. Every later ordinal is digits with no leading zero.
 _DATE_MAP_KEY_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _BARS_NAME_RE = re.compile(r"^bars_part_([0-9]+)\.csv\.gz$")
 _DAILY_NAME = "daily_rth.csv.gz"
@@ -118,9 +94,6 @@ _DAY = r"(?:0?[1-9]|[12][0-9]|3[01])"
 _MONTH2 = r"(?:0[1-9]|1[0-2])"
 _DAY2 = r"(?:0[1-9]|[12][0-9]|3[01])"
 _SEP = r"[-/._ ]"
-# Digit lookarounds, not \\b. Used only to word the error when a cell has
-# already failed its column grammar. Session ids are not scanned: the gate
-# requires the builder's exact ``S{day:05d}`` and the day sequence 1..n.
 _LEAK_DATE_RE = re.compile(
     rf"(?<![0-9])(?:{_YEAR}{_SEP}{_MONTH}{_SEP}{_DAY}|{_DAY}{_SEP}{_MONTH}{_SEP}{_YEAR}|{_YEAR}{_MONTH2}{_DAY2})(?![0-9])"
 )
@@ -129,8 +102,6 @@ _STREAM_UNREADABLE = "pack file streams could not be read"
 _DIR_ALT_STREAM = "pack directory has an alternate data stream"
 _DIR_STREAM_UNREADABLE = "pack directory streams could not be read"
 _DEFAULT_STREAM = "::$DATA"
-# The filename index. A directory listing returns it for every directory.
-# It is not an alternate data stream an operator can plant.
 _DIRECTORY_INDEX_STREAM = ":$i30:$index_allocation"
 _PACK_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _INT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
@@ -176,7 +147,6 @@ class LoadedPack:
 
 
 def draw_factor(generator: secrets.SystemRandom | None = None) -> float:
-    """A rescale away from 1 and away from the old 0.9 kit constant."""
     rng = generator or secrets.SystemRandom()
     value = math.exp(rng.uniform(math.log(0.15), math.log(0.75)))
     if not math.isfinite(value) or value <= 0.0 or value == 1.0 or abs(value - 0.9) < 1e-9:
@@ -208,11 +178,6 @@ def _keys(value, expected: set[str], path: str) -> None:
 
 
 def canonical_price_factor(price_factor: float) -> str:
-    """Shortest round-trip decimal of a scale factor.
-
-    ``1.7`` stays ``1.7``. The decimal is one field of the HMAC message. It
-    is not written into the pack.
-    """
     if isinstance(price_factor, bool) or not isinstance(price_factor, (int, float)):
         raise ValueError("price factor must be a positive finite number")
     value = float(price_factor)
@@ -222,7 +187,6 @@ def canonical_price_factor(price_factor: float) -> str:
 
 
 def _canonical_borrow_rate(value):
-    """``None`` stays JSON null. Any other rate is a finite non-negative float."""
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -234,14 +198,6 @@ def _canonical_borrow_rate(value):
 
 
 def _factor_mac_message(document: dict) -> bytes:
-    """Versioned canonical JSON bound to this pack, not only to k.
-
-    Version 2 also binds ``borrow_rate_source`` and ``borrow_rate_annual``.
-    A null borrow rate stays JSON null. The dividend file is not a pack or
-    sidecar field. It is an operator input supplied when the pack is run, so
-    it is not part of this message. ``date_map`` is what places those amounts
-    on session ids, and it is bound.
-    """
     if not isinstance(document.get("anonymized"), bool):
         raise ValueError("anonymized flag must be true or false")
     pack_id = document.get("pack_id")
@@ -273,7 +229,6 @@ def _factor_mac_message(document: dict) -> bytes:
 
 
 def factor_mac(key: bytes, document: dict) -> str:
-    """HMAC-SHA256 of the canonical pack binding. ``key`` is 32 raw bytes."""
     if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
         raise ValueError("factor key must be 32 bytes")
     if not isinstance(document, dict):
@@ -288,14 +243,6 @@ def _hex32(text, label: str) -> bytes:
 
 
 def _verify_factor_mac(document: dict) -> None:
-    """Refuse a sidecar whose pack binding was not authenticated at build.
-
-    Every pack sidecar needs the version-2 MAC. A missing tag fails closed
-    for a named pack and for an anonymized pack. A version-1 tag does not
-    match this message, so that pack has to be rebuilt. ``load_sidecar`` is
-    the gate for ``run_pack``, ``walk_pack``, and ``_prepare_pack``. A raw
-    local run never loads a sidecar.
-    """
     present = _FACTOR_MAC_KEYS & set(document)
     if not present:
         _fail("factor_mac", "sidecar has no operator factor MAC; rebuild the pack")
@@ -312,14 +259,6 @@ def _verify_factor_mac(document: dict) -> None:
 
 
 def require_build_price_factor(sidecar: dict) -> float:
-    """The price factor whose MAC matches the operator key.
-
-    Call this in the operator process before restating designer dividends
-    and before comparing ``share_scale`` to this factor. The MAC binds
-    ``pack_id``, the anonymized flag, the date map, this factor,
-    ``share_scale``, and the borrow rate (null stays null). Only version 2
-    verifies. A missing tag or a version-1 tag is refused.
-    """
     if not isinstance(sidecar, dict):
         raise ValueError("sidecar is not an object")
     _verify_factor_mac(sidecar)
@@ -368,17 +307,8 @@ def validate_sidecar(document: dict, *, allow_scale_mismatch: bool = False) -> N
         or float(borrow) < 0.0
     ):
         _fail("borrow_rate_annual", "expected a non-negative number or null")
-    # The MAC binds pack_id, the flag, the date map, k, share_scale, and the
-    # borrow rate. Check it before the share_scale comparison below, and again
-    # from require_build_price_factor before dividend restatement.
     require_build_price_factor(document)
     if document["anonymized"]:
-        # The builder writes share_scale equal to the price factor authenticated
-        # by the operator MAC. A later sidecar may not bill a different scale
-        # and still say the invoice used real share counts.
-        # allow_scale_mismatch is the test override that keeps one pack's
-        # designer tree comparable across billing scales. The caller records
-        # both factors in that case. The MAC is still checked.
         if float(document["price_factor"]) == 1.0 or float(document["volume_factor"]) == 1.0:
             _fail("price_factor", "an anonymized pack must actually rescale prices and volume")
         if not allow_scale_mismatch and float(document["share_scale"]) != float(document["price_factor"]):
@@ -406,11 +336,6 @@ def _pack_id(files: list[tuple[str, bytes]]) -> str:
 
 
 def _emitted_count(value) -> float:
-    """The count decimal ``to_csv`` will write, parsed back.
-
-    Anonymized counts are ``source * volume_factor``. Named counts are the
-    source integers. Both spellings are ``format(value, '.17g')``.
-    """
     return float(format(float(value), ".17g"))
 
 
@@ -434,24 +359,15 @@ def _read_csv_gz(path: Path) -> pd.DataFrame:
 
 
 def _token_present(symbol: str, text: str) -> bool:
-    """The report token rule. A raw substring would treat ``SS`` as present in ``RANDOM``."""
     return bool(ticker_token_spans(text, symbol))
 
 
 def _json_values_have_ticker(value, symbol: str) -> bool:
-    """String values only. Keys and pack column names are schema labels.
-
-    The manifest stores ``session_id`` in ``columns``. That label is not the
-    ticker ``ID``, which is the same exemption the report audit gives a CSV
-    header. Any other string still uses the token rule.
-    """
     if isinstance(value, dict):
         return any(_json_values_have_ticker(item, symbol) for item in value.values())
     if isinstance(value, list):
         return any(_json_values_have_ticker(item, symbol) for item in value)
     if isinstance(value, str):
-        # ``raw`` and ``total_return`` are series-kind labels. A symbol that
-        # casefolds to either word is rejected before this pack is written.
         if value in PACK_COLUMNS or value in {"raw", "total_return"}:
             return False
         return _token_present(symbol, value)
@@ -459,11 +375,6 @@ def _json_values_have_ticker(value, symbol: str) -> bool:
 
 
 def _text_has_ticker(name: str, text: str, symbol: str) -> bool:
-    """Apply the token rule the way the report audit does.
-
-    CSV headers and JSON keys are not tickers, so ``session_id`` is not the
-    symbol ``ID``. Every other string is.
-    """
     lower = name.lower()
     if lower.endswith(".json"):
         try:
@@ -481,13 +392,6 @@ def _text_has_ticker(name: str, text: str, symbol: str) -> bool:
 
 
 def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, bool, bool, int]:
-    """mtime, file name, FCOMMENT, FEXTRA, FHCRC, and the deflate offset.
-
-    RFC 1952 order after the 10-byte header is FEXTRA, FNAME, FCOMMENT, FHCRC.
-    ``blob`` is one member, or a member followed by further members. Only the
-    first header is read here. The offset is where the raw deflate stream
-    begins, so a later member is not swallowed with this one.
-    """
     if len(blob) < 10 or blob[:2] != b"\x1f\x8b":
         raise ValueError("gzip member is not gzip")
     flags = blob[3]
@@ -523,13 +427,6 @@ def _gzip_member(blob: bytes) -> tuple[int, bytes, bool, bool, bool, int]:
 
 
 def _gzip_members(blob: bytes):
-    """Every gzip member in ``blob``, not only the first.
-
-    A concatenated second member can carry a file name or a comment that the
-    first header does not. Each header is checked. The payloads are returned
-    in order so the caller can scan the text. ``GzipFile.read`` follows every
-    member in one call, so each member is inflated on its own with zlib.
-    """
     rest = blob
     while True:
         rest = rest.lstrip(b"\x00")
@@ -549,13 +446,6 @@ def _gzip_members(blob: bytes):
 
 
 def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
-    """One clean gzip member, inflated.
-
-    A second member is rejected even when its header is clean. ``GzipFile``
-    concatenates members, and duplicate rows still pass the unique-day check,
-    so the loaded book would be longer than the pack that was built. The
-    builder writes a single member.
-    """
     payloads = []
     for (mtime, fname, has_comment, has_extra, has_hcrc), payload in _gzip_members(blob):
         if mtime != 0:
@@ -577,12 +467,6 @@ def _anonymized_gzip_payloads(name: str, blob: bytes) -> list[bytes]:
 
 
 def _canonical_bars_name(name: str) -> bool:
-    """``bars_part_001`` … ``bars_part_999``, then ``bars_part_1000`` with no extra zero.
-
-    ``:03d`` is the builder's spelling. ``bars_part_1`` and ``bars_part_01000``
-    are a different spelling of the same part, so they are refused. Case
-    variants are refused.
-    """
     match = _BARS_NAME_RE.fullmatch(name)
     if match is None:
         return False
@@ -592,12 +476,10 @@ def _canonical_bars_name(name: str) -> bool:
 
 
 def _canonical_anonymized_name(name: str) -> bool:
-    """Builder file names only. Anything else is refused, not scanned."""
     return name in {_MANIFEST_NAME, _DAILY_NAME} or _canonical_bars_name(name)
 
 
 def _entry_is_regular_pack_file(mode: int, name: str) -> bool:
-    """lstat mode plus the builder's name. Symlinks and devices are not regular."""
     return stat.S_ISREG(mode) and _canonical_anonymized_name(name)
 
 
@@ -606,7 +488,6 @@ def _printable_ascii(blob: bytes) -> bool:
 
 
 def _session_ordinal(cell: str) -> int | None:
-    """The builder's ``S{n:05d}``. Longer ordinals stay unpadded past five digits."""
     if len(cell) < 6 or len(cell) > 16 or cell[0] != "S":
         return None
     digits = cell[1:]
@@ -628,7 +509,6 @@ def _canonical_int(cell: str, low: int, high: int) -> int | None:
 
 
 def _canonical_decimal(cell: str) -> bool:
-    """The spelling ``format(value, '.17g')`` produces. That is what ``to_csv`` writes."""
     if not cell or len(cell) > 64 or cell[0] == "+":
         return False
     try:
@@ -639,14 +519,12 @@ def _canonical_decimal(cell: str) -> bool:
 
 
 def _canonical_count(cell: str) -> bool:
-    """A non-negative count decimal. The same spelling as a scaled volume."""
     if not _canonical_decimal(cell):
         return False
     return float(cell) >= 0.0
 
 
 def _fail_cell(name: str, column: str, cell: str) -> None:
-    """A cell that is not its column. A date-shaped leftover still says so."""
     if _LEAK_DATE_RE.search(cell):
         raise ValueError(f"{name} contains a calendar date")
     raise ValueError(f"{column} cell is not the builder form")
@@ -665,7 +543,6 @@ def _manifest_bar_minutes(value) -> int:
 
 
 def _validate_anonymized_manifest(document: dict) -> None:
-    """Decoded manifest. Keys, types, and grammars. No date-format scan."""
     if not isinstance(document, dict):
         raise ValueError("pack manifest is not an object")
     extra = sorted(set(document) - _MANIFEST_KEYS)
@@ -732,14 +609,6 @@ def _csv_days(
     bar_minutes: int,
     single_row: bool = False,
 ) -> tuple[list[int], dict[int, float], dict[int, float]]:
-    """Typed rows.
-
-    Returns the day ordinals in appearance order, the sum of every count
-    cell for each day, and the daily count the builder writes: the regular
-    session when the day has one, otherwise every bar. ``single_row`` is
-    the daily file. Days inside the file are contiguous. ``session_id`` is
-    exactly ``S{day:05d}``.
-    """
     try:
         rows = list(csv.reader(io.StringIO(text)))
     except csv.Error as exc:
@@ -797,7 +666,6 @@ def _csv_days(
             session_counts[day] = session_counts.get(day, 0.0) + value
     if not days:
         raise ValueError(f"{name} CSV row does not match the pack header")
-    # The daily row sums the regular session when the day has one, else every bar.
     for day in days:
         if day not in saw_rth:
             session_counts[day] = counts[day]
@@ -811,15 +679,6 @@ def _reject_banned(name: str, text: str) -> None:
 
 
 def _stream_names(path: Path) -> list[str]:
-    """NTFS stream names on ``path``. Empty on platforms without them.
-
-    Callers that refuse a pack must not put these names in the error.
-    ``FindFirstStreamW`` and ``FindFirstFileW`` of ``path:*`` both fail
-    for a directory on the GitHub Windows runners. A directory is opened
-    with backup semantics and listed with ``FileStreamInformation``.
-    The names are the same (``::$DATA``, ``:$I30:$INDEX_ALLOCATION``,
-    ``:name:$DATA``).
-    """
     if os.name != "nt":
         return []
     try:
@@ -870,12 +729,6 @@ def _file_stream_names(path: Path) -> list[str]:
 
 
 def _stream_names_from_information(blob: bytes) -> list[str]:
-    """Names from a ``FileStreamInformation`` buffer.
-
-    Each entry is ``NextEntryOffset``, ``StreamNameLength`` in bytes,
-    two 8-byte sizes, then the UTF-16 name. ``NextEntryOffset`` is the
-    step to the next entry and is zero on the last one.
-    """
     names = []
     offset = 0
     while offset + 24 <= len(blob):
@@ -900,12 +753,6 @@ def _stream_names_from_information(blob: bytes) -> list[str]:
 
 
 def _directory_stream_names(path: Path) -> list[str]:
-    """Stream names from ``NtQueryInformationFile`` (``FileStreamInformation``).
-
-    The directory is opened with backup semantics, so the call is the
-    directory itself and not a search for children. The names match
-    ``FindFirstStreamW``.
-    """
     import ctypes
     from ctypes import wintypes
 
@@ -939,8 +786,6 @@ def _directory_stream_names(path: Path) -> list[str]:
     ]
     query.restype = ctypes.c_long
 
-    # GENERIC_READ, share read/write/delete, OPEN_EXISTING,
-    # FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT.
     handle = create(os.fspath(path), 0x80000000, 0x7, None, 3, 0x02200000, None)
     if handle is None or int(handle) in {0, -1, 2**32 - 1, 2**64 - 1}:
         raise OSError(_STREAM_UNREADABLE)
@@ -955,7 +800,6 @@ def _directory_stream_names(path: Path) -> list[str]:
             if status == 0:
                 raw = buf.raw
                 break
-            # STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH.
             if status not in {0x80000005, 0xC0000023, 0xC0000004}:
                 raise OSError(_STREAM_UNREADABLE)
             size *= 2
@@ -967,12 +811,6 @@ def _directory_stream_names(path: Path) -> list[str]:
 
 
 def _has_nondefault_stream(path: Path, *, directory: bool = False) -> bool:
-    """True when ``path`` has an NTFS stream other than the default data stream.
-
-    A directory also carries ``:$I30:$INDEX_ALLOCATION``. That is the
-    filename index, not a stream someone attached. A named ``:$DATA``
-    stream on the directory is still an alternate and is refused.
-    """
     allowed = {_DEFAULT_STREAM.casefold()}
     if directory:
         allowed.add(_DIRECTORY_INDEX_STREAM)
@@ -980,7 +818,6 @@ def _has_nondefault_stream(path: Path, *, directory: bool = False) -> bool:
 
 
 def _reject_alternate_streams(path: Path) -> None:
-    """Refuse an NTFS alternate stream. The error does not name it."""
     try:
         extra = _has_nondefault_stream(path)
     except OSError:
@@ -990,10 +827,6 @@ def _reject_alternate_streams(path: Path) -> None:
 
 
 def _reject_directory_streams(path: Path) -> None:
-    """Refuse an NTFS alternate stream on the pack directory itself.
-
-    The sentence is fixed. The stream name is not part of it.
-    """
     try:
         extra = _has_nondefault_stream(path, directory=True)
     except OSError:
@@ -1003,7 +836,6 @@ def _reject_directory_streams(path: Path) -> None:
 
 
 def _anonymized_directory(root: Path) -> list[str]:
-    """scandir plus lstat. No link is followed. The error names nothing."""
     try:
         info = os.lstat(root)
     except OSError:
@@ -1058,7 +890,6 @@ def _read_regular(root: Path, name: str) -> bytes:
 
 
 def _anonymized_text(name: str, raw: bytes) -> str:
-    """Printable ASCII text. Gzip is checked after inflation, not as a container."""
     if name.endswith(".gz"):
         blob = b"".join(_anonymized_gzip_payloads(name, raw))
     else:
@@ -1069,13 +900,6 @@ def _anonymized_text(name: str, raw: bytes) -> str:
 
 
 def _anonymized_pack_gate(root: Path, *, symbol: str | None = None) -> dict:
-    """One schema verdict for the audit and for ``load_pack``.
-
-    Directory entries, the manifest, and every CSV cell. A scaled price,
-    volume, or trade count may equal a date-shaped integer. That is a
-    number, not a calendar field. ``session_id`` is the day ordinal, and
-    ``pack_id`` is the hash of the chunk and daily bytes.
-    """
     names = _anonymized_directory(root)
     if _MANIFEST_NAME not in names:
         raise ValueError("pack manifest is missing")
@@ -1145,21 +969,12 @@ def _anonymized_pack_gate(root: Path, *, symbol: str | None = None) -> dict:
 
 
 def assert_anonymized_pack_clean(pack_dir, *, symbol: str) -> None:
-    """Refuse a designer tree that still carries identity or a scale factor."""
     if not symbol:
         raise ValueError("symbol is empty")
     _anonymized_pack_gate(Path(pack_dir), symbol=symbol)
 
 
 def copy_anonymized_pack(source, destination) -> None:
-    """Write a new pack directory from each file's default data stream.
-
-    The designer child is given the bar frame, not this directory. A file
-    handoff uses this copy. The bytes are the ones ``open`` reads, and the
-    destination files are created empty and then written, so an NTFS
-    alternate stream on the source does not ride along. A non-default
-    stream is refused before the copy.
-    """
     src = Path(source)
     dest = Path(destination)
     if dest.exists() and any(dest.iterdir()):
@@ -1193,7 +1008,6 @@ def _designer_frame(frame: pd.DataFrame, *, anonymize: bool, price_factor: float
         session_ids = {date: f"S{ordinal[date]:05d}" for date in dates}
         date_map = {str(ordinal[date]): date for date in dates}
     else:
-        # Named packs keep the loader's day index and the real session date.
         ordinal = {date: int(day) for date, day in zip(frame["date"].tolist(), frame["day"].tolist())}
         session_ids = {date: date for date in dates}
         date_map = {str(ordinal[date]): date for date in dates}
@@ -1315,11 +1129,6 @@ def build_pack(
     price_kind: str = "raw",
     operator_note: str = "",
 ) -> PackBuild:
-    """Inspect ``src``, optionally anonymize, and write a pack plus a sidecar.
-
-    The sidecar is never placed inside the pack directory. An existing pack
-    directory must be empty.
-    """
     if isinstance(chunk_sessions, bool) or not isinstance(chunk_sessions, int) or chunk_sessions < 1:
         raise ValueError("chunk_sessions must be a positive integer")
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
@@ -1452,7 +1261,6 @@ def build_pack(
 
 
 def _json_pairs(pairs):
-    """Object hook that refuses a repeated key. ``json.loads`` would keep the last one."""
     document = {}
     for key, value in pairs:
         if key in document:
@@ -1512,24 +1320,10 @@ def _validate_manifest(document: dict) -> None:
 
 
 def _reject_anonymized_gzip(name: str, blob: bytes) -> None:
-    """The same gzip rules as the designer-pack audit.
-
-    One member, mtime 0, no file name, no comment, no FEXTRA, and no FHCRC.
-    A second member is rejected here as well, including one whose header is clean.
-    ``load_pack`` repeats the check so a pack that bypassed the builder still
-    fails closed.
-    """
     _anonymized_gzip_payloads(name, blob)
 
 
 def _require_anonymized_flag(manifest: dict, session_ids: list[str]) -> None:
-    """Tie structural anonymization markers to the manifest flag.
-
-    The builder's ``S{n:05d}`` session ids and the stand-in asset name
-    require ``anonymized`` true. A named pack's session ids are ASCII
-    calendar dates. Anything else is refused. The operator MAC is checked
-    on the sidecar, not here.
-    """
     anonymized = manifest["anonymized"] is True
     if not anonymized and manifest.get("asset_name") == TICKER_STAND_IN:
         raise ValueError(
@@ -1559,11 +1353,6 @@ def _require_anonymized_flag(manifest: dict, session_ids: list[str]) -> None:
 
 
 def load_pack(pack_dir, *, symbol: str | None = None) -> LoadedPack:
-    """Read a pack. This does not open a sidecar.
-
-    ``symbol``, when the caller knows it, runs the same ticker check as
-    the audit. Typed cells cannot hold a split ticker either way.
-    """
     root = Path(pack_dir)
     manifest_path = root / _MANIFEST_NAME
     if manifest_path.is_symlink():
@@ -1618,8 +1407,6 @@ def load_pack(pack_dir, *, symbol: str | None = None) -> LoadedPack:
     daily = _read_csv_gz(daily_path)
     session_ids = [str(value) for frame in frames for value in frame["session_id"].tolist()]
     session_ids.extend(str(value) for value in daily["session_id"].tolist())
-    # Before any runner reads share_scale. An S##### id cannot be relabeled
-    # as a named pack to skip the operator MAC.
     _require_anonymized_flag(manifest, session_ids)
     frame = pd.concat(frames, ignore_index=True)
     frame["date"] = frame["session_id"].astype(str)

@@ -1,4 +1,3 @@
-"""Bit-identity of the ported Arena engine against the vendored reference."""
 
 from __future__ import annotations
 
@@ -11,8 +10,12 @@ import pytest
 
 from backtester import costs as port_costs
 from backtester import engine_arena as port
+from backtester.comment_guard import strip_python
 from backtester.data import load_named
 from backtester.strategy_loader import load_strategy_class
+
+PINNED_COSTS_SHA256 = "a3b0a522d8bf469001e75aaf274b0c5d3cbef624a68ed9fb94d29298110fe281"
+PINNED_COSTS_DESK_SHA256 = "07b0d25ceeebe292f03a2b7b6ca0d76d76fa8d6a59f21d60103abfceeab0ebbd"
 
 ROOT = Path(__file__).resolve().parents[1]
 REF = ROOT / "tests" / "reference" / "arena"
@@ -52,7 +55,11 @@ def _vendor_hashes():
             assert hashlib.sha256(mapping[name].read_bytes()).hexdigest() == digest
         else:
             assert not (ROOT / name).exists()
-    assert (ROOT / "src" / "backtester" / "costs.py").read_bytes() == (REF / "costs.py").read_bytes()
+    costs_path = ROOT / "src" / "backtester" / "costs.py"
+    desk_path = ROOT / "src" / "backtester" / "costs_desk.py"
+    assert hashlib.sha256(costs_path.read_bytes()).hexdigest() == PINNED_COSTS_SHA256
+    assert hashlib.sha256(desk_path.read_bytes()).hexdigest() == PINNED_COSTS_DESK_SHA256
+    assert strip_python(costs_path.read_text(encoding="utf-8")) == (REF / "costs.py").read_text(encoding="utf-8")
 
 
 def load_reference():
@@ -74,7 +81,6 @@ def load_reference():
 
 
 def _canon(value) -> str:
-    """Sorted-key serialization. Floats use repr of the Python float."""
     if isinstance(value, dict):
         body = ",".join(f"{key!r}:{_canon(value[key])}" for key in sorted(value, key=str))
         return "{" + body + "}"
@@ -114,7 +120,6 @@ def _same(ref_result, port_result, ref_mod, label):
 
 
 class ShortOne:
-    """None of the twenty designer strategies go short. This one does."""
 
     WANTS_EXTENDED_HOURS = False
 
@@ -145,7 +150,6 @@ def qqq():
 def test_vendor_bytes_and_sample_parity(qqq):
     _vendor_hashes()
     ref = load_reference()
-    # Official borrow rate through the override must match the default call.
     short_bars = qqq.iloc[:4000].copy()
     default = port.run(ShortOne(), short_bars)
     overridden = port.run(ShortOne(), short_bars, borrow_rate_annual=port_costs.BORROW_RATE_ANNUAL)
@@ -162,7 +166,6 @@ def test_vendor_bytes_and_sample_parity(qqq):
         ref_result = ref.run(cls(), qqq)
         port_result = port.run(cls(), qqq)
         _same(ref_result, port_result, ref, label)
-        # The reference class and the port class are separate objects. Same behavior.
         if label == "D01":
             ref_bh = ref.run(ref.BuyAndHold(), qqq)
             port_bh = port.run(port.BuyAndHold(), qqq)
@@ -182,12 +185,8 @@ def test_vendor_bytes_and_sample_parity(qqq):
                 ]
             )
         )
-    # Levered originals are in the twenty. Extended hours and the short are added
-    # because none of those files set either flag.
     assert any(row.startswith("D02,") or row.startswith("D14,") or row.startswith("D20,") for row in table)
     text = "\n".join(table) + "\n"
-    # Review artifact. tempfile.gettempdir() is the platform temp directory,
-    # so the same write works on Windows and Linux.
     out = Path(tempfile.gettempdir()) / "strategy_builder_parity_table.csv"
     out.write_text(text, encoding="utf-8")
     assert out.read_text(encoding="utf-8") == text

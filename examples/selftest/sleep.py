@@ -1,4 +1,3 @@
-"""Sleep past the per-call limit. The referee disqualifies the run."""
 
 import time
 

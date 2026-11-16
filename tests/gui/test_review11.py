@@ -1,4 +1,3 @@
-"""Eleventh review. A parallel designer export keeps the formatted leaderboard."""
 
 from __future__ import annotations
 

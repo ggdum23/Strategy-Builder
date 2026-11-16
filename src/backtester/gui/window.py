@@ -1,4 +1,3 @@
-"""Research terminal shell. Pages render. Runs go to a worker process."""
 
 from __future__ import annotations
 
@@ -192,7 +191,6 @@ class MainWindow(QMainWindow):
         self._publish_status()
 
     def note_results_audience(self) -> None:
-        """A designer report must not leave a ticker in the status bar or the root chip."""
         self._publish_status()
         self._refresh_chip()
 

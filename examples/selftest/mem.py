@@ -1,8 +1,3 @@
-"""Allocate until the memory cap raises MemoryError.
-
-Returns 0.0 when the allocation is refused and 1.0 if a large block was
-allocated anyway.
-"""
 
 
 class Strategy:
