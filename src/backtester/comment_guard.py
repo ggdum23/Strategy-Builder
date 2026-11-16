@@ -23,7 +23,30 @@ THREAT_MODEL = (
 
 EXECUTABLE_ALLOWLIST = ("apt-get", "python", "sudo")
 
-PYTHON_MODULES = ("backtester", "pip", "pytest")
+COMMAND_ALLOWLIST = (
+    ("apt-get", "install", "-y", "bubblewrap"),
+    ("apt-get", "update"),
+    ("python", "-m", "backtester", "test"),
+    ("python", "-m", "pip", "install", "--upgrade", "pip"),
+    ("python", "-m", "pip", "install", "-e", ".[dev,gui]"),
+    ("python", "-m", "pip", "install", "-e", ".[dev]"),
+    ("python", "-m", "pip", "install", "-r", "packaging/requirements-build.txt"),
+    ("python", "-m", "pip", "install", "."),
+    ("python", "-m", "pytest", "-q", "-m", "jailed_sample", "--timeout=60", "--timeout-method=thread", "tests/test_jailed_examples.py"),
+    ("python", "-m", "pytest", "-q", "-m", "jailed_sample", "tests/test_jailed_examples.py"),
+    ("python", "-m", "pytest", "-q", "tests/gui"),
+    ("python", ".github/install_qt_libraries.py"),
+    ("python", "packaging/build_windows.py"),
+    ("python", "packaging/ci_delete_userdata.py"),
+    ("python", "packaging/ci_install.py"),
+    ("python", "packaging/ci_uninstall.py"),
+    ("python", "packaging/ci_upgrade.py"),
+    ("python", "packaging/record_setup.py"),
+    ("python", "packaging/smoke_frozen.py", "--repo", "."),
+    ("python", "scripts/bench.py", "--scale", "ci", "--gate"),
+    ("python", "tests/ci_shards.py", "plan"),
+    ("python", "tests/ci_shards.py", "run"),
+)
 
 KNOWN_KEYS = {
     "root": ("concurrency", "defaults", "env", "jobs", "name", "on", "permissions", "run", "shell", "steps"),
@@ -228,6 +251,7 @@ def python_spans(text: str) -> list[tuple[int, int, str]]:
         spans.append((start, end, ""))
     tree = ast.parse(normalized)
     spans.extend(_no_effect_spans(normalized, starts, tree))
+    spans.extend(_commentary_write_spans(normalized, starts, tree))
     spans.sort()
     return spans
 
@@ -251,39 +275,49 @@ def _const_text(node: ast.AST) -> str | None:
     return None
 
 
-def _contains_call(node: ast.AST) -> bool:
-    return any(isinstance(item, ast.Call) for item in ast.walk(node))
-
-
-def _commentary_constant(node: ast.AST) -> bool:
-    if _contains_call(node):
-        return False
-    if isinstance(node, ast.Constant):
-        return isinstance(node.value, (str, bytes))
-    if isinstance(node, ast.JoinedStr):
-        return True
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        return bool(node.elts) and all(_commentary_constant(item) for item in node.elts)
-    return False
-
-
 def _underscore_name(name: str) -> bool:
     return bool(name) and set(name) == {"_"}
 
 
-def _target_is_doc(node: ast.AST) -> bool:
+def _different_constant_name(node: ast.AST) -> bool:
+    text = _const_text(node)
+    return text is not None and text != "__doc__"
+
+
+def _namespace_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
+        return False
+    func = node.func
+    names = {"globals", "vars", "locals"}
+    if isinstance(func, ast.Name):
+        return func.id in names
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in names
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "builtins"
+    )
+
+
+def _target_writes_doc(node: ast.AST) -> bool:
+    if isinstance(node, ast.Starred):
+        return _target_writes_doc(node.value)
     if isinstance(node, ast.Name):
         return node.id == "__doc__"
     if isinstance(node, ast.Attribute):
         return node.attr == "__doc__"
     if isinstance(node, ast.Subscript):
+        if _namespace_call(node.value):
+            return not _different_constant_name(node.slice)
         return _const_text(node.slice) == "__doc__"
     if isinstance(node, (ast.Tuple, ast.List)):
-        return any(_target_is_doc(item) for item in node.elts)
+        return any(_target_writes_doc(item) for item in node.elts)
     return False
 
 
 def _target_is_only_underscores(node: ast.AST) -> bool:
+    if isinstance(node, ast.Starred):
+        return _target_is_only_underscores(node.value)
     if isinstance(node, ast.Name):
         return _underscore_name(node.id)
     if isinstance(node, ast.Attribute):
@@ -298,19 +332,24 @@ def _assignment_targets(statement: ast.AST) -> list[ast.AST] | None:
         return list(statement.targets)
     if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
         return [statement.target]
+    if isinstance(statement, ast.NamedExpr):
+        return [statement.target]
     return None
 
 
-def _commentary_assignment(statement: ast.AST) -> bool:
+def _direct_call_or_await(node: ast.AST | None) -> bool:
+    return isinstance(node, (ast.Call, ast.Await))
+
+
+def _assignment_is_finding(statement: ast.AST) -> bool:
     targets = _assignment_targets(statement)
-    if targets is None:
+    if not targets:
         return False
-    value = getattr(statement, "value", None)
-    if value is None or not _commentary_constant(value):
-        return False
-    if any(_target_is_doc(target) for target in targets):
+    if any(_target_writes_doc(target) for target in targets):
         return True
-    return all(_target_is_only_underscores(target) for target in targets)
+    if all(_target_is_only_underscores(target) for target in targets):
+        return not _direct_call_or_await(getattr(statement, "value", None))
+    return False
 
 
 def _call_argument(node: ast.Call, index: int, keyword: str) -> ast.AST | None:
@@ -322,15 +361,69 @@ def _call_argument(node: ast.Call, index: int, keyword: str) -> ast.AST | None:
     return None
 
 
-def _setattr_doc_constant(node: ast.Call) -> bool:
-    func = node.func
-    if not isinstance(func, ast.Name) or func.id != "setattr":
+def _setter_kind(func: ast.AST) -> str | None:
+    if isinstance(func, ast.Name) and func.id == "setattr":
+        return "setattr"
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr == "__setitem__":
+        return "setitem"
+    owner = func.value
+    if not isinstance(owner, ast.Name):
+        return None
+    if func.attr == "setattr" and owner.id == "builtins":
+        return "setattr"
+    if func.attr == "__setattr__" and owner.id == "object":
+        return "setattr"
+    return None
+
+
+def _call_is_doc_write(node: ast.Call) -> bool:
+    kind = _setter_kind(node.func)
+    if kind is None:
         return False
-    name = _call_argument(node, 1, "name")
-    value = _call_argument(node, 2, "value")
-    if name is None or value is None or _const_text(name) != "__doc__":
-        return False
-    return _commentary_constant(value)
+    if kind == "setitem":
+        name = _call_argument(node, 0, "key")
+    else:
+        name = _call_argument(node, 1, "name")
+    if name is None:
+        return True
+    return not _different_constant_name(name)
+
+
+def _is_structural_commentary(node: ast.AST) -> bool:
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+        return _assignment_is_finding(node)
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+        return _target_writes_doc(node.target)
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return any(item.optional_vars is not None and _target_writes_doc(item.optional_vars) for item in node.items)
+    if isinstance(node, ast.ExceptHandler):
+        return node.name == "__doc__"
+    if isinstance(node, ast.Call):
+        return _call_is_doc_write(node)
+    return False
+
+
+def _node_span(text: str, starts: list[int], node: ast.AST) -> tuple[int, int, str] | None:
+    lineno = getattr(node, "lineno", None)
+    col = getattr(node, "col_offset", None)
+    if lineno is None or col is None:
+        return None
+    end_line = node.end_lineno if node.end_lineno is not None else lineno
+    end_column = node.end_col_offset if node.end_col_offset is not None else col
+    return (_position(starts, lineno, col), _position(starts, end_line, end_column), "")
+
+
+def _commentary_write_spans(text: str, starts: list[int], tree: ast.AST) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not _is_structural_commentary(node):
+            continue
+        span = _node_span(text, starts, node)
+        if span is not None:
+            spans.append(span)
+    return spans
 
 
 def _body_no_effect_spans(
@@ -343,15 +436,9 @@ def _body_no_effect_spans(
 ) -> list[tuple[int, int, str]]:
     discarded = []
     for statement in body:
-        if _commentary_assignment(statement):
-            discarded.append(statement)
-            continue
         if not isinstance(statement, ast.Expr):
             continue
         if stub_ok and len(body) == 1 and _bare_ellipsis(statement, text, starts):
-            continue
-        if isinstance(statement.value, ast.Call) and _setattr_doc_constant(statement.value):
-            discarded.append(statement)
             continue
         if _expression_is_allowed(statement.value):
             continue
@@ -438,13 +525,20 @@ def _scan_hash_config(text: str, markers: str = "#") -> tuple[list[tuple[int, in
     while index < size:
         if text.startswith('"""', index) or text.startswith("'''", index):
             quote = text[index : index + 3]
+            opened = index
             index += 3
-            while index < size and not text.startswith(quote, index):
+            closed = False
+            while index < size:
+                if text.startswith(quote, index):
+                    index += 3
+                    closed = True
+                    break
                 if quote == '"""' and text[index] == "\\":
                     index += 2
                     continue
                 index += 1
-            index = min(size, index + 3)
+            if not closed:
+                unclosed.append(opened)
             continue
         char = text[index]
         if char in "'\"":
@@ -503,10 +597,102 @@ def gitignore_issue_lines(text: str) -> list[tuple[int, str]]:
     return found
 
 
+def _inno_section_name(line: str) -> str | None:
+    stripped = line.strip()
+    if len(stripped) < 3 or stripped[0] != "[":
+        return None
+    end = stripped.find("]")
+    if end < 2:
+        return None
+    return stripped[1:end].strip()
+
+
+def _scan_inno_code_line(line: str, line_number: int, brace_open: int | None, paren_open: int | None) -> tuple[list[tuple[int, str]], int | None, int | None]:
+    found: list[tuple[int, str]] = []
+    quote = ""
+    index = 0
+    if brace_open is not None:
+        end = line.find("}")
+        if end < 0:
+            return found, brace_open, paren_open
+        brace_open = None
+        index = end + 1
+    elif paren_open is not None:
+        end = line.find("*)")
+        if end < 0:
+            return found, brace_open, paren_open
+        paren_open = None
+        index = end + 2
+    size = len(line)
+    while index < size:
+        if quote == "'":
+            if line.startswith("''", index):
+                index += 2
+                continue
+            if line[index] == "'":
+                quote = ""
+            index += 1
+            continue
+        if quote == '"':
+            if line[index] == '"':
+                quote = ""
+            index += 1
+            continue
+        if line.startswith("//", index):
+            found.append((line_number, "comment"))
+            break
+        if line.startswith("(*", index):
+            found.append((line_number, "comment"))
+            end = line.find("*)", index + 2)
+            if end < 0:
+                return found, brace_open, line_number
+            index = end + 2
+            continue
+        if line[index] == "{":
+            if index + 1 < size and line[index + 1] == "#":
+                end = line.find("}", index + 2)
+                if end < 0:
+                    found.append((line_number, "unscanned"))
+                    break
+                index = end + 1
+                continue
+            found.append((line_number, "comment"))
+            end = line.find("}", index + 1)
+            if end < 0:
+                return found, line_number, paren_open
+            index = end + 1
+            continue
+        if line[index] in "'\"":
+            quote = line[index]
+            index += 1
+            continue
+        index += 1
+    if quote:
+        found.append((line_number, "unscanned"))
+    return found, brace_open, paren_open
+
+
 def inno_issue_lines(text: str) -> list[tuple[int, str]]:
     normalized = _normalize_newlines(text)
-    found = []
-    for line_number, line in enumerate(normalized.split("\n"), 1):
+    found: list[tuple[int, str]] = []
+    in_code = False
+    brace_open: int | None = None
+    paren_open: int | None = None
+    lines = normalized.split("\n")
+    for line_number, line in enumerate(lines, 1):
+        section = _inno_section_name(line)
+        if section is not None:
+            if brace_open is not None:
+                found.append((brace_open, "unscanned"))
+                brace_open = None
+            if paren_open is not None:
+                found.append((paren_open, "unscanned"))
+                paren_open = None
+            in_code = section.casefold() == "code"
+        if in_code:
+            extra, brace_open, paren_open = _scan_inno_code_line(line, line_number, brace_open, paren_open)
+            found.extend(extra)
+            continue
         stripped = line.lstrip(" \t")
         if stripped.startswith(";"):
             found.append((line_number, "comment"))
@@ -516,7 +702,11 @@ def inno_issue_lines(text: str) -> list[tuple[int, str]]:
             found.append((line_number, "unscanned"))
         elif mark is not None:
             found.append((line_number, "comment"))
-    return found
+    if brace_open is not None:
+        found.append((brace_open, "unscanned"))
+    if paren_open is not None:
+        found.append((paren_open, "unscanned"))
+    return _unique_lines(found)
 
 
 def _inno_slash_comment(line: str) -> int | None:
@@ -805,8 +995,7 @@ def _split_yaml_comment(line: str) -> tuple[str, str | None]:
 
 _RUN_TOKEN = re.compile(r"[-A-Za-z0-9_./:=,@+,]+")
 _ALLOWED_SHELLS = {"bash", "pwsh", "cmd"}
-_BANNED_COMMANDS = {"eval", "bash", "sh", "dash", "pwsh", "powershell", "bash.exe", "sh.exe", "pwsh.exe", "powershell.exe"}
-_APT_SHAPES = {("update",), ("install", "-y", "bubblewrap")}
+_COMMANDS = set(COMMAND_ALLOWLIST)
 
 
 def _split_run_commands(line: str) -> list[list[str]] | None:
@@ -860,59 +1049,17 @@ def _base_name(token: str) -> str:
     return token.casefold().replace("\\", "/").rsplit("/", 1)[-1]
 
 
-def _python_shape_allowed(tokens: list[str]) -> bool:
-    if len(tokens) < 2:
-        return False
-    if tokens[1] == "-m":
-        return len(tokens) >= 3 and _base_name(tokens[2]) in PYTHON_MODULES
-    script = tokens[1]
-    return not script.startswith("-") and script.endswith(".py")
-
-
-def _command_shape_allowed(tokens: list[str]) -> bool:
-    executable = _base_name(tokens[0])
-    if executable == "python":
-        return _python_shape_allowed(tokens)
-    if executable == "apt-get":
-        return tuple(tokens[1:]) in _APT_SHAPES
-    return False
-
-
-def _subject_command(tokens: list[str]) -> list[str]:
-    if tokens and _base_name(tokens[0]) == "sudo":
-        return tokens[1:]
-    return tokens
-
-
-def _pip_command(tokens: list[str]) -> bool:
-    command = _subject_command(tokens)
-    return len(command) >= 3 and _base_name(command[0]) == "python" and command[1] == "-m" and _base_name(command[2]) == "pip"
-
-
-def _interpreter_flag(token: str, tokens: list[str]) -> bool:
-    folded = token.casefold()
-    if folded.startswith("-c") or folded in {"--eval", "-command", "-p"}:
-        return True
-    if folded in {"-e", "-r"}:
-        return not _pip_command(tokens)
-    return False
-
-
 def _command_allowed(tokens: list[str]) -> bool:
     if not tokens:
         return False
-    for token in tokens:
-        folded = token.casefold()
-        if _interpreter_flag(token, tokens) or folded in _BANNED_COMMANDS or _base_name(token) in _BANNED_COMMANDS:
+    subject = tokens
+    if _base_name(tokens[0]) == "sudo":
+        if len(tokens) < 2 or _base_name(tokens[1]) == "sudo":
             return False
-    executable = _base_name(tokens[0])
-    if executable not in EXECUTABLE_ALLOWLIST:
+        subject = tokens[1:]
+    if not subject or _base_name(subject[0]) not in EXECUTABLE_ALLOWLIST or _base_name(subject[0]) == "sudo":
         return False
-    if executable == "sudo":
-        if len(tokens) < 2 or _base_name(tokens[1]) not in EXECUTABLE_ALLOWLIST or _base_name(tokens[1]) == "sudo":
-            return False
-        return _command_shape_allowed(tokens[1:])
-    return _command_shape_allowed(tokens)
+    return tuple(subject) in _COMMANDS
 
 
 def _run_line_allowed(line: str) -> bool:
@@ -1066,7 +1213,7 @@ def html_issue_lines(text: str) -> list[tuple[int, str]]:
 
 def _json_executes_strings(node: object) -> bool:
     if isinstance(node, dict):
-        if "scripts" in node:
+        if any(isinstance(key, str) and key.casefold() == "scripts" for key in node):
             return True
         return any(_json_executes_strings(value) for value in node.values())
     if isinstance(node, list):

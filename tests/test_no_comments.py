@@ -19,6 +19,31 @@ def test_threat_model_rejects_unused_commentary_and_unmodeled_syntax():
         "treat every unmodeled file type, key, executable or syntax as a finding",
     )
     assert comment_guard.EXECUTABLE_ALLOWLIST == ("apt-get", "python", "sudo")
+    assert comment_guard.COMMAND_ALLOWLIST == (
+        ("apt-get", "install", "-y", "bubblewrap"),
+        ("apt-get", "update"),
+        ("python", "-m", "backtester", "test"),
+        ("python", "-m", "pip", "install", "--upgrade", "pip"),
+        ("python", "-m", "pip", "install", "-e", ".[dev,gui]"),
+        ("python", "-m", "pip", "install", "-e", ".[dev]"),
+        ("python", "-m", "pip", "install", "-r", "packaging/requirements-build.txt"),
+        ("python", "-m", "pip", "install", "."),
+        ("python", "-m", "pytest", "-q", "-m", "jailed_sample", "--timeout=60", "--timeout-method=thread", "tests/test_jailed_examples.py"),
+        ("python", "-m", "pytest", "-q", "-m", "jailed_sample", "tests/test_jailed_examples.py"),
+        ("python", "-m", "pytest", "-q", "tests/gui"),
+        ("python", ".github/install_qt_libraries.py"),
+        ("python", "packaging/build_windows.py"),
+        ("python", "packaging/ci_delete_userdata.py"),
+        ("python", "packaging/ci_install.py"),
+        ("python", "packaging/ci_uninstall.py"),
+        ("python", "packaging/ci_upgrade.py"),
+        ("python", "packaging/record_setup.py"),
+        ("python", "packaging/smoke_frozen.py", "--repo", "."),
+        ("python", "scripts/bench.py", "--scale", "ci", "--gate"),
+        ("python", "tests/ci_shards.py", "plan"),
+        ("python", "tests/ci_shards.py", "run"),
+    )
+    assert comment_guard.COMMAND_ALLOWLIST == tuple(sorted(comment_guard.COMMAND_ALLOWLIST))
     assert "script" not in comment_guard.KNOWN_KEYS["with"]
     assert "entrypoint" not in comment_guard.KNOWN_KEYS["step"]
     assert "args" not in comment_guard.KNOWN_KEYS["step"]
@@ -471,7 +496,8 @@ def test_workflow_grammar_blocks_the_review_bypasses():
     assert comment_guard.yaml_issue_lines("run: python3 script.py\n")
     assert comment_guard.yaml_issue_lines("shell: pwsh\nrun: python packaging/build_windows.py\n") == []
     assert comment_guard.yaml_issue_lines("shell: Bash\nrun: python -m backtester test\n") == []
-    assert comment_guard.yaml_issue_lines("shell: cmd\nrun: python script.py\n") == []
+    assert comment_guard.yaml_issue_lines("shell: cmd\nrun: python packaging/build_windows.py\n") == []
+    assert comment_guard.yaml_issue_lines("shell: cmd\nrun: python script.py\n")
     assert comment_guard.yaml_issue_lines('run: echo "hello # world"\n')
     assert comment_guard.yaml_issue_lines('run: python -m pip install -e ".[dev]"\n') == []
     assert comment_guard.yaml_issue_lines('run: python -m pip install -e ".[dev,gui]"\n') == []
@@ -508,6 +534,12 @@ def test_generated_run_lines_outside_the_grammar_are_flagged():
         if key in comment_guard.KNOWN_KEYS["root"]:
             continue
         assert any(kind == "unscanned" for _line, kind in comment_guard.yaml_issue_lines(key + ": hidden\n")), key
+        flagged += 1
+    extras = ["hidden", "comment", "version", "list", "freeze", "debug", "words"]
+    for command in comment_guard.COMMAND_ALLOWLIST:
+        extended = command + (rng.choice(extras),)
+        assert extended not in comment_guard.COMMAND_ALLOWLIST
+        assert comment_guard.yaml_issue_lines("run: " + " ".join(extended) + "\n"), extended
         flagged += 1
     assert flagged >= 40
 
@@ -637,6 +669,69 @@ def test_generated_executables_and_keys_outside_the_allowlist_are_flagged():
         produced += 1
         flagged += 1
     assert flagged >= 40
+
+
+def test_review5_structural_rules_close_the_filed_rows():
+    assert comment_guard.python_issue_lines('__doc__ = "hidden" + " comment"\n')
+    assert comment_guard.python_issue_lines('__doc__ = "hidden" if True else print(0)\n')
+    assert comment_guard.python_issue_lines('__doc__ = "hidden" or print(0)\n')
+    assert comment_guard.python_issue_lines('__doc__ = "hidden" * 1\n')
+    assert comment_guard.python_issue_lines('__doc__ = "%s" % "hidden"\n')
+    assert comment_guard.python_issue_lines('globals()[f"__doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('globals()["__" + "doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('setattr(sys, f"__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('setattr(sys, "__doc__", "hid" + "den")\n')
+    assert comment_guard.python_issue_lines('builtins.setattr(sys, "__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('object.__setattr__(sys, "__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('x = (__doc__ := "hidden")\n')
+    assert comment_guard.python_issue_lines('x = __doc__ = "hid" + "den"\n')
+    assert comment_guard.python_issue_lines('_ = "hidden" + " comment"\n')
+    assert comment_guard.python_issue_lines('_ = "hidden" if True else print(0)\n')
+    assert comment_guard.python_issue_lines('*_, = ("hidden",)\n')
+    assert comment_guard.python_issue_lines('obj.__setitem__("__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('globals().__setitem__("__doc__", "hidden")\n')
+    assert comment_guard.python_issue_lines('for __doc__ in ("hidden",):\n    pass\n')
+    assert comment_guard.python_issue_lines("_ = print(1)\n") == []
+    assert comment_guard.python_issue_lines('for _ in ("hidden",):\n    pass\n') == []
+    assert comment_guard.python_issue_lines('exec("x = 1 # hidden")\n') == []
+    assert comment_guard.python_issue_lines('globals()["name"] = "hidden"\n') == []
+    assert comment_guard.python_issue_lines('setattr(sys, "version", "hidden")\n') == []
+    assert comment_guard.python_issue_lines('monkeypatch.setattr(sys, "frozen", True)\n') == []
+    assert comment_guard.python_issue_lines("async def f():\n    _ = await name()\n") == []
+    assert comment_guard.python_issue_lines("def f():\n    _ = yield name()\n")
+    assert comment_guard.python_issue_lines('vars()[f"__doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('locals()["__" + "doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('builtins.globals()["__doc__"] = "hidden"\n')
+    assert comment_guard.python_issue_lines('x = """hidden"""\n') == []
+    for command in (
+        "python -m pip list this is a hidden comment",
+        "python -m pip freeze this is a hidden comment",
+        "python -m pip --version this is a hidden comment",
+        "python -m pip -V hidden commentary",
+        "python -m pip debug this is a hidden comment",
+        "python -m pytest --version this is a hidden comment",
+        "sudo python -m pip --version hidden commentary",
+        "python packaging/record_setup.py this is a hidden comment",
+        "python -m pip install --constraint constraints.txt .",
+    ):
+        assert comment_guard.yaml_issue_lines("run: " + command + "\n"), command
+    assert comment_guard.yaml_issue_lines('run: python -m pip install -e ".[dev]"\n') == []
+    assert comment_guard.yaml_issue_lines("run: python -m pytest -q tests/gui\n") == []
+    assert comment_guard.yaml_issue_lines("run: python -m backtester test\n") == []
+    assert comment_guard.yaml_issue_lines("run: sudo apt-get update\n") == []
+    assert comment_guard.yaml_issue_lines("run: sudo apt-get install -y bubblewrap\n") == []
+    assert any(kind == "unscanned" for _line, kind in comment_guard.hash_config_issue_lines('key = """unterminated\n# hidden comment\n'))
+    assert any(kind == "unscanned" for _line, kind in comment_guard.hash_config_issue_lines("key = '''unterminated\n# hidden comment\n"))
+    assert any(item.kind == "unscanned" for item in comment_guard.issues_for("requirements.txt", 'pkg """\n# hidden comment\n'))
+    assert any(kind == "unscanned" for _line, kind in comment_guard.ini_issue_lines('key = """unterminated\n; hidden comment\n'))
+    assert comment_guard.hash_config_issue_lines('key = """closed"""\n# real\n') == [(2, "comment")]
+    assert any(kind == "comment" for _line, kind in comment_guard.inno_issue_lines("[Code]\nbegin\n  { hidden comment }\nend\n"))
+    assert any(kind == "comment" for _line, kind in comment_guard.inno_issue_lines("[Code]\nbegin\n  (* hidden comment *)\nend\n"))
+    assert comment_guard.inno_issue_lines("#ifndef AppVersion\n") == []
+    assert comment_guard.inno_issue_lines("[Setup]\nAppVersion={#AppVersion}\n") == []
+    assert comment_guard.inno_issue_lines("[Code]\n  Result := '{#DefaultDataRoot}';\n") == []
+    assert comment_guard.issues_for("book.json", '{"Scripts": {"build": "echo hi # hidden"}}\n')
+    assert comment_guard.json_issue_lines('{"description": "echo hi # hidden"}\n') == []
 
 
 def test_decode_failures_are_findings(tmp_path: Path):
