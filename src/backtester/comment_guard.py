@@ -43,6 +43,11 @@ _DYNAMIC_CALLS = frozenset({"exec", "eval", "compile"})
 _BUILTIN_MODULES = frozenset({"builtins", "__builtins__"})
 _REFLECT_IMPORTS = frozenset({"setitem", "ior", "setattr", "exec", "eval", "compile", "globals", "vars", "locals"})
 _LOOKUP_NAMES = frozenset({"getattr", "setattr", "hasattr", "delattr"})
+_TYPE_PARAM_NODES = tuple(
+    item
+    for name in ("TypeVar", "TypeVarTuple", "ParamSpec")
+    if isinstance(item := getattr(ast, name, None), type)
+)
 
 EXECUTABLE_ALLOWLIST = ("apt-get", "python", "sudo")
 
@@ -570,7 +575,7 @@ def _doc_token(node: ast.AST) -> bool:
         return True
     if isinstance(node, ast.MatchMapping) and node.rest == "__doc__":
         return True
-    if isinstance(node, (ast.TypeVar, ast.TypeVarTuple, ast.ParamSpec)) and node.name == "__doc__":
+    if _TYPE_PARAM_NODES and isinstance(node, _TYPE_PARAM_NODES) and node.name == "__doc__":
         return True
     return False
 

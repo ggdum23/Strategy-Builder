@@ -855,7 +855,9 @@ def test_review7_bans_the_reflective_ingredients():
     assert comment_guard.python_issue_lines('with nullcontext("hidden") as _:\n    pass\n') == []
     assert comment_guard.python_issue_lines('for (_,) in items:\n    pass\n') == []
     assert comment_guard.python_issue_lines('match value:\n    case [*_]:\n        pass\n') == []
-    assert comment_guard.python_issue_lines('def f[__]():\n    pass\n') == []
+    plain_param = comment_guard.python_issue_lines('def f[__]():\n    pass\n')
+    parsed_param = comment_guard.python_issue_lines('def f[T]():\n    pass\n')
+    assert plain_param == ([] if parsed_param == [] else [(1, "unscanned")])
     assert comment_guard.python_issue_lines('x = type(exc).__name__\n') == []
     assert comment_guard.python_issue_lines('import builtins\n') == []
     assert comment_guard.python_issue_lines('from operator import add\n') == []
