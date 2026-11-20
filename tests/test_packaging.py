@@ -172,6 +172,7 @@ def test_spec_is_one_folder_and_collects_optional_gui_stack():
     assert 'name="backtester"' in text
     assert 'name="Strategy Builder"' in text
     assert "console=False" in text
+    assert 'datas.append((ICON, "assets"))' in text
     assert "version=str(VERSION_FILE)" in text
     assert '["Agg"]' in text
     assert 'contents_directory="_internal"' in text
@@ -185,10 +186,29 @@ def test_spec_is_one_folder_and_collects_optional_gui_stack():
 
 def test_icon_matches_the_generator():
     icon = PACKAGING / "assets" / "strategy_builder.ico"
+    source = PACKAGING / "assets" / "logo_source.png"
     assert icon.is_file()
+    assert source.is_file()
     blob = icon.read_bytes()
     assert blob[:4] == b"\x00\x00\x01\x00"
     assert blob == make_icon.build_ico()
+    count = int.from_bytes(blob[4:6], "little")
+    sizes = []
+    for index in range(count):
+        entry = 6 + 16 * index
+        width = blob[entry]
+        height = blob[entry + 1]
+        sizes.append(256 if width == 0 else width)
+        assert height == width
+        image_size = int.from_bytes(blob[entry + 8 : entry + 12], "little")
+        image_offset = int.from_bytes(blob[entry + 12 : entry + 16], "little")
+        image = blob[image_offset : image_offset + image_size]
+        header = image[:40]
+        assert len(header) == 40
+        stored = 256 if width == 0 else width
+        assert int.from_bytes(header[4:8], "little") == stored
+        assert int.from_bytes(header[8:12], "little") == stored * 2
+    assert sizes == [16, 20, 24, 32, 40, 48, 64, 128, 256]
 
 
 def test_freeze_support_runs_before_the_application():

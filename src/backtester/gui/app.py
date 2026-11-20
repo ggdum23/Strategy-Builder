@@ -3,6 +3,21 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+from pathlib import Path
+
+
+def icon_file() -> Path:
+    if getattr(sys, "frozen", False):
+        root = getattr(sys, "_MEIPASS", None)
+        base = Path(root) if root else Path(sys.executable).resolve().parent
+        return base / "assets" / "strategy_builder.ico"
+    return Path(__file__).resolve().parents[3] / "packaging" / "assets" / "strategy_builder.ico"
+
+
+def apply_window_icon(app) -> None:
+    from PySide6.QtGui import QIcon
+
+    app.setWindowIcon(QIcon(str(icon_file())))
 
 
 def main(argv=None) -> int:
@@ -29,6 +44,7 @@ def main(argv=None) -> int:
     app.setApplicationName("Strategy Builder")
     app.setOrganizationName("StrategyBuilder")
     app.setStyle("Fusion")
+    apply_window_icon(app)
     from .window import MainWindow
 
     window = MainWindow()

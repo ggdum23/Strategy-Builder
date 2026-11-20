@@ -53,6 +53,7 @@ FILE_SHARDS = {
     "gui": (
         "tests/gui/test_charts.py",
         "tests/gui/test_contract.py",
+        "tests/gui/test_icon.py",
         "tests/gui/test_jobs.py",
         "tests/gui/test_prepared_page.py",
         "tests/gui/test_review.py",
