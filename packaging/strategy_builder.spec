@@ -17,6 +17,7 @@ VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
 VERSION_FILE.write_text(versions.version_info_text(), encoding="utf-8")
 
 datas = collect_optional.matplotlib_datas()
+datas.append((ICON, "assets"))
 binaries = collect_optional.qt_plugin_binaries()
 hidden = collect_optional.hiddenimports()
 
